@@ -1,3 +1,9 @@
+---
+banner: |
+  ⚠️ **Superseded by issue drafts** — This document is archived for reference.
+  For current roadmap and implementation details, see `/docs/issues/` and `/AGENTS.md`.
+---
+
 # Đánh giá kiến trúc Agent hiện tại & Roadmap V2
 
 *Với tư cách techlead, đây là phân tích thẳng thắn — không tâng bốc kiến trúc V1, không liệt kê option vô tội vạ cho V2.*
