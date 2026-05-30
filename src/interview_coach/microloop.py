@@ -1,0 +1,160 @@
+"""The within-question Micro-loop (slice 0005, ADR 0001), hand-rolled in plain Python.
+
+The cycle that owns a single question end-to-end: the Interviewer asks → the Candidate answers → the
+Evaluator scores the turn and flags ``follow_up_recommended`` → if a Follow-up is flagged *and* the
+safety cap is not hit, the Interviewer generates one targeting the gap and we repeat → otherwise stop
+and keep the last score. The Evaluator's flag is the stop logic; the cap is only a guardrail against a
+pathological loop, and tripping it is logged distinctly from a normal resolution. On exit the resolved
+score updates the Skill state (slice 0002).
+
+Orchestration is deliberately plain Python — LangGraph is deferred to slice 0010 (ADR 0004). Tools
+stay out of here too: the Interviewer's RAG follow-up arrives in slice 0007 (ADR 0003).
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Sequence
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Protocol
+
+from .evaluator import Evaluation, evaluate
+from .interviewer import generate_follow_up
+from .llm import LLMClient
+from .seeds import SeedQuestion
+from .skill import SkillState, apply_evaluation
+
+logger = logging.getLogger(__name__)
+
+# 1 original question + up to 3 follow-ups. A guardrail, not the stop logic: a healthy loop stops
+# earlier because the Evaluator stops recommending follow-ups.
+DEFAULT_MAX_TURNS = 4
+
+
+class CandidateExhausted(RuntimeError):
+    """A scripted Candidate was asked more questions than it has canned answers for."""
+
+
+class Candidate(Protocol):
+    """Whoever answers the Interviewer within a question. A fixture here; a human/UI later (0012)."""
+
+    def answer(self, question: str) -> str: ...
+
+
+class ScriptedCandidate:
+    """A fixture Candidate that replies with canned answers in order (issue 0005: the Candidate is a
+    fixture). The first reply answers the seed question; the rest answer successive Follow-ups."""
+
+    def __init__(self, answers: Sequence[str]) -> None:
+        if not answers:
+            raise ValueError("a scripted candidate needs at least one answer")
+        self._answers = list(answers)
+        self._index = 0
+
+    def answer(self, question: str) -> str:
+        if self._index >= len(self._answers):
+            raise CandidateExhausted(
+                f"scripted candidate ran out of answers after {self._index} turn(s); "
+                "the micro-loop asked more follow-ups than were scripted"
+            )
+        reply = self._answers[self._index]
+        self._index += 1
+        return reply
+
+
+class StopReason(StrEnum):
+    """Why the micro-loop stopped — a normal resolution vs. a guardrail trip (see acceptance crit.)."""
+
+    RESOLVED = "resolved"  # the Evaluator stopped recommending a follow-up — the real stop logic
+    SAFETY_CAP = "safety_cap"  # the cap halted a still-flagging loop — a guardrail, not a stop
+
+
+@dataclass(frozen=True)
+class Turn:
+    """One ask→answer→score step of the micro-loop."""
+
+    question: str
+    answer: str
+    evaluation: Evaluation
+    is_follow_up: bool  # False for the seed question, True for an Interviewer-generated follow-up
+
+
+@dataclass(frozen=True)
+class MicroLoopResult:
+    """The outcome of resolving one question: the full exchange, why it stopped, and the new belief."""
+
+    skill: str
+    turns: tuple[Turn, ...]
+    stop_reason: StopReason
+    skill_state: SkillState  # the Skill state after folding in the resolved score (slice 0002)
+
+    @property
+    def resolved_evaluation(self) -> Evaluation:
+        """The kept score: the last turn's evaluation (slice 0005 keeps the last, not the best)."""
+        return self.turns[-1].evaluation
+
+
+def run_micro_loop(
+    client: LLMClient,
+    seed: SeedQuestion,
+    candidate: Candidate,
+    state: SkillState | None = None,
+    *,
+    max_turns: int = DEFAULT_MAX_TURNS,
+) -> MicroLoopResult:
+    """Resolve one question end-to-end, returning the exchange and the updated Skill state.
+
+    ``state`` is the Skill's belief coming in (a Session threads it across questions in the macro-loop,
+    slice 0010); it defaults to the neutral prior. The Evaluator scores *every* turn and the last score
+    is what the question resolves to — even when the safety cap fires.
+    """
+    if max_turns < 1:
+        raise ValueError(f"max_turns must be >= 1, got {max_turns}")
+    if state is None:
+        state = SkillState.neutral(seed.skill)
+
+    turns: list[Turn] = []
+    question = seed.question
+    is_follow_up = False
+
+    while True:
+        answer = candidate.answer(question)
+        evaluation = evaluate(client, question, answer, seed.rubric)
+        turns.append(Turn(question=question, answer=answer, evaluation=evaluation, is_follow_up=is_follow_up))
+
+        if not evaluation.follow_up_recommended:
+            stop_reason = StopReason.RESOLVED
+            logger.info(
+                "micro-loop resolved after %d turn(s): the Evaluator no longer recommends a follow-up",
+                len(turns),
+            )
+            break
+
+        if len(turns) >= max_turns:
+            stop_reason = StopReason.SAFETY_CAP
+            logger.warning(
+                "micro-loop SAFETY CAP tripped after %d turn(s): the Evaluator still recommends a "
+                "follow-up but the cap (max_turns=%d) halts the loop — this is a guardrail trip, NOT a "
+                "normal resolution; keeping the last score",
+                len(turns),
+                max_turns,
+            )
+            break
+
+        follow_up = generate_follow_up(
+            client,
+            original_question=seed.question,
+            answer=answer,
+            evaluation=evaluation,
+        )
+        question = follow_up.question
+        is_follow_up = True
+
+    resolved = turns[-1].evaluation
+    return MicroLoopResult(
+        skill=seed.skill,
+        turns=tuple(turns),
+        stop_reason=stop_reason,
+        skill_state=apply_evaluation(state, resolved),
+    )

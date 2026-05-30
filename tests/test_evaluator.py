@@ -118,6 +118,29 @@ def test_non_contiguous_evidence_rejected_then_corrected(make_client):
     assert fake.call_count == 2
 
 
+def test_evidence_retry_prompt_includes_candidate_answer_and_contiguous_rule(make_client):
+    # Non-contiguous evidence (two real phrases stitched together) is the live failure mode. The
+    # retry correction must hand the model the source answer + the exact rule so the repair is
+    # actionable, not just "that was invalid".
+    bad = _good_dimensions()
+    bad["correctness"] = {
+        "score": 5,
+        "evidence": (
+            "Bias is error from overly simple assumptions. "
+            "L2 shrinks weights to reduce variance"
+        ),
+    }
+
+    client, fake = make_client([_eval_json(bad), _eval_json(_good_dimensions())])
+
+    evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+
+    retry_msg = fake.chat.completions.calls[1]["messages"][-1]["content"]
+    assert "CANDIDATE ANSWER" in retry_msg
+    assert STRONG_ANSWER in retry_msg
+    assert "ONE contiguous substring" in retry_msg
+
+
 def test_no_evidence_is_allowed(make_client):
     dims = _good_dimensions()
     dims["system_thinking"] = {"score": 2, "evidence": "no evidence"}

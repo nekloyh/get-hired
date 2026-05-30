@@ -72,7 +72,8 @@ def _make_validators(rubric: Rubric, answer: str) -> list[Validator]:
             if not quote or quote not in answer:
                 raise ValueError(
                     f"evidence for '{dim}' is not a verbatim quote from the answer: {quote!r}. "
-                    f"{_EVIDENCE_RULE}"
+                    f"{_EVIDENCE_RULE}\n"
+                    f"Copy directly from this exact text — CANDIDATE ANSWER:\n{answer}"
                 )
 
     return [check_dimensions, check_evidence]
