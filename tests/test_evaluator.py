@@ -213,7 +213,7 @@ def test_cross_check_runs_inside_evaluate(make_client):
 def test_live_weak_scores_below_strong():
     settings = load_settings()
     if not settings.configured:
-        pytest.skip("LLM not configured — set LLM_API_KEY/BASE_URL/MODEL to run live tests")
+        pytest.skip("LLM primary provider not configured — set PRIMARY_PROVIDER and provider credentials")
     client = build_client(settings)
     strong = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
     weak = evaluate(client, QUESTION.question, WEAK_ANSWER, QUESTION.rubric)

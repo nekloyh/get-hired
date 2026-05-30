@@ -6,14 +6,14 @@ glossary.
 
 ## Status
 
-**Slice 0005 — within-question micro-loop.** The judgment path is now a loop that owns one question
-end-to-end (ADR 0001): the **Interviewer** asks → the fixture **Candidate** answers → the **Evaluator**
-scores the turn and flags `follow_up_recommended` → if a **Follow-up** is flagged and the safety cap
-is not hit, the Interviewer generates one targeting the gap and we repeat → otherwise stop and keep
-the last score, then update the **Skill** state (slice 0002). The Evaluator's flag is the stop logic;
-the cap is only a guardrail, logged distinctly when it trips. Ships with three seed questions for
-`ml_fundamentals`. Orchestrated in plain Python (LangGraph is deferred to slice 0010 — ADR 0004), and
-the Interviewer's RAG follow-up tool arrives in slice 0007 (ADR 0003).
+**Slices 0004–0005 — provider router + within-question micro-loop.** LLM calls now go through an
+`LLMRouter`: `PRIMARY_PROVIDER=mimo|groq` selects the primary OpenAI-compatible provider and falls
+back to the other configured provider on primary call failure. The judgment path is also a loop that
+owns one question end-to-end (ADR 0001): the **Interviewer** asks → the fixture **Candidate** answers
+→ the **Evaluator** scores the turn and flags `follow_up_recommended` → if a **Follow-up** is flagged
+and the safety cap is not hit, the Interviewer generates one targeting the gap and we repeat →
+otherwise stop and keep the last score, then update the **Skill** state (slice 0002). The Evaluator's
+flag is the stop logic; the cap is only a guardrail, logged distinctly when it trips.
 
 Earlier slices: **0001** evaluate one answer → typed `Evaluation`; **0002** Beta-distributed Skill
 state updated from the score (pure Python, no LLM — ADR 0002); **0003** a deterministic
@@ -26,11 +26,12 @@ Requires [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync                 # create the venv + install deps (downloads Python 3.12 if needed)
-cp .env.example .env    # then fill in your MiMo (OpenAI-compatible) credentials
+cp .env.example .env    # then fill in your MiMo/Groq credentials
 ```
 
-`.env` keys: `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`. MiMo is primary; a Groq cutover is planned
-for 2026-06-03 (see `docs/issues/0004`).
+`.env` keys: set `PRIMARY_PROVIDER=mimo` or `PRIMARY_PROVIDER=groq`, then fill that provider's
+`*_API_KEY`, `*_BASE_URL`, and `*_MODEL`. If both providers are configured, the non-primary provider
+is used as fallback.
 
 ## Run
 
@@ -49,9 +50,9 @@ uv run pytest -m live     # explicitly hit the real provider (needs .env configu
 
 ## Layout
 
-- `src/interview_coach/llm.py` — `MimoClient.chat_json`: structured output + one self-correcting
-  retry; quarantines MiMo's `reasoning_content` thinking-mode quirk (ADR 0003). Issue 0004
-  generalizes this into the multi-provider `LLMRouter`.
+- `src/interview_coach/llm.py` — `LLMClient`, `MimoClient`, `GroqClient`, and `LLMRouter`: structured
+  output + one self-correcting retry, primary-provider selection, fallback, and MiMo's
+  `reasoning_content` handling quarantined inside `MimoClient` (ADR 0003).
 - `src/interview_coach/evaluator.py` — the `Evaluation` schema + `evaluate()`, plus the slice-0003
   `weighted_score` cross-check. The Evaluator is the *only* component that judges (ADR 0001).
 - `src/interview_coach/interviewer.py` — the Interviewer: `generate_follow_up()` aims one Follow-up at

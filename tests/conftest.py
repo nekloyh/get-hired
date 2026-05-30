@@ -1,6 +1,6 @@
-"""Test helpers: a minimal fake OpenAI client that scripts successive chat replies.
+"""Test helpers: a minimal fake OpenAI-compatible client that scripts successive chat replies.
 
-The fake stands in for ``openai.OpenAI`` and is injected into a real :class:`MimoClient`, so the
+The fake stands in for ``openai.OpenAI`` and is injected into real provider clients, so the
 retry/validation logic in ``chat_json`` is exercised end-to-end against canned model output.
 """
 
@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from interview_coach.config import Settings
-from interview_coach.llm import MimoClient
+from interview_coach.llm import LLMRouter, MimoClient
 
 
 class _FakeMessage:
@@ -37,6 +37,8 @@ class _FakeCompletions:
     def create(self, **kwargs):
         self.calls.append(kwargs)
         reply = self.replies[min(len(self.calls) - 1, len(self.replies) - 1)]
+        if isinstance(reply, Exception):
+            raise reply
         content, reasoning = reply if isinstance(reply, tuple) else (reply, None)
         return _FakeResponse(_FakeMessage(content, reasoning))
 
@@ -59,13 +61,25 @@ class FakeOpenAI:
 
 @pytest.fixture
 def settings() -> Settings:
-    return Settings(_env_file=None, api_key="test", base_url="http://test", model="test-model")
+    return Settings(
+        _env_file=None,
+        primary_provider="mimo",
+        mimo_api_key="test",
+        mimo_base_url="http://test",
+        mimo_model="test-model",
+    )
+
+
+@pytest.fixture
+def fake_openai_factory():
+    return FakeOpenAI
 
 
 @pytest.fixture
 def make_client(settings: Settings):
-    def _make(replies: list) -> tuple[MimoClient, FakeOpenAI]:
+    def _make(replies: list) -> tuple[LLMRouter, FakeOpenAI]:
         fake = FakeOpenAI(replies)
-        return MimoClient(settings, client=fake), fake
+        mimo = MimoClient(settings.provider_config("mimo"), client=fake)
+        return LLMRouter("mimo", {"mimo": mimo}), fake
 
     return _make

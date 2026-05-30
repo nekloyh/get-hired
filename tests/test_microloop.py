@@ -177,7 +177,7 @@ def test_default_cap_is_one_question_plus_three_follow_ups():
 def test_live_strong_seed_resolves_high():
     settings = load_settings()
     if not settings.configured:
-        pytest.skip("LLM not configured — set LLM_API_KEY/BASE_URL/MODEL to run live tests")
+        pytest.skip("LLM primary provider not configured — set PRIMARY_PROVIDER and provider credentials")
     client = build_client(settings)
     seed = SEED_QUESTIONS[0]  # the strong opener
     result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers))
@@ -190,7 +190,7 @@ def test_live_strong_seed_resolves_high():
 def test_live_follow_up_does_not_re_ask_the_question():
     settings = load_settings()
     if not settings.configured:
-        pytest.skip("LLM not configured — set LLM_API_KEY/BASE_URL/MODEL to run live tests")
+        pytest.skip("LLM primary provider not configured — set PRIMARY_PROVIDER and provider credentials")
     client = build_client(settings)
     seed = SEED_QUESTIONS[1]  # the weak opener, likely to draw a follow-up
     result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers))

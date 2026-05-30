@@ -134,8 +134,9 @@ def main(argv: list[str] | None = None) -> int:
     settings = load_settings()
     if not settings.configured:
         print(
-            "LLM is not configured. Copy .env.example to .env and set "
-            "LLM_API_KEY, LLM_BASE_URL, and LLM_MODEL.",
+            f"LLM primary provider {settings.primary_provider!r} is not configured. Copy "
+            ".env.example to .env, set PRIMARY_PROVIDER, and fill that provider's API key, "
+            "base URL, and model.",
             file=sys.stderr,
         )
         return 2
