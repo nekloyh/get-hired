@@ -6,9 +6,11 @@ glossary.
 
 ## Status
 
-**Slice 0001 — evaluate one answer.** The thinnest end-to-end judgment path: a hard-coded question
-plus a fixture answer → the **Evaluator** (a single structured LLM call) → a typed, schema-validated
-`Evaluation`. No skill-state, micro-loop, or RAG yet — those are later slices.
+**Slice 0002 — skill-state update.** The judgment path now feeds a belief: a hard-coded question
+plus a fixture answer → the **Evaluator** (a single structured LLM call) → a typed `Evaluation` → a
+Beta-distributed **Skill** state updated from the score (pure Python, no LLM — ADR 0002). Each answer
+shifts mastery toward its score and shrinks the variance, so confidence rises. No micro-loop,
+correlations, informative priors, or RAG yet — those are later slices.
 
 ## Setup
 
@@ -32,8 +34,8 @@ uv run python -m interview_coach --answer weak   # just the weak one
 ## Test
 
 ```bash
-uv run pytest             # unit tests (mocked LLM — no credentials needed)
-uv run pytest -m live     # also hit the real provider (needs .env configured)
+uv run pytest             # offline/unit tests only (no credentials needed)
+uv run pytest -m live     # explicitly hit the real provider (needs .env configured)
 ```
 
 ## Layout
@@ -45,4 +47,7 @@ uv run pytest -m live     # also hit the real provider (needs .env configured)
   *only* component that judges (ADR 0001).
 - `src/interview_coach/rubric.py` — the fixed 5-dimension rubric; a weight of 0 disables a dimension.
 - `src/interview_coach/fixtures.py` — the hard-coded question + strong/weak fixture answers.
-- `src/interview_coach/cli.py` — runs the slice and prints the typed judgment.
+- `src/interview_coach/skill.py` — the Beta-distributed `SkillState` (`mastery`/`confidence` from
+  α/β) and its pure-Python updater `apply_evaluation()`. No LLM by design (ADR 0002).
+- `src/interview_coach/cli.py` — runs the slice: prints the judgment, then the before→after Skill
+  state showing how mastery and confidence moved.

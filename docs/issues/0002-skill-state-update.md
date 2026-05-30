@@ -10,11 +10,18 @@ Correlations and priors are not in scope here (they arrive with the Diagnostic, 
 
 ## Acceptance criteria
 
-- [ ] A skill state exposes `mastery` and `confidence` derived from α/β
-- [ ] Applying an evaluation shifts mastery toward the score and *increases* confidence (variance shrinks)
-- [ ] A strong answer and a weak answer move mastery in opposite directions
-- [ ] Update is pure Python — no LLM call, deterministic, unit-tested
+- [x] A skill state exposes `mastery` and `confidence` derived from α/β
+- [x] Applying an evaluation shifts mastery toward the score and *increases* confidence (variance shrinks)
+- [x] A strong answer and a weak answer move mastery in opposite directions
+- [x] Update is pure Python — no LLM call, deterministic, unit-tested
 
 ## Blocked by
 
 - 0001 (needs an evaluation to consume)
+
+## Done
+
+Shipped in `src/interview_coach/skill.py` (`SkillState` + `apply_evaluation`), wired into the CLI
+demo, and covered by `tests/test_skill.py`. Confidence is `1 − variance / variance(neutral prior)`,
+so it reads 0 at the `Beta(1,1)` prior and rises monotonically as evidence concentrates the belief.
+Also hardened the default test run to stay offline (`addopts = "-m 'not live'"`).
