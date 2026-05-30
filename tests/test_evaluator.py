@@ -5,9 +5,18 @@ import json
 import pytest
 
 from interview_coach.config import load_settings
-from interview_coach.evaluator import Evaluation, evaluate
+from interview_coach.evaluator import (
+    DIVERGENCE_CONFIDENCE_CEILING,
+    WEIGHTED_SCORE_TOLERANCE,
+    DimensionScore,
+    Evaluation,
+    apply_cross_check,
+    evaluate,
+    linear_weighted_score,
+)
 from interview_coach.fixtures import QUESTION, STRONG_ANSWER, WEAK_ANSWER
 from interview_coach.llm import build_client
+from interview_coach.rubric import Rubric
 
 ACTIVE = {"correctness", "depth", "communication", "system_thinking"}
 
@@ -25,15 +34,31 @@ def _good_dimensions() -> dict:
     }
 
 
-def _eval_json(dimensions: dict, weighted: float = 4.0) -> str:
+def _weak_dimensions() -> dict:
+    # All active dimensions score 2 -> a linear weighted score of 2.0 under QUESTION.rubric.
+    return {d: {"score": 2, "evidence": "no evidence"} for d in ACTIVE}
+
+
+def _eval_json(dimensions: dict, weighted: float = 4.0, confidence: float = 0.8) -> str:
     return json.dumps(
         {
             "dimensions": dimensions,
             "weighted_score": weighted,
-            "confidence": 0.8,
+            "confidence": confidence,
             "follow_up_recommended": False,
             "follow_up_rationale": "The answer is fully revealed.",
         }
+    )
+
+
+def _evaluation(scores: dict[str, int], weighted: float, confidence: float = 0.8) -> Evaluation:
+    """Build an Evaluation directly (bypassing the LLM) to exercise the cross-check in isolation."""
+    return Evaluation(
+        dimensions={d: DimensionScore(score=s, evidence="no evidence") for d, s in scores.items()},
+        weighted_score=weighted,
+        confidence=confidence,
+        follow_up_recommended=False,
+        follow_up_rationale="n/a",
     )
 
 
@@ -75,12 +100,90 @@ def test_case_changed_evidence_rejected_then_corrected(make_client):
     assert fake.call_count == 2
 
 
+def test_non_contiguous_evidence_rejected_then_corrected(make_client):
+    bad = _good_dimensions()
+    bad["correctness"] = {
+        "score": 5,
+        "evidence": (
+            "Bias is error from overly simple assumptions. "
+            "L2 shrinks weights to reduce variance"
+        ),
+    }
+
+    client, fake = make_client([_eval_json(bad), _eval_json(_good_dimensions())])
+
+    ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+
+    assert ev.dimensions["correctness"].evidence == "Bias is error from overly simple assumptions"
+    assert fake.call_count == 2
+
+
 def test_no_evidence_is_allowed(make_client):
     dims = _good_dimensions()
     dims["system_thinking"] = {"score": 2, "evidence": "no evidence"}
     client, _ = make_client([_eval_json(dims)])
     ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
     assert ev.dimensions["system_thinking"].evidence == "no evidence"
+
+
+# --- weighted_score cross-check guard (slice 0003) ---------------------------------------------
+
+
+def test_linear_weighted_score_normalizes_by_active_weights():
+    # (3*5 + 1*1) / (3 + 1) = 16 / 4 = 4.0 — weights need not sum to 1.
+    rubric = Rubric(weights={"correctness": 3.0, "depth": 1.0})
+    dims = {
+        "correctness": DimensionScore(score=5, evidence="x"),
+        "depth": DimensionScore(score=1, evidence="x"),
+    }
+    assert linear_weighted_score(dims, rubric) == pytest.approx(4.0)
+
+
+def test_cross_check_leaves_confidence_when_scores_agree():
+    # Dimensions {5,4,4,4} under QUESTION.rubric give a linear 4.4; holistic 4.0 is within tolerance.
+    ev = _evaluation({"correctness": 5, "depth": 4, "communication": 4, "system_thinking": 4}, 4.0)
+    guarded = apply_cross_check(ev, QUESTION.rubric)
+    assert guarded.confidence == ev.confidence
+    assert guarded is ev  # untouched: same object returned
+
+
+def test_cross_check_at_tolerance_boundary_does_not_trip():
+    # linear = 2.0, holistic = 3.0 -> divergence exactly == tolerance (1.0), which must NOT trip.
+    ev = _evaluation({d: 2 for d in ACTIVE}, 2.0 + WEIGHTED_SCORE_TOLERANCE, confidence=0.9)
+    assert apply_cross_check(ev, QUESTION.rubric).confidence == pytest.approx(0.9)
+
+
+def test_cross_check_inflated_score_drops_confidence():
+    # Weak dimensions (linear 2.0) but an inflated holistic 4.5 -> the hole the guard closes.
+    ev = _evaluation({d: 2 for d in ACTIVE}, 4.5, confidence=0.9)
+    guarded = apply_cross_check(ev, QUESTION.rubric)
+    assert guarded.confidence == pytest.approx(DIVERGENCE_CONFIDENCE_CEILING)
+    assert guarded.confidence < ev.confidence
+    assert guarded.weighted_score == ev.weighted_score  # the holistic score is kept, not overwritten
+
+
+def test_cross_check_is_symmetric_a_sharp_downward_cap_also_trips():
+    # Strong dimensions (linear 5.0) but the model caps the answer at 2.0 -> divergence is flagged too.
+    ev = _evaluation({d: 5 for d in ACTIVE}, 2.0, confidence=0.9)
+    assert apply_cross_check(ev, QUESTION.rubric).confidence == pytest.approx(DIVERGENCE_CONFIDENCE_CEILING)
+
+
+def test_cross_check_does_not_raise_already_low_confidence():
+    # Divergent, but the model was already unsure (<= ceiling) -> left exactly as-is, never raised.
+    ev = _evaluation({d: 2 for d in ACTIVE}, 4.5, confidence=0.1)
+    guarded = apply_cross_check(ev, QUESTION.rubric)
+    assert guarded.confidence == pytest.approx(0.1)
+    assert guarded is ev
+
+
+def test_cross_check_runs_inside_evaluate(make_client):
+    # Wiring: an inflated holistic score must come back from evaluate() with confidence lowered, and
+    # without any retry (the guard is post-processing, not a chat_json validator).
+    client, fake = make_client([_eval_json(_weak_dimensions(), weighted=4.5, confidence=0.9)])
+    ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+    assert ev.confidence == pytest.approx(DIVERGENCE_CONFIDENCE_CEILING)
+    assert ev.weighted_score == pytest.approx(4.5)
+    assert fake.call_count == 1
 
 
 @pytest.mark.live
