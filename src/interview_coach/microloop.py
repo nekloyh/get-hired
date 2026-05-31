@@ -7,8 +7,9 @@ and keep the last score. The Evaluator's flag is the stop logic; the cap is only
 pathological loop, and tripping it is logged distinctly from a normal resolution. On exit the resolved
 score updates the Skill state (slice 0002).
 
-Orchestration is deliberately plain Python — LangGraph is deferred to slice 0010 (ADR 0004). Tools
-stay out of here too: the Interviewer's RAG follow-up arrives in slice 0007 (ADR 0003).
+Orchestration is deliberately plain Python — LangGraph is deferred to slice 0010 (ADR 0004). The only
+tool-using agent is still the Interviewer; the micro-loop just passes the active Skill into
+``generate_follow_up`` so that concept lookup can be metadata-filtered (ADR 0003).
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
+from .concepts import ConceptStore
 from .evaluator import Evaluation, evaluate
 from .interviewer import generate_follow_up
 from .llm import LLMClient
@@ -78,6 +80,8 @@ class Turn:
     answer: str
     evaluation: Evaluation
     is_follow_up: bool  # False for the seed question, True for an Interviewer-generated follow-up
+    grounding_concept_id: str | None = None
+    grounding_concept_title: str | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +106,7 @@ def run_micro_loop(
     state: SkillState | None = None,
     *,
     max_turns: int = DEFAULT_MAX_TURNS,
+    concept_store: ConceptStore | None = None,
 ) -> MicroLoopResult:
     """Resolve one question end-to-end, returning the exchange and the updated Skill state.
 
@@ -117,11 +122,22 @@ def run_micro_loop(
     turns: list[Turn] = []
     question = seed.question
     is_follow_up = False
+    grounding_concept_id: str | None = None
+    grounding_concept_title: str | None = None
 
     while True:
         answer = candidate.answer(question)
         evaluation = evaluate(client, question, answer, seed.rubric)
-        turns.append(Turn(question=question, answer=answer, evaluation=evaluation, is_follow_up=is_follow_up))
+        turns.append(
+            Turn(
+                question=question,
+                answer=answer,
+                evaluation=evaluation,
+                is_follow_up=is_follow_up,
+                grounding_concept_id=grounding_concept_id,
+                grounding_concept_title=grounding_concept_title,
+            )
+        )
 
         if not evaluation.follow_up_recommended:
             stop_reason = StopReason.RESOLVED
@@ -147,9 +163,13 @@ def run_micro_loop(
             original_question=seed.question,
             answer=answer,
             evaluation=evaluation,
+            skill=seed.skill,
+            concept_store=concept_store,
         )
         question = follow_up.question
         is_follow_up = True
+        grounding_concept_id = follow_up.concept_id
+        grounding_concept_title = follow_up.concept_title
 
     resolved = turns[-1].evaluation
     return MicroLoopResult(

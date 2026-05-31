@@ -6,17 +6,38 @@ retry/validation logic in ``chat_json`` is exercised end-to-end against canned m
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from interview_coach.config import Settings
-from interview_coach.llm import LLMRouter, MimoClient
+from interview_coach.config import ProviderSettings, Settings
+from interview_coach.llm import GroqClient, LLMRouter, MimoClient
+
+
+class _FakeFunction:
+    def __init__(self, name: str, arguments: str) -> None:
+        self.name = name
+        self.arguments = arguments
+
+
+class _FakeToolCall:
+    def __init__(self, call_id: str, name: str, arguments: str) -> None:
+        self.id = call_id
+        self.type = "function"
+        self.function = _FakeFunction(name, arguments)
 
 
 class _FakeMessage:
-    def __init__(self, content: str, reasoning_content: str | None = None) -> None:
+    def __init__(
+        self,
+        content: str | None = None,
+        reasoning_content: str | None = None,
+        tool_calls: list | None = None,
+    ) -> None:
         self.content = content
         self.reasoning_content = reasoning_content
         self.model_extra = {"reasoning_content": reasoning_content} if reasoning_content else {}
+        self.tool_calls = tool_calls
 
 
 class _FakeChoice:
@@ -39,8 +60,19 @@ class _FakeCompletions:
         reply = self.replies[min(len(self.calls) - 1, len(self.replies) - 1)]
         if isinstance(reply, Exception):
             raise reply
+        if isinstance(reply, dict) and "tool_calls" in reply:
+            # A scripted native function-call turn: emit a message carrying tool_calls.
+            calls = [
+                _FakeToolCall(
+                    tc.get("id", f"call_{i}"),
+                    tc["name"],
+                    tc["arguments"] if isinstance(tc["arguments"], str) else json.dumps(tc["arguments"]),
+                )
+                for i, tc in enumerate(reply["tool_calls"])
+            ]
+            return _FakeResponse(_FakeMessage(content=reply.get("content"), tool_calls=calls))
         content, reasoning = reply if isinstance(reply, tuple) else (reply, None)
-        return _FakeResponse(_FakeMessage(content, reasoning))
+        return _FakeResponse(_FakeMessage(content=content, reasoning_content=reasoning))
 
 
 class _FakeChat:
@@ -81,5 +113,20 @@ def make_client(settings: Settings):
         fake = FakeOpenAI(replies)
         mimo = MimoClient(settings.provider_config("mimo"), client=fake)
         return LLMRouter("mimo", {"mimo": mimo}), fake
+
+    return _make
+
+
+@pytest.fixture
+def make_tool_client():
+    """A router whose primary (Groq) does native function-calling — exercises the real tool path."""
+
+    def _make(replies: list) -> tuple[LLMRouter, FakeOpenAI]:
+        fake = FakeOpenAI(replies)
+        groq = GroqClient(
+            ProviderSettings(name="groq", api_key="test", base_url="http://groq.test", model="groq-model"),
+            client=fake,
+        )
+        return LLMRouter("groq", {"groq": groq}), fake
 
     return _make

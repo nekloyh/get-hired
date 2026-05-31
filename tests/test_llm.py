@@ -10,6 +10,7 @@ from interview_coach.llm import (
     LLMRouter,
     MimoClient,
     StructuredOutputError,
+    ToolCallingUnsupported,
     build_client,
 )
 
@@ -33,7 +34,7 @@ class _StaticClient(LLMClient):
         self.reply = reply
         self.calls = 0
 
-    def chat(self, messages, *, response_format=None) -> str:
+    def chat(self, messages, *, response_format=None, disable_thinking=False) -> str:
         self.calls += 1
         return self.reply
 
@@ -43,7 +44,7 @@ class _FailingClient(LLMClient):
         self.exc = exc
         self.calls = 0
 
-    def chat(self, messages, *, response_format=None) -> str:
+    def chat(self, messages, *, response_format=None, disable_thinking=False) -> str:
         self.calls += 1
         raise self.exc
 
@@ -73,6 +74,25 @@ def test_reasoning_content_is_ignored(make_client):
     client, _ = make_client([('{"x": 3, "label": "y"}', "<long chain-of-thought>")])
     out = client.chat_json([{"role": "user", "content": "go"}], Foo)
     assert out.x == 3
+
+
+def test_mimo_can_disable_thinking_for_tool_loops(make_client):
+    client, fake = make_client(['{"x": 3, "label": "tool-loop"}'])
+    out = client.chat_json(
+        [{"role": "user", "content": "go"}],
+        Foo,
+        disable_thinking=True,
+    )
+    assert out.x == 3
+    assert fake.chat.completions.calls[0]["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+def test_mimo_and_groq_support_native_tool_calls(fake_openai_factory):
+    mimo_client = MimoClient(_provider("mimo"), client=fake_openai_factory([]))
+    groq_client = GroqClient(_provider("groq"), client=fake_openai_factory([]))
+
+    assert mimo_client.supports_tool_calls is True
+    assert groq_client.supports_tool_calls is True
 
 
 def test_strips_code_fences(make_client):
@@ -166,3 +186,60 @@ def test_router_falls_back_on_primary_error():
     assert out == Foo(x=3, label="fallback")
     assert primary.calls == 1
     assert fallback.calls == 1
+
+
+class _ToolClient(LLMClient):
+    """A tool-capable client whose chat_with_tools outcome is scripted."""
+
+    def __init__(self, *, declines: bool = False, error: Exception | None = None, result: str = "ok") -> None:
+        self._declines = declines
+        self._error = error
+        self._result = result
+        self.tool_calls = 0
+
+    @property
+    def supports_tool_calls(self) -> bool:
+        return True
+
+    def chat(self, messages, *, response_format=None, disable_thinking=False) -> str:
+        return ""
+
+    def chat_with_tools(self, messages, **kwargs):
+        self.tool_calls += 1
+        if self._error is not None:
+            raise self._error
+        if self._declines:
+            raise ToolCallingUnsupported("primary declined the forced tool call")
+        return self._result
+
+
+def _tool_kwargs() -> dict:
+    return {"tools": [], "tool_executor": lambda name, args: "", "response_model": Foo, "final_instruction": "x"}
+
+
+def test_router_tool_decline_propagates_without_failover():
+    # A declined/unsupported native tool call must fail loudly — failing over would hide exactly the
+    # tool-call integration problem this path exists to surface.
+    primary = _ToolClient(declines=True)
+    fallback = _ToolClient(result="groq")
+    router = LLMRouter("mimo", {"mimo": primary, "groq": fallback})
+
+    with pytest.raises(ToolCallingUnsupported):
+        router.chat_with_tools([{"role": "user", "content": "go"}], **_tool_kwargs())
+
+    assert primary.tool_calls == 1
+    assert fallback.tool_calls == 0  # NOT silently retried on the fallback
+
+
+def test_router_tool_transport_error_fails_over():
+    # A transport-level failure (timeout/5xx) is a real outage, so failover to a tool-capable
+    # fallback is correct.
+    primary = _ToolClient(error=RuntimeError("boom"))
+    fallback = _ToolClient(result="groq-result")
+    router = LLMRouter("mimo", {"mimo": primary, "groq": fallback})
+
+    out = router.chat_with_tools([{"role": "user", "content": "go"}], **_tool_kwargs())
+
+    assert out == "groq-result"
+    assert primary.tool_calls == 1
+    assert fallback.tool_calls == 1

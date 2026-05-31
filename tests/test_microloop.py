@@ -42,7 +42,26 @@ def _eval(score: int, *, follow_up: bool, confidence: float = 0.8) -> str:
     )
 
 
-def _followup(question: str = "What is the actual mechanism?", targets: str = "the gap") -> str:
+def _tool(query: str = "L2 penalty variance mechanism") -> dict:
+    return {
+        "tool_calls": [
+            {
+                "name": "lookup_concept",
+                "arguments": {
+                    "query": query,
+                    "skill": "ml_fundamentals",
+                    "language": None,
+                    "reason": "The candidate needs to explain the mechanism.",
+                },
+            }
+        ]
+    }
+
+
+def _followup(
+    question: str = "What mechanism connects the L2 penalty to lower variance?",
+    targets: str = "penalty-to-variance mechanism",
+) -> str:
     return json.dumps({"question": question, "targets": targets})
 
 
@@ -86,7 +105,8 @@ def test_weak_answer_triggers_follow_up_then_resolves(make_client):
     client, fake = make_client(
         [
             _eval(2, follow_up=True),
-            _followup(question="Probe the missing mechanism?"),
+            _tool(),
+            _followup(question="What mechanism connects the L2 penalty to lower variance?"),
             _eval(4, follow_up=False),
         ]
     )
@@ -95,17 +115,18 @@ def test_weak_answer_triggers_follow_up_then_resolves(make_client):
     assert len(result.turns) == 2
     assert result.turns[0].is_follow_up is False
     assert result.turns[1].is_follow_up is True
-    assert result.turns[1].question == "Probe the missing mechanism?"  # the Interviewer-generated one
+    assert result.turns[1].question == "What mechanism connects the L2 penalty to lower variance?"
+    assert result.turns[1].grounding_concept_id == "ml_fundamentals_l2_regularization"
     assert result.turns[1].question != seed.question  # not a re-ask of the original
     assert result.turns[1].answer == "a better answer"  # the candidate answered the follow-up
     assert result.stop_reason is StopReason.RESOLVED
-    assert fake.call_count == 3  # eval, follow-up, eval
+    assert fake.call_count == 4  # eval, native lookup tool call, follow-up, eval
 
 
 def test_question_resolves_to_the_last_score(make_client):
     # The kept score is the LAST turn's (4), not the first weak one (2) — "keep the last score".
     client, _ = make_client(
-        [_eval(2, follow_up=True), _followup(), _eval(4, follow_up=False)]
+        [_eval(2, follow_up=True), _tool(), _followup(), _eval(4, follow_up=False)]
     )
     seed = _seed(["weak", "better"])
     result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers))
@@ -117,21 +138,21 @@ def test_safety_cap_halts_pathological_loop_and_logs_a_guardrail_trip(make_clien
     # The Evaluator never stops flagging; the cap must halt the loop and log it as a guardrail trip
     # that is distinct from a normal resolution.
     client, fake = make_client(
-        [_eval(2, follow_up=True), _followup(), _eval(2, follow_up=True)]
+        [_eval(2, follow_up=True), _tool(), _followup(), _eval(2, follow_up=True)]
     )
     seed = _seed(["a1", "a2"])
     with caplog.at_level(logging.INFO, logger="interview_coach.microloop"):
         result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers), max_turns=2)
     assert result.stop_reason is StopReason.SAFETY_CAP
     assert len(result.turns) == 2  # halted at the cap, not run away
-    assert fake.call_count == 3  # eval, follow-up, eval — then capped before a 3rd ask
+    assert fake.call_count == 4  # eval, native lookup tool call, follow-up, eval — then capped before a 3rd ask
     cap_logs = [r for r in caplog.records if "SAFETY CAP" in r.message]
     assert cap_logs and cap_logs[0].levelno == logging.WARNING  # a warning, not a routine info
     assert not any("resolved" in r.message for r in caplog.records)  # distinct from a normal stop
 
 
 def test_cap_keeps_the_last_score_on_exit(make_client):
-    client, _ = make_client([_eval(2, follow_up=True), _followup(), _eval(2, follow_up=True)])
+    client, _ = make_client([_eval(2, follow_up=True), _tool(), _followup(), _eval(2, follow_up=True)])
     seed = _seed(["a1", "a2"])
     result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers), max_turns=2)
     assert result.resolved_evaluation is result.turns[-1].evaluation
@@ -193,7 +214,12 @@ def test_live_follow_up_does_not_re_ask_the_question():
         pytest.skip("LLM primary provider not configured — set PRIMARY_PROVIDER and provider credentials")
     client = build_client(settings)
     seed = SEED_QUESTIONS[1]  # the weak opener, likely to draw a follow-up
-    result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers))
+    result = run_micro_loop(
+        client,
+        seed,
+        ScriptedCandidate(seed.answers),
+        max_turns=len(seed.answers),
+    )
     # If a follow-up was asked, it must be a genuinely new question, not the original restated.
     for turn in result.turns:
         if turn.is_follow_up:

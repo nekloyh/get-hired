@@ -10,6 +10,12 @@ dependencies = [
     "pydantic-settings>=2.2",
 ]
 
+[project.optional-dependencies]
+rag = [
+    "chromadb>=0.5",
+    "sentence-transformers>=3.0",
+]
+
 [project.scripts]
 coach = "interview_coach.cli:main"
 
@@ -28,11 +34,12 @@ packages = ["src/interview_coach"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# Default run is offline: provider-hitting tests are deselected unless explicitly requested with
-# `-m live` (which overrides this). Without it, a configured .env would silently hit the provider.
-addopts = "-m 'not live'"
+# Default run is offline/lightweight: provider-hitting tests and optional Chroma/BGE tests are
+# deselected unless explicitly requested with `-m live` or `-m rag`.
+addopts = "-m 'not live and not rag'"
 markers = [
     "live: hits a real LLM provider; deselected by default — select explicitly with `-m live`",
+    "rag: requires optional Chroma + sentence-transformers extras; deselected by default",
 ]
 
 [tool.ruff]
