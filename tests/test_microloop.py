@@ -117,6 +117,10 @@ def test_weak_answer_triggers_follow_up_then_resolves(make_client):
     assert result.turns[1].is_follow_up is True
     assert result.turns[1].question == "What mechanism connects the L2 penalty to lower variance?"
     assert result.turns[1].grounding_concept_id == "ml_fundamentals_l2_regularization"
+    assert result.turns[0].trace.concept_lookup_query == "L2 penalty variance mechanism"
+    assert result.turns[0].trace.concept_lookup_skill == "ml_fundamentals"
+    assert result.turns[0].trace.concept_hit_id == "ml_fundamentals_l2_regularization"
+    assert result.turns[1].trace.stop_reason is StopReason.RESOLVED
     assert result.turns[1].question != seed.question  # not a re-ask of the original
     assert result.turns[1].answer == "a better answer"  # the candidate answered the follow-up
     assert result.stop_reason is StopReason.RESOLVED
@@ -145,6 +149,7 @@ def test_safety_cap_halts_pathological_loop_and_logs_a_guardrail_trip(make_clien
         result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers), max_turns=2)
     assert result.stop_reason is StopReason.SAFETY_CAP
     assert len(result.turns) == 2  # halted at the cap, not run away
+    assert result.turns[-1].trace.stop_reason is StopReason.SAFETY_CAP
     assert fake.call_count == 4  # eval, native lookup tool call, follow-up, eval — then capped before a 3rd ask
     cap_logs = [r for r in caplog.records if "SAFETY CAP" in r.message]
     assert cap_logs and cap_logs[0].levelno == logging.WARNING  # a warning, not a routine info
@@ -168,6 +173,17 @@ def test_skill_state_is_updated_on_exit(make_client):
     result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers))
     assert result.skill_state.mastery > neutral.mastery
     assert result.skill_state.confidence > neutral.confidence
+
+
+def test_turn_trace_records_self_critique_trigger(make_client):
+    # The Evaluator self-critique trace is copied onto the transcript turn so a Session can be
+    # debugged without unpacking the raw Evaluation JSON.
+    client, fake = make_client([_eval(3, follow_up=False, confidence=0.3), _eval(4, follow_up=False, confidence=0.9)])
+    seed = _seed(["uncertain but sufficient"])
+    result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers))
+    assert result.turns[0].trace.evaluator_self_critique_triggers == ("low_confidence",)
+    assert result.turns[0].trace.stop_reason is StopReason.RESOLVED
+    assert fake.call_count == 2
 
 
 def test_incoming_skill_state_is_threaded(make_client):

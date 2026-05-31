@@ -15,6 +15,7 @@ signal.
 from __future__ import annotations
 
 import logging
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -39,6 +40,15 @@ class DimensionScore(BaseModel):
     )
 
 
+class SelfCritiqueTrace(BaseModel):
+    """Trace of the Evaluator's one allowed self-critique pass."""
+
+    triggers: tuple[str, ...]
+    first_confidence: float = Field(ge=0, le=1)
+    second_confidence: float = Field(ge=0, le=1)
+    kept_pass: Literal["first_pass", "self_critique"]
+
+
 class Evaluation(BaseModel):
     """The Evaluator's typed judgment of a single answer."""
 
@@ -51,6 +61,7 @@ class Evaluation(BaseModel):
     follow_up_rationale: str = Field(
         description="Whether one more probing question would reveal something not already known."
     )
+    self_critique: SelfCritiqueTrace | None = None
 
 
 def _make_validators(rubric: Rubric, answer: str) -> list[Validator]:
@@ -102,6 +113,14 @@ _SCHEMA_HINT = (
 )
 
 
+# --- Self-critique reflection (slice 0006) -----------------------------------------------------
+
+# The weighted-score cross-check caps divergent judgments at 0.4, so the self-critique threshold must
+# sit above that ceiling. This keeps the trigger deterministic: a low-confidence first pass gets one
+# second look, then the higher-confidence judgment wins.
+SELF_CRITIQUE_CONFIDENCE_THRESHOLD = 0.5
+
+
 def _build_messages(question: str, answer: str, rubric: Rubric) -> list[Message]:
     user = (
         f"QUESTION:\n{question}\n\n"
@@ -112,6 +131,31 @@ def _build_messages(question: str, answer: str, rubric: Rubric) -> list[Message]
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user},
+    ]
+
+
+def _build_self_critique_messages(
+    question: str,
+    answer: str,
+    rubric: Rubric,
+    first_pass: Evaluation,
+    triggers: tuple[str, ...],
+) -> list[Message]:
+    base_user = _build_messages(question, answer, rubric)[1]["content"]
+    critique = (
+        f"{base_user}\n\n"
+        "SELF-CRITIQUE REQUIRED.\n"
+        f"Trigger(s): {', '.join(triggers)}.\n\n"
+        "Your first-pass judgment is below the confidence bar or failed the deterministic "
+        "weighted_score cross-check. Re-evaluate the SAME exchange from scratch. Check whether the "
+        "dimension scores, quoted evidence, weighted_score, confidence, and follow-up decision are "
+        "internally consistent. Keep the Evaluator role: judge only, do not ask or coach.\n\n"
+        f"FIRST-PASS JSON AFTER DETERMINISTIC GUARDS:\n{first_pass.model_dump_json()}\n\n"
+        f"Return JSON shaped like:\n{_SCHEMA_HINT}"
+    )
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": critique},
     ]
 
 
@@ -145,6 +189,16 @@ def linear_weighted_score(dimensions: dict[str, DimensionScore], rubric: Rubric)
     return sum(rubric.weights[d] * ds.score for d, ds in dimensions.items()) / total_weight
 
 
+def weighted_score_divergence(evaluation: Evaluation, rubric: Rubric) -> float:
+    """Absolute gap between the Evaluator's holistic score and the deterministic linear mean."""
+    return abs(evaluation.weighted_score - linear_weighted_score(evaluation.dimensions, rubric))
+
+
+def cross_check_diverged(evaluation: Evaluation, rubric: Rubric) -> bool:
+    """Whether the deterministic weighted-score guard should treat this judgment as suspect."""
+    return weighted_score_divergence(evaluation, rubric) > WEIGHTED_SCORE_TOLERANCE
+
+
 def apply_cross_check(evaluation: Evaluation, rubric: Rubric) -> Evaluation:
     """Lower ``confidence`` when the holistic ``weighted_score`` diverges from the linear one.
 
@@ -172,16 +226,65 @@ def apply_cross_check(evaluation: Evaluation, rubric: Rubric) -> Evaluation:
     return evaluation.model_copy(update={"confidence": guarded})
 
 
-def evaluate(client: LLMClient, question: str, answer: str, rubric: Rubric) -> Evaluation:
-    """Run the Evaluator on one question + answer and return a typed, validated judgment.
-
-    The structured LLM call is followed by the deterministic cross-check (slice 0003), which may
-    lower ``confidence`` when the holistic and linear weighted scores disagree.
-    """
-    evaluation = client.chat_json(
-        _build_messages(question, answer, rubric),
+def _evaluate_once(client: LLMClient, messages: list[Message], answer: str, rubric: Rubric) -> Evaluation:
+    return client.chat_json(
+        messages,
         Evaluation,
         validators=_make_validators(rubric, answer),
         max_retries=1,
     )
-    return apply_cross_check(evaluation, rubric)
+
+
+def _self_critique_triggers(evaluation: Evaluation, rubric: Rubric) -> tuple[str, ...]:
+    triggers: list[str] = []
+    if evaluation.confidence < SELF_CRITIQUE_CONFIDENCE_THRESHOLD:
+        triggers.append("low_confidence")
+    if cross_check_diverged(evaluation, rubric):
+        triggers.append("weighted_score_divergence")
+    return tuple(triggers)
+
+
+def evaluate(client: LLMClient, question: str, answer: str, rubric: Rubric) -> Evaluation:
+    """Run the Evaluator on one question + answer and return a typed, validated judgment.
+
+    The structured LLM call is followed by the deterministic cross-check (slice 0003), which may
+    lower ``confidence`` when the holistic and linear weighted scores disagree. Slice 0006 then runs
+    exactly one self-critique pass when the guarded first pass is low-confidence, keeping whichever
+    pass is more confident before control returns to the micro-loop.
+    """
+    first = apply_cross_check(
+        _evaluate_once(client, _build_messages(question, answer, rubric), answer, rubric),
+        rubric,
+    )
+    triggers = _self_critique_triggers(first, rubric)
+    if not triggers:
+        return first
+
+    second = apply_cross_check(
+        _evaluate_once(
+            client,
+            _build_self_critique_messages(question, answer, rubric, first, triggers),
+            answer,
+            rubric,
+        ),
+        rubric,
+    )
+    kept = second if second.confidence > first.confidence else first
+    kept_pass: Literal["first_pass", "self_critique"] = "self_critique" if kept is second else "first_pass"
+    logger.info(
+        "self-critique triggered (%s): first confidence %.2f, second confidence %.2f; keeping %s",
+        ", ".join(triggers),
+        first.confidence,
+        second.confidence,
+        kept_pass,
+    )
+    return kept.model_copy(
+        update={
+            "self_critique": SelfCritiqueTrace(
+                triggers=triggers,
+                first_confidence=first.confidence,
+                second_confidence=second.confidence,
+                kept_pass=kept_pass,
+            )
+        }
+    )

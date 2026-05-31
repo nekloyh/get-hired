@@ -36,6 +36,10 @@ class FollowUp(BaseModel):
     )
     concept_id: str | None = Field(default=None, description="The retrieved concept note that grounded it.")
     concept_title: str | None = Field(default=None, description="Human-readable title of the grounding note.")
+    concept_score: float | None = Field(default=None, description="Store-specific retrieval similarity score.")
+    concept_lookup_query: str | None = Field(default=None, description="The lookup_concept query the Interviewer used.")
+    concept_lookup_skill: str | None = Field(default=None, description="Skill filter used for lookup_concept.")
+    concept_lookup_language: str | None = Field(default=None, description="Language filter used for lookup_concept.")
 
 
 class ConceptToolRequest(BaseModel):
@@ -277,7 +281,7 @@ def _generate_follow_up_native(
     note is fed back as a ``tool`` turn; then the model returns the schema-validated Follow-up. The
     same grounding gates apply — they read the retrieved note through the captured-lookup getter.
     """
-    captured: dict[str, ConceptLookup] = {}
+    captured: dict[str, ConceptLookup | ConceptToolRequest | str | None] = {}
 
     def execute(name: str, args: dict[str, object]) -> str:
         if name != "lookup_concept":
@@ -287,6 +291,9 @@ def _generate_follow_up_native(
         lookup_language = request.language or ("vi" if lookup_skill == "vietnamese_nlp" else None)
         lookup = lookup_concept(store, request.query, skill=lookup_skill, language=lookup_language)
         captured["lookup"] = lookup
+        captured["request"] = request
+        captured["lookup_skill"] = lookup_skill
+        captured["lookup_language"] = lookup_language
         return lookup.render()
 
     messages = [
@@ -305,10 +312,20 @@ def _generate_follow_up_native(
         disable_thinking=True,
     )
     lookup = captured.get("lookup")
-    if lookup is None:
+    if not isinstance(lookup, ConceptLookup):
         raise ToolCallingUnsupported("the model never executed lookup_concept")
+    request = captured.get("request")
+    if not isinstance(request, ConceptToolRequest):
+        raise ToolCallingUnsupported("the model never executed lookup_concept with a valid request")
     follow_up = follow_up.model_copy(
-        update={"concept_id": lookup.note.id, "concept_title": lookup.note.title}
+        update={
+            "concept_id": lookup.note.id,
+            "concept_title": lookup.note.title,
+            "concept_score": lookup.score,
+            "concept_lookup_query": request.query,
+            "concept_lookup_skill": captured.get("lookup_skill"),
+            "concept_lookup_language": captured.get("lookup_language"),
+        }
     )
     logger.info(
         "interviewer follow-up (native tool-call) targets %r using concept %r: %s",
@@ -358,6 +375,10 @@ def _generate_follow_up_json(
         update={
             "concept_id": lookup.note.id,
             "concept_title": lookup.note.title,
+            "concept_score": lookup.score,
+            "concept_lookup_query": tool_request.query,
+            "concept_lookup_skill": lookup_skill,
+            "concept_lookup_language": lookup_language,
         }
     )
     logger.info(

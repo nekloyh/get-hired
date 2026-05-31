@@ -73,6 +73,10 @@ def test_generate_follow_up_returns_structured(make_client):
     assert fu.question and fu.targets
     assert fu.concept_id == "l2"
     assert fu.concept_title == "L2 penalty and variance"
+    assert fu.concept_score is not None
+    assert fu.concept_lookup_query == "L2 penalty variance mechanism"
+    assert fu.concept_lookup_skill == "ml_fundamentals"
+    assert fu.concept_lookup_language is None
     assert fake.call_count == 2
     assert store.lookup_calls == [
         {"query": "L2 penalty variance mechanism", "skill": "ml_fundamentals", "language": None}

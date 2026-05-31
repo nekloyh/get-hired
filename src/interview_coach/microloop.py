@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Protocol
 
@@ -73,6 +73,24 @@ class StopReason(StrEnum):
 
 
 @dataclass(frozen=True)
+class TurnTrace:
+    """Debug trace for the agent decisions attached to one micro-loop turn.
+
+    Concept lookup fields describe the Follow-up generated because of this turn's evaluation. The
+    Follow-up turn itself still carries ``grounding_concept_id`` for transcript display.
+    """
+
+    evaluator_self_critique_triggers: tuple[str, ...] = ()
+    concept_lookup_query: str | None = None
+    concept_lookup_skill: str | None = None
+    concept_lookup_language: str | None = None
+    concept_hit_id: str | None = None
+    concept_hit_title: str | None = None
+    concept_hit_score: float | None = None
+    stop_reason: StopReason | None = None
+
+
+@dataclass(frozen=True)
 class Turn:
     """One ask→answer→score step of the micro-loop."""
 
@@ -82,6 +100,7 @@ class Turn:
     is_follow_up: bool  # False for the seed question, True for an Interviewer-generated follow-up
     grounding_concept_id: str | None = None
     grounding_concept_title: str | None = None
+    trace: TurnTrace = TurnTrace()
 
 
 @dataclass(frozen=True)
@@ -128,27 +147,32 @@ def run_micro_loop(
     while True:
         answer = candidate.answer(question)
         evaluation = evaluate(client, question, answer, seed.rubric)
-        turns.append(
-            Turn(
-                question=question,
-                answer=answer,
-                evaluation=evaluation,
-                is_follow_up=is_follow_up,
-                grounding_concept_id=grounding_concept_id,
-                grounding_concept_title=grounding_concept_title,
-            )
+        turn = Turn(
+            question=question,
+            answer=answer,
+            evaluation=evaluation,
+            is_follow_up=is_follow_up,
+            grounding_concept_id=grounding_concept_id,
+            grounding_concept_title=grounding_concept_title,
+            trace=TurnTrace(
+                evaluator_self_critique_triggers=(
+                    evaluation.self_critique.triggers if evaluation.self_critique is not None else ()
+                )
+            ),
         )
 
         if not evaluation.follow_up_recommended:
             stop_reason = StopReason.RESOLVED
+            turns.append(replace(turn, trace=replace(turn.trace, stop_reason=stop_reason)))
             logger.info(
                 "micro-loop resolved after %d turn(s): the Evaluator no longer recommends a follow-up",
                 len(turns),
             )
             break
 
-        if len(turns) >= max_turns:
+        if len(turns) + 1 >= max_turns:
             stop_reason = StopReason.SAFETY_CAP
+            turns.append(replace(turn, trace=replace(turn.trace, stop_reason=stop_reason)))
             logger.warning(
                 "micro-loop SAFETY CAP tripped after %d turn(s): the Evaluator still recommends a "
                 "follow-up but the cap (max_turns=%d) halts the loop — this is a guardrail trip, NOT a "
@@ -165,6 +189,20 @@ def run_micro_loop(
             evaluation=evaluation,
             skill=seed.skill,
             concept_store=concept_store,
+        )
+        turns.append(
+            replace(
+                turn,
+                trace=replace(
+                    turn.trace,
+                    concept_lookup_query=follow_up.concept_lookup_query,
+                    concept_lookup_skill=follow_up.concept_lookup_skill,
+                    concept_lookup_language=follow_up.concept_lookup_language,
+                    concept_hit_id=follow_up.concept_id,
+                    concept_hit_title=follow_up.concept_title,
+                    concept_hit_score=follow_up.concept_score,
+                ),
+            )
         )
         question = follow_up.question
         is_follow_up = True

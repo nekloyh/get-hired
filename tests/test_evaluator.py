@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
 from interview_coach.config import load_settings
 from interview_coach.evaluator import (
     DIVERGENCE_CONFIDENCE_CEILING,
+    SELF_CRITIQUE_CONFIDENCE_THRESHOLD,
     WEIGHTED_SCORE_TOLERANCE,
     DimensionScore,
     Evaluation,
@@ -200,13 +202,78 @@ def test_cross_check_does_not_raise_already_low_confidence():
 
 
 def test_cross_check_runs_inside_evaluate(make_client):
-    # Wiring: an inflated holistic score must come back from evaluate() with confidence lowered, and
-    # without any retry (the guard is post-processing, not a chat_json validator).
-    client, fake = make_client([_eval_json(_weak_dimensions(), weighted=4.5, confidence=0.9)])
+    # Wiring: an inflated holistic score lowers confidence, which now triggers one self-critique pass.
+    client, fake = make_client(
+        [
+            _eval_json(_weak_dimensions(), weighted=4.5, confidence=0.9),
+            _eval_json(_weak_dimensions(), weighted=2.0, confidence=0.8),
+        ]
+    )
     ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
-    assert ev.confidence == pytest.approx(DIVERGENCE_CONFIDENCE_CEILING)
-    assert ev.weighted_score == pytest.approx(4.5)
+    assert ev.confidence == pytest.approx(0.8)
+    assert ev.weighted_score == pytest.approx(2.0)
+    assert fake.call_count == 2
+
+
+# --- self-critique reflection (slice 0006) -----------------------------------------------------
+
+
+def test_low_confidence_triggers_exactly_one_self_critique(make_client):
+    assert DIVERGENCE_CONFIDENCE_CEILING < SELF_CRITIQUE_CONFIDENCE_THRESHOLD
+    client, fake = make_client(
+        [
+            _eval_json(_good_dimensions(), weighted=4.0, confidence=0.3),
+            _eval_json(_good_dimensions(), weighted=4.0, confidence=0.7),
+        ]
+    )
+
+    ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+
+    assert ev.confidence == pytest.approx(0.7)
+    assert ev.self_critique is not None
+    assert ev.self_critique.triggers == ("low_confidence",)
+    assert ev.self_critique.kept_pass == "self_critique"
+    assert fake.call_count == 2
+
+
+def test_high_confidence_does_not_trigger_self_critique(make_client):
+    client, fake = make_client([_eval_json(_good_dimensions(), weighted=4.0, confidence=0.7)])
+
+    ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+
+    assert ev.confidence == pytest.approx(0.7)
+    assert ev.self_critique is None
     assert fake.call_count == 1
+
+
+def test_self_critique_keeps_more_confident_first_pass(make_client):
+    client, fake = make_client(
+        [
+            _eval_json(_good_dimensions(), weighted=4.0, confidence=0.3),
+            _eval_json(_good_dimensions(), weighted=4.0, confidence=0.2),
+        ]
+    )
+
+    ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+
+    assert ev.confidence == pytest.approx(0.3)
+    assert fake.call_count == 2
+
+
+def test_self_critique_logs_trigger_and_outcome(make_client, caplog):
+    client, _ = make_client(
+        [
+            _eval_json(_good_dimensions(), weighted=4.0, confidence=0.3),
+            _eval_json(_good_dimensions(), weighted=4.0, confidence=0.7),
+        ]
+    )
+
+    with caplog.at_level(logging.INFO, logger="interview_coach.evaluator"):
+        evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+
+    messages = [record.message for record in caplog.records]
+    assert any("self-critique triggered" in msg for msg in messages)
+    assert any("low_confidence" in msg and "keeping self_critique" in msg for msg in messages)
 
 
 @pytest.mark.live

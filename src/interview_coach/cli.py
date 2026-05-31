@@ -89,6 +89,13 @@ def _print_micro_loop(result: MicroLoopResult) -> None:
             f"  weighted_score {ev.weighted_score:.2f}/5   confidence {ev.confidence:.2f}   "
             f"follow_up_recommended={ev.follow_up_recommended}"
         )
+        if turn.trace.evaluator_self_critique_triggers:
+            print(f"  self_critique_triggers: {', '.join(turn.trace.evaluator_self_critique_triggers)}")
+        if turn.trace.concept_lookup_query:
+            hit = turn.trace.concept_hit_id or "none"
+            print(f"  follow_up_lookup: {turn.trace.concept_lookup_query!r} -> {hit}")
+        if turn.trace.stop_reason:
+            print(f"  turn_stop_reason: {turn.trace.stop_reason.value}")
     verdict = "resolved normally" if result.stop_reason is StopReason.RESOLVED else "halted by SAFETY CAP"
     print(f"\n  stop: {result.stop_reason.value} ({verdict}) after {len(result.turns)} turn(s)")
     print(

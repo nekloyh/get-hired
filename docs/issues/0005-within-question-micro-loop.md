@@ -10,11 +10,18 @@ Orchestrated in plain Python (LangGraph is deferred to slice 0010 per `ADR 0004`
 
 ## Acceptance criteria
 
+### Implemented
+
 - [x] A weak fixture answer triggers a Follow-up; a strong one does not
 - [x] The score is recomputed each turn and the last score is what the question resolves to
 - [x] The Follow-up cannot be answered by repeating the original answer (it targets the gap)
 - [x] The safety cap halts a pathological loop, and this is logged as a guardrail trip distinct from a normal stop
 - [x] On loop exit, the resolved Skill state is updated (via slice 0002)
+- [x] Each transcript turn carries a `TurnTrace` for self-critique triggers, Follow-up concept lookup query/hit, and per-turn stop reason
+
+### Verified live
+
+- [x] MiMo live micro-loop sanity checks pass (`uv run pytest -m live -ra`, verified 2026-05-31)
 
 ## Blocked by
 
@@ -36,3 +43,8 @@ guardrail whose trip is a distinct `StopReason.SAFETY_CAP` logged at WARNING, se
 0002's `apply_evaluation`. The fixture **Candidate** is `ScriptedCandidate` over the three seed
 questions in `seeds.py`. `coach interview` runs it; covered by `tests/test_microloop.py` +
 `tests/test_interviewer.py` (offline, with live sanity checks marked `live`).
+
+Traceability is now part of the loop output: `Turn.trace` records Evaluator self-critique triggers,
+the Interviewer's `lookup_concept` query/filter/hit when that turn generated a Follow-up, and the
+turn that actually stopped the loop (`resolved` or `safety_cap`). This makes a bad Session transcript
+debuggable without unpacking provider logs.

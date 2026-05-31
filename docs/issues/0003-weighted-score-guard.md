@@ -10,11 +10,18 @@ This keeps the holistic LLM `weighted_score` (so the model can apply non-linear 
 
 ## Acceptance criteria
 
-- [ ] Python computes the linear weighted score from dimension scores × weights
-- [ ] When |LLM score − linear score| exceeds the threshold, confidence is reduced
-- [ ] When they agree, confidence is unaffected
-- [ ] An evaluation with low dimension scores but an inflated LLM `weighted_score` is caught (confidence drops)
+- [x] Python computes the linear weighted score from dimension scores × weights
+- [x] When |LLM score − linear score| exceeds the threshold, confidence is reduced
+- [x] When they agree, confidence is unaffected
+- [x] An evaluation with low dimension scores but an inflated LLM `weighted_score` is caught (confidence drops)
 
 ## Blocked by
 
 - 0001 (refines the evaluation output)
+
+## Done
+
+Implemented in `src/interview_coach/evaluator.py` as the deterministic `linear_weighted_score` /
+`apply_cross_check` guard. The guard preserves the Evaluator's holistic score but lowers confidence
+when it diverges from the mechanical weighted mean, which now deterministically triggers the slice
+0006 Self-critique path. Covered by `tests/test_evaluator.py`.
