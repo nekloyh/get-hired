@@ -26,6 +26,25 @@ from .llm import LLMClient, Message, ToolCallingUnsupported, ToolSpec, Validator
 logger = logging.getLogger(__name__)
 
 
+class UnknownToolCall(RuntimeError):
+    """The model asked for a tool the Interviewer does not expose.
+
+    Usually a transient MiMo glitch (a garbled/misspelled tool name), not a genuine capability
+    failure — so it is retried once before the loop gives up, and it is deliberately distinct from
+    :class:`ToolCallingUnsupported`.
+    """
+
+
+class FollowUpUnavailable(RuntimeError):
+    """A transient tool-call glitch persisted past one retry; resolve the question without a follow-up.
+
+    Distinct from :class:`ToolCallingUnsupported` (ADR 0003): that signals a genuine provider
+    tool-calling integration failure and must stay loud, whereas this is a recoverable malformed-output
+    blip. A follow-up is an optional "go deeper" step — the turn already has a valid score — so the
+    micro-loop degrades (keeps the last score) instead of crashing the question and the whole Session.
+    """
+
+
 class FollowUp(BaseModel):
     """A probing question asked within the same original question to stress-test a weak answer."""
 
@@ -266,26 +285,26 @@ def _build_native_user(
     )
 
 
-def _generate_follow_up_native(
+# A transient garbled tool name is a recoverable blip, so the native tool round-trip gets one retry
+# before the loop degrades. This is the tool-round-trip's own retry budget; ``chat_with_tools`` already
+# has a separate ``max_retries`` for the *final* structured answer after the tool turn.
+_NATIVE_TOOL_ATTEMPTS = 2
+
+
+def _native_follow_up_attempt(
     client: LLMClient,
     *,
+    messages: list[Message],
     original_question: str,
-    answer: str,
-    evaluation: Evaluation,
     skill: str | None,
     store: ConceptStore,
 ) -> FollowUp:
-    """Generate a Follow-up via a real provider-level tool call (one lookup_concept round-trip).
-
-    The model emits a genuine ``tool_calls`` request; the ``execute`` callback runs it; the rendered
-    note is fed back as a ``tool`` turn; then the model returns the schema-validated Follow-up. The
-    same grounding gates apply — they read the retrieved note through the captured-lookup getter.
-    """
+    """One lookup_concept tool round-trip; raises :class:`UnknownToolCall` on a garbled tool name."""
     captured: dict[str, ConceptLookup | ConceptToolRequest | str | None] = {}
 
     def execute(name: str, args: dict[str, object]) -> str:
         if name != "lookup_concept":
-            raise ValueError(f"interviewer received an unexpected tool call: {name!r}")
+            raise UnknownToolCall(f"interviewer received an unexpected tool call: {name!r}")
         request = ConceptToolRequest.model_validate({"reason": "tool call", **args})
         lookup_skill = skill or request.skill
         lookup_language = request.language or ("vi" if lookup_skill == "vietnamese_nlp" else None)
@@ -296,10 +315,6 @@ def _generate_follow_up_native(
         captured["lookup_language"] = lookup_language
         return lookup.render()
 
-    messages = [
-        {"role": "system", "content": NATIVE_TOOL_SYSTEM_PROMPT},
-        {"role": "user", "content": _build_native_user(original_question, answer, evaluation, skill)},
-    ]
     follow_up = client.chat_with_tools(
         messages,
         tools=[LOOKUP_CONCEPT_TOOL],
@@ -334,6 +349,55 @@ def _generate_follow_up_native(
         follow_up.question,
     )
     return follow_up
+
+
+def _generate_follow_up_native(
+    client: LLMClient,
+    *,
+    original_question: str,
+    answer: str,
+    evaluation: Evaluation,
+    skill: str | None,
+    store: ConceptStore,
+) -> FollowUp:
+    """Generate a Follow-up via a real provider-level tool call (one lookup_concept round-trip).
+
+    The model emits a genuine ``tool_calls`` request; the ``execute`` callback runs it; the rendered
+    note is fed back as a ``tool`` turn; then the model returns the schema-validated Follow-up. The
+    same grounding gates apply — they read the retrieved note through the captured-lookup getter.
+
+    A genuine tool-calling integration failure (no tool call at all) still surfaces as
+    :class:`ToolCallingUnsupported` and stays loud (ADR 0003). A *garbled tool name* is a transient
+    blip instead: it is retried once, and only if it persists do we raise :class:`FollowUpUnavailable`
+    so the micro-loop resolves the question without a follow-up rather than crashing the Session.
+    """
+    messages = [
+        {"role": "system", "content": NATIVE_TOOL_SYSTEM_PROMPT},
+        {"role": "user", "content": _build_native_user(original_question, answer, evaluation, skill)},
+    ]
+    last_error: UnknownToolCall | None = None
+    for attempt in range(_NATIVE_TOOL_ATTEMPTS):
+        try:
+            return _native_follow_up_attempt(
+                client,
+                messages=messages,
+                original_question=original_question,
+                skill=skill,
+                store=store,
+            )
+        except UnknownToolCall as err:
+            last_error = err
+            logger.warning(
+                "interviewer received an unknown/garbled tool call (attempt %d/%d); retrying once: %s",
+                attempt + 1,
+                _NATIVE_TOOL_ATTEMPTS,
+                err,
+            )
+    raise FollowUpUnavailable(
+        "interviewer could not obtain a usable lookup_concept tool call after "
+        f"{_NATIVE_TOOL_ATTEMPTS} attempts; resolving the question without a follow-up. "
+        f"Last error: {last_error}"
+    )
 
 
 def _generate_follow_up_json(

@@ -51,6 +51,57 @@ def _eval(score: int, *, follow_up: bool) -> str:
     )
 
 
+_RESOURCE_FOR_SKILL = {
+    "ml_fundamentals": "ml_fundamentals_cross_validation",
+    "deep_learning": "deep_learning_resnet_d2l",
+    "mlops": "mlops_google_rules",
+    "system_design": "system_design_backpressure_rate_limiting",
+    "vietnamese_nlp": "vietnamese_nlp_phobert",
+}
+
+
+def _plan(*skills: str) -> str:
+    resource_ids = [_RESOURCE_FOR_SKILL[skill] for skill in skills]
+    return json.dumps(
+        {
+            "readiness_estimate": 0.48,
+            "readiness_rationale": "Several role-critical gaps still need focused practice.",
+            "prioritized_topics": [
+                {
+                    "priority": i,
+                    "skill": skill,
+                    "title": f"Practice {skill}",
+                    "rationale": "Final Skill state makes this a high-priority gap.",
+                    "target_mastery": "Explain the core tradeoffs and handle a follow-up.",
+                    "resource_ids": [_RESOURCE_FOR_SKILL[skill]],
+                }
+                for i, skill in enumerate(skills, start=1)
+            ],
+            "schedule": [
+                {
+                    "day": day,
+                    "focus": f"Study day {day}",
+                    "outcome": "Write a concise interview answer with one concrete tradeoff.",
+                    "resource_ids": [resource_ids[(day - 1) % len(resource_ids)]],
+                }
+                for day in range(1, 15)
+            ],
+            "milestones": [
+                {
+                    "week": 1,
+                    "description": "Answer the weakest Skill question without notes.",
+                    "evidence": "A self-recorded answer covers the missing concepts.",
+                },
+                {
+                    "week": 2,
+                    "description": "Run a timed mixed mock interview.",
+                    "evidence": "All planned Skills have a 3-minute answer and follow-up.",
+                },
+            ],
+        }
+    )
+
+
 def _diagnostic():
     return diagnose(
         CandidateProfile(
@@ -92,7 +143,12 @@ def test_strong_candidate_can_end_early_and_reasoning_is_logged(make_client, mon
     from interview_coach import supervisor
 
     monkeypatch.setattr(supervisor, "run_micro_loop", _fake_micro_loop(5.0))
-    client, fake = make_client([_decision("end_early", "Scores are consistently above the evidence bars.")])
+    client, fake = make_client(
+        [
+            _decision("end_early", "Scores are consistently above the evidence bars."),
+            _plan("system_design", "vietnamese_nlp", "ml_fundamentals"),
+        ]
+    )
     state = initial_session_state("strong-session", _diagnostic(), max_questions=5, started_at=0)
 
     graph = build_session_graph(client, now=lambda: 1)
@@ -103,14 +159,20 @@ def test_strong_candidate_can_end_early_and_reasoning_is_logged(make_client, mon
     assert final["supervisor_decisions"][0]["action"] == "end_early"
     assert final["supervisor_decisions"][0]["deviation"] is True
     assert "consistently above" in final["supervisor_decisions"][0]["llm_reasoning"]
-    assert fake.call_count == 1
+    assert final["study_plan"]["prioritized_topics"][0]["skill"] == "system_design"
+    assert fake.call_count == 2
 
 
 def test_struggling_candidate_can_trigger_extra_probe(make_client, monkeypatch):
     from interview_coach import supervisor
 
     monkeypatch.setattr(supervisor, "run_micro_loop", _fake_micro_loop(2.0))
-    client, fake = make_client([_decision("extra_question", "Weak evidence needs one more probe.")])
+    client, fake = make_client(
+        [
+            _decision("extra_question", "Weak evidence needs one more probe."),
+            _plan("mlops", "system_design", "vietnamese_nlp"),
+        ]
+    )
     state = initial_session_state("weak-session", _diagnostic(), max_questions=2, started_at=0)
 
     graph = build_session_graph(client, now=lambda: 1)
@@ -120,14 +182,36 @@ def test_struggling_candidate_can_trigger_extra_probe(make_client, monkeypatch):
     assert final["stop_reason"] == "max_questions"
     assert final["supervisor_decisions"][0]["action"] == "extra_question"
     assert final["supervisor_decisions"][0]["deviation"] is True
-    assert fake.call_count == 1  # the second Supervisor pass is the deterministic max_questions rail
+    assert final["study_plan"]["prioritized_topics"][0]["skill"] == "mlops"
+    assert fake.call_count == 2  # second Supervisor pass is deterministic; Planner is the second LLM call
+
+
+def test_session_completes_when_study_planner_fails(make_client, monkeypatch):
+    # The Study Plan is end-matter: a planner that returns an invalid plan past its retry must NOT
+    # discard the fully-resolved interview. The Session completes with no plan + an error marker, so
+    # one bad LLM response at the final node cannot sink the whole run.
+    from interview_coach import supervisor
+
+    monkeypatch.setattr(supervisor, "run_micro_loop", _fake_micro_loop(5.0))
+    client, fake = make_client(['{"bad": 1}', '{"bad": 1}'])  # planner invalid on both attempts
+    state = initial_session_state("planner-fail-session", _diagnostic(), max_questions=1, started_at=0)
+
+    graph = build_session_graph(client, now=lambda: 1)
+    final = graph.invoke(state, session_config("planner-fail-session"))
+
+    assert final["status"] == SessionStatus.COMPLETE.value
+    assert final["stop_reason"] == "max_questions"
+    assert len(final["transcript"]) == 1  # the resolved interview is preserved
+    assert final["study_plan"] is None
+    assert "StructuredOutputError" in final["study_plan_error"]
+    assert fake.call_count == 2  # the two failed planner attempts; the hard cap means no Supervisor LLM call
 
 
 def test_hard_question_cap_preempts_llm_choice(make_client, monkeypatch):
     from interview_coach import supervisor
 
     monkeypatch.setattr(supervisor, "run_micro_loop", _fake_micro_loop(5.0))
-    client, fake = make_client([_decision("advance_plan", "The LLM would continue, but must not be called.")])
+    client, fake = make_client([_plan("system_design", "vietnamese_nlp", "ml_fundamentals")])
     state = initial_session_state("capped-session", _diagnostic(), max_questions=1, started_at=0)
 
     graph = build_session_graph(client, now=lambda: 1)
@@ -137,7 +221,8 @@ def test_hard_question_cap_preempts_llm_choice(make_client, monkeypatch):
     assert final["stop_reason"] == "max_questions"
     assert final["supervisor_decisions"][0]["action"] == "end_early"
     assert "Hard cap reached" in final["supervisor_decisions"][0]["llm_reasoning"]
-    assert fake.call_count == 0
+    assert final["study_plan"]["prioritized_topics"][0]["skill"] == "system_design"
+    assert fake.call_count == 1
 
 
 def test_session_caps_micro_loop_to_scripted_seed_answers(make_client, monkeypatch):
@@ -150,14 +235,14 @@ def test_session_caps_micro_loop_to_scripted_seed_answers(make_client, monkeypat
         answers=("partial answer",),
     )
     monkeypatch.setattr(supervisor, "select_seed_question", lambda skill, question_number=0: one_answer_seed)
-    client, fake = make_client([_eval(2, follow_up=True)])
+    client, fake = make_client([_eval(2, follow_up=True), _plan("mlops", "system_design", "vietnamese_nlp")])
     state = initial_session_state("one-answer-session", _diagnostic(), max_questions=1, started_at=0)
 
     graph = build_session_graph(client, now=lambda: 1)
     final = graph.invoke(state, session_config("one-answer-session"))
 
     assert final["transcript"][0]["stop_reason"] == StopReason.SAFETY_CAP.value
-    assert fake.call_count == 1  # no Follow-up generation; the seed has no scripted answer for it
+    assert fake.call_count == 2  # Evaluator + Planner; no Follow-up generation because the seed has no answer
 
 
 def test_session_resumes_from_sqlite_checkpoint_by_session_id(tmp_path, make_client, monkeypatch):
@@ -182,6 +267,7 @@ def test_session_resumes_from_sqlite_checkpoint_by_session_id(tmp_path, make_cli
             [
                 _decision("advance_plan", "Need the next planned Skill."),
                 _decision("end_early", "Enough evidence after resume."),
+                _plan("mlops", "system_design", "vietnamese_nlp"),
             ]
         )
         resumed_graph = build_session_graph(second_client, checkpointer=checkpointer, now=lambda: 1)

@@ -65,6 +65,18 @@ def _followup(
     return json.dumps({"question": question, "targets": targets})
 
 
+def _garbled_tool(name: str = "lookup_concpet") -> dict:
+    # A garbled tool name (transient MiMo glitch) that the Interviewer cannot execute.
+    return {
+        "tool_calls": [
+            {
+                "name": name,
+                "arguments": {"query": "x", "skill": "ml_fundamentals", "language": None, "reason": "r"},
+            }
+        ]
+    }
+
+
 # --- ScriptedCandidate ------------------------------------------------------------------------
 
 
@@ -154,6 +166,24 @@ def test_safety_cap_halts_pathological_loop_and_logs_a_guardrail_trip(make_clien
     cap_logs = [r for r in caplog.records if "SAFETY CAP" in r.message]
     assert cap_logs and cap_logs[0].levelno == logging.WARNING  # a warning, not a routine info
     assert not any("resolved" in r.message for r in caplog.records)  # distinct from a normal stop
+
+
+def test_micro_loop_degrades_when_follow_up_tool_call_stays_garbled(make_tool_client, caplog):
+    # The Evaluator wants a follow-up but the Interviewer's tool name stays garbled past its retry.
+    # One transient LLM glitch must not crash the question: the loop keeps the last score and resolves
+    # with a distinct FOLLOW_UP_UNAVAILABLE stop reason (a degrade, not a normal resolution).
+    client, fake = make_tool_client([_eval(2, follow_up=True), _garbled_tool()])
+    seed = _seed(["a weak answer"])
+    with caplog.at_level(logging.WARNING, logger="interview_coach.microloop"):
+        result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers), max_turns=4)
+
+    assert result.stop_reason is StopReason.FOLLOW_UP_UNAVAILABLE
+    assert len(result.turns) == 1  # only the seed turn; the follow-up could not be generated
+    assert result.turns[-1].trace.stop_reason is StopReason.FOLLOW_UP_UNAVAILABLE
+    assert result.resolved_evaluation.weighted_score == pytest.approx(2.0)  # the last score is kept
+    assert result.skill_state.mastery < 0.5  # the kept weak score still folds into the Skill state
+    assert fake.call_count == 3  # eval + 2 garbled tool round-trips (one retry), then degrade
+    assert any("could not obtain a follow-up" in r.message for r in caplog.records)
 
 
 def test_cap_keeps_the_last_score_on_exit(make_client):

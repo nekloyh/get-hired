@@ -22,7 +22,7 @@ from typing import Protocol
 
 from .concepts import ConceptStore
 from .evaluator import Evaluation, evaluate
-from .interviewer import generate_follow_up
+from .interviewer import FollowUpUnavailable, generate_follow_up
 from .llm import LLMClient
 from .seeds import SeedQuestion
 from .skill import SkillState, apply_evaluation
@@ -70,6 +70,9 @@ class StopReason(StrEnum):
 
     RESOLVED = "resolved"  # the Evaluator stopped recommending a follow-up — the real stop logic
     SAFETY_CAP = "safety_cap"  # the cap halted a still-flagging loop — a guardrail, not a stop
+    # A follow-up was wanted but could not be generated (a persistent malformed tool call); the loop
+    # resolves with the last score instead of crashing the question. A degrade, not a normal stop.
+    FOLLOW_UP_UNAVAILABLE = "follow_up_unavailable"
 
 
 @dataclass(frozen=True)
@@ -182,14 +185,29 @@ def run_micro_loop(
             )
             break
 
-        follow_up = generate_follow_up(
-            client,
-            original_question=seed.question,
-            answer=answer,
-            evaluation=evaluation,
-            skill=seed.skill,
-            concept_store=concept_store,
-        )
+        try:
+            follow_up = generate_follow_up(
+                client,
+                original_question=seed.question,
+                answer=answer,
+                evaluation=evaluation,
+                skill=seed.skill,
+                concept_store=concept_store,
+            )
+        except FollowUpUnavailable as err:
+            # The Evaluator wanted a follow-up but the Interviewer could not produce one (a persistent
+            # malformed tool call survived its retry). Resolve with the last score rather than letting
+            # one transient LLM glitch crash the question and the whole Session.
+            stop_reason = StopReason.FOLLOW_UP_UNAVAILABLE
+            turns.append(replace(turn, trace=replace(turn.trace, stop_reason=stop_reason)))
+            logger.warning(
+                "micro-loop could not obtain a follow-up after %d turn(s) (%s); keeping the last score "
+                "and resolving instead of crashing the question",
+                len(turns),
+                err,
+            )
+            break
+
         turns.append(
             replace(
                 turn,

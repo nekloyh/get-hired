@@ -6,17 +6,22 @@ glossary.
 
 ## Status
 
-**Slices 0006–0009 — self-critique, RAG Follow-ups, and Diagnostic priors.** Low-confidence
-Evaluator judgments now get exactly one Self-critique pass, including judgments whose
-`weighted_score` failed the deterministic cross-check; the higher-confidence pass is kept and logged.
-The Interviewer is now the only tool-using agent: Follow-up generation first calls `lookup_concept`,
-then asks a grounded question using the retrieved note, with MiMo thinking disabled for that tool
-loop. The concept store can run in-memory for tests/demos or against a Chroma `concepts` collection
-using `BAAI/bge-small-en-v1.5`. The Diagnostic reads the Candidate profile and produces a Topic Plan
-plus weak Beta priors with prior-only correlations and Role criticality metadata. The single-shot
-LLM agent is the primary Topic Plan path whenever a provider is configured; a deterministic ordering
-is the offline fallback. `DiagnosticResult.topic_plan_source` records which path ran (`llm` |
-`deterministic`).
+**Slices 0010–0011 — persisted Sessions, Study Planner, and Markdown export.** `coach session`
+runs/resumes a multi-question Session through LangGraph + `SqliteSaver`, then a single-shot Study
+Planner reads the final Skill states, retrieves catalog materials from a `resources` store, and
+returns a schema-valid `StudyPlan` with prioritized topics, mapped real URLs, a 14-day schedule,
+milestones, and a readiness estimate. `--export-markdown` writes the full Session transcript,
+evaluations, Supervisor decisions, and Study Plan as a portfolio artifact.
+
+Earlier slices: **0006–0009** added Self-critique, RAG Follow-ups, and Diagnostic priors.
+Low-confidence Evaluator judgments get exactly one Self-critique pass. The Interviewer is the only
+tool-using agent: Follow-up generation first calls `lookup_concept`, then asks a grounded question
+using the retrieved note, with MiMo thinking disabled for that tool loop. The concept store can run
+in-memory for tests/demos or against a Chroma `concepts` collection using `BAAI/bge-small-en-v1.5`.
+The Diagnostic reads the Candidate profile and produces a Topic Plan plus weak Beta priors with
+prior-only correlations and Role criticality metadata. The single-shot LLM agent is the primary
+Topic Plan path whenever a provider is configured; a deterministic ordering is the offline fallback.
+`DiagnosticResult.topic_plan_source` records which path ran (`llm` | `deterministic`).
 
 Earlier slices: **0004–0005** added the provider router + within-question micro-loop. LLM calls go
 through an
@@ -56,7 +61,9 @@ uv run python -m interview_coach interview --concept-store chroma --concept-pers
 uv run python -m interview_coach evaluate --answer weak   # slices 0001–0002: evaluate one fixture answer
 uv run python -m interview_coach diagnose --target-role "machine learning engineer" --claim mlops=4             # LLM agent when configured, else deterministic
 uv run python -m interview_coach diagnose --offline --target-role "machine learning engineer" --claim mlops=4   # force the deterministic offline path
+uv run python -m interview_coach session --max-questions 3 --export-markdown exports/session.md
 uv run python -m interview_coach ingest-concepts --persist-dir .chroma
+uv run python -m interview_coach ingest-resources --persist-dir .chroma
 uv run python scripts/smoke_issue_0007.py
 uv run python scripts/smoke_issue_0009.py   # live: validate the Diagnostic agent against the real provider
 ```
@@ -81,6 +88,12 @@ uv sync --extra rag && uv run pytest -m rag  # optional Chroma/BGE integration
   the gap the Evaluator flagged using the `lookup_concept` tool. It never scores.
 - `src/interview_coach/concepts.py` — seed concept notes, the `lookup_concept` tool interface,
   deterministic in-memory retrieval for tests, and the Chroma/BGE persistent store.
+- `src/interview_coach/resources.py` — seed learning resources, deterministic in-memory retrieval,
+  and the Chroma/BGE `resources` collection used by the Study Planner.
+- `src/interview_coach/study_planner.py` — end-of-Session Study Planner: ranks weak/role-critical
+  Skills, retrieves resource candidates, and produces a typed two-week `StudyPlan`.
+- `src/interview_coach/exporter.py` — Markdown export of the full Session transcript, evaluations,
+  Supervisor decisions, and Study Plan.
 - `src/interview_coach/diagnostic.py` — Candidate profile → Topic Plan + weak seeded Skill priors
   with Role criticality and prior-only correlations.
 - `src/interview_coach/microloop.py` — `run_micro_loop()`: the within-question loop, the `Candidate`

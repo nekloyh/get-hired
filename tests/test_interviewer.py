@@ -7,7 +7,7 @@ import pytest
 from interview_coach.concepts import ConceptNote, InMemoryConceptStore
 from interview_coach.config import load_settings
 from interview_coach.evaluator import DimensionScore, Evaluation
-from interview_coach.interviewer import FollowUp, generate_follow_up
+from interview_coach.interviewer import FollowUp, FollowUpUnavailable, generate_follow_up
 from interview_coach.llm import LLMClient, ToolCallingUnsupported, build_client
 
 _CONCEPT = ConceptNote(
@@ -214,6 +214,68 @@ def test_generate_follow_up_uses_native_tool_call(make_tool_client):
     assert store.lookup_calls == [
         {"query": "L2 penalty variance mechanism", "skill": "ml_fundamentals", "language": None}
     ]
+
+
+def _garbled_tool_reply(name: str = "lookup_concpet") -> dict:
+    # A misspelled/garbled tool name — the transient MiMo glitch that used to crash the whole Session.
+    return {
+        "tool_calls": [
+            {
+                "name": name,
+                "arguments": {
+                    "query": "L2 penalty variance mechanism",
+                    "skill": "ml_fundamentals",
+                    "language": None,
+                    "reason": "probe the penalty-to-variance mechanism",
+                },
+            }
+        ]
+    }
+
+
+def test_garbled_tool_name_is_retried_then_recovers(make_tool_client):
+    # A garbled tool name is a transient blip, not an integration failure: retry the round-trip once,
+    # and when the retry yields a valid lookup_concept call the follow-up still succeeds.
+    store = _store()
+    client, fake = make_tool_client([_garbled_tool_reply(), _tool_call_reply(), _followup_json()])
+
+    fu = generate_follow_up(
+        client,
+        original_question="Why does L2 regularization reduce overfitting?",
+        answer="It makes the weights smaller which is better.",
+        evaluation=_weak_evaluation(),
+        skill="ml_fundamentals",
+        concept_store=store,
+    )
+
+    assert isinstance(fu, FollowUp)
+    assert fu.concept_id == "l2"  # the retried, valid tool call actually retrieved the note
+    assert fake.call_count == 3  # garbled round-trip, retried round-trip, final follow-up
+    assert store.lookup_calls == [
+        {"query": "L2 penalty variance mechanism", "skill": "ml_fundamentals", "language": None}
+    ]
+
+
+def test_garbled_tool_name_that_persists_degrades_not_crashes(make_tool_client):
+    # If the garbled name survives the one retry, raise FollowUpUnavailable — a recoverable degrade
+    # signal the micro-loop catches — NOT ToolCallingUnsupported, which is reserved for genuine
+    # tool-calling integration failures that must stay loud (ADR 0003).
+    assert not issubclass(FollowUpUnavailable, ToolCallingUnsupported)
+    store = _store()
+    client, fake = make_tool_client([_garbled_tool_reply()])  # clamped: every round-trip is garbled
+
+    with pytest.raises(FollowUpUnavailable):
+        generate_follow_up(
+            client,
+            original_question="Why does L2 regularization reduce overfitting?",
+            answer="It makes weights smaller.",
+            evaluation=_weak_evaluation(),
+            skill="ml_fundamentals",
+            concept_store=store,
+        )
+
+    assert fake.call_count == 2  # one attempt + one retry, both garbled
+    assert store.lookup_calls == []  # the garbled name never reached lookup_concept
 
 
 def test_native_declined_fails_loudly(make_tool_client):

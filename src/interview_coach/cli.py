@@ -8,6 +8,7 @@
 - ``coach diagnose`` (slice 0009): turn a Candidate profile into a Topic Plan and seeded priors.
 - ``coach session`` (slice 0010): run/resume a multi-question Session through LangGraph + SqliteSaver.
 - ``coach ingest-concepts`` (slice 0007): fill a Chroma ``concepts`` collection with seed notes.
+- ``coach ingest-resources`` (slice 0011): fill a Chroma ``resources`` collection with study materials.
 
 ``interview`` is the default so the bare command shows the newest slice.
 """
@@ -24,9 +25,11 @@ from .concepts import SEED_CONCEPTS, ChromaConceptStore, build_concept_store
 from .config import load_settings
 from .diagnostic import CandidateProfile, diagnose
 from .evaluator import Evaluation, evaluate
+from .exporter import export_session_markdown
 from .fixtures import QUESTION, STRONG_ANSWER, WEAK_ANSWER
 from .llm import LLMClient, build_client
 from .microloop import DEFAULT_MAX_TURNS, MicroLoopResult, ScriptedCandidate, StopReason, run_micro_loop
+from .resources import SEED_RESOURCES, ChromaResourceStore, build_resource_store
 from .seeds import SEED_QUESTIONS
 from .skill import SkillState, apply_evaluation
 from .supervisor import (
@@ -193,6 +196,18 @@ def _print_session_summary(state: dict) -> None:
                 f"- after Q{decision['after_question']}: {decision['action']} "
                 f"(deviation={decision['deviation']}) — {decision['llm_reasoning']}"
             )
+    if plan := state.get("study_plan"):
+        print("\n=== STUDY PLAN ===")
+        print(f"readiness_estimate={plan['readiness_estimate']:.0%} — {plan['readiness_rationale']}")
+        for topic in plan.get("prioritized_topics", []):
+            resources = ", ".join(resource["id"] for resource in topic.get("resources", []))
+            print(
+                f"{topic['priority']}. {topic['skill']} "
+                f"(mastery={topic['mastery']:.0%}, criticality={topic['role_criticality']}): {resources}"
+            )
+    elif error := state.get("study_plan_error"):
+        # The interview still completed; only the optional end-of-session plan was unavailable.
+        print(f"\n=== STUDY PLAN ===\n(planner unavailable: {error})")
 
 
 def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
@@ -208,8 +223,18 @@ def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
         persist_dir=args.concept_persist_dir,
         seed=not args.no_seed_concepts,
     )
+    resource_store = build_resource_store(
+        args.resource_store,
+        persist_dir=args.resource_persist_dir,
+        seed=not args.no_seed_resources,
+    )
     with SqliteSaver.from_conn_string(args.checkpoint_db) as checkpointer:
-        graph = build_session_graph(client, checkpointer=checkpointer, concept_store=concept_store)
+        graph = build_session_graph(
+            client,
+            checkpointer=checkpointer,
+            concept_store=concept_store,
+            resource_store=resource_store,
+        )
         config = session_config(args.session_id)
         if args.resume:
             final = graph.invoke(None, config)
@@ -228,6 +253,9 @@ def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
             )
             final = graph.invoke(state, config)
     _print_session_summary(final)
+    if args.export_markdown:
+        path = export_session_markdown(final, args.export_markdown)
+        print(f"\nExported Session Markdown to {path}")
     return 0
 
 
@@ -235,6 +263,13 @@ def _cmd_ingest_concepts(client: LLMClient | None, args: argparse.Namespace) -> 
     store = ChromaConceptStore.create(persist_dir=args.persist_dir)
     count = store.ingest(SEED_CONCEPTS)
     print(f"Ingested {count} concept notes into Chroma collection at {args.persist_dir!r}.")
+    return 0
+
+
+def _cmd_ingest_resources(client: LLMClient | None, args: argparse.Namespace) -> int:
+    store = ChromaResourceStore.create(persist_dir=args.persist_dir)
+    count = store.ingest(SEED_RESOURCES)
+    print(f"Ingested {count} learning resources into Chroma collection at {args.persist_dir!r}.")
     return 0
 
 
@@ -342,6 +377,26 @@ def main(argv: list[str] | None = None) -> int:
         help="Do not upsert the built-in seed concept notes before the Session.",
     )
     session_parser.add_argument(
+        "--resource-store",
+        choices=["memory", "chroma"],
+        default="memory",
+        help="Resource store used by the Study Planner.",
+    )
+    session_parser.add_argument(
+        "--resource-persist-dir",
+        default=".chroma",
+        help="Chroma persistence directory when --resource-store=chroma.",
+    )
+    session_parser.add_argument(
+        "--no-seed-resources",
+        action="store_true",
+        help="Do not upsert the built-in learning resources before planning.",
+    )
+    session_parser.add_argument(
+        "--export-markdown",
+        help="Write the completed Session transcript, evaluations, and Study Plan to this Markdown path.",
+    )
+    session_parser.add_argument(
         "--resume",
         action="store_true",
         help="Resume an existing checkpoint by --session-id instead of starting from Diagnostic.",
@@ -355,6 +410,10 @@ def main(argv: list[str] | None = None) -> int:
     ingest_parser = sub.add_parser("ingest-concepts", help="Slice 0007: seed the Chroma concepts collection")
     ingest_parser.add_argument("--persist-dir", default=".chroma", help="Chroma persistence directory.")
     ingest_parser.set_defaults(func=_cmd_ingest_concepts, requires_llm=False)
+
+    resources_parser = sub.add_parser("ingest-resources", help="Slice 0011: seed the Chroma resources collection")
+    resources_parser.add_argument("--persist-dir", default=".chroma", help="Chroma persistence directory.")
+    resources_parser.set_defaults(func=_cmd_ingest_resources, requires_llm=False)
 
     # Default to the newest slice when no subcommand is given.
     parser.set_defaults(

@@ -8,6 +8,7 @@ prefer. LangGraph owns only the stateful wiring/checkpoint seam; the existing ag
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict
@@ -24,8 +25,12 @@ from .concepts import ConceptStore
 from .diagnostic import SKILLS, DiagnosticResult
 from .llm import LLMClient, Message, Validator
 from .microloop import MicroLoopResult, ScriptedCandidate, run_micro_loop
+from .resources import ResourceStore
 from .seeds import seed_count, select_seed_question
 from .skill import SkillState
+from .study_planner import plan_study
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_QUESTIONS = 5
 DEFAULT_MAX_ELAPSED_SECONDS = 30 * 60
@@ -59,6 +64,8 @@ class SessionState(TypedDict, total=False):
     stop_reason: str | None
     transcript: list[dict[str, Any]]
     supervisor_decisions: list[dict[str, Any]]
+    study_plan: dict[str, Any] | None
+    study_plan_error: str | None
 
 
 class SupervisorDecision(BaseModel):
@@ -127,6 +134,8 @@ def initial_session_state(
         "stop_reason": None,
         "transcript": [],
         "supervisor_decisions": [],
+        "study_plan": None,
+        "study_plan_error": None,
     }
 
 
@@ -140,6 +149,7 @@ def build_session_graph(
     *,
     checkpointer: SqliteSaver | None = None,
     concept_store: ConceptStore | None = None,
+    resource_store: ResourceStore | None = None,
     now: Callable[[], float] = time.time,
 ):
     """Compile the StateGraph that runs one persisted multi-question Session."""
@@ -175,16 +185,31 @@ def build_session_graph(
         decision = decide_next_move(client, state, now=now)
         return _apply_supervisor_decision(state, decision, now=now)
 
+    def study_plan_node(state: SessionState) -> dict[str, Any]:
+        if state.get("status") != SessionStatus.COMPLETE.value or state.get("study_plan"):
+            return {}
+        # The Study Plan is end-matter produced after a fully-resolved interview. A planner failure
+        # (a malformed plan that survives its retry, an empty catalog, a provider blip) must never
+        # discard the completed Session — degrade to no plan and let the graph reach END.
+        try:
+            plan = plan_study(client, state, resource_store=resource_store)
+        except Exception as err:  # noqa: BLE001 — last optional node; any failure here must not crash the run
+            logger.warning("study planner failed; completing the Session without a Study Plan: %s", err)
+            return {"study_plan": None, "study_plan_error": f"{type(err).__name__}: {err}"}
+        return {"study_plan": plan.model_dump(mode="json"), "study_plan_error": None}
+
     graph = StateGraph(SessionState)
     graph.add_node("run_question", question_node)
     graph.add_node("supervisor", supervisor_node)
+    graph.add_node("study_plan", study_plan_node)
     graph.add_edge(START, "run_question")
     graph.add_edge("run_question", "supervisor")
     graph.add_conditional_edges(
         "supervisor",
-        lambda state: END if state.get("status") == SessionStatus.COMPLETE.value else "run_question",
-        {"run_question": "run_question", END: END},
+        lambda state: "study_plan" if state.get("status") == SessionStatus.COMPLETE.value else "run_question",
+        {"run_question": "run_question", "study_plan": "study_plan"},
     )
+    graph.add_edge("study_plan", END)
     return graph.compile(checkpointer=checkpointer)
 
 
