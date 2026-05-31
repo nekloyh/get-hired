@@ -4,6 +4,7 @@ import pytest
 
 from interview_coach.concepts import (
     CONCEPT_COLLECTION,
+    SEED_CONCEPTS,
     ChromaConceptStore,
     ConceptNote,
     InMemoryConceptStore,
@@ -11,6 +12,14 @@ from interview_coach.concepts import (
     lookup_concept,
     seed_concept_store,
 )
+from interview_coach.diagnostic import SKILLS
+
+
+def test_seed_concepts_cover_every_canonical_skill():
+    # The Interviewer applies a mandatory Skill filter in lookup_concept, so a Skill with no seed
+    # note makes a Follow-up on that Skill crash with LookupError. Every canonical Skill needs ≥1.
+    covered = {note.skill for note in SEED_CONCEPTS}
+    assert set(SKILLS) <= covered, f"skills with no seed concept note: {sorted(set(SKILLS) - covered)}"
 
 
 def test_concepts_ingest_and_lookup_by_similarity():

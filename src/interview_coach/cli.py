@@ -6,6 +6,7 @@
   Interviewer asks, the fixture Candidate answers, the Evaluator scores every turn and a Follow-up is
   asked when flagged, until the question resolves; then the Skill state is updated.
 - ``coach diagnose`` (slice 0009): turn a Candidate profile into a Topic Plan and seeded priors.
+- ``coach session`` (slice 0010): run/resume a multi-question Session through LangGraph + SqliteSaver.
 - ``coach ingest-concepts`` (slice 0007): fill a Chroma ``concepts`` collection with seed notes.
 
 ``interview`` is the default so the bare command shows the newest slice.
@@ -17,6 +18,8 @@ import argparse
 import logging
 import sys
 
+from langgraph.checkpoint.sqlite import SqliteSaver
+
 from .concepts import SEED_CONCEPTS, ChromaConceptStore, build_concept_store
 from .config import load_settings
 from .diagnostic import CandidateProfile, diagnose
@@ -26,6 +29,14 @@ from .llm import LLMClient, build_client
 from .microloop import DEFAULT_MAX_TURNS, MicroLoopResult, ScriptedCandidate, StopReason, run_micro_loop
 from .seeds import SEED_QUESTIONS
 from .skill import SkillState, apply_evaluation
+from .supervisor import (
+    DEFAULT_MAX_ELAPSED_SECONDS,
+    DEFAULT_MAX_QUESTIONS,
+    build_session_graph,
+    export_architecture_diagram,
+    initial_session_state,
+    session_config,
+)
 
 ANSWERS = {"strong": STRONG_ANSWER, "weak": WEAK_ANSWER}
 
@@ -158,6 +169,68 @@ def _cmd_diagnose(client: LLMClient | None, args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_session_summary(state: dict) -> None:
+    print(f"=== SESSION {state['session_id']} ({state['status']}) ===")
+    print(f"questions: {state['question_count']}   stop_reason: {state.get('stop_reason')}")
+    for i, item in enumerate(state.get("transcript", []), start=1):
+        print(
+            f"\n--- QUESTION {i} ({item['skill']}) ---\n"
+            f"score={item['resolved_weighted_score']:.2f}/5   "
+            f"confidence={item['resolved_confidence']:.2f}   stop={item['stop_reason']}"
+        )
+        for turn_n, turn in enumerate(item["turns"], start=1):
+            kind = "FOLLOW-UP" if turn["is_follow_up"] else "QUESTION"
+            print(f"  {turn_n}. {kind}: {turn['question']}")
+            trace = turn["trace"]
+            if trace.get("concept_lookup_query"):
+                print(f"     lookup: {trace['concept_lookup_query']!r} -> {trace.get('concept_hit_id') or 'none'}")
+            if trace.get("stop_reason"):
+                print(f"     turn_stop_reason: {trace['stop_reason']}")
+    if state.get("supervisor_decisions"):
+        print("\n=== SUPERVISOR DECISIONS ===")
+        for decision in state["supervisor_decisions"]:
+            print(
+                f"- after Q{decision['after_question']}: {decision['action']} "
+                f"(deviation={decision['deviation']}) — {decision['llm_reasoning']}"
+            )
+
+
+def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
+    if client is None:
+        raise RuntimeError("session requires an LLM client")
+    if args.diagram:
+        path = export_architecture_diagram(args.diagram, client)
+        print(f"Exported architecture diagram to {path}")
+        return 0
+
+    concept_store = build_concept_store(
+        args.concept_store,
+        persist_dir=args.concept_persist_dir,
+        seed=not args.no_seed_concepts,
+    )
+    with SqliteSaver.from_conn_string(args.checkpoint_db) as checkpointer:
+        graph = build_session_graph(client, checkpointer=checkpointer, concept_store=concept_store)
+        config = session_config(args.session_id)
+        if args.resume:
+            final = graph.invoke(None, config)
+        else:
+            profile = CandidateProfile(
+                target_role=args.target_role,
+                target_companies=tuple(args.company),
+                claimed_skills=dict(args.claim),
+            )
+            diagnostic = diagnose(profile, client)
+            state = initial_session_state(
+                args.session_id,
+                diagnostic,
+                max_questions=args.max_questions,
+                max_elapsed_seconds=args.max_elapsed_seconds,
+            )
+            final = graph.invoke(state, config)
+    _print_session_summary(final)
+    return 0
+
+
 def _cmd_ingest_concepts(client: LLMClient | None, args: argparse.Namespace) -> int:
     store = ChromaConceptStore.create(persist_dir=args.persist_dir)
     count = store.ingest(SEED_CONCEPTS)
@@ -228,6 +301,56 @@ def main(argv: list[str] | None = None) -> int:
     # LLM agent is the primary Topic Plan path: used whenever a provider is configured, with the
     # deterministic ordering as the offline fallback (no error when unconfigured).
     diag_parser.set_defaults(func=_cmd_diagnose, requires_llm=False, prefers_llm=True)
+
+    session_parser = sub.add_parser("session", help="Slice 0010: run/resume a LangGraph Session")
+    session_parser.add_argument("--session-id", default="local-session", help="Stable id used as LangGraph thread_id.")
+    session_parser.add_argument(
+        "--checkpoint-db",
+        default=".session-checkpoints.sqlite",
+        help="SQLite checkpoint database used by SqliteSaver.",
+    )
+    session_parser.add_argument("--target-role", default="machine learning engineer")
+    session_parser.add_argument(
+        "--company",
+        action="append",
+        default=[],
+        help="Target company; may be passed multiple times.",
+    )
+    session_parser.add_argument(
+        "--claim",
+        type=_parse_claim,
+        action="append",
+        default=[],
+        help="Candidate self-assessment as skill=score on a 1–5 scale; may be repeated.",
+    )
+    session_parser.add_argument("--max-questions", type=int, default=DEFAULT_MAX_QUESTIONS)
+    session_parser.add_argument("--max-elapsed-seconds", type=float, default=DEFAULT_MAX_ELAPSED_SECONDS)
+    session_parser.add_argument(
+        "--concept-store",
+        choices=["memory", "chroma"],
+        default="memory",
+        help="Concept store used by lookup_concept during Follow-up generation.",
+    )
+    session_parser.add_argument(
+        "--concept-persist-dir",
+        default=".chroma",
+        help="Chroma persistence directory when --concept-store=chroma.",
+    )
+    session_parser.add_argument(
+        "--no-seed-concepts",
+        action="store_true",
+        help="Do not upsert the built-in seed concept notes before the Session.",
+    )
+    session_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume an existing checkpoint by --session-id instead of starting from Diagnostic.",
+    )
+    session_parser.add_argument(
+        "--diagram",
+        help="Export the LangGraph architecture PNG to this path and exit.",
+    )
+    session_parser.set_defaults(func=_cmd_session, requires_llm=True)
 
     ingest_parser = sub.add_parser("ingest-concepts", help="Slice 0007: seed the Chroma concepts collection")
     ingest_parser.add_argument("--persist-dir", default=".chroma", help="Chroma persistence directory.")

@@ -220,6 +220,20 @@ SEED_CONCEPTS: tuple[ConceptNote, ...] = (
         tags=("cross_validation", "leakage", "folds"),
     ),
     ConceptNote(
+        id="deep_learning_residual_connections",
+        skill="deep_learning",
+        title="Residual connections and normalization in deep networks",
+        content=(
+            "Residual (skip) connections let a block learn a delta around an identity path, keeping "
+            "the Jacobian near identity so gradients reach early layers without vanishing — which is "
+            "what makes very deep networks trainable. They do not fix a wrong objective, leaked "
+            "features, or label noise. Normalization layers (batch/layer/group norm) smooth the loss "
+            "landscape and allow higher learning rates, but batch norm degrades with tiny or "
+            "non-i.i.d. batches and introduces train/inference skew via its running statistics."
+        ),
+        tags=("residual", "skip_connections", "normalization", "gradient_flow"),
+    ),
+    ConceptNote(
         id="mlops_drift_monitoring",
         skill="mlops",
         title="Drift monitoring and retraining",
