@@ -6,7 +6,20 @@ glossary.
 
 ## Status
 
-**Slices 0004–0005 — provider router + within-question micro-loop.** LLM calls now go through an
+**Slices 0006–0009 — self-critique, RAG Follow-ups, and Diagnostic priors.** Low-confidence
+Evaluator judgments now get exactly one Self-critique pass, including judgments whose
+`weighted_score` failed the deterministic cross-check; the higher-confidence pass is kept and logged.
+The Interviewer is now the only tool-using agent: Follow-up generation first calls `lookup_concept`,
+then asks a grounded question using the retrieved note, with MiMo thinking disabled for that tool
+loop. The concept store can run in-memory for tests/demos or against a Chroma `concepts` collection
+using `BAAI/bge-small-en-v1.5`. The Diagnostic reads the Candidate profile and produces a Topic Plan
+plus weak Beta priors with prior-only correlations and Role criticality metadata. The single-shot
+LLM agent is the primary Topic Plan path whenever a provider is configured; a deterministic ordering
+is the offline fallback. `DiagnosticResult.topic_plan_source` records which path ran (`llm` |
+`deterministic`).
+
+Earlier slices: **0004–0005** added the provider router + within-question micro-loop. LLM calls go
+through an
 `LLMRouter`: `PRIMARY_PROVIDER=mimo|groq` selects the primary OpenAI-compatible provider and falls
 back to the other configured provider on primary call failure. The judgment path is also a loop that
 owns one question end-to-end (ADR 0001): the **Interviewer** asks → the fixture **Candidate** answers
@@ -17,8 +30,8 @@ flag is the stop logic; the cap is only a guardrail, logged distinctly when it t
 
 Earlier slices: **0001** evaluate one answer → typed `Evaluation`; **0002** Beta-distributed Skill
 state updated from the score (pure Python, no LLM — ADR 0002); **0003** a deterministic
-`weighted_score` cross-check that lowers `confidence` on divergence. Correlations, informative priors,
-RAG, and the Supervisor macro-loop are later slices.
+`weighted_score` cross-check that lowers `confidence` on divergence. The Supervisor macro-loop is the
+next major orchestration slice.
 
 ## Setup
 
@@ -26,6 +39,7 @@ Requires [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync                 # create the venv + install deps (downloads Python 3.12 if needed)
+uv sync --extra rag     # optional: install Chroma + sentence-transformers for persistent RAG
 cp .env.example .env    # then fill in your MiMo/Groq credentials
 ```
 
@@ -38,7 +52,13 @@ is used as fallback.
 ```bash
 uv run python -m interview_coach                          # run the micro-loop over the seed questions
 uv run python -m interview_coach interview --max-turns 6  # raise the per-question safety cap
+uv run python -m interview_coach interview --concept-store chroma --concept-persist-dir .chroma
 uv run python -m interview_coach evaluate --answer weak   # slices 0001–0002: evaluate one fixture answer
+uv run python -m interview_coach diagnose --target-role "machine learning engineer" --claim mlops=4             # LLM agent when configured, else deterministic
+uv run python -m interview_coach diagnose --offline --target-role "machine learning engineer" --claim mlops=4   # force the deterministic offline path
+uv run python -m interview_coach ingest-concepts --persist-dir .chroma
+uv run python scripts/smoke_issue_0007.py
+uv run python scripts/smoke_issue_0009.py   # live: validate the Diagnostic agent against the real provider
 ```
 
 ## Test
@@ -46,6 +66,7 @@ uv run python -m interview_coach evaluate --answer weak   # slices 0001–0002: 
 ```bash
 uv run pytest             # offline/unit tests only (no credentials needed)
 uv run pytest -m live     # explicitly hit the real provider (needs .env configured)
+uv sync --extra rag && uv run pytest -m rag  # optional Chroma/BGE integration
 ```
 
 ## Layout
@@ -54,9 +75,14 @@ uv run pytest -m live     # explicitly hit the real provider (needs .env configu
   output + one self-correcting retry, primary-provider selection, fallback, and MiMo's
   `reasoning_content` handling quarantined inside `MimoClient` (ADR 0003).
 - `src/interview_coach/evaluator.py` — the `Evaluation` schema + `evaluate()`, plus the slice-0003
-  `weighted_score` cross-check. The Evaluator is the *only* component that judges (ADR 0001).
+  `weighted_score` cross-check and slice-0006 Self-critique. The Evaluator is the *only* component
+  that judges (ADR 0001).
 - `src/interview_coach/interviewer.py` — the Interviewer: `generate_follow_up()` aims one Follow-up at
-  the gap the Evaluator flagged. It never scores. Single-shot for now; RAG tools land in slice 0007.
+  the gap the Evaluator flagged using the `lookup_concept` tool. It never scores.
+- `src/interview_coach/concepts.py` — seed concept notes, the `lookup_concept` tool interface,
+  deterministic in-memory retrieval for tests, and the Chroma/BGE persistent store.
+- `src/interview_coach/diagnostic.py` — Candidate profile → Topic Plan + weak seeded Skill priors
+  with Role criticality and prior-only correlations.
 - `src/interview_coach/microloop.py` — `run_micro_loop()`: the within-question loop, the `Candidate`
   protocol + `ScriptedCandidate` fixture, and the `RESOLVED`/`SAFETY_CAP` stop reasons. Plain Python.
 - `src/interview_coach/seeds.py` — the seed questions and their scripted candidate transcripts.
