@@ -5,11 +5,13 @@ description = "Adaptive Interview Coach — a multi-agent mock technical intervi
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.115",
     "langgraph>=1.2.2",
     "langgraph-checkpoint-sqlite>=3.1.0",
     "openai>=1.40",
     "pydantic>=2.7",
     "pydantic-settings>=2.2",
+    "uvicorn[standard]>=0.30",
 ]
 
 [project.optional-dependencies]
@@ -23,6 +25,7 @@ coach = "interview_coach.cli:main"
 
 [dependency-groups]
 dev = [
+    "httpx>=0.27",
     "pytest>=8.0",
     "ruff>=0.6",
 ]

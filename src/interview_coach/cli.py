@@ -8,6 +8,7 @@
 - ``coach diagnose`` (slice 0009): turn a Candidate profile into a Topic Plan and seeded priors.
 - ``coach session`` (slice 0010): run/resume a multi-question Session through LangGraph + SqliteSaver.
 - ``coach eval-harness`` (slice 0012): run held-out golden answers through the Evaluator.
+- ``coach api`` (slice 0012): run the FastAPI/WebSocket backend for the React UI.
 - ``coach ingest-concepts`` (slice 0007): fill a Chroma ``concepts`` collection with seed notes.
 - ``coach ingest-resources`` (slice 0011): fill a Chroma ``resources`` collection with study materials.
 
@@ -339,6 +340,16 @@ def _cmd_ingest_resources(client: LLMClient | None, args: argparse.Namespace) ->
     print(f"Ingested {count} learning resources into Chroma collection at {args.persist_dir!r}.")
     return 0
 
+def _cmd_api(client: LLMClient | None, args: argparse.Namespace) -> int:
+    import uvicorn
+
+    uvicorn.run(
+        "interview_coach.web_api:app",
+        host=args.host,
+        port=args.port,
+        reload=args.reload,
+    )
+    return 0
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Adaptive Interview Coach — slice demos.")
@@ -503,6 +514,12 @@ def main(argv: list[str] | None = None) -> int:
     resources_parser = sub.add_parser("ingest-resources", help="Slice 0011: seed the Chroma resources collection")
     resources_parser.add_argument("--persist-dir", default=".chroma", help="Chroma persistence directory.")
     resources_parser.set_defaults(func=_cmd_ingest_resources, requires_llm=False)
+
+    api_parser = sub.add_parser("api", help="Slice 0012: run the FastAPI WebSocket backend")
+    api_parser.add_argument("--host", default="127.0.0.1")
+    api_parser.add_argument("--port", type=int, default=8000)
+    api_parser.add_argument("--reload", action="store_true")
+    api_parser.set_defaults(func=_cmd_api, requires_llm=False)
 
     # Default to the newest slice when no subcommand is given.
     parser.set_defaults(

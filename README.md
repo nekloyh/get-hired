@@ -6,14 +6,16 @@ glossary.
 
 ## Status
 
-**Slices 0010–0012 — persisted Sessions, Study Planner, CLI UI, and Evaluator harness.** `coach
-session` runs/resumes a multi-question interactive Session through LangGraph + `SqliteSaver`,
-prompts the Candidate in the terminal, streams live Skill-state bars after each resolved question,
-then produces a Study Plan from final Skill states and retrieved resource candidates. `--scripted`
-runs the built-in fixture Candidate for demos/tests. `--export-markdown` writes the full Session
-transcript, evaluations, Supervisor decisions, and Study Plan as a portfolio artifact. `coach
-eval-harness` runs held-out golden answers through the Evaluator and exits non-zero when score ranges
-regress.
+**Slices 0010–0012 — persisted Sessions, Study Planner, React UI/API, and Evaluator harness.**
+`coach session` still runs/resumes a multi-question interactive Session through LangGraph +
+`SqliteSaver` in the terminal. The local web MVP is now a Vite React + TypeScript app backed by
+`coach api`, a thin FastAPI/WebSocket layer over the same Python Session graph. The backend uses live
+LLMs when configured and has an explicit demo-only deterministic client for UI review without
+credentials. `--scripted` runs the built-in fixture Candidate for demos/tests. `--export-markdown`
+writes the full Session transcript, evaluations, Supervisor decisions, and Study Plan as a portfolio
+artifact; the web API also exposes completed Session Markdown at `/api/sessions/{session_id}/export.md`.
+`coach eval-harness` runs held-out golden answers through the Evaluator and exits non-zero when score
+ranges regress.
 
 Earlier slices: **0006–0009** added Self-critique, RAG Follow-ups, and Diagnostic priors.
 Low-confidence Evaluator judgments get exactly one Self-critique pass. The Interviewer is the only
@@ -48,6 +50,7 @@ Requires [uv](https://docs.astral.sh/uv/).
 uv sync                 # create the venv + install deps (downloads Python 3.12 if needed)
 uv sync --extra rag     # optional: install Chroma + sentence-transformers for persistent RAG
 cp .env.example .env    # then fill in your MiMo/Groq credentials
+cd web && npm install   # install the React UI toolchain
 ```
 
 `.env` keys: set `PRIMARY_PROVIDER=mimo` or `PRIMARY_PROVIDER=groq`, then fill that provider's
@@ -72,12 +75,26 @@ uv run python scripts/smoke_issue_0007.py
 uv run python scripts/smoke_issue_0009.py   # live: validate the Diagnostic agent against the real provider
 ```
 
+Web MVP:
+
+```bash
+uv run coach api --port 8000
+cd web && npm run dev
+```
+
+Then open `http://127.0.0.1:5173`. Choose `demo` mode to run without credentials; choose `live` once
+`.env` has the selected provider configured.
+
 ## Test
 
 ```bash
 uv run pytest             # offline/unit tests only (no credentials needed)
 uv run pytest -m live     # explicitly hit the real provider (needs .env configured)
 uv sync --extra rag && uv run pytest -m rag  # optional Chroma/BGE integration
+cd web && npm run lint
+cd web && npm run test
+cd web && npm run build
+cd web && npm run test:e2e  # optional: requires the backend API running and Playwright browsers installed
 ```
 
 ## Layout
@@ -101,6 +118,10 @@ uv sync --extra rag && uv run pytest -m rag  # optional Chroma/BGE integration
 - `src/interview_coach/ui.py` — terminal Skill-state rendering helpers used by the Session CLI.
 - `src/interview_coach/exporter.py` — Markdown export of the full Session transcript, evaluations,
   Supervisor decisions, and Study Plan.
+- `src/interview_coach/web_api.py` — FastAPI health, WebSocket Session, and Markdown export endpoints
+  for the React UI.
+- `src/interview_coach/demo_llm.py` — demo-only deterministic `LLMClient` for local UI review without
+  provider credentials; it is deliberately separate from production provider routing.
 - `src/interview_coach/diagnostic.py` — Candidate profile → Topic Plan + weak seeded Skill priors
   with Role criticality and prior-only correlations.
 - `src/interview_coach/microloop.py` — `run_micro_loop()`: the within-question loop, the `Candidate`
@@ -113,4 +134,6 @@ uv sync --extra rag && uv run pytest -m rag  # optional Chroma/BGE integration
   α/β) and its pure-Python updater `apply_evaluation()`. No LLM by design (ADR 0002).
 - `src/interview_coach/cli.py` — `interview` runs the micro-loop over the seed questions; `evaluate`
   runs the slices 0001–0002 demo (judgment → before→after Skill state); `session` is the live
-  terminal UI; `eval-harness` runs the Evaluator regression checks.
+  terminal UI; `api` runs the web backend; `eval-harness` runs the Evaluator regression checks.
+- `web/` — Vite React + TypeScript local UI with typed WebSocket events, setup controls, interview
+  workspace, live Skill/Topic Plan sidebars, final report, unit tests, and a Playwright demo-flow spec.

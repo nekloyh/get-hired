@@ -15,10 +15,13 @@ The demo surface and the evaluation harness. A thin UI (Streamlit and/or a Typer
 
 ## Done
 
-- Chose the existing `coach session` CLI as the issue-0012 UI surface. It now prompts the Candidate
-  in the terminal by default, streams live Skill-state bars after each resolved question, then prints
-  the final transcript, Supervisor decisions, and Study Plan summary. `--scripted` preserves the
-  fixture Candidate demo path.
+- Replaced the unfinished Streamlit path with a local Vite React + TypeScript web UI plus
+  `coach api`, a thin FastAPI/WebSocket backend over the existing Python Session graph. The terminal
+  `coach session` path remains available for direct CLI practice, but the issue-0012 web surface now
+  supports setup, live Candidate answers, Skill-state bars, Topic Plan progress, Supervisor markers,
+  and the final Study Plan/report.
+- Added a demo-only deterministic `LLMClient` for UI review without credentials. It is separate from
+  production provider routing; live Sessions still use `LLMRouter`.
 - Added `coach eval-harness`, backed by `interview_coach.eval_harness`, with held-out empty, weak,
   strong, excellent, and prompt-injection answer cases. The command prints expected ranges vs actual
   scores and exits non-zero on any regression.
@@ -33,8 +36,11 @@ The demo surface and the evaluation harness. A thin UI (Streamlit and/or a Typer
 
 ## Verified
 
-- `uv run pytest` -> 133 passed, 7 deselected.
+- `uv run pytest` -> 136 passed, 7 deselected.
 - `uv run ruff check .` -> all checks passed.
+- `cd web && npm run lint` -> all checks passed.
+- `cd web && npm run test` -> 11 passed.
+- `cd web && npm run build` -> production build completed.
 
 ## Blocked by
 
