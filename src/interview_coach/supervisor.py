@@ -23,10 +23,10 @@ from typing_extensions import TypedDict
 
 from .concepts import ConceptStore
 from .diagnostic import SKILLS, DiagnosticResult
-from .llm import LLMClient, Message, Validator
-from .microloop import MicroLoopResult, ScriptedCandidate, run_micro_loop
+from .llm import LLMClient, Message, StructuredOutputError, Validator
+from .microloop import DEFAULT_MAX_TURNS, Candidate, MicroLoopResult, ScriptedCandidate, StopReason, run_micro_loop
 from .resources import ResourceStore
-from .seeds import seed_count, select_seed_question
+from .seeds import SeedQuestion, seed_count, select_seed_question
 from .skill import SkillState
 from .study_planner import plan_study
 
@@ -150,9 +150,13 @@ def build_session_graph(
     checkpointer: SqliteSaver | None = None,
     concept_store: ConceptStore | None = None,
     resource_store: ResourceStore | None = None,
+    candidate_factory: Callable[[SeedQuestion], Candidate] | None = None,
+    max_turns_per_question: int | None = None,
     now: Callable[[], float] = time.time,
 ):
     """Compile the StateGraph that runs one persisted multi-question Session."""
+    if max_turns_per_question is not None and max_turns_per_question < 1:
+        raise ValueError("max_turns_per_question must be >= 1")
 
     def question_node(state: SessionState) -> dict[str, Any]:
         if state.get("status") == SessionStatus.COMPLETE.value:
@@ -160,13 +164,19 @@ def build_session_graph(
         skill = _next_skill(state)
         attempts_for_skill = sum(1 for item in state.get("transcript", []) if item["skill"] == skill)
         seed = select_seed_question(skill, attempts_for_skill)
+        candidate = candidate_factory(seed) if candidate_factory is not None else ScriptedCandidate(seed.answers)
+        max_turns = (
+            max_turns_per_question
+            if max_turns_per_question is not None
+            else (DEFAULT_MAX_TURNS if candidate_factory is not None else len(seed.answers))
+        )
         before = _load_skill_state(state, skill)
         result = run_micro_loop(
             client,
             seed,
-            ScriptedCandidate(seed.answers),
+            candidate,
             before,
-            max_turns=len(seed.answers),
+            max_turns=max_turns,
             concept_store=concept_store,
         )
         skill_states = dict(state["skill_states"])
@@ -240,12 +250,21 @@ def decide_next_move(
             reasoning="The Topic Plan is exhausted.",
         )
 
-    return client.chat_json(
-        _build_supervisor_messages(state),
-        SupervisorDecision,
-        validators=_make_supervisor_validators(state),
-        max_retries=1,
-    )
+    try:
+        return client.chat_json(
+            _build_supervisor_messages(state),
+            SupervisorDecision,
+            validators=_make_supervisor_validators(state),
+            max_retries=1,
+        )
+    except StructuredOutputError as err:
+        fallback = _deterministic_supervisor_fallback(state)
+        logger.warning(
+            "Supervisor LLM decision failed validation after retry; using deterministic fallback %s: %s",
+            fallback.action.value,
+            err,
+        )
+        return fallback
 
 
 def export_architecture_diagram(path: str | Path, client: LLMClient) -> Path:
@@ -311,6 +330,28 @@ def _apply_supervisor_decision(
     }
 
 
+def _deterministic_supervisor_fallback(state: SessionState) -> SupervisorDecision:
+    attempts = _attempts_by_skill(state)
+    if _extra_probe_required(state, attempts):
+        last_skill = state.get("transcript", [{}])[-1].get("skill")
+        return SupervisorDecision(
+            action=SupervisorAction.EXTRA_QUESTION,
+            reasoning=(
+                f"Deterministic fallback: the last {last_skill} question stopped by safety_cap below "
+                "the evidence bar, and another seed remains."
+            ),
+        )
+    if _advance_plan_target_skill(state) is None:
+        return SupervisorDecision(
+            action=SupervisorAction.END_EARLY,
+            reasoning="Deterministic fallback: the Topic Plan is exhausted.",
+        )
+    return SupervisorDecision(
+        action=SupervisorAction.ADVANCE_PLAN,
+        reasoning="Deterministic fallback: move to the next Topic Plan entry.",
+    )
+
+
 def _build_supervisor_messages(state: SessionState) -> list[Message]:
     evidence = _evidence_summary(state)
     plan_lines = "\n".join(
@@ -326,6 +367,7 @@ def _build_supervisor_messages(state: SessionState) -> list[Message]:
         f"SKILL STATES:\n{_skill_state_summary(state)}\n\n"
         f"RESOLVED QUESTION EVIDENCE:\n{evidence}\n\n"
         f"SEED AVAILABILITY (a Skill with 0 left cannot be probed again):\n{_seed_availability_summary(state)}\n\n"
+        f"NEXT ACTION SEMANTICS:\n{_next_action_semantics(state)}\n\n"
         "Choose the next Macro-loop move. Prefer advance_plan unless the evidence justifies a "
         "deviation. A consistently strong Candidate may end early; weak or uncertain evidence may "
         "justify extra_question or switch_skill — but only toward a Skill that still has seeds left.\n"
@@ -342,6 +384,8 @@ def _make_supervisor_validators(state: SessionState) -> list[Validator]:
     plan_len = len(state.get("topic_plan", []))
     attempts = _attempts_by_skill(state)
     last_skill = state.get("transcript", [{}])[-1].get("skill") if state.get("transcript") else None
+    extra_probe_required = _extra_probe_required(state, attempts)
+    expected_advance_skill = _advance_plan_target_skill(state)
 
     def validate(decision: SupervisorDecision) -> None:
         if decision.target_skill is not None and decision.target_skill not in skills:
@@ -352,6 +396,24 @@ def _make_supervisor_validators(state: SessionState) -> list[Validator]:
             raise ValueError("switch_skill requires target_skill")
         if decision.action is SupervisorAction.SKIP_AHEAD and decision.target_plan_index is None:
             raise ValueError("skip_ahead requires target_plan_index")
+        if decision.action is SupervisorAction.ADVANCE_PLAN and extra_probe_required:
+            raise ValueError(
+                "advance_plan is inconsistent here: the last question stopped by safety_cap, scored "
+                "below that Skill's evidence_bar, and another seed remains. Choose extra_question for "
+                f"{last_skill!r}, or provide a different valid deviation."
+            )
+        if (
+            decision.action is SupervisorAction.ADVANCE_PLAN
+            and expected_advance_skill is not None
+            and last_skill is not None
+            and expected_advance_skill != last_skill
+            and _reasoning_claims_same_skill_probe(decision.reasoning, last_skill)
+        ):
+            raise ValueError(
+                "advance_plan moves to the next Topic Plan Skill "
+                f"({expected_advance_skill!r}), but the reasoning claims it will ask another "
+                f"{last_skill!r} question. Use extra_question for the same Skill or correct the reasoning."
+            )
         # Seed gate: a deviation that probes a Skill with no unused seed would only re-ask an
         # identical question, so it is rejected — the model must advance, switch elsewhere, or end.
         if decision.action is SupervisorAction.EXTRA_QUESTION and not _has_unused_seed(last_skill, attempts):
@@ -367,6 +429,65 @@ def _make_supervisor_validators(state: SessionState) -> list[Validator]:
             )
 
     return [validate]
+
+
+def _extra_probe_required(state: SessionState, attempts: Mapping[str, int]) -> bool:
+    """Whether advancing would discard unresolved, below-bar evidence while another seed remains."""
+    if not state.get("transcript"):
+        return False
+    last = state["transcript"][-1]
+    if last.get("stop_reason") != StopReason.SAFETY_CAP.value:
+        return False
+    skill = last.get("skill")
+    if not _has_unused_seed(skill, attempts):
+        return False
+    evidence_bar = float(state.get("skill_metadata", {}).get(skill, {}).get("evidence_bar", 0))
+    return float(last.get("resolved_weighted_score", 0)) < evidence_bar
+
+
+def _advance_plan_target_skill(state: SessionState) -> str | None:
+    plan = state.get("topic_plan", [])
+    next_index = state.get("current_plan_index", 0) + 1
+    return plan[next_index]["skill"] if next_index < len(plan) else None
+
+
+def _reasoning_claims_same_skill_probe(reasoning: str, skill: str) -> bool:
+    text = reasoning.lower()
+    skill_terms = {skill.lower(), skill.replace("_", " ").lower()}
+    if not any(term in text for term in skill_terms):
+        return False
+    if any(
+        marker in text
+        for marker in (
+            "already probed",
+            "already been probed",
+            "has been probed",
+            "was probed",
+            "no more",
+            "not need more",
+            "does not need more",
+            "sufficient evidence",
+            "move on from",
+        )
+    ):
+        return False
+    future_probe_phrases = (
+        "ask another",
+        "ask one more",
+        "another question",
+        "one more question",
+        "more evidence",
+        "gather more evidence",
+        "collect more evidence",
+        "probe further",
+        "further probe",
+        "continue probing",
+        "probe again",
+        "re-probe",
+        "same skill",
+        "current skill",
+    )
+    return any(phrase in text for phrase in future_probe_phrases)
 
 
 def _attempts_by_skill(state: SessionState) -> dict[str, int]:
@@ -463,6 +584,31 @@ def _seed_availability_summary(state: SessionState) -> str:
         used = attempts.get(skill, 0)
         total = seed_count(skill)
         lines.append(f"- {skill}: probed {used}/{total} seeds ({max(0, total - used)} left)")
+    return "\n".join(lines)
+
+
+def _next_action_semantics(state: SessionState) -> str:
+    current = state.get("current_plan_index", 0)
+    current_skill = state.get("next_skill")
+    advance_target = _advance_plan_target_skill(state)
+    attempts = _attempts_by_skill(state)
+    lines = [
+        (
+            f"- advance_plan moves from Topic Plan index {current} ({current_skill}) "
+            f"to index {current + 1} ({advance_target})."
+        ),
+        "- extra_question asks a separate new seed question for the same Skill as the last resolved question.",
+        (
+            "- safety_cap means the Micro-loop stopped while the Evaluator still wanted a Follow-up; "
+            "treat it as unresolved evidence, not normal resolution."
+        ),
+    ]
+    if _extra_probe_required(state, attempts):
+        last_skill = state.get("transcript", [{}])[-1].get("skill")
+        lines.append(
+            f"- The last {last_skill} question stopped by safety_cap below its evidence bar and another seed remains; "
+            "prefer extra_question unless a stronger deviation is justified."
+        )
     return "\n".join(lines)
 
 

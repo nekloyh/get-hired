@@ -7,7 +7,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 
 from interview_coach.diagnostic import CandidateProfile, diagnose
 from interview_coach.evaluator import DimensionScore, Evaluation
-from interview_coach.microloop import MicroLoopResult, StopReason, Turn
+from interview_coach.microloop import MicroLoopResult, ScriptedCandidate, StopReason, Turn
 from interview_coach.rubric import Rubric
 from interview_coach.seeds import SeedQuestion, seed_count
 from interview_coach.skill import SkillState, apply_evaluation
@@ -245,6 +245,31 @@ def test_session_caps_micro_loop_to_scripted_seed_answers(make_client, monkeypat
     assert fake.call_count == 2  # Evaluator + Planner; no Follow-up generation because the seed has no answer
 
 
+def test_session_can_use_candidate_factory_for_interactive_answers(make_client, monkeypatch):
+    from interview_coach import supervisor
+
+    seed = SeedQuestion(
+        skill="ml_fundamentals",
+        question="Factory question?",
+        rubric=Rubric(weights={"correctness": 1.0}),
+        answers=("scripted answer",),
+    )
+    monkeypatch.setattr(supervisor, "select_seed_question", lambda skill, question_number=0: seed)
+    client, _ = make_client([_eval(5, follow_up=False), _plan("system_design", "vietnamese_nlp", "ml_fundamentals")])
+    state = initial_session_state("factory-session", _diagnostic(), max_questions=1, started_at=0)
+
+    graph = build_session_graph(
+        client,
+        candidate_factory=lambda active_seed: ScriptedCandidate(["factory answer"]),
+        max_turns_per_question=1,
+        now=lambda: 1,
+    )
+    final = graph.invoke(state, session_config("factory-session"))
+
+    assert final["transcript"][0]["turns"][0]["question"] == "Factory question?"
+    assert final["transcript"][0]["turns"][0]["answer"] == "factory answer"
+
+
 def test_session_resumes_from_sqlite_checkpoint_by_session_id(tmp_path, make_client, monkeypatch):
     from interview_coach import supervisor
 
@@ -288,11 +313,11 @@ def test_architecture_diagram_exports_png(tmp_path, make_client):
 # --- seed gate: a deviation must not re-probe a Skill with no unused seed -----------------------
 
 
-def _transcript_item(skill: str, *, score: float = 3.0) -> dict:
+def _transcript_item(skill: str, *, score: float = 3.0, stop_reason: str = "resolved") -> dict:
     return {
         "skill": skill,
         "plan_index": 0,
-        "stop_reason": "resolved",
+        "stop_reason": stop_reason,
         "resolved_weighted_score": score,
         "resolved_confidence": 0.7,
         "skill_state": {"skill": skill, "alpha": 1.0, "beta": 1.0},
@@ -337,6 +362,73 @@ def test_extra_question_allowed_when_a_seed_remains(make_client):
 
     assert decision.action is SupervisorAction.EXTRA_QUESTION
     assert fake.call_count == 1
+
+
+def test_safety_cap_below_evidence_bar_requires_extra_question_when_seed_remains(make_client):
+    state = initial_session_state("safety-cap-session", _diagnostic(), max_questions=10, started_at=0)
+    state["transcript"] = [_transcript_item("mlops", score=3.0, stop_reason=StopReason.SAFETY_CAP.value)]
+    state["question_count"] = 1
+    client, fake = make_client(
+        [
+            _decision("advance_plan", "Move on despite the unresolved mlops evidence."),
+            _decision("extra_question", "The safety cap left mlops unresolved and one seed remains."),
+        ]
+    )
+
+    decision = decide_next_move(client, state, now=lambda: 1)
+
+    assert decision.action is SupervisorAction.EXTRA_QUESTION
+    assert fake.call_count == 2
+
+
+def test_advance_plan_rejects_reasoning_that_claims_same_skill_probe(make_client):
+    state = initial_session_state("reasoning-session", _diagnostic(), max_questions=10, started_at=0)
+    state["transcript"] = [_transcript_item("mlops", score=4.0)]
+    state["question_count"] = 1
+    client, fake = make_client(
+        [
+            _decision("advance_plan", "Advance plan so we can ask another mlops question for more evidence."),
+            _decision("advance_plan", "Move to the next planned Skill."),
+        ]
+    )
+
+    decision = decide_next_move(client, state, now=lambda: 1)
+
+    assert decision.action is SupervisorAction.ADVANCE_PLAN
+    assert decision.reasoning == "Move to the next planned Skill."
+    assert fake.call_count == 2
+
+
+def test_advance_plan_allows_reasoning_that_says_skill_was_already_probed(make_client):
+    state = initial_session_state("already-probed-session", _diagnostic(), max_questions=10, started_at=0)
+    state["transcript"] = [_transcript_item("mlops", score=4.0)]
+    state["question_count"] = 1
+    client, fake = make_client(
+        [_decision("advance_plan", "mlops was already probed, so move to the next planned Skill.")]
+    )
+
+    decision = decide_next_move(client, state, now=lambda: 1)
+
+    assert decision.action is SupervisorAction.ADVANCE_PLAN
+    assert fake.call_count == 1
+
+
+def test_supervisor_uses_deterministic_fallback_after_repeated_invalid_reasoning(make_client):
+    state = initial_session_state("fallback-session", _diagnostic(), max_questions=10, started_at=0)
+    state["transcript"] = [_transcript_item("mlops", score=4.0)]
+    state["question_count"] = 1
+    client, fake = make_client(
+        [
+            _decision("advance_plan", "Advance plan so we can ask another mlops question for more evidence."),
+            _decision("advance_plan", "Still ask another mlops question for more evidence."),
+        ]
+    )
+
+    decision = decide_next_move(client, state, now=lambda: 1)
+
+    assert decision.action is SupervisorAction.ADVANCE_PLAN
+    assert decision.reasoning == "Deterministic fallback: move to the next Topic Plan entry."
+    assert fake.call_count == 2
 
 
 def test_switch_skill_gated_to_exhausted_target(make_client):

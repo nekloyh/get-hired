@@ -27,6 +27,15 @@ from .skill import SkillState
 
 DEFAULT_STUDY_TOPICS = 3
 DEFAULT_RESOURCES_PER_TOPIC = 3
+MAX_RESOURCELESS_SCHEDULE_DAYS = 2
+_RESOURCELESS_DAY_MARKERS = (
+    "review",
+    "consolidat",
+    "synthesis",
+    "mock interview",
+    "assessment",
+    "retrospective",
+)
 
 _CRITICALITY_BONUS = {
     "must_have": 0.25,
@@ -78,7 +87,9 @@ class StudyScheduleItem(BaseModel):
     day: int = Field(ge=1, le=14)
     focus: str = Field(min_length=1)
     outcome: str = Field(min_length=1)
-    resources: list[StudyResource] = Field(min_length=1)
+    # Explicit consolidation/review days may cite no *new* resource. The validator bounds this so the
+    # model cannot silently return an ungrounded schedule.
+    resources: list[StudyResource] = Field(default_factory=list)
 
 
 class StudyMilestone(BaseModel):
@@ -109,7 +120,8 @@ class StudyScheduleDraft(BaseModel):
     day: int = Field(ge=1, le=14)
     focus: str = Field(min_length=1)
     outcome: str = Field(min_length=1)
-    resource_ids: list[str] = Field(min_length=1)
+    # Empty only for explicit review/consolidation days — see the validator below.
+    resource_ids: list[str] = Field(default_factory=list)
 
 
 class StudyMilestoneDraft(BaseModel):
@@ -135,6 +147,8 @@ STUDY_PLANNER_SYSTEM_PROMPT = (
     "criticality.\n"
     "- Use only resource IDs listed in RESOURCE CANDIDATES. Do not invent URLs, titles, or IDs.\n"
     "- The final schedule must have exactly days 1 through 14.\n"
+    "- Each schedule day should cite at least one resource_id unless it is explicitly a review, "
+    "consolidation, synthesis, mock interview, or assessment day. Use at most two resource-free days.\n"
     "- Milestones should be evidence-based checks the Candidate can perform.\n"
     "- You do not ask questions, evaluate answers, call tools, or act as Supervisor.\n"
     "- Respond with one JSON object only."
@@ -286,22 +300,44 @@ def _make_study_plan_validators(
         if sorted(days) != list(range(1, 15)):
             raise ValueError("schedule must contain exactly days 1 through 14")
         for topic in draft.prioritized_topics:
-            _validate_resource_ids(topic.resource_ids, catalog)
+            _validate_resource_ids(topic.resource_ids, catalog, require_nonempty=True)
             wrong_skill = [rid for rid in topic.resource_ids if catalog[rid].skill != topic.skill]
             if wrong_skill:
                 raise ValueError(f"topic {topic.skill!r} references resources from another Skill: {wrong_skill}")
+        resourceless_days = [item.day for item in draft.schedule if not item.resource_ids]
+        if len(resourceless_days) > MAX_RESOURCELESS_SCHEDULE_DAYS:
+            raise ValueError(
+                f"schedule may include at most {MAX_RESOURCELESS_SCHEDULE_DAYS} resource-free review days; "
+                f"got days {resourceless_days}"
+            )
         for item in draft.schedule:
-            _validate_resource_ids(item.resource_ids, catalog)
+            if not item.resource_ids and not _is_resource_optional_schedule_item(item):
+                raise ValueError(
+                    f"schedule day {item.day} has no resource_ids but is not explicitly a review, "
+                    "consolidation, synthesis, mock interview, or assessment day"
+                )
+            # A bounded review day may cite no resource; only the ids it *does* cite must be from the catalog.
+            _validate_resource_ids(item.resource_ids, catalog, require_nonempty=False)
 
     return [validate]
 
 
-def _validate_resource_ids(resource_ids: Sequence[str], catalog: Mapping[str, LearningResource]) -> None:
-    if not resource_ids:
-        raise ValueError("each topic or schedule item must include at least one resource_id")
+def _validate_resource_ids(
+    resource_ids: Sequence[str],
+    catalog: Mapping[str, LearningResource],
+    *,
+    require_nonempty: bool,
+) -> None:
+    if require_nonempty and not resource_ids:
+        raise ValueError("each prioritized topic must include at least one resource_id")
     unknown = sorted(set(resource_ids) - set(catalog))
     if unknown:
         raise ValueError(f"unknown resource_id(s); choose only from retrieved catalog: {unknown}")
+
+
+def _is_resource_optional_schedule_item(item: StudyScheduleDraft) -> bool:
+    text = f"{item.focus} {item.outcome}".lower()
+    return any(marker in text for marker in _RESOURCELESS_DAY_MARKERS)
 
 
 def _materialize_study_plan(

@@ -10,6 +10,8 @@ from interview_coach.llm import build_client
 from interview_coach.microloop import (
     DEFAULT_MAX_TURNS,
     CandidateExhausted,
+    CandidateInputUnavailable,
+    InteractiveCandidate,
     ScriptedCandidate,
     StopReason,
     run_micro_loop,
@@ -96,6 +98,28 @@ def test_scripted_candidate_raises_when_exhausted():
 def test_scripted_candidate_rejects_empty():
     with pytest.raises(ValueError):
         ScriptedCandidate([])
+
+
+def test_interactive_candidate_collects_multiline_answer():
+    inputs = iter(["first line", "second line", ""])
+    printed: list[str] = []
+    candidate = InteractiveCandidate(input_func=lambda prompt: next(inputs), print_func=printed.append)
+
+    answer = candidate.answer("Explain overfitting.")
+
+    assert answer == "first line\nsecond line"
+    assert printed[0] == "\nInterviewer:\nExplain overfitting.\n"
+    assert "finish with a blank line" in printed[1]
+
+
+def test_interactive_candidate_reports_eof_cleanly():
+    def _eof(prompt: str) -> str:
+        raise EOFError
+
+    candidate = InteractiveCandidate(input_func=_eof, print_func=lambda text: None)
+
+    with pytest.raises(CandidateInputUnavailable, match="run in a terminal"):
+        candidate.answer("Question?")
 
 
 # --- micro-loop control flow ------------------------------------------------------------------
@@ -192,6 +216,56 @@ def test_cap_keeps_the_last_score_on_exit(make_client):
     result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers), max_turns=2)
     assert result.resolved_evaluation is result.turns[-1].evaluation
     assert result.skill_state.mastery < 0.5  # the kept weak score pulls mastery down
+
+
+def test_micro_loop_does_not_override_evaluator_follow_up_decision(make_client):
+    # ADR 0001 makes the Evaluator the single judge of whether a Follow-up is still useful. Even a
+    # strong, confident follow-up answer must not be relabelled as resolved while the Evaluator flag
+    # remains true; the Micro-loop can only stop by the safety cap in that case.
+    client, fake = make_client(
+        [
+            _eval(3, follow_up=True),  # seed: a real gap -> probe once
+            _tool(), _followup(), _eval(5, follow_up=True, confidence=0.9),  # FU1: strong + confident
+            _tool(), _followup(), _eval(5, follow_up=True, confidence=0.9),  # FU2 -> cap
+        ]
+    )
+    seed = _seed(["ok-ish", "strong fu1", "strong fu2"])
+    result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers), max_turns=3)
+
+    assert result.stop_reason is StopReason.SAFETY_CAP
+    assert len(result.turns) == 3
+    assert result.turns[-1].is_follow_up is True
+    assert result.turns[-1].trace.stop_reason is StopReason.SAFETY_CAP
+    assert fake.call_count == 7
+
+
+def test_strong_seed_follow_up_still_runs_until_evaluator_resolves(make_client):
+    # A strong seed the Evaluator wants to probe still earns its confirmatory Follow-up; resolution only
+    # happens when the Evaluator lowers follow_up_recommended.
+    client, fake = make_client(
+        [
+            _eval(5, follow_up=True, confidence=0.9),  # strong seed, but Evaluator still wants to probe
+            _tool(), _followup(),
+            _eval(5, follow_up=False, confidence=0.9),  # the follow-up answer resolves naturally
+        ]
+    )
+    seed = _seed(["strong seed", "strong follow-up"])
+    result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers), max_turns=4)
+
+    assert len(result.turns) == 2
+    assert result.turns[1].is_follow_up is True  # the first probe DID happen
+    assert result.stop_reason is StopReason.RESOLVED
+
+
+def test_weak_follow_up_reaches_cap_when_evaluator_keeps_flagging(make_client):
+    # A weak follow-up answer is unresolved evidence, so the loop keeps probing to the cap.
+    client, _ = make_client(
+        [_eval(2, follow_up=True), _tool(), _followup(), _eval(2, follow_up=True, confidence=0.9)]
+    )
+    seed = _seed(["weak", "still weak"])
+    result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers), max_turns=2)
+
+    assert result.stop_reason is StopReason.SAFETY_CAP
 
 
 def test_skill_state_is_updated_on_exit(make_client):

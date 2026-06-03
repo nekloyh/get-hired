@@ -7,6 +7,7 @@
   asked when flagged, until the question resolves; then the Skill state is updated.
 - ``coach diagnose`` (slice 0009): turn a Candidate profile into a Topic Plan and seeded priors.
 - ``coach session`` (slice 0010): run/resume a multi-question Session through LangGraph + SqliteSaver.
+- ``coach eval-harness`` (slice 0012): run held-out golden answers through the Evaluator.
 - ``coach ingest-concepts`` (slice 0007): fill a Chroma ``concepts`` collection with seed notes.
 - ``coach ingest-resources`` (slice 0011): fill a Chroma ``resources`` collection with study materials.
 
@@ -24,11 +25,20 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from .concepts import SEED_CONCEPTS, ChromaConceptStore, build_concept_store
 from .config import load_settings
 from .diagnostic import CandidateProfile, diagnose
+from .eval_harness import harness_passed, render_golden_answer_report, run_golden_answer_harness
 from .evaluator import Evaluation, evaluate
 from .exporter import export_session_markdown
 from .fixtures import QUESTION, STRONG_ANSWER, WEAK_ANSWER
 from .llm import LLMClient, build_client
-from .microloop import DEFAULT_MAX_TURNS, MicroLoopResult, ScriptedCandidate, StopReason, run_micro_loop
+from .microloop import (
+    DEFAULT_MAX_TURNS,
+    CandidateInputUnavailable,
+    InteractiveCandidate,
+    MicroLoopResult,
+    ScriptedCandidate,
+    StopReason,
+    run_micro_loop,
+)
 from .resources import SEED_RESOURCES, ChromaResourceStore, build_resource_store
 from .seeds import SEED_QUESTIONS
 from .skill import SkillState, apply_evaluation
@@ -40,8 +50,17 @@ from .supervisor import (
     initial_session_state,
     session_config,
 )
+from .ui import render_skill_state_rows
 
 ANSWERS = {"strong": STRONG_ANSWER, "weak": WEAK_ANSWER}
+
+
+def _display_stop_reason(stop_reason: str | None) -> str:
+    if stop_reason == StopReason.SAFETY_CAP.value:
+        return "unresolved_by_safety_cap"
+    if stop_reason == StopReason.FOLLOW_UP_UNAVAILABLE.value:
+        return "degraded_follow_up_unavailable"
+    return str(stop_reason)
 
 
 def _print_evaluation(label: str, answer: str, ev: Evaluation) -> None:
@@ -175,11 +194,14 @@ def _cmd_diagnose(client: LLMClient | None, args: argparse.Namespace) -> int:
 def _print_session_summary(state: dict) -> None:
     print(f"=== SESSION {state['session_id']} ({state['status']}) ===")
     print(f"questions: {state['question_count']}   stop_reason: {state.get('stop_reason')}")
+    print("\n=== SKILL STATES ===")
+    for row in render_skill_state_rows(state):
+        print(row)
     for i, item in enumerate(state.get("transcript", []), start=1):
         print(
             f"\n--- QUESTION {i} ({item['skill']}) ---\n"
             f"score={item['resolved_weighted_score']:.2f}/5   "
-            f"confidence={item['resolved_confidence']:.2f}   stop={item['stop_reason']}"
+            f"confidence={item['resolved_confidence']:.2f}   stop={_display_stop_reason(item['stop_reason'])}"
         )
         for turn_n, turn in enumerate(item["turns"], start=1):
             kind = "FOLLOW-UP" if turn["is_follow_up"] else "QUESTION"
@@ -188,7 +210,7 @@ def _print_session_summary(state: dict) -> None:
             if trace.get("concept_lookup_query"):
                 print(f"     lookup: {trace['concept_lookup_query']!r} -> {trace.get('concept_hit_id') or 'none'}")
             if trace.get("stop_reason"):
-                print(f"     turn_stop_reason: {trace['stop_reason']}")
+                print(f"     turn_stop_reason: {_display_stop_reason(trace['stop_reason'])}")
     if state.get("supervisor_decisions"):
         print("\n=== SUPERVISOR DECISIONS ===")
         for decision in state["supervisor_decisions"]:
@@ -210,6 +232,36 @@ def _print_session_summary(state: dict) -> None:
         print(f"\n=== STUDY PLAN ===\n(planner unavailable: {error})")
 
 
+def _print_live_question_update(state: dict, item: dict, question_number: int) -> None:
+    print(f"\n=== LIVE UPDATE: QUESTION {question_number} RESOLVED ({item['skill']}) ===")
+    print(
+        f"score={item['resolved_weighted_score']:.2f}/5   "
+        f"confidence={item['resolved_confidence']:.2f}   stop={_display_stop_reason(item['stop_reason'])}"
+    )
+    print("--- SKILL STATES ---")
+    for row in render_skill_state_rows(state):
+        print(row)
+
+
+def _run_session_graph(graph, state: dict | None, config: dict, *, live: bool) -> dict:
+    if not live:
+        return graph.invoke(state, config)
+
+    final: dict | None = None
+    seen_questions = 0
+    for event in graph.stream(state, config, stream_mode="values"):
+        final = dict(event)
+        transcript = final.get("transcript", [])
+        if len(transcript) <= seen_questions:
+            continue
+        for question_index in range(seen_questions, len(transcript)):
+            _print_live_question_update(final, transcript[question_index], question_index + 1)
+        seen_questions = len(transcript)
+    if final is None:
+        raise RuntimeError("Session graph produced no final state")
+    return final
+
+
 def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
     if client is None:
         raise RuntimeError("session requires an LLM client")
@@ -229,34 +281,49 @@ def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
         seed=not args.no_seed_resources,
     )
     with SqliteSaver.from_conn_string(args.checkpoint_db) as checkpointer:
+        candidate_factory = None if args.scripted else lambda seed: InteractiveCandidate()
         graph = build_session_graph(
             client,
             checkpointer=checkpointer,
             concept_store=concept_store,
             resource_store=resource_store,
+            candidate_factory=candidate_factory,
+            max_turns_per_question=None if args.scripted else args.max_turns,
         )
         config = session_config(args.session_id)
-        if args.resume:
-            final = graph.invoke(None, config)
-        else:
-            profile = CandidateProfile(
-                target_role=args.target_role,
-                target_companies=tuple(args.company),
-                claimed_skills=dict(args.claim),
-            )
-            diagnostic = diagnose(profile, client)
-            state = initial_session_state(
-                args.session_id,
-                diagnostic,
-                max_questions=args.max_questions,
-                max_elapsed_seconds=args.max_elapsed_seconds,
-            )
-            final = graph.invoke(state, config)
+        try:
+            if args.resume:
+                final = _run_session_graph(graph, None, config, live=not args.no_live)
+            else:
+                profile = CandidateProfile(
+                    target_role=args.target_role,
+                    target_companies=tuple(args.company),
+                    claimed_skills=dict(args.claim),
+                )
+                diagnostic = diagnose(profile, client)
+                state = initial_session_state(
+                    args.session_id,
+                    diagnostic,
+                    max_questions=args.max_questions,
+                    max_elapsed_seconds=args.max_elapsed_seconds,
+                )
+                final = _run_session_graph(graph, state, config, live=not args.no_live)
+        except CandidateInputUnavailable as err:
+            print(str(err), file=sys.stderr)
+            return 2
     _print_session_summary(final)
     if args.export_markdown:
         path = export_session_markdown(final, args.export_markdown)
         print(f"\nExported Session Markdown to {path}")
     return 0
+
+
+def _cmd_eval_harness(client: LLMClient | None, args: argparse.Namespace) -> int:
+    if client is None:
+        raise RuntimeError("eval-harness requires an LLM client")
+    results = run_golden_answer_harness(client)
+    print(render_golden_answer_report(results))
+    return 0 if harness_passed(results) else 1
 
 
 def _cmd_ingest_concepts(client: LLMClient | None, args: argparse.Namespace) -> int:
@@ -274,9 +341,12 @@ def _cmd_ingest_resources(client: LLMClient | None, args: argparse.Namespace) ->
 
 
 def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-
     parser = argparse.ArgumentParser(description="Adaptive Interview Coach — slice demos.")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show provider and internal INFO logs. By default the CLI hides noisy demo logs.",
+    )
     sub = parser.add_subparsers(dest="command")
 
     ev_parser = sub.add_parser("evaluate", help="Slices 0001–0002: evaluate fixture answers + skill update")
@@ -359,6 +429,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Candidate self-assessment as skill=score on a 1–5 scale; may be repeated.",
     )
     session_parser.add_argument("--max-questions", type=int, default=DEFAULT_MAX_QUESTIONS)
+    session_parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=DEFAULT_MAX_TURNS,
+        help=f"Safety cap on turns per question for interactive Sessions (default: {DEFAULT_MAX_TURNS}).",
+    )
     session_parser.add_argument("--max-elapsed-seconds", type=float, default=DEFAULT_MAX_ELAPSED_SECONDS)
     session_parser.add_argument(
         "--concept-store",
@@ -402,10 +478,23 @@ def main(argv: list[str] | None = None) -> int:
         help="Resume an existing checkpoint by --session-id instead of starting from Diagnostic.",
     )
     session_parser.add_argument(
+        "--no-live",
+        action="store_true",
+        help="Suppress live Skill-state updates and print only the final Session summary.",
+    )
+    session_parser.add_argument(
+        "--scripted",
+        action="store_true",
+        help="Use built-in scripted Candidate answers instead of prompting in the terminal.",
+    )
+    session_parser.add_argument(
         "--diagram",
         help="Export the LangGraph architecture PNG to this path and exit.",
     )
     session_parser.set_defaults(func=_cmd_session, requires_llm=True)
+
+    harness_parser = sub.add_parser("eval-harness", help="Slice 0012: run Evaluator golden-answer checks")
+    harness_parser.set_defaults(func=_cmd_eval_harness, requires_llm=True)
 
     ingest_parser = sub.add_parser("ingest-concepts", help="Slice 0007: seed the Chroma concepts collection")
     ingest_parser.add_argument("--persist-dir", default=".chroma", help="Chroma persistence directory.")
@@ -425,6 +514,12 @@ def main(argv: list[str] | None = None) -> int:
         requires_llm=True,
     )
     args = parser.parse_args(argv)
+    logging.basicConfig(
+        level=logging.INFO if args.verbose else logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
+    logging.getLogger("httpx").setLevel(logging.INFO if args.verbose else logging.WARNING)
 
     # Three LLM modes: required (error if unconfigured), preferred (LLM when configured, else an
     # offline deterministic fallback), or none. ``--offline`` downgrades a preferred command to none.

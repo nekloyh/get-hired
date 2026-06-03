@@ -9,6 +9,15 @@ from typing import Any
 from .skill import SkillState
 
 
+def _display_stop_reason(stop_reason: Any) -> str:
+    text = "" if stop_reason is None else str(stop_reason)
+    if text == "safety_cap":
+        return "unresolved_by_safety_cap"
+    if text == "follow_up_unavailable":
+        return "degraded_follow_up_unavailable"
+    return text
+
+
 def export_session_markdown(session_state: Mapping[str, Any], path: str | Path) -> Path:
     """Write a readable Markdown export of a completed Session."""
     output = Path(path)
@@ -73,10 +82,11 @@ def _append_transcript(lines: list[str], session_state: Mapping[str, Any]) -> No
     for i, item in enumerate(session_state.get("transcript", []), start=1):
         lines.append(f"### Question {i}: `{_md(item.get('skill'))}`")
         lines.append("")
+        score_label = "Kept score" if item.get("stop_reason") == "safety_cap" else "Resolved score"
         lines.append(
-            f"Resolved score: **{float(item.get('resolved_weighted_score', 0)):.2f}/5**; "
+            f"{score_label}: **{float(item.get('resolved_weighted_score', 0)):.2f}/5**; "
             f"confidence: **{float(item.get('resolved_confidence', 0)):.2f}**; "
-            f"stop: `{_md(item.get('stop_reason'))}`."
+            f"stop: `{_md(_display_stop_reason(item.get('stop_reason')))}`."
         )
         lines.append("")
         for turn_n, turn in enumerate(item.get("turns", []), start=1):

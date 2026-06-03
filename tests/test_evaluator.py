@@ -151,6 +151,60 @@ def test_no_evidence_is_allowed(make_client):
     assert ev.dimensions["system_thinking"].evidence == "no evidence"
 
 
+def _single_dim_eval(evidence: str) -> str:
+    # One-dimension rubric keeps weighted_score == the dimension score (no cross-check, no critique),
+    # so call_count isolates exactly whether the evidence gate accepted the quote on the first attempt.
+    return json.dumps(
+        {
+            "dimensions": {"correctness": {"score": 5, "evidence": evidence}},
+            "weighted_score": 5.0,
+            "confidence": 0.9,
+            "follow_up_recommended": False,
+            "follow_up_rationale": "n/a",
+        }
+    )
+
+
+def test_whitespace_reflowed_evidence_accepted_without_a_retry(make_client):
+    # The model commonly reflows a verbatim span across a line break, joining it with a space. That is
+    # a faithful quote, so the gate must accept it on the FIRST attempt rather than burning a retry.
+    answer = "Bias is systematic error from\ntoo-simple assumptions, while variance\nis sensitivity."
+    rubric = Rubric(weights={"correctness": 1.0})
+    client, fake = make_client([_single_dim_eval("systematic error from too-simple assumptions")])
+
+    ev = evaluate(client, "Explain bias.", answer, rubric)
+
+    assert ev.dimensions["correctness"].evidence == "systematic error from too-simple assumptions"
+    assert fake.call_count == 1  # accepted first time — no retry
+
+
+def test_smart_quote_evidence_accepted_without_a_retry(make_client):
+    # The model renders straight quotes as smart quotes; that is cosmetic, so the gate accepts it.
+    answer = 'He framed it as "too-simple" assumptions causing bias.'
+    rubric = Rubric(weights={"correctness": 1.0})
+    client, fake = make_client([_single_dim_eval("“too-simple” assumptions")])
+
+    ev = evaluate(client, "Explain bias.", answer, rubric)
+
+    assert fake.call_count == 1
+    assert ev.dimensions["correctness"].evidence == "“too-simple” assumptions"  # original text kept
+
+
+def test_tolerant_match_still_rejects_a_paraphrase(make_client):
+    # The fold is whitespace + quote glyphs only — never word content — so a paraphrase still fails and
+    # is retried, preserving the anti-fabrication guarantee.
+    answer = "Bias is systematic error from too-simple assumptions."
+    rubric = Rubric(weights={"correctness": 1.0})
+    client, fake = make_client(
+        [_single_dim_eval("bias comes from oversimplified models"), _single_dim_eval("systematic error")]
+    )
+
+    ev = evaluate(client, "Explain bias.", answer, rubric)
+
+    assert ev.dimensions["correctness"].evidence == "systematic error"
+    assert fake.call_count == 2  # paraphrase rejected, corrected on retry
+
+
 # --- weighted_score cross-check guard (slice 0003) ---------------------------------------------
 
 

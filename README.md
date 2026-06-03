@@ -6,12 +6,14 @@ glossary.
 
 ## Status
 
-**Slices 0010–0011 — persisted Sessions, Study Planner, and Markdown export.** `coach session`
-runs/resumes a multi-question Session through LangGraph + `SqliteSaver`, then a single-shot Study
-Planner reads the final Skill states, retrieves catalog materials from a `resources` store, and
-returns a schema-valid `StudyPlan` with prioritized topics, mapped real URLs, a 14-day schedule,
-milestones, and a readiness estimate. `--export-markdown` writes the full Session transcript,
-evaluations, Supervisor decisions, and Study Plan as a portfolio artifact.
+**Slices 0010–0012 — persisted Sessions, Study Planner, CLI UI, and Evaluator harness.** `coach
+session` runs/resumes a multi-question interactive Session through LangGraph + `SqliteSaver`,
+prompts the Candidate in the terminal, streams live Skill-state bars after each resolved question,
+then produces a Study Plan from final Skill states and retrieved resource candidates. `--scripted`
+runs the built-in fixture Candidate for demos/tests. `--export-markdown` writes the full Session
+transcript, evaluations, Supervisor decisions, and Study Plan as a portfolio artifact. `coach
+eval-harness` runs held-out golden answers through the Evaluator and exits non-zero when score ranges
+regress.
 
 Earlier slices: **0006–0009** added Self-critique, RAG Follow-ups, and Diagnostic priors.
 Low-confidence Evaluator judgments get exactly one Self-critique pass. The Interviewer is the only
@@ -61,7 +63,9 @@ uv run python -m interview_coach interview --concept-store chroma --concept-pers
 uv run python -m interview_coach evaluate --answer weak   # slices 0001–0002: evaluate one fixture answer
 uv run python -m interview_coach diagnose --target-role "machine learning engineer" --claim mlops=4             # LLM agent when configured, else deterministic
 uv run python -m interview_coach diagnose --offline --target-role "machine learning engineer" --claim mlops=4   # force the deterministic offline path
-uv run python -m interview_coach session --max-questions 3 --export-markdown exports/session.md
+uv run python -m interview_coach session --max-questions 3 --export-markdown exports/session.md                 # interactive Candidate answers
+uv run python -m interview_coach session --scripted --max-questions 3                                           # deterministic demo Candidate
+uv run python -m interview_coach eval-harness        # issue 0012: golden-answer Evaluator harness
 uv run python -m interview_coach ingest-concepts --persist-dir .chroma
 uv run python -m interview_coach ingest-resources --persist-dir .chroma
 uv run python scripts/smoke_issue_0007.py
@@ -92,16 +96,21 @@ uv sync --extra rag && uv run pytest -m rag  # optional Chroma/BGE integration
   and the Chroma/BGE `resources` collection used by the Study Planner.
 - `src/interview_coach/study_planner.py` — end-of-Session Study Planner: ranks weak/role-critical
   Skills, retrieves resource candidates, and produces a typed two-week `StudyPlan`.
+- `src/interview_coach/eval_harness.py` — golden-answer Evaluator harness with expected score ranges,
+  including an adversarial prompt-injection case.
+- `src/interview_coach/ui.py` — terminal Skill-state rendering helpers used by the Session CLI.
 - `src/interview_coach/exporter.py` — Markdown export of the full Session transcript, evaluations,
   Supervisor decisions, and Study Plan.
 - `src/interview_coach/diagnostic.py` — Candidate profile → Topic Plan + weak seeded Skill priors
   with Role criticality and prior-only correlations.
 - `src/interview_coach/microloop.py` — `run_micro_loop()`: the within-question loop, the `Candidate`
-  protocol + `ScriptedCandidate` fixture, and the `RESOLVED`/`SAFETY_CAP` stop reasons. Plain Python.
+  protocol, `InteractiveCandidate`, `ScriptedCandidate`, and the `RESOLVED`/`SAFETY_CAP` stop
+  reasons. Plain Python.
 - `src/interview_coach/seeds.py` — the seed questions and their scripted candidate transcripts.
 - `src/interview_coach/rubric.py` — the fixed 5-dimension rubric; a weight of 0 disables a dimension.
 - `src/interview_coach/fixtures.py` — the slice-0001 hard-coded question + strong/weak fixture answers.
 - `src/interview_coach/skill.py` — the Beta-distributed `SkillState` (`mastery`/`confidence` from
   α/β) and its pure-Python updater `apply_evaluation()`. No LLM by design (ADR 0002).
 - `src/interview_coach/cli.py` — `interview` runs the micro-loop over the seed questions; `evaluate`
-  runs the slices 0001–0002 demo (judgment → before→after Skill state).
+  runs the slices 0001–0002 demo (judgment → before→after Skill state); `session` is the live
+  terminal UI; `eval-harness` runs the Evaluator regression checks.

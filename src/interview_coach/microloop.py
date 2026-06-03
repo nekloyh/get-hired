@@ -15,7 +15,7 @@ tool-using agent is still the Interviewer; the micro-loop just passes the active
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Protocol
@@ -33,9 +33,12 @@ logger = logging.getLogger(__name__)
 # earlier because the Evaluator stops recommending follow-ups.
 DEFAULT_MAX_TURNS = 4
 
-
 class CandidateExhausted(RuntimeError):
     """A scripted Candidate was asked more questions than it has canned answers for."""
+
+
+class CandidateInputUnavailable(RuntimeError):
+    """An interactive Candidate could not read terminal input."""
 
 
 class Candidate(Protocol):
@@ -63,6 +66,34 @@ class ScriptedCandidate:
         reply = self._answers[self._index]
         self._index += 1
         return reply
+
+
+class InteractiveCandidate:
+    """Terminal-backed Candidate for MVP prep Sessions.
+
+    The Candidate can type multiple lines and finish with a blank line. A blank first line is allowed
+    and is treated as an empty answer, which lets the Evaluator handle it normally.
+    """
+
+    def __init__(self, input_func: Callable[[str], str] = input, print_func: Callable[[str], None] = print) -> None:
+        self._input = input_func
+        self._print = print_func
+
+    def answer(self, question: str) -> str:
+        self._print(f"\nInterviewer:\n{question}\n")
+        self._print("Candidate answer (finish with a blank line):")
+        lines: list[str] = []
+        while True:
+            try:
+                line = self._input("> " if not lines else "... ")
+            except EOFError as err:
+                raise CandidateInputUnavailable(
+                    "interactive Candidate input ended before an answer was provided; "
+                    "run in a terminal or pass --scripted for non-interactive demos"
+                ) from err
+            if not line.strip():
+                return "\n".join(lines)
+            lines.append(line)
 
 
 class StopReason(StrEnum):

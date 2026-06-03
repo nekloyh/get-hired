@@ -83,7 +83,12 @@ def _state() -> dict:
     }
 
 
-def _plan_json(*skills: str, bad_resource: bool = False) -> str:
+def _plan_json(
+    *skills: str,
+    bad_resource: bool = False,
+    review_days: tuple[int, ...] = (),
+    empty_days: tuple[int, ...] = (),
+) -> str:
     resource_ids = [_RESOURCE_FOR_SKILL[skill] for skill in skills]
     first_resource = "invented_resource" if bad_resource else resource_ids[0]
     return json.dumps(
@@ -104,9 +109,17 @@ def _plan_json(*skills: str, bad_resource: bool = False) -> str:
             "schedule": [
                 {
                     "day": day,
-                    "focus": f"Practice day {day}",
-                    "outcome": "Produce a short answer and one follow-up answer.",
-                    "resource_ids": [resource_ids[(day - 1) % len(resource_ids)]],
+                    "focus": f"Review day {day}" if day in review_days else f"Practice day {day}",
+                    "outcome": (
+                        "Consolidate prior practice and write a short retrospective."
+                        if day in review_days
+                        else "Produce a short answer and one follow-up answer."
+                    ),
+                    "resource_ids": (
+                        []
+                        if day in review_days or day in empty_days
+                        else [resource_ids[(day - 1) % len(resource_ids)]]
+                    ),
                 }
                 for day in range(1, 15)
             ],
@@ -157,6 +170,44 @@ def test_plan_study_rejects_unknown_resource_id_and_retries(make_client):
 
     assert plan.prioritized_topics[0].resources[0].id == "mlops_google_rules"
     assert fake.call_count == 2
+
+
+def test_plan_study_accepts_a_review_day_with_no_resources_without_a_retry(make_client):
+    # A consolidation/review day legitimately cites no new resource. The schema now allows an empty
+    # schedule resource list, so the planner must accept it on the FIRST attempt rather than burning a
+    # retry, while every prioritized topic still carries at least one resource.
+    client, fake = make_client([_plan_json("mlops", "system_design", review_days=(7, 14))])
+
+    plan = plan_study(client, _state(), resource_store=seed_resource_store(InMemoryResourceStore()), topic_count=2)
+
+    assert fake.call_count == 1  # empty schedule resource_ids accepted, no retry
+    by_day = {item.day: item for item in plan.schedule}
+    assert by_day[7].resources == []  # review day carries no resource
+    assert by_day[1].resources  # a normal day still does
+    assert all(topic.resources for topic in plan.prioritized_topics)  # topics still require resources
+
+
+def test_plan_study_rejects_unmarked_empty_schedule_day_and_retries(make_client):
+    client, fake = make_client(
+        [_plan_json("mlops", "system_design", empty_days=(7,)), _plan_json("mlops", "system_design")]
+    )
+
+    plan = plan_study(client, _state(), resource_store=seed_resource_store(InMemoryResourceStore()), topic_count=2)
+
+    assert fake.call_count == 2
+    assert all(item.resources for item in plan.schedule)
+
+
+def test_plan_study_rejects_all_empty_schedule_days_and_retries(make_client):
+    all_days = tuple(range(1, 15))
+    client, fake = make_client(
+        [_plan_json("mlops", "system_design", review_days=all_days), _plan_json("mlops", "system_design")]
+    )
+
+    plan = plan_study(client, _state(), resource_store=seed_resource_store(InMemoryResourceStore()), topic_count=2)
+
+    assert fake.call_count == 2
+    assert all(item.resources for item in plan.schedule)
 
 
 def test_session_export_markdown_includes_transcript_evaluations_and_plan(tmp_path, make_client):
