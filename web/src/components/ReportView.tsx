@@ -1,4 +1,4 @@
-import { Download, ExternalLink, FileText } from 'lucide-react'
+import { CalendarDays, Download, ExternalLink, FileText, Trophy } from 'lucide-react'
 import { exportMarkdownUrl } from '../lib/api'
 import { pct } from '../lib/skillMetrics'
 import type { SessionState } from '../lib/types'
@@ -10,14 +10,20 @@ export function ReportView({ state }: { state: SessionState | null }) {
   return (
     <section className="report" aria-label="Final report">
       <div className="report-heading">
-        <div>
+        <div className="readiness-gauge" aria-label="Readiness estimate">
+          <strong>{plan ? Math.round(plan.readiness_estimate * 100) : 'N/A'}</strong>
+          <span>% readiness</span>
+        </div>
+        <div className="report-copy">
           <span className="eyebrow">Final Report</span>
           <h2>{plan ? pct(plan.readiness_estimate) : 'No readiness estimate'}</h2>
           <p>{plan?.readiness_rationale ?? state.study_plan_error ?? 'Study Plan was not produced.'}</p>
         </div>
-        <a className="icon-button" href={exportMarkdownUrl(state.session_id)} title="Download Markdown export">
-          <Download size={18} aria-hidden />
-        </a>
+        <div className="report-actions">
+          <a className="icon-button" href={exportMarkdownUrl(state.session_id)} title="Download Markdown export">
+            <Download size={18} aria-hidden />
+          </a>
+        </div>
       </div>
 
       {plan ? (
@@ -25,7 +31,10 @@ export function ReportView({ state }: { state: SessionState | null }) {
           <div className="report-grid">
             {plan.prioritized_topics.map((topic) => (
               <article className="report-card" key={topic.skill}>
-                <div className="card-kicker">Priority {topic.priority}</div>
+                <header>
+                  <div className="card-kicker">Priority {topic.priority}</div>
+                  <span>{pct(topic.mastery)}</span>
+                </header>
                 <h3>{topic.title}</h3>
                 <p>{topic.rationale}</p>
                 <div className="resource-list">
@@ -39,6 +48,20 @@ export function ReportView({ state }: { state: SessionState | null }) {
                 </div>
               </article>
             ))}
+          </div>
+          <div className="milestone-strip" aria-label="Milestones">
+            {plan.milestones.map((milestone) => (
+              <article key={milestone.week}>
+                <Trophy size={16} aria-hidden />
+                <strong>Week {milestone.week}</strong>
+                <span>{milestone.description}</span>
+                <small>{milestone.evidence}</small>
+              </article>
+            ))}
+          </div>
+          <div className="schedule-heading">
+            <CalendarDays size={18} aria-hidden />
+            <h3>Study Schedule</h3>
           </div>
           <div className="schedule-grid">
             {plan.schedule.map((item) => (
