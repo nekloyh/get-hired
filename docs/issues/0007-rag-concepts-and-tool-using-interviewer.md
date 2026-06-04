@@ -10,11 +10,20 @@ Baseline dense retrieval only (HyDE/hybrid/rerank are deferred). Ships with a sm
 
 ## Acceptance criteria
 
-- [ ] `concepts` collection ingests and is queryable by semantic similarity
-- [ ] The Interviewer calls `lookup_concept` while generating a follow-up and the retrieved note demonstrably informs the question
-- [ ] Tool-calling exists only in the Interviewer; all other agents remain single-shot with injected state
-- [ ] With MiMo as primary, the tool-using loop runs without the `reasoning_content` 400 error
-- [ ] Vietnamese concept notes are reached via Skill/metadata, not relied on through semantic search under the English embedder
+### Implemented
+
+- [x] `concepts` collection ingests and is queryable by semantic similarity
+- [x] The Interviewer calls `lookup_concept` while generating a follow-up and the retrieved note demonstrably informs the question
+- [x] Tool-calling exists only in the Interviewer; all other agents remain single-shot with injected state
+- [x] With MiMo as primary, the tool-using loop runs without the `reasoning_content` 400 error
+- [x] Vietnamese concept notes are reached via Skill/metadata, not relied on through semantic search under the English embedder
+- [x] Follow-up trace records the `lookup_concept` query/filter and retrieved concept hit for Session debugging
+
+### Verified live / integration
+
+- [x] Chroma ingest/query integration passes (`uv run pytest -m rag -ra`, verified 2026-05-31)
+- [x] MiMo native tool-call path passes (`uv run pytest -m live -ra`, verified 2026-05-31)
+- [x] Offline native-tool smoke passes (`uv run python scripts/smoke_issue_0007.py`, verified 2026-05-31)
 
 ## Blocked by
 

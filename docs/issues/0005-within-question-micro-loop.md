@@ -10,13 +10,41 @@ Orchestrated in plain Python (LangGraph is deferred to slice 0010 per `ADR 0004`
 
 ## Acceptance criteria
 
-- [ ] A weak fixture answer triggers a Follow-up; a strong one does not
-- [ ] The score is recomputed each turn and the last score is what the question resolves to
-- [ ] The Follow-up cannot be answered by repeating the original answer (it targets the gap)
-- [ ] The safety cap halts a pathological loop, and this is logged as a guardrail trip distinct from a normal stop
-- [ ] On loop exit, the resolved Skill state is updated (via slice 0002)
+### Implemented
+
+- [x] A weak fixture answer triggers a Follow-up; a strong one does not
+- [x] The score is recomputed each turn and the last score is what the question resolves to
+- [x] The Follow-up cannot be answered by repeating the original answer (it targets the gap)
+- [x] The safety cap halts a pathological loop, and this is logged as a guardrail trip distinct from a normal stop
+- [x] On loop exit, the resolved Skill state is updated (via slice 0002)
+- [x] Each transcript turn carries a `TurnTrace` for self-critique triggers, Follow-up concept lookup query/hit, and per-turn stop reason
+
+### Verified live
+
+- [x] MiMo live micro-loop sanity checks pass (`uv run pytest -m live -ra`, verified 2026-05-31)
 
 ## Blocked by
 
 - 0001 (Evaluator)
 - 0002 (skill-state update on resolution)
+
+## Done
+
+`run_micro_loop` in `src/interview_coach/microloop.py` orchestrates the loop in plain Python: it
+evaluates every turn (slice 0001), and when `follow_up_recommended` is set and the cap is not hit it
+calls the new **Interviewer** (`interviewer.generate_follow_up`, a single-shot `chat_json` call fed the
+weakest dimensions + the Evaluator's rationale so the Follow-up targets the gap — RAG tools wait for
+0007). The "must not be answerable by repeating the original answer" criterion is enforced, not just
+prompted: a validator (`interviewer._make_validators`, the extension point for 0007's grounding checks)
+rejects a Follow-up whose normalized question restates the original, and the `chat_json` retry
+regenerates. The Evaluator's flag is the stop logic; `max_turns` (default 4 = 1 question + 3 follow-ups) is a
+guardrail whose trip is a distinct `StopReason.SAFETY_CAP` logged at WARNING, separate from the INFO
+`RESOLVED` path. The last turn's score is kept either way and folded into the Skill state via slice
+0002's `apply_evaluation`. The fixture **Candidate** is `ScriptedCandidate` over the three seed
+questions in `seeds.py`. `coach interview` runs it; covered by `tests/test_microloop.py` +
+`tests/test_interviewer.py` (offline, with live sanity checks marked `live`).
+
+Traceability is now part of the loop output: `Turn.trace` records Evaluator self-critique triggers,
+the Interviewer's `lookup_concept` query/filter/hit when that turn generated a Follow-up, and the
+turn that actually stopped the loop (`resolved` or `safety_cap`). This makes a bad Session transcript
+debuggable without unpacking provider logs.

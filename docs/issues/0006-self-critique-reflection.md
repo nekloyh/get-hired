@@ -8,10 +8,17 @@ The evaluator-optimizer reflection step (see `ADR 0001`): **Self-critique** live
 
 ## Acceptance criteria
 
-- [ ] A low-confidence evaluation triggers exactly one re-evaluation pass
-- [ ] A high-confidence evaluation does not trigger re-evaluation
-- [ ] The cross-check divergence from slice 0003 is one of the triggers
-- [ ] The result kept is the higher-confidence of the two passes, and the trigger + outcome are logged
+### Implemented
+
+- [x] A low-confidence evaluation triggers exactly one re-evaluation pass
+- [x] A high-confidence evaluation does not trigger re-evaluation
+- [x] The cross-check divergence from slice 0003 is one of the triggers
+- [x] The result kept is the higher-confidence of the two passes, and the trigger + outcome are logged
+- [x] Micro-loop transcript trace exposes the self-critique triggers for the turn that was judged
+
+### Verified live
+
+- [x] MiMo live Evaluator sanity check passes (`uv run pytest -m live -ra`, verified 2026-05-31)
 
 ## Blocked by
 

@@ -10,12 +10,18 @@ The `follow_up_recommended` flag is the Evaluator's own judgment framed around *
 
 ## Acceptance criteria
 
-- [ ] Running the slice on a fixture Q+answer prints a valid, schema-validated evaluation object
-- [ ] Per-dimension scores carry verbatim evidence quotes from the answer (or an explicit "no evidence")
-- [ ] Dimensions with weight 0 are not scored
-- [ ] A clearly weak answer yields low scores; a strong fixture answer yields high scores
-- [ ] Structured-output parsing retries once on validation failure before erroring
+- [x] Running the slice on a fixture Q+answer prints a valid, schema-validated evaluation object
+- [x] Per-dimension scores carry verbatim evidence quotes from the answer (or an explicit "no evidence")
+- [x] Dimensions with weight 0 are not scored
+- [x] A clearly weak answer yields low scores; a strong fixture answer yields high scores
+- [x] Structured-output parsing retries once on validation failure before erroring
 
 ## Blocked by
 
 None - can start immediately.
+
+## Done
+
+Implemented by `src/interview_coach/evaluator.py`, fixture content in `src/interview_coach/fixtures.py`,
+and the `coach evaluate` CLI path. Covered by `tests/test_evaluator.py`, including schema validation,
+retry behavior, verbatim evidence enforcement, disabled dimensions, and live weak-vs-strong scoring.
