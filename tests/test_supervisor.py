@@ -139,6 +139,58 @@ def _fake_micro_loop(score: float):
     return _run
 
 
+def _failing_then_resolving_micro_loop(score: float, *, fail_times: int = 1):
+    """A micro-loop stub that raises on the first ``fail_times`` questions, then resolves normally."""
+    base = _fake_micro_loop(score)
+    calls = {"n": 0}
+
+    def _run(client, seed, candidate, state=None, *, max_turns=4, concept_store=None):
+        calls["n"] += 1
+        if calls["n"] <= fail_times:
+            raise RuntimeError("evaluator blew up on this question")
+        return base(client, seed, candidate, state, max_turns=max_turns, concept_store=concept_store)
+
+    return _run
+
+
+def test_question_failure_is_isolated_and_session_continues(make_client, monkeypatch):
+    # A crash inside one question (here the Evaluator/micro-loop raises) must NOT abort the whole
+    # multi-question Session (slice 0014): the question is recorded as `failed`, the Skill belief is
+    # left untouched, the Supervisor advances, and questions resolved afterwards are preserved.
+    from interview_coach import supervisor
+
+    monkeypatch.setattr(
+        supervisor, "run_micro_loop", _failing_then_resolving_micro_loop(5.0, fail_times=1)
+    )
+    client, fake = make_client(
+        [
+            _decision("advance_plan", "The first question could not be scored; move to the next planned Skill."),
+            _plan("mlops", "system_design", "vietnamese_nlp"),
+        ]
+    )
+    state = initial_session_state("failure-isolation-session", _diagnostic(), max_questions=2, started_at=0)
+
+    graph = build_session_graph(client, now=lambda: 1)
+    final = graph.invoke(state, session_config("failure-isolation-session"))
+
+    assert final["status"] == SessionStatus.COMPLETE.value
+    assert len(final["transcript"]) == 2  # the failed question and the later resolved one are both kept
+
+    failed = final["transcript"][0]
+    assert failed["stop_reason"] == StopReason.FAILED.value
+    assert failed["turns"] == []
+    assert "RuntimeError" in failed["error"]  # the failure is recorded, not silently swallowed
+    # a failed question is not evidence of low mastery: the Skill belief is the unchanged prior
+    assert final["skill_states"][failed["skill"]] == failed["skill_state"]
+
+    resolved = final["transcript"][1]
+    assert resolved["stop_reason"] == StopReason.RESOLVED.value
+
+    assert final["question_count"] == 2
+    assert final["study_plan"] is not None  # the run completed and still produced a plan
+    assert fake.call_count == 2  # one Supervisor advance after the failure + the Planner
+
+
 def test_strong_candidate_can_end_early_and_reasoning_is_logged(make_client, monkeypatch):
     from interview_coach import supervisor
 

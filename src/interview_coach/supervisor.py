@@ -171,14 +171,37 @@ def build_session_graph(
             else (DEFAULT_MAX_TURNS if candidate_factory is not None else len(seed.answers))
         )
         before = _load_skill_state(state, skill)
-        result = run_micro_loop(
-            client,
-            seed,
-            candidate,
-            before,
-            max_turns=max_turns,
-            concept_store=concept_store,
-        )
+        try:
+            result = run_micro_loop(
+                client,
+                seed,
+                candidate,
+                before,
+                max_turns=max_turns,
+                concept_store=concept_store,
+            )
+        except Exception as err:  # noqa: BLE001 — one bad question must not abort the Session (slice 0014)
+            # A failure inside a single question (a malformed Evaluator output that survived its retry,
+            # a provider blip, an unexpected tool error) must not discard every question resolved so
+            # far. Record the question as `failed` — visible, not swallowed (ADR 0003) — keep the
+            # Skill's prior belief untouched, and let the Supervisor advance as if the question
+            # resolved. The interviewer already retries transient tool noise at its own layer; this is
+            # the Session-level backstop for everything else.
+            logger.warning(
+                "question on skill %r failed (%s: %s); recording it as a failed question and "
+                "continuing the Session",
+                skill,
+                type(err).__name__,
+                err,
+            )
+            transcript = [
+                *state.get("transcript", []),
+                _dump_failed_question(skill, before, plan_index=state.get("current_plan_index", 0), error=err),
+            ]
+            return {
+                "question_count": state.get("question_count", 0) + 1,
+                "transcript": transcript,
+            }
         skill_states = dict(state["skill_states"])
         skill_states[skill] = _dump_skill_state(result.skill_state)
         transcript = [
@@ -524,6 +547,27 @@ def _load_skill_state(state: SessionState, skill: str) -> SkillState:
 
 def _dump_skill_state(state: SkillState) -> dict[str, float | str]:
     return {"skill": state.skill, "alpha": state.alpha, "beta": state.beta}
+
+
+def _dump_failed_question(
+    skill: str, prior: SkillState, *, plan_index: int, error: BaseException
+) -> dict[str, Any]:
+    """Transcript entry for a question that crashed (slice 0014).
+
+    It carries the same keys as a resolved entry so every transcript consumer keeps working, but with
+    zero-evidence sentinels, no turns, the Skill's *unchanged* prior belief (a crash is not evidence of
+    low mastery), and a visible ``error`` so the failure is recorded rather than swallowed (ADR 0003).
+    """
+    return {
+        "skill": skill,
+        "plan_index": plan_index,
+        "stop_reason": StopReason.FAILED.value,
+        "resolved_weighted_score": 0.0,
+        "resolved_confidence": 0.0,
+        "skill_state": _dump_skill_state(prior),
+        "turns": [],
+        "error": f"{type(error).__name__}: {error}",
+    }
 
 
 def _dump_micro_loop(result: MicroLoopResult, *, plan_index: int) -> dict[str, Any]:

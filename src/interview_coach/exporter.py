@@ -15,6 +15,8 @@ def _display_stop_reason(stop_reason: Any) -> str:
         return "unresolved_by_safety_cap"
     if text == "follow_up_unavailable":
         return "degraded_follow_up_unavailable"
+    if text == "failed":
+        return "failed_recorded_and_skipped"
     return text
 
 
@@ -82,12 +84,18 @@ def _append_transcript(lines: list[str], session_state: Mapping[str, Any]) -> No
     for i, item in enumerate(session_state.get("transcript", []), start=1):
         lines.append(f"### Question {i}: `{_md(item.get('skill'))}`")
         lines.append("")
-        score_label = "Kept score" if item.get("stop_reason") == "safety_cap" else "Resolved score"
-        lines.append(
-            f"{score_label}: **{float(item.get('resolved_weighted_score', 0)):.2f}/5**; "
-            f"confidence: **{float(item.get('resolved_confidence', 0)):.2f}**; "
-            f"stop: `{_md(_display_stop_reason(item.get('stop_reason')))}`."
-        )
+        if item.get("stop_reason") == "failed":
+            lines.append(
+                f"**Question failed and was skipped** — `{_md(item.get('error', 'unknown error'))}`; "
+                f"stop: `{_md(_display_stop_reason(item.get('stop_reason')))}`."
+            )
+        else:
+            score_label = "Kept score" if item.get("stop_reason") == "safety_cap" else "Resolved score"
+            lines.append(
+                f"{score_label}: **{float(item.get('resolved_weighted_score', 0)):.2f}/5**; "
+                f"confidence: **{float(item.get('resolved_confidence', 0)):.2f}**; "
+                f"stop: `{_md(_display_stop_reason(item.get('stop_reason')))}`."
+            )
         lines.append("")
         for turn_n, turn in enumerate(item.get("turns", []), start=1):
             kind = "Follow-up" if turn.get("is_follow_up") else "Question"

@@ -299,8 +299,12 @@ def _native_follow_up_attempt(
     skill: str | None,
     store: ConceptStore,
 ) -> FollowUp:
-    """One lookup_concept tool round-trip; raises :class:`UnknownToolCall` on a garbled tool name."""
-    captured: dict[str, ConceptLookup | ConceptToolRequest | str | None] = {}
+    """One lookup_concept tool round-trip.
+
+    Raises :class:`UnknownToolCall` on a garbled tool name, or :class:`FollowUpUnavailable` when the
+    requested concept note does not exist (no note matches the Skill/language filter).
+    """
+    captured: dict[str, ConceptLookup | ConceptToolRequest | LookupError | str | None] = {}
 
     def execute(name: str, args: dict[str, object]) -> str:
         if name != "lookup_concept":
@@ -308,7 +312,16 @@ def _native_follow_up_attempt(
         request = ConceptToolRequest.model_validate({"reason": "tool call", **args})
         lookup_skill = skill or request.skill
         lookup_language = request.language or ("vi" if lookup_skill == "vietnamese_nlp" else None)
-        lookup = lookup_concept(store, request.query, skill=lookup_skill, language=lookup_language)
+        try:
+            lookup = lookup_concept(store, request.query, skill=lookup_skill, language=lookup_language)
+        except LookupError as err:
+            # No concept note matches this Skill/language filter. Do NOT let this surface as an
+            # exception out of the executor: the provider router would read it as a transport failure
+            # and spuriously fail over (llm.py). Record the miss, hand the model a benign tool result,
+            # and degrade to FollowUpUnavailable after the round-trip so the question resolves on its
+            # existing score instead of crashing the Session (slice 0014, ADR 0003 fail-at-right-layer).
+            captured["concept_miss"] = err
+            return "No concept note matched the requested Skill/language filter."
         captured["lookup"] = lookup
         captured["request"] = request
         captured["lookup_skill"] = lookup_skill
@@ -326,6 +339,14 @@ def _native_follow_up_attempt(
         max_retries=1,
         disable_thinking=True,
     )
+    concept_miss = captured.get("concept_miss")
+    if concept_miss is not None:
+        # The tool ran but no note matched; degrade (after the round-trip, so the router never saw an
+        # exception) to resolving the question without a follow-up rather than crashing the Session.
+        raise FollowUpUnavailable(
+            f"no concept note matched lookup_concept for skill={skill!r}; resolving the question "
+            f"without a follow-up. Last error: {concept_miss}"
+        )
     lookup = captured.get("lookup")
     if not isinstance(lookup, ConceptLookup):
         raise ToolCallingUnsupported("the model never executed lookup_concept")
@@ -422,12 +443,20 @@ def _generate_follow_up_json(
     )
     lookup_skill = skill or tool_request.skill
     lookup_language = tool_request.language or ("vi" if lookup_skill == "vietnamese_nlp" else None)
-    lookup = lookup_concept(
-        store,
-        tool_request.query,
-        skill=lookup_skill,
-        language=lookup_language,
-    )
+    try:
+        lookup = lookup_concept(
+            store,
+            tool_request.query,
+            skill=lookup_skill,
+            language=lookup_language,
+        )
+    except LookupError as err:
+        # No concept note matches this Skill/language filter — degrade to no follow-up rather than
+        # crashing the question (slice 0014); the micro-loop keeps the existing score.
+        raise FollowUpUnavailable(
+            f"no concept note matched lookup_concept for skill={lookup_skill!r}; resolving the "
+            f"question without a follow-up. Last error: {err}"
+        ) from err
     follow_up = client.chat_json(
         _build_follow_up_messages(original_question, answer, evaluation, lookup),
         FollowUp,

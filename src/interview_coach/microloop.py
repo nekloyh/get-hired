@@ -104,6 +104,10 @@ class StopReason(StrEnum):
     # A follow-up was wanted but could not be generated (a persistent malformed tool call); the loop
     # resolves with the last score instead of crashing the question. A degrade, not a normal stop.
     FOLLOW_UP_UNAVAILABLE = "follow_up_unavailable"
+    # The question itself blew up (an Evaluator/Interviewer error survived its retries); the Session
+    # records the question as failed and moves on instead of aborting (slice 0014). Set by the
+    # Supervisor's question_node, never by the micro-loop, which by then has already crashed.
+    FAILED = "failed"
 
 
 @dataclass(frozen=True)

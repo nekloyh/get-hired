@@ -278,6 +278,52 @@ def test_garbled_tool_name_that_persists_degrades_not_crashes(make_tool_client):
     assert store.lookup_calls == []  # the garbled name never reached lookup_concept
 
 
+def test_missing_concept_note_degrades_on_native_path(make_tool_client):
+    # lookup_concept finds no note for the requested Skill: the question must degrade to no follow-up
+    # (FollowUpUnavailable) rather than crash (slice 0014). Crucially the miss is NOT raised out of the
+    # tool executor — that would surface to the provider router as a transport fault and trip a
+    # spurious failover — so the round-trip completes and the degrade is raised afterwards.
+    store = _store()  # only an ml_fundamentals note exists
+    client, fake = make_tool_client([_tool_call_reply(skill="mlops"), _followup_json()])
+
+    with pytest.raises(FollowUpUnavailable):
+        generate_follow_up(
+            client,
+            original_question="How do you monitor data drift in production?",
+            answer="You just retrain sometimes.",
+            evaluation=_weak_evaluation(),
+            skill="mlops",
+            concept_store=store,
+        )
+
+    assert fake.call_count == 2  # the tool round-trip + the final structured turn both ran
+    assert store.lookup_calls == [
+        {"query": "L2 penalty variance mechanism", "skill": "mlops", "language": None}
+    ]
+
+
+def test_missing_concept_note_degrades_on_json_path():
+    # The non-native JSON path degrades the same way: a concept miss raises FollowUpUnavailable before
+    # the follow-up is generated, so the micro-loop keeps the last score instead of crashing.
+    store = _store()
+    client = _JsonOnlyClient([_tool_json(skill="mlops")])
+
+    with pytest.raises(FollowUpUnavailable):
+        generate_follow_up(
+            client,
+            original_question="How do you monitor data drift in production?",
+            answer="You just retrain sometimes.",
+            evaluation=_weak_evaluation(),
+            skill="mlops",
+            concept_store=store,
+        )
+
+    assert len(client.calls) == 1  # the tool-plan call ran; the follow-up call never happens
+    assert store.lookup_calls == [
+        {"query": "L2 penalty variance mechanism", "skill": "mlops", "language": None}
+    ]
+
+
 def test_native_declined_fails_loudly(make_tool_client):
     # If a native-tool provider declines the forced tool call, do not hide it behind the JSON
     # fallback: this slice is specifically proving provider-level tool-calling.
