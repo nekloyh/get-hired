@@ -27,15 +27,34 @@ Supervisor advance, versus a bounded internal retry inside the Interviewer for m
 
 ## Acceptance criteria
 
-- [ ] A transient failure in one question (raised tool/Evaluator/Interviewer error) does not abort
+- [x] A transient failure in one question (raised tool/Evaluator/Interviewer error) does not abort
       the Session; resolved questions so far are preserved and the run can continue or end cleanly.
-- [ ] The failure mode is recorded in the transcript (e.g. a `failed` stop reason) so it is visible,
+- [x] The failure mode is recorded in the transcript (a `failed` stop reason) so it is visible,
       not silently swallowed — the fail-loudly intent (`ADR 0003`) is preserved at the right layer.
-- [ ] A malformed/unexpected tool name from the provider is retried a bounded number of times before
-      it is treated as a failed question.
-- [ ] `lookup_concept` with no matching note degrades to a defined behaviour (defined fallback or a
-      recorded failed question) rather than crashing the Session.
-- [ ] Tests cover both failure modes through the Session graph (a fake client that raises once).
+- [x] A malformed/unexpected tool name from the provider is retried a bounded number of times before
+      it degrades (retry-once-then-`FollowUpUnavailable`); the Session-level catch backstops anything else.
+- [x] `lookup_concept` with no matching note degrades to a defined behaviour (resolves the question
+      without a follow-up, `FOLLOW_UP_UNAVAILABLE`) rather than crashing the Session.
+- [x] Tests cover both failure modes through the Session graph (a fake client/micro-loop that raises once).
+
+## Done
+
+- `question_node` now wraps `run_micro_loop` in `try/except`: an error records a `failed` question
+  (`_dump_failed_question`, new `StopReason.FAILED`) with the Skill's unchanged prior belief and a
+  visible `error`, bumps `question_count`, and lets the Supervisor advance — mirroring the existing
+  `study_plan_node` crash-resilience pattern.
+- `lookup_concept` `LookupError` is caught inside the Interviewer (both native and JSON follow-up
+  paths) and converted to the existing `FollowUpUnavailable` degrade. On the native path the miss is
+  caught *inside* the tool executor so it never surfaces to the provider router as a transport fault
+  (which would trip a spurious failover).
+- The Markdown export renders a failed question honestly (shows the error, skips the misleading score).
+
+## Verified
+
+- `uv run pytest` -> 153 passed, 7 deselected. New: graph-level failure isolation
+  (`test_question_failure_is_isolated_and_session_continues`) and concept-miss degrade on both the
+  native and JSON paths (`tests/test_interviewer.py`).
+- `uv run ruff check .` -> all checks passed.
 
 ## Blocked by
 
