@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from .bank import load_concepts
+
 logger = logging.getLogger(__name__)
 
 CONCEPT_COLLECTION = "concepts"
@@ -195,79 +197,9 @@ def _metadata_filter(values: Mapping[str, str | None]) -> dict | None:
     return {"$and": clauses}
 
 
-SEED_CONCEPTS: tuple[ConceptNote, ...] = (
-    ConceptNote(
-        id="ml_fundamentals_l2_regularization",
-        skill="ml_fundamentals",
-        title="L2 regularization and variance",
-        content=(
-            "L2 regularization adds a squared-weight penalty to the loss. The optimizer accepts a "
-            "little more training error in exchange for smaller weights, which smooths the learned "
-            "function and lowers variance. The strength is usually chosen with validation or "
-            "cross-validation on a log-spaced grid."
-        ),
-        tags=("regularization", "variance", "validation"),
-    ),
-    ConceptNote(
-        id="ml_fundamentals_cv_leakage",
-        skill="ml_fundamentals",
-        title="Cross-validation leakage traps",
-        content=(
-            "K-fold cross-validation misleads when folds violate the data-generating structure. "
-            "Time series need forward-chaining splits, grouped data needs grouped folds, and all "
-            "preprocessing that learns from data must be fit inside each training fold."
-        ),
-        tags=("cross_validation", "leakage", "folds"),
-    ),
-    ConceptNote(
-        id="deep_learning_residual_connections",
-        skill="deep_learning",
-        title="Residual connections and normalization in deep networks",
-        content=(
-            "Residual (skip) connections let a block learn a delta around an identity path, keeping "
-            "the Jacobian near identity so gradients reach early layers without vanishing — which is "
-            "what makes very deep networks trainable. They do not fix a wrong objective, leaked "
-            "features, or label noise. Normalization layers (batch/layer/group norm) smooth the loss "
-            "landscape and allow higher learning rates, but batch norm degrades with tiny or "
-            "non-i.i.d. batches and introduces train/inference skew via its running statistics."
-        ),
-        tags=("residual", "skip_connections", "normalization", "gradient_flow"),
-    ),
-    ConceptNote(
-        id="mlops_drift_monitoring",
-        skill="mlops",
-        title="Drift monitoring and retraining",
-        content=(
-            "Production ML systems need data-quality checks, feature drift and prediction drift "
-            "monitoring, labeled performance audits when labels arrive, and a retraining trigger "
-            "that is tied to business risk rather than a fixed calendar alone."
-        ),
-        tags=("drift", "monitoring", "retraining"),
-    ),
-    ConceptNote(
-        id="system_design_backpressure",
-        skill="system_design",
-        title="Backpressure in asynchronous systems",
-        content=(
-            "Backpressure prevents an overloaded consumer from being buried by producers. Common "
-            "mechanisms include bounded queues, admission control, retry budgets, load shedding, and "
-            "explicit signals that slow upstream senders."
-        ),
-        tags=("queues", "backpressure", "resilience"),
-    ),
-    ConceptNote(
-        id="vietnamese_nlp_word_segmentation",
-        skill="vietnamese_nlp",
-        title="Vietnamese word segmentation",
-        language="vi",
-        content=(
-            "Tiếng Việt dùng khoảng trắng giữa âm tiết, không luôn luôn giữa từ. Nhiều mô hình NLP "
-            "cần xử lý tách từ hoặc thiết kế tokenizer phù hợp để tránh nhầm ranh giới từ ghép, tên "
-            "riêng và thực thể."
-        ),
-        tags=("tokenization", "word_segmentation", "metadata_routed"),
-    ),
-)
+# The concept notes themselves live in data/concepts.yaml (issue 0008) so they are hand-editable and
+# diff-friendly; they are loaded + validated here at import time (a malformed bank fails loudly).
+SEED_CONCEPTS: tuple[ConceptNote, ...] = load_concepts()
 
 
 def seed_concept_store(store: ConceptStore | None = None) -> ConceptStore:

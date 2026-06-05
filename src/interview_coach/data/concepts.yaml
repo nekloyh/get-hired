@@ -1,0 +1,161 @@
+# Concept notes for the Interviewer's lookup_concept tool (issues 0007 / 0008).
+#
+# Each note is a short, self-contained explanation (a whole-document chunk — do NOT split a concept
+# across notes). The Interviewer ALWAYS filters by the current Skill, so every canonical Skill needs
+# at least one note (the loader enforces this). Vietnamese-specific notes set language: vi so they are
+# reachable by metadata filter without trusting an English embedder.
+#
+# Fields: id (unique), skill (canonical Skill), title, content, language (default en), tags (list).
+# HITL: review content for accuracy before relying on it in a live Session.
+
+# --- ml_fundamentals -----------------------------------------------------------------------------
+- id: ml_fundamentals_l2_regularization
+  skill: ml_fundamentals
+  title: L2 regularization and variance
+  content: >-
+    L2 regularization adds a squared-weight penalty to the loss. The optimizer accepts a little more
+    training error in exchange for smaller weights, which smooths the learned function and lowers
+    variance. The strength is usually chosen with validation or cross-validation on a log-spaced grid.
+  tags: [regularization, variance, validation]
+
+- id: ml_fundamentals_cv_leakage
+  skill: ml_fundamentals
+  title: Cross-validation leakage traps
+  content: >-
+    K-fold cross-validation misleads when folds violate the data-generating structure. Time series
+    need forward-chaining splits, grouped data needs grouped folds, and all preprocessing that learns
+    from data must be fit inside each training fold.
+  tags: [cross_validation, leakage, folds]
+
+- id: ml_fundamentals_bias_variance
+  skill: ml_fundamentals
+  title: Bias-variance decomposition
+  content: >-
+    Expected test error decomposes into bias squared, variance, and irreducible noise. A high-bias
+    model underfits — train and validation error are both high and close; a high-variance model
+    overfits — low train error but a wide gap to validation. Adding capacity or features lowers bias;
+    regularization, more data, or a simpler model lowers variance. Learning curves tell the two apart.
+  tags: [bias, variance, underfitting, overfitting, learning_curves]
+
+# --- deep_learning -------------------------------------------------------------------------------
+- id: deep_learning_residual_connections
+  skill: deep_learning
+  title: Residual connections and normalization in deep networks
+  content: >-
+    Residual (skip) connections let a block learn a delta around an identity path, keeping the
+    Jacobian near identity so gradients reach early layers without vanishing — which is what makes
+    very deep networks trainable. They do not fix a wrong objective, leaked features, or label noise.
+    Normalization layers (batch/layer/group norm) smooth the loss landscape and allow higher learning
+    rates, but batch norm degrades with tiny or non-i.i.d. batches and introduces train/inference skew
+    via its running statistics.
+  tags: [residual, skip_connections, normalization, gradient_flow]
+
+- id: deep_learning_batch_normalization
+  skill: deep_learning
+  title: Batch normalization behavior and pitfalls
+  content: >-
+    Batch normalization standardizes a layer's pre-activations using mini-batch mean and variance,
+    which smooths the optimization landscape and lets you train with higher learning rates. At
+    inference it switches to running (exponential-moving-average) statistics, so a train/inference
+    mismatch appears when batches are tiny, non-i.i.d., or distribution-shifted. With small batches,
+    recurrent layers, or fine-tuning across domains, prefer group/layer norm or freeze the running
+    stats so they do not drift away from the deployment distribution.
+  tags: [batch_norm, normalization, running_statistics, train_inference_skew]
+
+# --- mlops ---------------------------------------------------------------------------------------
+- id: mlops_drift_monitoring
+  skill: mlops
+  title: Drift monitoring and retraining
+  content: >-
+    Production ML systems need data-quality checks, feature drift and prediction drift monitoring,
+    labeled performance audits when labels arrive, and a retraining trigger that is tied to business
+    risk rather than a fixed calendar alone. Covariate drift without a measured accuracy drop usually
+    does not justify the retraining-and-redeploy risk.
+  tags: [drift, monitoring, retraining]
+
+- id: mlops_model_rollout
+  skill: mlops
+  title: Safe model rollout and rollback
+  content: >-
+    Roll a new model out in stages: shadow it against live traffic first, then canary it on a small
+    slice behind a feature flag, watching guardrail metrics (latency p99, error rate, and a business
+    KPI proxy) versus the control arm. Promote gradually and keep the previous version warm so the
+    flag can flip back instantly. The rollback trigger is a guardrail metric breaching a preset
+    threshold against control; log the canary verdict for the post-mortem.
+  tags: [rollout, canary, shadow, rollback, feature_flag]
+
+# --- system_design -------------------------------------------------------------------------------
+- id: system_design_backpressure
+  skill: system_design
+  title: Backpressure in asynchronous systems
+  content: >-
+    Backpressure prevents an overloaded consumer from being buried by producers. Common mechanisms
+    include bounded queues, admission control, retry budgets, load shedding, and explicit signals that
+    slow upstream senders.
+  tags: [queues, backpressure, resilience]
+
+- id: system_design_feature_store
+  skill: system_design
+  title: Feature stores and training-serving skew
+  content: >-
+    An online feature store serves low-latency features to a real-time model while an offline store
+    backs training. The central risk is training-serving skew: online and offline features must come
+    from one declarative definition, and training must read point-in-time-correct values (log the
+    features actually served). Bound freshness with a TTL plus a staleness metric so a lagging stream
+    surfaces as an alert instead of silently degrading quality.
+  tags: [feature_store, training_serving_skew, point_in_time, freshness]
+
+- id: system_design_serving_latency
+  skill: system_design
+  title: Low-latency serving under a p99 budget
+  content: >-
+    To hold a strict p99 latency budget, precompute candidate sets offline, cache user/item embeddings
+    in a low-latency store, and do only light reranking online. The tail, not the mean, breaks the
+    budget: protect it with request hedging, timeouts that fall back to a cheaper ranker, and request
+    coalescing plus stale-while-revalidate so a cold-cache stampede does not send every miss to the
+    model.
+  tags: [latency, p99, caching, hedging, cache_stampede]
+
+# --- vietnamese_nlp ------------------------------------------------------------------------------
+- id: vietnamese_nlp_word_segmentation
+  skill: vietnamese_nlp
+  title: Vietnamese word segmentation
+  language: vi
+  content: >-
+    Tiếng Việt dùng khoảng trắng giữa âm tiết, không luôn luôn giữa từ. Nhiều mô hình NLP cần xử lý
+    tách từ hoặc thiết kế tokenizer phù hợp để tránh nhầm ranh giới từ ghép, tên riêng và thực thể.
+    Ví dụ "học máy" là hai âm tiết nhưng một khái niệm.
+  tags: [tokenization, word_segmentation, metadata_routed]
+
+- id: vietnamese_nlp_phobert
+  skill: vietnamese_nlp
+  title: PhoBERT cho tiếng Việt
+  language: vi
+  content: >-
+    PhoBERT là mô hình ngôn ngữ pre-trained kiểu RoBERTa cho tiếng Việt, huấn luyện trên dữ liệu đã
+    được tách từ (word-segmented) bằng công cụ như VnCoreNLP. Vì vậy đầu vào cho PhoBERT nên được tách
+    từ trước, khác với các tokenizer subword đa ngôn ngữ. PhoBERT thường vượt mBERT/XLM-R trên các tác
+    vụ tiếng Việt như NER, POS và phân loại cảm xúc nhờ vốn từ và dữ liệu in-domain.
+  tags: [phobert, pretrained, roberta, word_segmented]
+
+- id: vietnamese_nlp_vncorenlp
+  skill: vietnamese_nlp
+  title: VnCoreNLP toolkit
+  language: vi
+  content: >-
+    VnCoreNLP là bộ công cụ xử lý tiếng Việt cung cấp tách từ, gán nhãn từ loại (POS), nhận dạng thực
+    thể (NER) và phân tích cú pháp phụ thuộc. Tách từ của VnCoreNLP thường là bước tiền xử lý chuẩn
+    trước khi đưa vào PhoBERT hoặc các mô hình cổ điển, giúp thống nhất ranh giới từ ghép giữa lúc
+    huấn luyện và lúc phục vụ.
+  tags: [vncorenlp, segmentation, pos, ner, toolkit]
+
+- id: vietnamese_nlp_diacritic_restoration
+  skill: vietnamese_nlp
+  title: Khôi phục dấu tiếng Việt
+  language: vi
+  content: >-
+    Người dùng thường gõ không dấu, nên "toi di hoc" hay "ma" trở nên nhập nhằng ("ma, má, mà, mã,
+    mạ"). Khôi phục dấu (diacritic restoration) thường được mô hình hóa như gán nhãn chuỗi hoặc seq2seq
+    trên âm tiết, huấn luyện trên văn bản có dấu với dữ liệu song song tạo bằng cách bỏ dấu. Bỏ qua
+    bước này sẽ đẩy sự nhập nhằng xuống mọi bộ phân loại phía sau và làm giảm chất lượng NER, intent.
+  tags: [diacritics, restoration, noisy_text, sequence_labeling]
