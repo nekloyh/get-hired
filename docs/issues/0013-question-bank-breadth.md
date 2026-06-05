@@ -34,3 +34,8 @@ Grow the question bank from the single-Skill seed set (slice 0005) into full cov
 ## Blocked by
 
 - 0005 (proves the question + rubric shape with the seed set)
+
+## Status
+
+**Open.** Structural work and the first tranche are implemented, but the target breadth and
+human calibration review remain explicit HITL acceptance criteria.

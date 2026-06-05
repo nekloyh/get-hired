@@ -67,3 +67,7 @@ Supervisor advance, versus a bounded internal retry inside the Interviewer for m
 ## Blocked by
 
 - 0010 (the Session graph this hardens)
+
+## Status
+
+**Closed.** Acceptance criteria are implemented and covered.

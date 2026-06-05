@@ -23,3 +23,7 @@ The planner-executor entry point. A **Diagnostic** agent reads the Candidate pro
 ## Blocked by
 
 - 0002 (Beta skill-state model the priors seed)
+
+## Status
+
+**Closed.** Acceptance criteria are implemented and covered.

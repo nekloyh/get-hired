@@ -25,3 +25,7 @@ None - can start immediately.
 Implemented by `src/interview_coach/evaluator.py`, fixture content in `src/interview_coach/fixtures.py`,
 and the `coach evaluate` CLI path. Covered by `tests/test_evaluator.py`, including schema validation,
 retry behavior, verbatim evidence enforcement, disabled dimensions, and live weak-vs-strong scoring.
+
+## Status
+
+**Closed.** Acceptance criteria are implemented and covered.

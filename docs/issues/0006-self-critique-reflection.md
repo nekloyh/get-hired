@@ -23,3 +23,7 @@ The evaluator-optimizer reflection step (see `ADR 0001`): **Self-critique** live
 ## Blocked by
 
 - 0005 (operates within the micro-loop)
+
+## Status
+
+**Closed.** Acceptance criteria are implemented and covered.

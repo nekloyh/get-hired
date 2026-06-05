@@ -30,3 +30,7 @@ primary chat call errors. `build_client(load_settings())` is the CLI constructio
 fixtures also route agent calls through `LLMRouter`, so agent modules keep depending on `LLMClient`
 rather than provider clients. Covered by `tests/test_llm.py`; `.env.example` documents
 provider-specific credentials.
+
+## Status
+
+**Closed.** Acceptance criteria are implemented and covered.

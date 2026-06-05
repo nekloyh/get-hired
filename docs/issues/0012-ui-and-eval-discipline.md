@@ -48,3 +48,7 @@ The demo surface and the evaluation harness. A thin UI (Streamlit and/or a Typer
 ## Blocked by
 
 - 0010 (the orchestrated session the UI and trajectory tests drive)
+
+## Status
+
+**Closed.** Acceptance criteria are implemented and covered.

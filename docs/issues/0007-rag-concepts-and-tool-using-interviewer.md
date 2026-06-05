@@ -28,3 +28,7 @@ Baseline dense retrieval only (HyDE/hybrid/rerank are deferred). Ships with a sm
 ## Blocked by
 
 - 0005 (the micro-loop the tool plugs into)
+
+## Status
+
+**Closed.** Acceptance criteria are implemented and covered.

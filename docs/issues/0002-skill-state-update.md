@@ -25,3 +25,7 @@ Shipped in `src/interview_coach/skill.py` (`SkillState` + `apply_evaluation`), w
 demo, and covered by `tests/test_skill.py`. Confidence is `1 − variance / variance(neutral prior)`,
 so it reads 0 at the `Beta(1,1)` prior and rises monotonically as evidence concentrates the belief.
 Also hardened the default test run to stay offline (`addopts = "-m 'not live'"`).
+
+## Status
+
+**Closed.** Acceptance criteria are implemented and covered.

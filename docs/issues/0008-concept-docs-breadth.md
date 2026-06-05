@@ -24,3 +24,8 @@ Grow the `concepts` collection from the seed set into real coverage across the S
 ## Blocked by
 
 - 0007 (the concepts mechanism + tool)
+
+## Status
+
+**Open.** Structural work and the first tranche are implemented, but human-reviewed retrieval
+relevance remains an explicit HITL acceptance criterion.

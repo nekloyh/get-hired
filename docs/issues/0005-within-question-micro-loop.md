@@ -48,3 +48,7 @@ Traceability is now part of the loop output: `Turn.trace` records Evaluator self
 the Interviewer's `lookup_concept` query/filter/hit when that turn generated a Follow-up, and the
 turn that actually stopped the loop (`resolved` or `safety_cap`). This makes a bad Session transcript
 debuggable without unpacking provider logs.
+
+## Status
+
+**Closed.** Acceptance criteria are implemented and covered.

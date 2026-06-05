@@ -25,3 +25,7 @@ Implemented in `src/interview_coach/evaluator.py` as the deterministic `linear_w
 `apply_cross_check` guard. The guard preserves the Evaluator's holistic score but lowers confidence
 when it diverges from the mechanical weighted mean, which now deterministically triggers the slice
 0006 Self-critique path. Covered by `tests/test_evaluator.py`.
+
+## Status
+
+**Closed.** Acceptance criteria are implemented and covered.
