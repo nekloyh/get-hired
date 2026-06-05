@@ -61,6 +61,8 @@ def _display_stop_reason(stop_reason: str | None) -> str:
         return "unresolved_by_safety_cap"
     if stop_reason == StopReason.FOLLOW_UP_UNAVAILABLE.value:
         return "degraded_follow_up_unavailable"
+    if stop_reason == StopReason.FAILED.value:
+        return "failed_recorded_and_skipped"
     return str(stop_reason)
 
 
@@ -130,7 +132,13 @@ def _print_micro_loop(result: MicroLoopResult) -> None:
             print(f"  follow_up_lookup: {turn.trace.concept_lookup_query!r} -> {hit}")
         if turn.trace.stop_reason:
             print(f"  turn_stop_reason: {turn.trace.stop_reason.value}")
-    verdict = "resolved normally" if result.stop_reason is StopReason.RESOLVED else "halted by SAFETY CAP"
+    verdict_by_reason = {
+        StopReason.RESOLVED: "resolved normally",
+        StopReason.SAFETY_CAP: "halted by SAFETY CAP",
+        StopReason.FOLLOW_UP_UNAVAILABLE: "degraded because a Follow-up was unavailable",
+        StopReason.FAILED: "failed and was recorded by the Session",
+    }
+    verdict = verdict_by_reason[result.stop_reason]
     print(f"\n  stop: {result.stop_reason.value} ({verdict}) after {len(result.turns)} turn(s)")
     print(
         f"  resolved skill state ({result.skill_state.skill}): "

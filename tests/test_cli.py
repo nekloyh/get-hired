@@ -18,7 +18,9 @@ from interview_coach.diagnostic import CandidateProfile, DiagnosticResult, Topic
 from interview_coach.eval_harness import GoldenAnswerCase, GoldenAnswerResult
 from interview_coach.evaluator import DimensionScore, Evaluation
 from interview_coach.fixtures import QUESTION
+from interview_coach.microloop import MicroLoopResult, StopReason, Turn
 from interview_coach.rubric import DIMENSIONS
+from interview_coach.skill import SkillState
 from interview_coach.supervisor import build_session_graph, initial_session_state, session_config
 
 
@@ -204,3 +206,32 @@ def test_run_session_graph_prints_live_skill_state_updates(make_client, capsys):
     assert "LIVE UPDATE: QUESTION 1 RESOLVED" in output
     assert "--- SKILL STATES ---" in output
     assert "mlops" in output
+
+
+def test_cli_prints_follow_up_unavailable_as_degrade(capsys):
+    ev = Evaluation(
+        dimensions={"correctness": DimensionScore(score=2, evidence="no evidence")},
+        weighted_score=2.0,
+        confidence=0.8,
+        follow_up_recommended=True,
+        follow_up_rationale="needs a probe",
+    )
+    result = MicroLoopResult(
+        skill="ml_fundamentals",
+        turns=(
+            Turn(
+                question="Explain L2 regularization.",
+                answer="It makes weights smaller.",
+                evaluation=ev,
+                is_follow_up=False,
+            ),
+        ),
+        stop_reason=StopReason.FOLLOW_UP_UNAVAILABLE,
+        skill_state=SkillState.neutral("ml_fundamentals"),
+    )
+
+    cli._print_micro_loop(result)
+
+    output = capsys.readouterr().out
+    assert "degraded because a Follow-up was unavailable" in output
+    assert "halted by SAFETY CAP" not in output

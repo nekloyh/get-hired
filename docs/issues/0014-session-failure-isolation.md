@@ -48,13 +48,21 @@ Supervisor advance, versus a bounded internal retry inside the Interviewer for m
   caught *inside* the tool executor so it never surfaces to the provider router as a transport fault
   (which would trip a spurious failover).
 - The Markdown export renders a failed question honestly (shows the error, skips the misleading score).
+- The CLI display now labels `failed` and `follow_up_unavailable` distinctly instead of presenting
+  every non-resolved stop as a safety-cap halt.
 
 ## Verified
 
-- `uv run pytest` -> 153 passed, 7 deselected. New: graph-level failure isolation
+- `uv run pytest` -> 154 passed, 7 deselected. New: graph-level failure isolation
   (`test_question_failure_is_isolated_and_session_continues`) and concept-miss degrade on both the
-  native and JSON paths (`tests/test_interviewer.py`).
+  native and JSON paths (`tests/test_interviewer.py`), plus CLI degrade-label coverage.
 - `uv run ruff check .` -> all checks passed.
+- Offline smoke: forced `run_micro_loop` failure records a `failed` transcript entry, preserves the
+  Session, and Markdown renders "Question failed and was skipped".
+- Offline smoke: missing concept store resolves the micro-loop as `follow_up_unavailable`, keeps the
+  last score, and does not crash.
+- Live smoke: `uv run coach session --scripted --max-questions 1 --export-markdown ...` completed
+  through MiMo, produced a Study Plan, and exported Markdown.
 
 ## Blocked by
 

@@ -36,11 +36,14 @@ The demo surface and the evaluation harness. A thin UI (Streamlit and/or a Typer
 
 ## Verified
 
-- `uv run pytest` -> 136 passed, 7 deselected.
+- `uv run pytest` -> 154 passed, 7 deselected.
+- `uv run pytest tests/test_web_api.py` -> 3 passed.
 - `uv run ruff check .` -> all checks passed.
 - `cd web && npm run lint` -> all checks passed.
 - `cd web && npm run test` -> 11 passed.
 - `cd web && npm run build` -> production build completed.
+- `cd web && VITE_API_URL=http://127.0.0.1:8010 npm run test:e2e` against a real demo-mode
+  FastAPI server -> Playwright desktop Chromium and mobile Chrome both reached the final report.
 
 ## Blocked by
 
