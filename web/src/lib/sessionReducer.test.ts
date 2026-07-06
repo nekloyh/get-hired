@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { addCandidateAnswer, initialSession, reduceSessionEvent, validateSetup } from './sessionReducer'
+import {
+  addCandidateAnswer,
+  initialSession,
+  reduceConnectionClosed,
+  reduceSessionEvent,
+  validateSetup,
+} from './sessionReducer'
 import type { SessionState, SetupForm } from './types'
 
 const form: SetupForm = {
@@ -53,6 +59,34 @@ describe('session event reducer', () => {
     const errored = reduceSessionEvent(completed, { type: 'session_error', error: 'provider missing' })
     expect(errored.status).toBe('error')
     expect(errored.error).toBe('provider missing')
+  })
+})
+
+describe('connection lifecycle', () => {
+  it('marks a mid-session close as disconnected with a resume hint', () => {
+    const started = reduceSessionEvent(initialSession, {
+      type: 'session_started',
+      session_id: 's1',
+      mode: 'demo',
+      resumed: false,
+    })
+    const asked = reduceSessionEvent(started, { type: 'question', question: 'Explain drift monitoring.' })
+
+    const dropped = reduceConnectionClosed(asked)
+
+    expect(dropped.status).toBe('disconnected')
+    expect(dropped.currentQuestion).toBe('')
+    expect(dropped.messages.at(-1)?.content).toMatch(/Connection to the interviewer was lost/)
+  })
+
+  it('ignores a close after completion (a clean shutdown is not a fault)', () => {
+    const completed = reduceSessionEvent(initialSession, { type: 'session_completed', state: stateFixture })
+    expect(reduceConnectionClosed(completed)).toBe(completed)
+  })
+
+  it('leaves an already-surfaced error untouched on close', () => {
+    const errored = reduceSessionEvent(initialSession, { type: 'session_error', error: 'provider missing' })
+    expect(reduceConnectionClosed(errored)).toBe(errored)
   })
 })
 

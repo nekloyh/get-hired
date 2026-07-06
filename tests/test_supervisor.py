@@ -191,6 +191,118 @@ def test_question_failure_is_isolated_and_session_continues(make_client, monkeyp
     assert fake.call_count == 2  # one Supervisor advance after the failure + the Planner
 
 
+def test_candidate_intent_aborts_session_and_is_not_recorded_as_failed(make_client):
+    # ADR 0005 / issue 0018: a Candidate-intent signal (EOF/Ctrl-D, a web cancel/disconnect) must
+    # propagate OUT of the per-question failure-isolation net — it aborts the Session and is never
+    # converted into a zero-evidence `failed` question. This is the opposite of an infrastructure
+    # failure (see test_question_failure_is_isolated_and_session_continues, which records + advances).
+    from interview_coach.microloop import CandidateInputUnavailable
+
+    class _AbortingCandidate:
+        def answer(self, question: str) -> str:
+            raise CandidateInputUnavailable("interactive Candidate input ended before an answer")
+
+    client, fake = make_client([_eval(5, follow_up=False)])
+    state = initial_session_state("intent-abort-session", _diagnostic(), max_questions=3, started_at=0)
+    graph = build_session_graph(
+        client, candidate_factory=lambda seed: _AbortingCandidate(), max_turns_per_question=1, now=lambda: 1
+    )
+
+    with pytest.raises(CandidateInputUnavailable):
+        graph.invoke(state, session_config("intent-abort-session"))
+
+    # The Candidate aborted before the Evaluator ran, so no LLM call and no failed question was recorded.
+    assert fake.call_count == 0
+
+
+def test_supervisor_degrades_on_transport_error_at_decision_node(make_client, monkeypatch):
+    # Issue 0020: a provider/transport error at the Supervisor's decision node (the only otherwise
+    # unguarded macro-loop LLM call) must degrade to the deterministic plan-following decision, not
+    # crash the Session — mirroring question_node/study_plan_node. Recorded distinctly from a schema
+    # fallback so the export shows the degrade honestly.
+    from interview_coach import supervisor
+
+    monkeypatch.setattr(supervisor, "run_micro_loop", _fake_micro_loop(4.0))
+    client, _ = make_client(
+        [
+            ConnectionError("provider timed out after fallback exhaustion"),  # supervisor decision call
+            _plan("mlops", "system_design", "vietnamese_nlp"),  # the Study Plan still runs at the end
+        ]
+    )
+    state = initial_session_state("transport-degrade-session", _diagnostic(), max_questions=2, started_at=0)
+
+    graph = build_session_graph(client, now=lambda: 1)
+    final = graph.invoke(state, session_config("transport-degrade-session"))
+
+    assert final["status"] == SessionStatus.COMPLETE.value
+    assert len(final["transcript"]) == 2  # the Session continued past the transport error, did not crash
+    reasons = [d["llm_reasoning"] for d in final["supervisor_decisions"]]
+    assert any("transport error" in reason for reason in reasons)  # the degrade is recorded honestly
+
+
+def test_max_elapsed_seconds_hard_rail_ends_session(make_client):
+    # Issue 0019 gave the elapsed-time rail its first test: a clock past the budget ends the Session
+    # deterministically, before any Supervisor LLM deviation choice.
+    state = initial_session_state(
+        "elapsed-session", _diagnostic(), max_questions=10, max_elapsed_seconds=100, started_at=0
+    )
+    state["transcript"] = [_transcript_item("mlops")]
+    state["question_count"] = 1
+    client, fake = make_client([])  # the hard rail preempts the LLM, so no reply is needed
+
+    decision = decide_next_move(client, state, now=lambda: 10_000)
+
+    assert decision.action is SupervisorAction.END_EARLY
+    assert "max_elapsed_seconds" in decision.reasoning
+    assert fake.call_count == 0
+
+
+def test_resumable_session_state_returns_none_for_unknown_id(tmp_path, make_client):
+    from interview_coach.supervisor import resumable_session_state
+
+    client, _ = make_client([])
+    with SqliteSaver.from_conn_string(str(tmp_path / "session.sqlite")) as checkpointer:
+        graph = build_session_graph(client, checkpointer=checkpointer, now=lambda: 1)
+        assert resumable_session_state(graph, "never-started") is None
+
+
+def test_resume_resets_elapsed_clock_so_a_long_gap_does_not_force_complete(tmp_path, make_client, monkeypatch):
+    # Issue 0019: max_elapsed_seconds measured wall-clock since creation, so resuming a day later
+    # force-completed after one question. Resetting started_at on resume restarts the sitting's budget
+    # so the Session continues instead.
+    from interview_coach import supervisor
+
+    monkeypatch.setattr(supervisor, "run_micro_loop", _fake_micro_loop(4.0))
+    db_path = str(tmp_path / "session.sqlite")
+    session_id = "gap-session"
+    state = initial_session_state(session_id, _diagnostic(), max_questions=3, max_elapsed_seconds=100, started_at=0)
+
+    # First sitting: resolve one question, then suspend before the Supervisor decides.
+    with SqliteSaver.from_conn_string(db_path) as checkpointer:
+        first_client, _ = make_client([_decision("advance_plan", "next planned Skill")])
+        graph = build_session_graph(first_client, checkpointer=checkpointer, now=lambda: 1)
+        partial = graph.invoke(state, session_config(session_id), interrupt_after=["run_question"])
+    assert len(partial["transcript"]) == 1
+
+    # Resume "a day later": a clock far past the budget (now=10_000, started_at=0) WOULD trip the
+    # elapsed rail immediately if the budget still measured time since creation. Resetting started_at
+    # to now restarts the budget, so the Session continues past the gap.
+    with SqliteSaver.from_conn_string(db_path) as checkpointer:
+        second_client, _ = make_client(
+            [
+                _decision("advance_plan", "continue after the gap"),
+                _decision("end_early", "enough evidence after the gap"),
+                _plan("mlops", "system_design", "vietnamese_nlp"),
+            ]
+        )
+        resumed_graph = build_session_graph(second_client, checkpointer=checkpointer, now=lambda: 10_000)
+        resumed_graph.update_state(session_config(session_id), {"started_at": 10_000.0})
+        final = resumed_graph.invoke(None, session_config(session_id))
+
+    assert final["status"] == SessionStatus.COMPLETE.value
+    assert len(final["transcript"]) >= 2  # continued past the gap, not force-completed after one question
+
+
 def test_strong_candidate_can_end_early_and_reasoning_is_logged(make_client, monkeypatch):
     from interview_coach import supervisor
 

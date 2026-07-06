@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import time
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 
@@ -33,7 +34,7 @@ from .fixtures import QUESTION, STRONG_ANSWER, WEAK_ANSWER
 from .llm import LLMClient, build_client
 from .microloop import (
     DEFAULT_MAX_TURNS,
-    CandidateInputUnavailable,
+    CandidateIntent,
     InteractiveCandidate,
     MicroLoopResult,
     ScriptedCandidate,
@@ -46,9 +47,11 @@ from .skill import SkillState, apply_evaluation
 from .supervisor import (
     DEFAULT_MAX_ELAPSED_SECONDS,
     DEFAULT_MAX_QUESTIONS,
+    SessionStatus,
     build_session_graph,
     export_architecture_diagram,
     initial_session_state,
+    resumable_session_state,
     session_config,
 )
 from .ui import render_skill_state_rows
@@ -212,6 +215,10 @@ def _print_session_summary(state: dict) -> None:
             f"score={item['resolved_weighted_score']:.2f}/5   "
             f"confidence={item['resolved_confidence']:.2f}   stop={_display_stop_reason(item['stop_reason'])}"
         )
+        if error := item.get("error"):
+            # A genuinely failed question (issue 0014) carries the recorded error; surface the reason
+            # here so it is visible without opening the Markdown export (issue 0018).
+            print(f"  error: {error}")
         for turn_n, turn in enumerate(item["turns"], start=1):
             kind = "FOLLOW-UP" if turn["is_follow_up"] else "QUESTION"
             print(f"  {turn_n}. {kind}: {turn['question']}")
@@ -252,12 +259,14 @@ def _print_live_question_update(state: dict, item: dict, question_number: int) -
         print(row)
 
 
-def _run_session_graph(graph, state: dict | None, config: dict, *, live: bool) -> dict:
+def _run_session_graph(graph, state: dict | None, config: dict, *, live: bool, already_seen: int = 0) -> dict:
     if not live:
         return graph.invoke(state, config)
 
+    # On resume, ``already_seen`` is the number of questions already resolved in the checkpoint, so
+    # the stream prints only genuinely new questions instead of replaying history as live (issue 0019).
     final: dict | None = None
-    seen_questions = 0
+    seen_questions = already_seen
     for event in graph.stream(state, config, stream_mode="values"):
         final = dict(event)
         transcript = final.get("transcript", [])
@@ -269,6 +278,43 @@ def _run_session_graph(graph, state: dict | None, config: dict, *, live: bool) -
     if final is None:
         raise RuntimeError("Session graph produced no final state")
     return final
+
+
+def _known_session_ids(checkpointer) -> list[str]:
+    """Best-effort list of Session ids that have a checkpoint, for a friendly unknown-id message."""
+    try:
+        rows = checkpointer.conn.execute("SELECT DISTINCT thread_id FROM checkpoints").fetchall()
+    except Exception:  # noqa: BLE001 — listing ids is a convenience; never let it mask the real error
+        return []
+    return sorted(str(row[0]) for row in rows)
+
+
+def _unknown_session_message(session_id: str, checkpointer, checkpoint_db: str) -> str:
+    known = _known_session_ids(checkpointer)
+    if known:
+        hint = "Known Session ids: " + ", ".join(known) + "."
+    else:
+        hint = f"No saved Sessions found in {checkpoint_db!r}; start one without --resume."
+    return f"No saved Session found for --session-id {session_id!r}. {hint}"
+
+
+def _inflight_session_message(session_id: str) -> str:
+    return (
+        f"A Session with id {session_id!r} is already in progress. Pass --resume to continue it, or "
+        "choose a different --session-id — starting fresh would discard its progress."
+    )
+
+
+def _print_resume_recap(state: dict) -> None:
+    """Compact recap of what a resumed Session already resolved, instead of replaying history."""
+    transcript = state.get("transcript", [])
+    print(f"=== RESUMING SESSION {state.get('session_id')} ===")
+    print(f"resolved so far: {len(transcript)} question(s)   current Skill: {state.get('next_skill') or '—'}")
+    for i, item in enumerate(transcript, start=1):
+        print(
+            f"  Q{i} {item['skill']}: {item['resolved_weighted_score']:.2f}/5 "
+            f"({_display_stop_reason(item['stop_reason'])})"
+        )
 
 
 def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
@@ -302,8 +348,25 @@ def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
         config = session_config(args.session_id)
         try:
             if args.resume:
-                final = _run_session_graph(graph, None, config, live=not args.no_live)
+                resumed = resumable_session_state(graph, args.session_id)
+                if resumed is None:
+                    # An unknown --resume id would otherwise surface langgraph's EmptyInputError as a
+                    # bare traceback; fail with a friendly one-liner that points at valid ids (0019).
+                    print(_unknown_session_message(args.session_id, checkpointer, args.checkpoint_db), file=sys.stderr)
+                    return 2
+                # The max_elapsed_seconds rail bounds a single sitting, so resuming after a gap
+                # restarts the time budget rather than force-completing on wall-clock since creation.
+                graph.update_state(config, {"started_at": time.time()})
+                _print_resume_recap(resumed)
+                final = _run_session_graph(
+                    graph, None, config, live=not args.no_live, already_seen=len(resumed.get("transcript", []))
+                )
             else:
+                existing = resumable_session_state(graph, args.session_id)
+                if existing is not None and existing.get("status") != SessionStatus.COMPLETE.value:
+                    # Don't silently restart over an in-flight Session on the same id (0019).
+                    print(_inflight_session_message(args.session_id), file=sys.stderr)
+                    return 2
                 profile = CandidateProfile(
                     target_role=args.target_role,
                     target_companies=tuple(args.company),
@@ -317,7 +380,10 @@ def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
                     max_elapsed_seconds=args.max_elapsed_seconds,
                 )
                 final = _run_session_graph(graph, state, config, live=not args.no_live)
-        except CandidateInputUnavailable as err:
+        except CandidateIntent as err:
+            # ADR 0005 / issue 0018: the Candidate asked to stop (EOF/Ctrl-D, or a scripted Candidate
+            # with nothing left). Abort cleanly with the designed exit code — no partial "complete"
+            # Session, no fabricated failed questions.
             print(str(err), file=sys.stderr)
             return 2
     _print_session_summary(final)
@@ -454,7 +520,16 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_MAX_TURNS,
         help=f"Safety cap on turns per question for interactive Sessions (default: {DEFAULT_MAX_TURNS}).",
     )
-    session_parser.add_argument("--max-elapsed-seconds", type=float, default=DEFAULT_MAX_ELAPSED_SECONDS)
+    session_parser.add_argument(
+        "--max-elapsed-seconds",
+        type=float,
+        default=DEFAULT_MAX_ELAPSED_SECONDS,
+        help=(
+            "Time budget for one sitting. It bounds active interviewing time: --resume restarts this "
+            "budget so a Session picked up after a gap is not force-completed "
+            f"(default: {DEFAULT_MAX_ELAPSED_SECONDS})."
+        ),
+    )
     session_parser.add_argument(
         "--concept-store",
         choices=["memory", "chroma"],
@@ -494,7 +569,10 @@ def main(argv: list[str] | None = None) -> int:
     session_parser.add_argument(
         "--resume",
         action="store_true",
-        help="Resume an existing checkpoint by --session-id instead of starting from Diagnostic.",
+        help=(
+            "Resume an existing checkpoint by --session-id instead of starting from Diagnostic. "
+            "Restarts the elapsed-time budget and prints a recap instead of replaying history."
+        ),
     )
     session_parser.add_argument(
         "--no-live",

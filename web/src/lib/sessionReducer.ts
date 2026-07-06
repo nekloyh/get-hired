@@ -60,8 +60,29 @@ export function reduceSessionEvent(session: AppSession, event: SessionEvent): Ap
   return {
     ...session,
     status: 'error',
+    // Clear the pending question so the composer disables — sending into a failed socket would throw.
+    currentQuestion: '',
     error: event.error,
     messages: [...session.messages, systemMessage(event.error)],
+  }
+}
+
+export function reduceConnectionClosed(session: AppSession): AppSession {
+  // A WebSocket close mid-Session (restarted backend, uvicorn shutdown, network sleep) fires only
+  // `onclose`, so no event reaches the reducer and the UI would hang forever on "Waiting for the
+  // Interviewer". Surface a distinct disconnected state with a resume path. A clean close after
+  // completion, an idle socket, or an already-surfaced error is not a fault, so leave those be.
+  if (session.status === 'complete' || session.status === 'idle' || session.status === 'error') {
+    return session
+  }
+  return {
+    ...session,
+    status: 'disconnected',
+    currentQuestion: '',
+    messages: [
+      ...session.messages,
+      systemMessage('Connection to the interviewer was lost. Reconnect to resume where you left off.'),
+    ],
   }
 }
 
