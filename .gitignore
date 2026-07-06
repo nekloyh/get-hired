@@ -27,6 +27,8 @@ chroma_db/
 logs/
 *.db
 sessions.db
+# LangGraph SQLite checkpoints + their WAL/SHM sidecars are per-machine runtime state
+.session-checkpoints.sqlite*
 
 # OS
 .DS_Store
