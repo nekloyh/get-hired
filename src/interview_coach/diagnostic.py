@@ -178,15 +178,24 @@ _DIAGNOSTIC_SCHEMA_HINT = (
 )
 
 
-def diagnose(profile: CandidateProfile, client: LLMClient | None = None) -> DiagnosticResult:
+def diagnose(
+    profile: CandidateProfile,
+    client: LLMClient | None = None,
+    *,
+    ledger_priors: Mapping[str, float] | None = None,
+) -> DiagnosticResult:
     """Produce the Topic Plan and seeded priors for a Candidate.
 
     The single-shot LLM agent is the primary Topic Plan path; the deterministic ordering is the
     offline fallback used only when no ``client`` is supplied. ``topic_plan_source`` records which
     path ran.
+
+    ``ledger_priors`` (ADR 0006) optionally carries a returning Candidate's *decayed* per-Skill prior
+    means, which override the cold-start baseline for those Skills. With none supplied the Diagnostic
+    behaves exactly as a first-ever Session (cold start).
     """
     criticality = role_criticality(profile.target_role, profile.target_companies)
-    means = _initial_mastery_means(profile)
+    means = _initial_mastery_means(profile, ledger_priors)
     priors = {
         skill: _seed_prior(skill, means[skill], criticality[skill])
         for skill in SKILLS
@@ -290,19 +299,33 @@ def role_criticality(target_role: str, target_companies: tuple[str, ...] = ()) -
     return result
 
 
-def _initial_mastery_means(profile: CandidateProfile) -> dict[str, float]:
+def _initial_mastery_means(
+    profile: CandidateProfile,
+    ledger_priors: Mapping[str, float] | None = None,
+) -> dict[str, float]:
     means = {skill: 0.5 for skill in SKILLS}
     for skill, value in profile.claimed_skills.items():
         means[skill] = _self_assessment_to_mean(value)
 
-    # Prior-only correlations: one cold-start nudge before direct evidence starts arriving.
+    # A returning Candidate's carried (decayed) mean is measured past evidence, so it overrides both
+    # the cold-start baseline and any fresh self-claim for that Skill (ADR 0002: evidence beats claims;
+    # ADR 0006: the ledger sets the mean, criticality still sets strength in _seed_prior).
+    informed = set(profile.claimed_skills)
+    if ledger_priors:
+        for skill, mean in ledger_priors.items():
+            if skill in means:
+                means[skill] = _clamp_mean(mean)
+                informed.add(skill)
+
+    # Prior-only correlations: one cold-start nudge before direct evidence starts arriving. Skip any
+    # Skill that already has an informative mean (a self-claim or a carried ledger prior).
     for source, related in _CORRELATIONS.items():
         source_mean = means[source]
         delta_from_neutral = source_mean - 0.5
         if delta_from_neutral == 0:
             continue
         for target, strength in related.items():
-            if target in profile.claimed_skills:
+            if target in informed:
                 continue
             means[target] = _clamp_mean(means[target] + delta_from_neutral * strength)
     return means

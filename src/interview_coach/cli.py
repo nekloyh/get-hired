@@ -31,6 +31,7 @@ from .eval_harness import harness_passed, render_golden_answer_report, run_golde
 from .evaluator import Evaluation, evaluate
 from .exporter import export_session_markdown
 from .fixtures import QUESTION, STRONG_ANSWER, WEAK_ANSWER
+from .ledger import load_priors, save_posteriors
 from .llm import LLMClient, build_client
 from .microloop import (
     DEFAULT_MAX_TURNS,
@@ -53,6 +54,7 @@ from .supervisor import (
     initial_session_state,
     resumable_session_state,
     session_config,
+    skill_states_from_state,
 )
 from .ui import render_skill_state_rows
 
@@ -209,6 +211,17 @@ def _print_session_summary(state: dict) -> None:
     print("\n=== SKILL STATES ===")
     for row in render_skill_state_rows(state):
         print(row)
+    if prior := state.get("ledger_prior_mastery"):
+        # A returning Candidate (issue 0023): show progress since their last Session.
+        print("\n=== SINCE LAST SESSION ===")
+        skill_states = state.get("skill_states", {})
+        for skill in sorted(prior):
+            raw = skill_states.get(skill)
+            if raw is None:
+                continue
+            after = float(raw["alpha"]) / (float(raw["alpha"]) + float(raw["beta"]))
+            before = float(prior[skill])
+            print(f"  {skill}: {before:.2f} -> {after:.2f} ({after - before:+.2f})")
     for i, item in enumerate(state.get("transcript", []), start=1):
         print(
             f"\n--- QUESTION {i} ({item['skill']}) ---\n"
@@ -372,12 +385,19 @@ def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
                     target_companies=tuple(args.company),
                     claimed_skills=dict(args.claim),
                 )
-                diagnostic = diagnose(profile, client)
+                carried = load_priors(args.ledger_db, args.candidate, now=time.time())
+                diagnostic = diagnose(
+                    profile,
+                    client,
+                    ledger_priors=carried.seed_means if carried else None,
+                )
                 state = initial_session_state(
                     args.session_id,
                     diagnostic,
                     max_questions=args.max_questions,
                     max_elapsed_seconds=args.max_elapsed_seconds,
+                    candidate_id=args.candidate,
+                    ledger_prior_mastery=carried.raw_mastery if carried else None,
                 )
                 final = _run_session_graph(graph, state, config, live=not args.no_live)
         except CandidateIntent as err:
@@ -386,6 +406,9 @@ def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
             # Session, no fabricated failed questions.
             print(str(err), file=sys.stderr)
             return 2
+    if args.candidate and final.get("status") == SessionStatus.COMPLETE.value:
+        # Persist the final posteriors so the next Session for this Candidate starts warm (0023).
+        save_posteriors(args.ledger_db, args.candidate, skill_states_from_state(final), now=time.time())
     _print_session_summary(final)
     if args.export_markdown:
         path = export_session_markdown(final, args.export_markdown)
@@ -498,6 +521,17 @@ def main(argv: list[str] | None = None) -> int:
         "--checkpoint-db",
         default=".session-checkpoints.sqlite",
         help="SQLite checkpoint database used by SqliteSaver.",
+    )
+    session_parser.add_argument(
+        "--candidate",
+        default="",
+        help="Candidate id for the cross-session Skill ledger (0023): seed priors from and persist "
+        "posteriors to it. Omit for a one-shot cold-start Session.",
+    )
+    session_parser.add_argument(
+        "--ledger-db",
+        default=".skill-ledger.json",
+        help="JSON file holding per-Candidate decayed Beta priors (0023).",
     )
     session_parser.add_argument("--target-role", default="machine learning engineer")
     session_parser.add_argument(

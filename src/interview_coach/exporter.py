@@ -39,6 +39,7 @@ def render_session_markdown(session_state: Mapping[str, Any]) -> str:
     lines.append(f"- Questions: `{session_state.get('question_count', 0)}`")
     lines.append("")
     _append_skill_states(lines, session_state)
+    _append_ledger_deltas(lines, session_state)
     _append_topic_plan(lines, session_state)
     _append_transcript(lines, session_state)
     _append_supervisor_decisions(lines, session_state)
@@ -60,6 +61,26 @@ def _append_skill_states(lines: list[str], session_state: Mapping[str, Any]) -> 
             f"alpha={state.alpha:.2f}, beta={state.beta:.2f} | "
             f"{_md(meta.get('role_criticality', 'unknown'))} |"
         )
+    lines.append("")
+
+
+def _append_ledger_deltas(lines: list[str], session_state: Mapping[str, Any]) -> None:
+    """Since-last-session mastery deltas for a returning Candidate (issue 0023). Cold start renders nothing."""
+    prior = session_state.get("ledger_prior_mastery")
+    if not prior:
+        return
+    skill_states = session_state.get("skill_states", {})
+    lines.append("## Since Previous Session")
+    lines.append("")
+    lines.append("| Skill | Previous | Now | Change |")
+    lines.append("| --- | ---: | ---: | ---: |")
+    for skill in sorted(prior):
+        raw = skill_states.get(skill)
+        if raw is None:
+            continue
+        before = float(prior[skill])
+        after = SkillState(skill=str(raw["skill"]), alpha=float(raw["alpha"]), beta=float(raw["beta"])).mastery
+        lines.append(f"| `{_md(skill)}` | {before:.3f} | {after:.3f} | {after - before:+.3f} |")
     lines.append("")
 
 

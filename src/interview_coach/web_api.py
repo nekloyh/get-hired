@@ -6,6 +6,7 @@ import asyncio
 import logging
 import queue
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -21,6 +22,7 @@ from .config import Settings, load_settings
 from .demo_llm import DemoLLMClient
 from .diagnostic import CandidateProfile, diagnose
 from .exporter import render_session_markdown
+from .ledger import load_priors, save_posteriors
 from .llm import LLMClient, build_client
 from .microloop import CandidateInputUnavailable, CandidateIntent
 from .resources import build_resource_store
@@ -31,6 +33,7 @@ from .supervisor import (
     build_session_graph,
     initial_session_state,
     session_config,
+    skill_states_from_state,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,6 +47,7 @@ class StartSessionPayload(BaseModel):
     target_role: str = "machine learning engineer"
     target_companies: list[str] = Field(default_factory=list)
     claimed_skills: dict[str, float] = Field(default_factory=dict)
+    candidate_id: str = ""  # cross-session Skill ledger id (0023); empty = one-shot cold start
     max_questions: int = Field(DEFAULT_MAX_QUESTIONS, ge=1, le=10)
     max_elapsed_seconds: float = Field(DEFAULT_MAX_ELAPSED_SECONDS, gt=0)
 
@@ -137,6 +141,7 @@ class RuntimeSession:
 class WebApiState:
     settings: Settings
     checkpoint_db: str
+    ledger_db: str = ".skill-ledger.json"
     completed_sessions: dict[str, dict[str, Any]] = field(default_factory=dict)
     runtimes: dict[str, RuntimeSession] = field(default_factory=dict)
 
@@ -145,8 +150,13 @@ def create_app(
     *,
     settings: Settings | None = None,
     checkpoint_db: str | Path = ".session-checkpoints.sqlite",
+    ledger_db: str | Path = ".skill-ledger.json",
 ) -> FastAPI:
-    api_state = WebApiState(settings=settings or load_settings(), checkpoint_db=str(checkpoint_db))
+    api_state = WebApiState(
+        settings=settings or load_settings(),
+        checkpoint_db=str(checkpoint_db),
+        ledger_db=str(ledger_db),
+    )
     app = FastAPI(title="Adaptive Interview Coach API")
     app.state.web_api = api_state
     app.add_middleware(
@@ -325,12 +335,19 @@ def _run_session_thread(
                     target_companies=tuple(payload.target_companies),
                     claimed_skills=payload.claimed_skills,
                 )
-                diagnostic = diagnose(profile, client)
+                carried = load_priors(api_state.ledger_db, payload.candidate_id, now=time.time())
+                diagnostic = diagnose(
+                    profile,
+                    client,
+                    ledger_priors=carried.seed_means if carried else None,
+                )
                 initial_state = initial_session_state(
                     runtime.session_id,
                     diagnostic,
                     max_questions=payload.max_questions,
                     max_elapsed_seconds=payload.max_elapsed_seconds,
+                    candidate_id=payload.candidate_id,
+                    ledger_prior_mastery=carried.raw_mastery if carried else None,
                 )
             runtime.emit(
                 {
@@ -343,6 +360,15 @@ def _run_session_thread(
             final_state = _stream_graph(graph, initial_state, config, runtime)
         if final_state is not None:
             api_state.completed_sessions[runtime.session_id] = final_state
+            # Persist posteriors for a returning Candidate (0023); candidate_id rides in the state so a
+            # resumed Session saves too. save_posteriors no-ops on an empty id.
+            if final_state.get("status") == SessionStatus.COMPLETE.value:
+                save_posteriors(
+                    api_state.ledger_db,
+                    str(final_state.get("candidate_id", "")),
+                    skill_states_from_state(final_state),
+                    now=time.time(),
+                )
             runtime.emit({"type": "session_completed", "state": final_state})
     except CandidateIntent as err:
         # ADR 0005 / issue 0017: the Candidate asked to stop (web cancel/disconnect). This is intent,

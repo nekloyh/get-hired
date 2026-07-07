@@ -16,7 +16,11 @@ def _test_client(tmp_path):
         groq_api_key="",
         groq_model="",
     )
-    app = create_app(settings=settings, checkpoint_db=tmp_path / "checkpoints.sqlite")
+    app = create_app(
+        settings=settings,
+        checkpoint_db=tmp_path / "checkpoints.sqlite",
+        ledger_db=tmp_path / "ledger.json",
+    )
     return TestClient(app)
 
 
@@ -167,6 +171,30 @@ def test_second_connection_to_same_session_is_rejected(tmp_path):
             rejected = ws2.receive_json()
             assert rejected["type"] == "session_error"
             assert "active connection" in rejected["error"]
+
+
+def test_returning_candidate_seeds_priors_and_carries_a_delta(tmp_path):
+    # End-to-end 0023: a completed Session persists posteriors; the same candidate's next Session
+    # loads them and carries the since-last-session prior means into its state.
+    client = _test_client(tmp_path)
+
+    def _run_one(session_id: str) -> dict:
+        with client.websocket_connect(f"/api/sessions/{session_id}") as ws:
+            ws.send_json(
+                {"type": "start_session", "mode": "demo", "candidate_id": "demo", "max_questions": 1}
+            )
+            _receive_until(ws, "session_started")
+            _receive_until(ws, "question")
+            ws.send_json(
+                {"type": "candidate_answer", "answer": "A solid answer about bias, variance, leakage, and drift."}
+            )
+            return _receive_until(ws, "session_completed")["state"]
+
+    first = _run_one("s1")
+    assert "ledger_prior_mastery" not in first  # first-ever Session is a cold start
+
+    second = _run_one("s2")
+    assert second["ledger_prior_mastery"]  # returning candidate: priors carried from the ledger
 
 
 def _receive_until(ws, event_type: str, *, limit: int = 20):
