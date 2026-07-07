@@ -15,16 +15,23 @@ signal.
 from __future__ import annotations
 
 import logging
+import unicodedata
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from .llm import LLMClient, Message, Validator
+from .llm import LLMClient, Message, StructuredOutputError, Validator
 from .rubric import Rubric
 
 logger = logging.getLogger(__name__)
 
 NO_EVIDENCE = "no evidence"
+
+# Degrade marker (issue 0030 follow-up / calibration bench): when the model cites a paraphrase we
+# cannot verify against the answer even after a retry, we blank that one citation to this marker and
+# keep the score, rather than crash the whole judgment. The evidence is an audit trail — a valid
+# score must never be lost to an unverifiable quote (seen live on gpt-4o-mini's strong-answer cases).
+UNVERIFIABLE_EVIDENCE = "no verbatim quote (paraphrased; not verifiable)"
 
 _EVIDENCE_RULE = (
     f"'evidence' MUST be ONE contiguous substring copied character-for-character from the "
@@ -47,8 +54,14 @@ _QUOTE_GLYPHS = str.maketrans(
 
 
 def _normalize_evidence(text: str) -> str:
-    """Fold whitespace runs and smart-quote glyphs so a lightly-reflowed verbatim quote still matches."""
-    return " ".join(text.translate(_QUOTE_GLYPHS).split())
+    """Fold whitespace runs, smart-quote glyphs, and Unicode form so a faithful quote still matches.
+
+    NFC normalization is what lets a character-perfect Vietnamese quote match the answer when the
+    model emits diacritics in a different composition form (NFC vs NFD) than the source text — a
+    faithful copy that a naive substring test would otherwise reject (seen live on the bench's
+    strong Vietnamese case). Word content, order, and case stay significant on purpose.
+    """
+    return " ".join(unicodedata.normalize("NFC", text.translate(_QUOTE_GLYPHS)).split())
 
 
 class DimensionScore(BaseModel):
@@ -82,8 +95,22 @@ class Evaluation(BaseModel):
     self_critique: SelfCritiqueTrace | None = None
 
 
-def _make_validators(rubric: Rubric, answer: str) -> list[Validator]:
-    """Domain validators that the LLM call must satisfy (the retry self-corrects on failure)."""
+def _evidence_is_verbatim(quote: str, answer: str) -> bool:
+    """Whether ``quote`` is the literal 'no evidence' or a normalized substring of ``answer``."""
+    quote = quote.strip()
+    if quote.lower() == NO_EVIDENCE:
+        return True
+    needle = _normalize_evidence(quote)
+    return bool(needle) and needle in _normalize_evidence(answer)
+
+
+def _make_validators(rubric: Rubric, answer: str, *, include_evidence: bool = True) -> list[Validator]:
+    """Domain validators that the LLM call must satisfy (the retry self-corrects on failure).
+
+    ``include_evidence`` is dropped on the degrade path (see :func:`_evaluate_once`): the
+    verbatim-quote check is enforced-with-retry first, but a score must never be lost to an
+    unverifiable citation, so the fallback keeps the schema/dimension guards and sanitizes evidence.
+    """
     expected = set(rubric.active)
 
     def check_dimensions(ev: Evaluation) -> None:
@@ -94,20 +121,37 @@ def _make_validators(rubric: Rubric, answer: str) -> list[Validator]:
             raise ValueError(f"do not score these dimensions (weight 0): {sorted(extra)}")
 
     def check_evidence(ev: Evaluation) -> None:
-        haystack = _normalize_evidence(answer)
         for dim, ds in ev.dimensions.items():
-            quote = ds.evidence.strip()
-            if quote.lower() == NO_EVIDENCE:
-                continue
-            needle = _normalize_evidence(quote)
-            if not needle or needle not in haystack:
+            if not _evidence_is_verbatim(ds.evidence, answer):
                 raise ValueError(
-                    f"evidence for '{dim}' is not a verbatim quote from the answer: {quote!r}. "
+                    f"evidence for '{dim}' is not a verbatim quote from the answer: {ds.evidence.strip()!r}. "
                     f"{_EVIDENCE_RULE}\n"
                     f"Copy directly from this exact text — CANDIDATE ANSWER:\n{answer}"
                 )
 
-    return [check_dimensions, check_evidence]
+    return [check_dimensions, check_evidence] if include_evidence else [check_dimensions]
+
+
+def _sanitize_unverifiable_evidence(evaluation: Evaluation, answer: str) -> Evaluation:
+    """Blank any dimension evidence that isn't a verbatim quote, keeping the score intact.
+
+    The degrade backstop: reached only after the enforced-with-retry evidence check has already
+    failed, so we replace the unverifiable citation with :data:`UNVERIFIABLE_EVIDENCE` rather than
+    discard the whole (schema- and dimension-valid) judgment.
+    """
+    changed = {
+        dim: ds.model_copy(update={"evidence": UNVERIFIABLE_EVIDENCE})
+        for dim, ds in evaluation.dimensions.items()
+        if not _evidence_is_verbatim(ds.evidence, answer)
+    }
+    if not changed:
+        return evaluation
+    logger.warning(
+        "evidence degrade: blanked %d unverifiable quote(s) to keep the score: %s",
+        len(changed),
+        sorted(changed),
+    )
+    return evaluation.model_copy(update={"dimensions": {**evaluation.dimensions, **changed}})
 
 
 SYSTEM_PROMPT = (
@@ -251,12 +295,27 @@ def apply_cross_check(evaluation: Evaluation, rubric: Rubric) -> Evaluation:
 
 
 def _evaluate_once(client: LLMClient, messages: list[Message], answer: str, rubric: Rubric) -> Evaluation:
-    return client.chat_json(
-        messages,
-        Evaluation,
-        validators=_make_validators(rubric, answer),
-        max_retries=1,
-    )
+    try:
+        return client.chat_json(
+            messages,
+            Evaluation,
+            validators=_make_validators(rubric, answer),
+            max_retries=1,
+        )
+    except StructuredOutputError:
+        # The verbatim-quote check survived the retry (the model kept paraphrasing its citation, as
+        # gpt-4o-mini does on long strong answers). A valid score must not be lost to an audit-trail
+        # quote, so make one more pass WITHOUT the hard evidence check — schema and dimension coverage
+        # stay enforced — and sanitize any unverifiable citation. If schema/dimensions themselves are
+        # still broken, this re-raises, which is correct: that is genuinely unusable output.
+        logger.warning("evaluation evidence check exhausted its retry; degrading to sanitize-and-keep")
+        degraded = client.chat_json(
+            messages,
+            Evaluation,
+            validators=_make_validators(rubric, answer, include_evidence=False),
+            max_retries=1,
+        )
+        return _sanitize_unverifiable_evidence(degraded, answer)
 
 
 def _self_critique_triggers(evaluation: Evaluation, rubric: Rubric) -> tuple[str, ...]:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import unicodedata
 
 import pytest
 
@@ -9,6 +10,7 @@ from interview_coach.config import load_settings
 from interview_coach.evaluator import (
     DIVERGENCE_CONFIDENCE_CEILING,
     SELF_CRITIQUE_CONFIDENCE_THRESHOLD,
+    UNVERIFIABLE_EVIDENCE,
     WEIGHTED_SCORE_TOLERANCE,
     DimensionScore,
     Evaluation,
@@ -203,6 +205,41 @@ def test_tolerant_match_still_rejects_a_paraphrase(make_client):
 
     assert ev.dimensions["correctness"].evidence == "systematic error"
     assert fake.call_count == 2  # paraphrase rejected, corrected on retry
+
+
+def test_nfc_normalized_vietnamese_evidence_accepted_without_a_retry(make_client):
+    # A character-perfect Vietnamese quote can arrive in a different Unicode composition form (NFD)
+    # than the source (NFC) — a faithful copy that a naive substring test wrongly rejects. This was
+    # the live cause of the bench's strong Vietnamese case failing. NFC-folding must accept it on the
+    # FIRST attempt.
+    answer = unicodedata.normalize("NFC", "Phân đoạn từ tiếng Việt cần xử lý dấu thanh cẩn thận.")
+    span = unicodedata.normalize("NFC", "xử lý dấu thanh")
+    assert span in answer
+    nfd_quote = unicodedata.normalize("NFD", span)
+    assert nfd_quote != span  # the model emitted a different composition form
+    rubric = Rubric(weights={"correctness": 1.0})
+    client, fake = make_client([_single_dim_eval(nfd_quote)])
+
+    ev = evaluate(client, "Explain VN segmentation.", answer, rubric)
+
+    assert fake.call_count == 1  # accepted despite the NFD/NFC mismatch — no retry burned
+    assert ev.dimensions["correctness"].score == 5
+
+
+def test_persistently_unverifiable_evidence_degrades_instead_of_crashing(make_client):
+    # gpt-4o-mini's live failure: on long strong answers it keeps paraphrasing its citation even after
+    # the enforced retry, which used to raise StructuredOutputError and lose the whole valid score.
+    # The evidence is an audit trail, so the judge must degrade — blank the quote, keep the score —
+    # never crash on an otherwise-valid answer.
+    answer = "Bias is systematic error from too-simple assumptions."
+    rubric = Rubric(weights={"correctness": 1.0})
+    client, fake = make_client([_single_dim_eval("the model oversimplifies the data")])  # never verbatim
+
+    ev = evaluate(client, "Explain bias.", answer, rubric)
+
+    assert ev.dimensions["correctness"].score == 5  # score preserved
+    assert ev.dimensions["correctness"].evidence == UNVERIFIABLE_EVIDENCE  # citation blanked, not crashed
+    assert fake.call_count == 3  # 2 enforced attempts fail evidence, then 1 degrade pass without it
 
 
 # --- weighted_score cross-check guard (slice 0003) ---------------------------------------------
