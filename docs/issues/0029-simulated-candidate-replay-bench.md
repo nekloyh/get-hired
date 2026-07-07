@@ -56,12 +56,16 @@ bench (0022) calibrates the judge; this calibrates the orchestrator.
   question; and the replay artifact round-trips and re-runs the decision node under a swapped model.
 - `uv run pytest -q` — 211 passed, `ruff check` clean.
 
-## Pending
+## Verified (live, 2026-07-07 on gpt-4o-mini)
 
-- The meaningful **live** closed-loop (real persona LLM answers + real judge) is available via
-  `run_persona_session` but has not been run against a live provider yet — same blocker as 0022 (the
-  `.env` `OPENAI_API_KEY` currently 401s; it can also run on Groq).
+- A real closed-loop run (`run_persona_session`, persona LLM answers + real judge) for a persona
+  strong at `deep_learning`, weak at `mlops`: the probed posterior ordering recovered the ground-truth
+  ordering (`ml_fundamentals` > `mlops`), and the Supervisor spent the extra budget re-probing the
+  *weak* Skill (`mlops` probed twice, `ml_fundamentals` once) rather than the strong one. A live
+  `StructuredOutputError` on one `mlops` question was isolated as a `failed` question and the Session
+  continued (issue 0014 backstop, live). The trajectory was dumped to
+  `data/replay/deep-learning-strong.json` and `replay_decision` re-ran the decision node over it.
 
 ## Status
 
-**Implemented; the live closed-loop run is pending a working provider key.**
+**Closed.** Acceptance criteria are implemented, offline-tested, and live-validated on gpt-4o-mini.

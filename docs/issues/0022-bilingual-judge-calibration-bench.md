@@ -28,9 +28,8 @@ or provider.
 
 - [x] ≥20 golden cases with EN + VN paired answers, human labels on the 5-dim rubric, and
       per-band anchors for ≥2 dimensions
-- [~] `coach bench` runs live, writes the calibration report to `docs/audits/`, and exits
-      non-zero on regression vs recorded ranges — *harness + report + gate implemented and
-      offline-verified; the actual live run is pending a working provider key (see below)*
+- [x] `coach bench` runs live, writes the calibration report to `docs/audits/`, and exits
+      non-zero on regression vs recorded ranges
 - [x] Report covers per-dimension bias, weak/strong separation, EN/VN paired deltas, and
       confidence calibration
 - [x] The prompt-injection adversarial case is retained and gets a VN twin
@@ -55,12 +54,14 @@ or provider.
 - An OpenAI provider was wired (`config.py` / `llm.py`: `ProviderName` gained `openai`,
   `OpenAIClient`) so the bench can run on `gpt-4o-mini` without spending Groq's free-tier TPD.
 
-## Pending
+## Verified (live, 2026-07-07 on gpt-4o-mini)
 
-- The single **live** run + a committed real report is blocked: the `OPENAI_API_KEY` in `.env`
-  returns 401 (invalid). The wiring is confirmed correct (the client builds, reaches the OpenAI API,
-  and only the credential is rejected). Once a valid key is set — or the bench is run on Groq —
-  `uv run coach bench` produces the first real calibration report.
+- `PRIMARY_PROVIDER=openai uv run coach bench` — first real run. **17/20 within band** (report:
+  `docs/audits/calibration-bench-2026-07-07.md`), so the gate exits non-zero, as designed. Real
+  findings the bench surfaced: gpt-4o-mini failed the Evaluator's verbatim-evidence schema on 3
+  strong cases (`StructuredOutputError` after retries — a genuine judge limitation, honestly recorded,
+  not swallowed); a per-dimension bias of `correctness +0.53` / `system_thinking −0.53`; and an EN/VN
+  paired delta up to 1.60 (the VN weak bias-variance answer scored harder than its EN twin).
 
 ## Verified (offline)
 
@@ -73,4 +74,4 @@ or provider.
 
 ## Status
 
-**Implemented; one live run pending a working provider key.**
+**Closed.** Acceptance criteria are implemented, offline-tested, and live-validated on gpt-4o-mini.

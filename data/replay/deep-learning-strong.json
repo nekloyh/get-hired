@@ -1,0 +1,409 @@
+{
+  "final_state": {
+    "candidate_id": "",
+    "current_plan_index": 1,
+    "max_elapsed_seconds": 1800,
+    "max_questions": 3,
+    "next_skill": null,
+    "question_count": 3,
+    "session_id": "persona-live-dl",
+    "skill_metadata": {
+      "deep_learning": {
+        "evidence_bar": 3.0,
+        "role_criticality": "core"
+      },
+      "ml_fundamentals": {
+        "evidence_bar": 4.0,
+        "role_criticality": "must_have"
+      },
+      "mlops": {
+        "evidence_bar": 4.0,
+        "role_criticality": "must_have"
+      },
+      "system_design": {
+        "evidence_bar": 3.0,
+        "role_criticality": "core"
+      },
+      "vietnamese_nlp": {
+        "evidence_bar": 2.0,
+        "role_criticality": "peripheral"
+      }
+    },
+    "skill_states": {
+      "deep_learning": {
+        "alpha": 1.2647058823529411,
+        "beta": 1.2647058823529411,
+        "skill": "deep_learning"
+      },
+      "ml_fundamentals": {
+        "alpha": 2.3875,
+        "beta": 1.4625,
+        "skill": "ml_fundamentals"
+      },
+      "mlops": {
+        "alpha": 1.425,
+        "beta": 2.2750000000000004,
+        "skill": "mlops"
+      },
+      "system_design": {
+        "alpha": 1.2647058823529411,
+        "beta": 1.2647058823529411,
+        "skill": "system_design"
+      },
+      "vietnamese_nlp": {
+        "alpha": 1.6428571428571432,
+        "beta": 1.6428571428571432,
+        "skill": "vietnamese_nlp"
+      }
+    },
+    "started_at": 1783429511.0499337,
+    "status": "complete",
+    "stop_reason": "max_questions",
+    "study_plan": null,
+    "study_plan_error": "StructuredOutputError: could not obtain schema-valid output after 2 attempt(s)",
+    "supervisor_decisions": [
+      {
+        "action": "advance_plan",
+        "after_question": 1,
+        "deviation": false,
+        "from_plan_index": 0,
+        "llm_reasoning": "The Candidate has demonstrated strong evidence in ml_fundamentals with a score of 4.00 and high confidence. This justifies moving to the next topic, mlops, as it is a must-have skill for the target role.",
+        "reasoning": "The Candidate has demonstrated strong evidence in ml_fundamentals with a score of 4.00 and high confidence. This justifies moving to the next topic, mlops, as it is a must-have skill for the target role.",
+        "target_plan_index": 1,
+        "target_skill": "mlops",
+        "to_plan_index": 1
+      },
+      {
+        "action": "extra_question",
+        "after_question": 2,
+        "deviation": true,
+        "from_plan_index": 1,
+        "llm_reasoning": "The last question on mlops was unresolved due to safety_cap and scored below the evidence bar, indicating weak evidence. An extra question will help clarify the Candidate's understanding of mlops before moving on.",
+        "reasoning": "The last question on mlops was unresolved due to safety_cap and scored below the evidence bar, indicating weak evidence. An extra question will help clarify the Candidate's understanding of mlops before moving on.",
+        "target_plan_index": null,
+        "target_skill": "mlops",
+        "to_plan_index": 1
+      },
+      {
+        "action": "end_early",
+        "after_question": 3,
+        "deviation": true,
+        "from_plan_index": 1,
+        "llm_reasoning": "Hard cap reached: max_questions bound the Session before any LLM deviation choice.",
+        "reasoning": "Hard cap reached: max_questions bound the Session before any LLM deviation choice.",
+        "target_plan_index": null,
+        "target_skill": null,
+        "to_plan_index": 1
+      }
+    ],
+    "topic_plan": [
+      {
+        "rationale": "must_have for the target role; start near difficulty 3 from the Candidate's weak prior (mastery 0.50, evidence bar 4.0)",
+        "skill": "ml_fundamentals",
+        "target_difficulty": 3
+      },
+      {
+        "rationale": "must_have for the target role; start near difficulty 3 from the Candidate's weak prior (mastery 0.50, evidence bar 4.0)",
+        "skill": "mlops",
+        "target_difficulty": 3
+      },
+      {
+        "rationale": "core for the target role; start near difficulty 3 from the Candidate's weak prior (mastery 0.50, evidence bar 3.0)",
+        "skill": "deep_learning",
+        "target_difficulty": 3
+      },
+      {
+        "rationale": "core for the target role; start near difficulty 3 from the Candidate's weak prior (mastery 0.50, evidence bar 3.0)",
+        "skill": "system_design",
+        "target_difficulty": 3
+      },
+      {
+        "rationale": "peripheral for the target role; start near difficulty 3 from the Candidate's weak prior (mastery 0.50, evidence bar 2.0)",
+        "skill": "vietnamese_nlp",
+        "target_difficulty": 3
+      }
+    ],
+    "transcript": [
+      {
+        "evidence_weight": 1.85,
+        "plan_index": 0,
+        "resolved_confidence": 0.9,
+        "resolved_weighted_score": 4.0,
+        "skill": "ml_fundamentals",
+        "skill_state": {
+          "alpha": 2.3875,
+          "beta": 1.4625,
+          "skill": "ml_fundamentals"
+        },
+        "stop_reason": "resolved",
+        "turns": [
+          {
+            "answer": "The bias-variance tradeoff is a concept that describes the balance between two types of errors that a model can make. Bias refers to the error due to overly simplistic assumptions in the learning algorithm, which can lead to underfitting, while variance refers to the error due to excessive complexity in the model, which can lead to overfitting. When selecting a model, I try to find a balance where both bias and variance are minimized, but it can be tricky. \n\nWhen looking at learning curves, I watch for the training and validation errors. If the training error is low but the validation error is high, it might indicate overfitting, while if both errors are high, it could suggest underfitting. So, I guess I would adjust the model complexity or apply regularization based on those observations, but it's a bit nuanced.",
+            "evaluation": {
+              "confidence": 0.9,
+              "dimensions": {
+                "communication": {
+                  "evidence": "If the training error is low but the validation error is high, it might indicate overfitting, while if both errors are high, it could suggest underfitting.",
+                  "score": 4
+                },
+                "correctness": {
+                  "evidence": "Bias refers to the error due to overly simplistic assumptions in the learning algorithm, which can lead to underfitting, while variance refers to the error due to excessive complexity in the model, which can lead to overfitting.",
+                  "score": 5
+                },
+                "depth": {
+                  "evidence": "When selecting a model, I try to find a balance where both bias and variance are minimized, but it can be tricky.",
+                  "score": 4
+                },
+                "system_thinking": {
+                  "evidence": "I would adjust the model complexity or apply regularization based on those observations, but it's a bit nuanced.",
+                  "score": 3
+                }
+              },
+              "follow_up_rationale": "The answer is strong and covers key aspects of the bias-variance tradeoff and learning curves.",
+              "follow_up_recommended": false,
+              "self_critique": null,
+              "weighted_score": 4.0
+            },
+            "grounding_concept_id": null,
+            "grounding_concept_title": null,
+            "is_follow_up": false,
+            "question": "Explain the bias\u2013variance tradeoff and how it guides model selection and regularization. What do you watch on the learning curves?",
+            "trace": {
+              "concept_hit_id": null,
+              "concept_hit_score": null,
+              "concept_hit_title": null,
+              "concept_lookup_language": null,
+              "concept_lookup_query": null,
+              "concept_lookup_skill": null,
+              "evaluator_self_critique_triggers": [],
+              "stop_reason": "resolved"
+            }
+          }
+        ]
+      },
+      {
+        "evidence_weight": 1.7000000000000002,
+        "plan_index": 1,
+        "resolved_confidence": 0.8,
+        "resolved_weighted_score": 2.0,
+        "skill": "mlops",
+        "skill_state": {
+          "alpha": 1.425,
+          "beta": 2.2750000000000004,
+          "skill": "mlops"
+        },
+        "stop_reason": "safety_cap",
+        "turns": [
+          {
+            "answer": "Well, monitoring a production model for data drift, I think you would typically look at the input data and the model's predictions over time. You might use statistical tests or visualizations to see if the data distribution changes. As for deciding when to retrain, I guess it would depend on how significant the drift is and if it affects the model's performance, but I'm not entirely sure about the specific thresholds or metrics to use. I think it\u2019s important to have some kind of alert system in place, though.",
+            "evaluation": {
+              "confidence": 0.8,
+              "dimensions": {
+                "communication": {
+                  "evidence": "I guess it would depend on how significant the drift is and if it affects the model's performance, but I'm not entirely sure",
+                  "score": 3
+                },
+                "correctness": {
+                  "evidence": "you would typically look at the input data and the model's predictions over time.",
+                  "score": 4
+                },
+                "depth": {
+                  "evidence": "it would depend on how significant the drift is and if it affects the model's performance",
+                  "score": 3
+                },
+                "mlops_awareness": {
+                  "evidence": "monitoring a production model for data drift",
+                  "score": 3
+                },
+                "system_thinking": {
+                  "evidence": "I think it\u2019s important to have some kind of alert system in place, though.",
+                  "score": 2
+                }
+              },
+              "follow_up_rationale": "The candidate's uncertainty about specific thresholds and metrics for retraining suggests that further probing could clarify their understanding of practical implementations.",
+              "follow_up_recommended": true,
+              "self_critique": null,
+              "weighted_score": 3.0
+            },
+            "grounding_concept_id": null,
+            "grounding_concept_title": null,
+            "is_follow_up": false,
+            "question": "How would you monitor a production model for data drift and decide when retraining is actually justified?",
+            "trace": {
+              "concept_hit_id": "mlops_drift_monitoring",
+              "concept_hit_score": 0.0975609756097561,
+              "concept_hit_title": "Drift monitoring and retraining",
+              "concept_lookup_language": null,
+              "concept_lookup_query": "monitoring production models for data drift",
+              "concept_lookup_skill": "mlops",
+              "evaluator_self_critique_triggers": [],
+              "stop_reason": null
+            }
+          },
+          {
+            "answer": "Well, um, covariate drift is when the input data changes over time, which can affect the model's performance. To determine the business risk, I think I would look at how much the model's predictions are impacted by these changes. As for metrics, I guess I would consider things like accuracy or maybe precision and recall, but I'm not entirely sure how to quantify the risk specifically. I suppose if those metrics drop significantly, it might indicate a need for retraining, but I\u2019d need to look into it more.",
+            "evaluation": {
+              "confidence": 0.8,
+              "dimensions": {
+                "communication": {
+                  "evidence": "Well, um, covariate drift is when the input data changes over time, which can affect the model's performance.",
+                  "score": 3
+                },
+                "correctness": {
+                  "evidence": "covariate drift is when the input data changes over time, which can affect the model's performance.",
+                  "score": 3
+                },
+                "depth": {
+                  "evidence": "I guess I would consider things like accuracy or maybe precision and recall",
+                  "score": 2
+                },
+                "mlops_awareness": {
+                  "evidence": "I\u2019d need to look into it more.",
+                  "score": 2
+                },
+                "system_thinking": {
+                  "evidence": "if those metrics drop significantly, it might indicate a need for retraining",
+                  "score": 2
+                }
+              },
+              "follow_up_rationale": "The candidate's understanding of metrics and their application to business risk is unclear, which could benefit from further exploration.",
+              "follow_up_recommended": true,
+              "self_critique": null,
+              "weighted_score": 2.0
+            },
+            "grounding_concept_id": "mlops_drift_monitoring",
+            "grounding_concept_title": "Drift monitoring and retraining",
+            "is_follow_up": true,
+            "question": "Can you explain how you would determine the business risk associated with covariate drift and what specific metrics you would use to decide if retraining is necessary?",
+            "trace": {
+              "concept_hit_id": "mlops_drift_monitoring",
+              "concept_hit_score": 0.0975609756097561,
+              "concept_hit_title": "Drift monitoring and retraining",
+              "concept_lookup_language": null,
+              "concept_lookup_query": "monitoring production model for data drift",
+              "concept_lookup_skill": "mlops",
+              "evaluator_self_critique_triggers": [],
+              "stop_reason": null
+            }
+          },
+          {
+            "answer": "Sure, I think establishing a retraining trigger based on business risk involves identifying key performance indicators that are directly tied to business outcomes, rather than just focusing on accuracy. For example, you might look at how model predictions impact revenue or customer satisfaction. I guess you could set thresholds for these business metrics, and if they fall below a certain level, that could trigger a retraining process. But, um, I'm not entirely sure how to implement that in a detailed way.",
+            "evaluation": {
+              "confidence": 0.8,
+              "dimensions": {
+                "communication": {
+                  "evidence": "I guess you could set thresholds for these business metrics",
+                  "score": 3
+                },
+                "correctness": {
+                  "evidence": "identifying key performance indicators that are directly tied to business outcomes",
+                  "score": 4
+                },
+                "depth": {
+                  "evidence": "set thresholds for these business metrics, and if they fall below a certain level",
+                  "score": 3
+                },
+                "mlops_awareness": {
+                  "evidence": "retraining trigger based on business risk",
+                  "score": 2
+                },
+                "system_thinking": {
+                  "evidence": "trigger a retraining process",
+                  "score": 2
+                }
+              },
+              "follow_up_rationale": "The candidate's uncertainty about implementation suggests there may be deeper knowledge or specific strategies they could elaborate on.",
+              "follow_up_recommended": true,
+              "self_critique": null,
+              "weighted_score": 3.0
+            },
+            "grounding_concept_id": "mlops_drift_monitoring",
+            "grounding_concept_title": "Drift monitoring and retraining",
+            "is_follow_up": true,
+            "question": "Can you explain how you would establish a retraining trigger that is tied to business risk, rather than just relying on accuracy metrics alone?",
+            "trace": {
+              "concept_hit_id": "mlops_drift_monitoring",
+              "concept_hit_score": 0.14285714285714285,
+              "concept_hit_title": "Drift monitoring and retraining",
+              "concept_lookup_language": null,
+              "concept_lookup_query": "monitoring production model for data drift and retraining triggers",
+              "concept_lookup_skill": "mlops",
+              "evaluator_self_critique_triggers": [],
+              "stop_reason": null
+            }
+          },
+          {
+            "answer": "Well, um, data quality checks are important, I think. I would probably start by, like, checking for missing values and maybe some outliers in the data. For feature drift, I guess I would monitor the features over time to see if they change, but I'm not entirely sure how to set that up. I think you can use some metrics or something to trigger retraining when the drift is significant, but the specifics are a bit fuzzy for me.",
+            "evaluation": {
+              "confidence": 0.8,
+              "dimensions": {
+                "communication": {
+                  "evidence": "I would probably start by, like, checking for missing values and maybe some outliers in the data.",
+                  "score": 3
+                },
+                "correctness": {
+                  "evidence": "checking for missing values and maybe some outliers in the data.",
+                  "score": 3
+                },
+                "depth": {
+                  "evidence": "the specifics are a bit fuzzy for me.",
+                  "score": 2
+                },
+                "mlops_awareness": {
+                  "evidence": "trigger retraining when the drift is significant",
+                  "score": 3
+                },
+                "system_thinking": {
+                  "evidence": "monitor the features over time to see if they change",
+                  "score": 2
+                }
+              },
+              "follow_up_rationale": "The candidate's understanding of feature drift and retraining is vague, suggesting a follow-up could clarify their knowledge and approach.",
+              "follow_up_recommended": true,
+              "self_critique": null,
+              "weighted_score": 2.0
+            },
+            "grounding_concept_id": "mlops_drift_monitoring",
+            "grounding_concept_title": "Drift monitoring and retraining",
+            "is_follow_up": true,
+            "question": "Can you explain how you would implement data-quality checks and monitor for feature drift in your production model to effectively trigger retraining based on business risk?",
+            "trace": {
+              "concept_hit_id": null,
+              "concept_hit_score": null,
+              "concept_hit_title": null,
+              "concept_lookup_language": null,
+              "concept_lookup_query": null,
+              "concept_lookup_skill": null,
+              "evaluator_self_critique_triggers": [],
+              "stop_reason": "safety_cap"
+            }
+          }
+        ]
+      },
+      {
+        "error": "StructuredOutputError: could not obtain schema-valid output after 2 attempt(s)",
+        "evidence_weight": 0.0,
+        "plan_index": 1,
+        "resolved_confidence": 0.0,
+        "resolved_weighted_score": 0.0,
+        "skill": "mlops",
+        "skill_state": {
+          "alpha": 1.425,
+          "beta": 2.2750000000000004,
+          "skill": "mlops"
+        },
+        "stop_reason": "failed",
+        "turns": []
+      }
+    ]
+  },
+  "ground_truth": {
+    "deep_learning": 0.9,
+    "ml_fundamentals": 0.5,
+    "mlops": 0.2,
+    "system_design": 0.6,
+    "vietnamese_nlp": 0.4
+  },
+  "persona": "deep-learning-strong",
+  "version": 1
+}
