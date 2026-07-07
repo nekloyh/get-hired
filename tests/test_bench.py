@@ -177,3 +177,9 @@ def test_run_bench_marks_provider_error_as_out_of_band(make_client):
     assert results[0].error is not None
     assert not results[0].within_band
     assert not bench_passed(results)
+
+
+def test_empty_bench_does_not_pass_the_gate_vacuously():
+    # all([]) is True, so a malformed/empty cases.yaml (zero results) must not wave the gate through
+    # green — a bench that evaluated nothing has not passed.
+    assert not bench_passed([])
