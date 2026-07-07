@@ -21,10 +21,13 @@ import argparse
 import logging
 import sys
 import time
+from datetime import UTC, datetime
+from pathlib import Path
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from .bank import BankError, load_pack
+from .bench import bench_passed, load_bench_data, render_bench_report, run_bench
 from .concepts import SEED_CONCEPTS, ChromaConceptStore, InMemoryConceptStore, build_concept_store
 from .config import load_settings
 from .diagnostic import CandidateProfile, diagnose
@@ -455,6 +458,32 @@ def _cmd_eval_harness(client: LLMClient | None, args: argparse.Namespace) -> int
     return 0 if harness_passed(results) else 1
 
 
+def _utc_date() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%d")
+
+
+def _cmd_bench(client: LLMClient | None, args: argparse.Namespace) -> int:
+    if client is None:
+        raise RuntimeError("bench requires an LLM client")
+    data = load_bench_data(args.cases or None)
+    results = run_bench(client, data.cases)
+    provider = getattr(client, "primary_provider", "unknown")
+    settings = load_settings()
+    report = render_bench_report(
+        results,
+        anchors=data.anchors,
+        provider=str(provider),
+        model=settings.primary_config.model or "unknown",
+        date=_utc_date(),
+    )
+    out = Path(args.out) if args.out else Path("docs/audits") / f"calibration-bench-{_utc_date()}.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(report, encoding="utf-8")
+    within = sum(1 for r in results if r.within_band)
+    print(f"Bench: {within}/{len(results)} cases within band. Report written to {out}.")
+    return 0 if bench_passed(results) else 1
+
+
 def _cmd_ingest_concepts(client: LLMClient | None, args: argparse.Namespace) -> int:
     store = ChromaConceptStore.create(persist_dir=args.persist_dir)
     count = store.ingest(SEED_CONCEPTS)
@@ -663,6 +692,13 @@ def main(argv: list[str] | None = None) -> int:
 
     harness_parser = sub.add_parser("eval-harness", help="Slice 0012: run Evaluator golden-answer checks")
     harness_parser.set_defaults(func=_cmd_eval_harness, requires_llm=True)
+
+    bench_parser = sub.add_parser("bench", help="Issue 0022: bilingual Judge calibration bench")
+    bench_parser.add_argument("--cases", default="", help="Path to a cases YAML (default: data/bench/cases.yaml).")
+    bench_parser.add_argument(
+        "--out", default="", help="Report output path (default: docs/audits/calibration-bench-<date>.md)."
+    )
+    bench_parser.set_defaults(func=_cmd_bench, requires_llm=True)
 
     pack_parser = sub.add_parser("pack", help="Issue 0025: manage external content packs")
     pack_parser.set_defaults(func=_cmd_pack, requires_llm=False)

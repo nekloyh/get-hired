@@ -108,6 +108,24 @@ pack, and `data/packs/fpt/` ships as a first FPT-style pack. A pack directory ho
 reference, bad difficulty, missing name) and exits non-zero, so a broken pack fails at lint time,
 never mid-interview. `coach session --pack <dir>` then runs the whole Session from that pack.
 
+## Judge calibration gate (issue 0022 / ADR 0009)
+
+The Evaluator is the single judge everything downstream trusts, so **every judge change — its prompt,
+self-critique thresholds, structured-output path, or the provider/model behind it (a provider swap is
+a judge change) — must pass `coach bench` before it merges.**
+
+```bash
+uv run coach bench                                  # run the bilingual calibration bench live
+uv run coach bench --out docs/audits/bench-x.md     # choose the report path
+```
+
+`coach bench` runs the hand-labelled EN/VN paired golden set (`data/bench/cases.yaml`) against the
+configured provider and writes a Markdown report to `docs/audits/`: per-dimension bias vs the human
+labels, weak/strong separation, EN-vs-VN paired deltas, and a confidence-calibration table ("when it
+says 0.9, is it right ~90% of the time?"). It exits non-zero on any range regression, so it gates a
+judge change the same way a failing test would. Reports are versioned in `docs/audits/` so judge
+quality has a history, not a vibe.
+
 ## Test
 
 ```bash
