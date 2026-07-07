@@ -2,6 +2,7 @@
 
 **Type:** AFK
 **Kind:** bug (minor)
+**Tracked on GitHub:** [#36](https://github.com/nekloyh/get-hired/issues/36)
 
 ## What to build
 
