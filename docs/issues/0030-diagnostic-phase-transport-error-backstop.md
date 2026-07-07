@@ -27,19 +27,43 @@ the degrade distinctly (mirroring issue 0020's `reason_prefix` convention).
 
 ## Acceptance criteria
 
-- [ ] A provider/transport exception during the CLI's Diagnostic phase degrades to the
+- [x] A provider/transport exception during the CLI's Diagnostic phase degrades to the
       deterministic Topic Plan instead of crashing the process
-- [ ] The degrade is logged distinctly (transport failure, not "no provider configured") and the
+- [x] The degrade is logged distinctly (transport failure, not "no provider configured") and the
       Session proceeds normally from there
-- [ ] Test: a fake client raising a transport error at the Diagnostic call site — the Session still
+- [x] Test: a fake client raising a transport error at the Diagnostic call site — the Session still
       starts and completes
-- [ ] Consider whether the same gap exists in `web_api.py`'s equivalent Diagnostic call (the
+- [x] Consider whether the same gap exists in `web_api.py`'s equivalent Diagnostic call (the
       websocket `start_session` path) and fix it there too if so
 
 ## Blocked by
 
 None — can start immediately.
 
+## Done
+
+- Added `diagnose_or_degrade()` in `diagnostic.py`: the ADR 0005 runtime backstop for the
+  pre-graph Diagnostic call. It runs `diagnose(profile, client)` and, on any provider/transport
+  failure (or a schema-invalid plan after retry), logs the degrade distinctly and falls back to the
+  deterministic Topic Plan (`diagnose(profile, None)`). `diagnose()` itself stays strict — benches
+  and tests that want the raw error keep calling it directly (see
+  `test_diagnose_propagates_llm_failure_without_deterministic_fallback`). A genuine bug in the pure
+  prep helpers still surfaces: it re-raises on the deterministic retry, which is not caught.
+- Wired the two unguarded CLI entry points (`_cmd_session`, `_cmd_diagnose`) through the backstop.
+- `web_api.py`'s Diagnostic call was already inside `_run_session_thread`'s outer
+  `except Exception` (the API boundary converts graph/provider failures to a `session_error`
+  event), so it never crashed the process — no raw-traceback gap exists there. Left as-is:
+  continuing the web session with a deterministic plan instead of erroring out is a possible future
+  UX enhancement, not part of this bug.
+
+## Verified
+
+- `tests/test_diagnostic.py`: provider-error degrade, healthy-provider passthrough, and offline
+  equivalence to plain `diagnose`.
+- `tests/test_cli.py`: the `spy_diagnose` wiring tests confirm the CLI commands route through the
+  backstop with the correct client selection.
+- `uv run pytest -q` — 214 passed; `uv run ruff check` clean.
+
 ## Status
 
-**Open.**
+**Closed.** Acceptance criteria are implemented and covered.
