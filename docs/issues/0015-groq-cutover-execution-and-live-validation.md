@@ -21,20 +21,43 @@ and silently steered the live path onto a dead provider.
 
 ## Acceptance criteria
 
-- [ ] `.env` matches the documented scheme; a live `coach session --scripted --max-questions 1`
+- [x] `.env` matches the documented scheme; a live `coach session --scripted --max-questions 1`
       completes on Groq end-to-end (micro-loop, follow-up tool call, Study Plan, export)
-- [ ] `uv run pytest -m live` passes against Groq with the tests actually *executing* — a run
+- [x] `uv run pytest -m live` passes against Groq with the tests actually *executing* — a run
       where they all skip on missing credentials counts as failure for this criterion
-- [ ] A `docs/audits/` entry records the first Groq validation: date, model, which tests ran,
+- [x] A `docs/audits/` entry records the first Groq validation: date, model, which tests ran,
       any behavioral deltas vs the MiMo-era notes (tool-name flakiness, `reasoning_content`)
-- [ ] The legacy `LLM_*` alias path is either documented or removed — it can no longer silently
+- [x] The legacy `LLM_*` alias path is either documented or removed — it can no longer silently
       select an unconfigured/dead provider while the documented vars are absent
-- [ ] README setup instructions match the final scheme
+- [x] README setup instructions match the final scheme
 
 ## Blocked by
 
 None — can start immediately. Everything live-dependent (0022, 0029) is blocked on this.
 
+## Done
+
+- `.env` migrated from the legacy `LLM_PROVIDER`/`LLM_API_KEY`/`LLM_BASE_URL`/`LLM_MODEL` scheme to
+  `PRIMARY_PROVIDER`/`MIMO_*`/`GROQ_*` (the `.env.example`/README scheme). `GROQ_MODEL` had never
+  been set — `GROQ_API_KEY` alone was a silent no-op.
+- `GROQ_MODEL=llama-3.3-70b-versatile` chosen after comparing free-tier rate limits with
+  `llama-3.1-8b-instant` and `openai/gpt-oss-120b` (highest TPM of the three despite being the
+  largest model).
+- Removed the legacy `LLM_*` alias `validation_alias` entries from `config.py` — this was the exact
+  mechanism that let `.env` silently stay on expired MiMo while `GROQ_API_KEY` looked configured.
+  No test depended on the aliases; README/`.env.example` never documented them.
+- Also live re-validated issues 0016/0018/0019/0020, which had only ever been closed on
+  fake/simulated evidence, and filed issue 0030 for a new gap found in the process (the CLI's
+  Diagnostic-phase call has no transport-error backstop, unlike the three graph node call sites).
+
+## Verified
+
+- `uv run python scripts/smoke_issue_0009.py` — real Groq call, schema-valid Topic Plans.
+- `uv run pytest -m live` — 5 passed, 0 skipped, first-ever non-MiMo run of this suite.
+- `uv run pytest -q` — 165 passed, ruff clean, after the `config.py` alias removal.
+- Full detail, including the live re-validation of 0016/0018/0019/0020 and the rate-limit/process-
+  group findings along the way, in `docs/audits/0015-groq-cutover-live-validation.md`.
+
 ## Status
 
-**Open.**
+**Closed.** Acceptance criteria are implemented and covered.

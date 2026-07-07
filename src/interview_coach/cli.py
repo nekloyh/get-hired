@@ -21,10 +21,14 @@ import argparse
 import logging
 import sys
 import time
+from datetime import UTC, datetime
+from pathlib import Path
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from .concepts import SEED_CONCEPTS, ChromaConceptStore, build_concept_store
+from .bank import BankError, load_pack
+from .bench import bench_passed, load_bench_data, render_bench_report, run_bench
+from .concepts import SEED_CONCEPTS, ChromaConceptStore, InMemoryConceptStore, build_concept_store
 from .config import load_settings
 from .diagnostic import CandidateProfile, diagnose
 from .eval_harness import harness_passed, render_golden_answer_report, run_golden_answer_harness
@@ -338,11 +342,20 @@ def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
         print(f"Exported architecture diagram to {path}")
         return 0
 
-    concept_store = build_concept_store(
-        args.concept_store,
-        persist_dir=args.concept_persist_dir,
-        seed=not args.no_seed_concepts,
-    )
+    question_bank = None
+    if args.pack:
+        # Run entirely from the pack (0025): its questions drive selection and its concept notes back
+        # the Interviewer's lookups, instead of the built-in reference bank.
+        pack = load_pack(args.pack)
+        question_bank = pack.questions
+        concept_store = InMemoryConceptStore(pack.concepts)
+        print(f"Running from pack {pack.metadata.get('name')!r} ({args.pack}).")
+    else:
+        concept_store = build_concept_store(
+            args.concept_store,
+            persist_dir=args.concept_persist_dir,
+            seed=not args.no_seed_concepts,
+        )
     resource_store = build_resource_store(
         args.resource_store,
         persist_dir=args.resource_persist_dir,
@@ -357,6 +370,7 @@ def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
             resource_store=resource_store,
             candidate_factory=candidate_factory,
             max_turns_per_question=None if args.scripted else args.max_turns,
+            question_bank=question_bank,
         )
         config = session_config(args.session_id)
         try:
@@ -416,12 +430,58 @@ def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_pack_lint(client: LLMClient | None, args: argparse.Namespace) -> int:
+    try:
+        pack = load_pack(args.pack_dir)
+    except BankError as err:
+        # The contract dies at lint time with a named violation, never mid-interview (ADR 0008).
+        print(f"Pack lint FAILED: {err}", file=sys.stderr)
+        return 1
+    n_questions = sum(len(qs) for qs in pack.questions.values())
+    print(
+        f"Pack {pack.metadata.get('name')!r} is valid: {n_questions} question(s) across "
+        f"{len(pack.questions)} Skill(s) and {len(pack.concepts)} concept note(s)."
+    )
+    return 0
+
+
+def _cmd_pack(client: LLMClient | None, args: argparse.Namespace) -> int:
+    print("usage: coach pack lint <dir>", file=sys.stderr)
+    return 2
+
+
 def _cmd_eval_harness(client: LLMClient | None, args: argparse.Namespace) -> int:
     if client is None:
         raise RuntimeError("eval-harness requires an LLM client")
     results = run_golden_answer_harness(client)
     print(render_golden_answer_report(results))
     return 0 if harness_passed(results) else 1
+
+
+def _utc_date() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%d")
+
+
+def _cmd_bench(client: LLMClient | None, args: argparse.Namespace) -> int:
+    if client is None:
+        raise RuntimeError("bench requires an LLM client")
+    data = load_bench_data(args.cases or None)
+    results = run_bench(client, data.cases)
+    provider = getattr(client, "primary_provider", "unknown")
+    settings = load_settings()
+    report = render_bench_report(
+        results,
+        anchors=data.anchors,
+        provider=str(provider),
+        model=settings.primary_config.model or "unknown",
+        date=_utc_date(),
+    )
+    out = Path(args.out) if args.out else Path("docs/audits") / f"calibration-bench-{_utc_date()}.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(report, encoding="utf-8")
+    within = sum(1 for r in results if r.within_band)
+    print(f"Bench: {within}/{len(results)} cases within band. Report written to {out}.")
+    return 0 if bench_passed(results) else 1
 
 
 def _cmd_ingest_concepts(client: LLMClient | None, args: argparse.Namespace) -> int:
@@ -533,6 +593,12 @@ def main(argv: list[str] | None = None) -> int:
         default=".skill-ledger.json",
         help="JSON file holding per-Candidate decayed Beta priors (0023).",
     )
+    session_parser.add_argument(
+        "--pack",
+        default="",
+        help="Run the Session from an external content pack directory instead of the built-in bank "
+        "(0025). Lint it first with `coach pack lint <dir>`.",
+    )
     session_parser.add_argument("--target-role", default="machine learning engineer")
     session_parser.add_argument(
         "--company",
@@ -626,6 +692,20 @@ def main(argv: list[str] | None = None) -> int:
 
     harness_parser = sub.add_parser("eval-harness", help="Slice 0012: run Evaluator golden-answer checks")
     harness_parser.set_defaults(func=_cmd_eval_harness, requires_llm=True)
+
+    bench_parser = sub.add_parser("bench", help="Issue 0022: bilingual Judge calibration bench")
+    bench_parser.add_argument("--cases", default="", help="Path to a cases YAML (default: data/bench/cases.yaml).")
+    bench_parser.add_argument(
+        "--out", default="", help="Report output path (default: docs/audits/calibration-bench-<date>.md)."
+    )
+    bench_parser.set_defaults(func=_cmd_bench, requires_llm=True)
+
+    pack_parser = sub.add_parser("pack", help="Issue 0025: manage external content packs")
+    pack_parser.set_defaults(func=_cmd_pack, requires_llm=False)
+    pack_sub = pack_parser.add_subparsers(dest="pack_command")
+    lint_parser = pack_sub.add_parser("lint", help="Validate a pack directory (fail-loud, non-zero on violation)")
+    lint_parser.add_argument("pack_dir", help="Path to the pack directory to validate.")
+    lint_parser.set_defaults(func=_cmd_pack_lint, requires_llm=False)
 
     ingest_parser = sub.add_parser("ingest-concepts", help="Slice 0007: seed the Chroma concepts collection")
     ingest_parser.add_argument("--persist-dir", default=".chroma", help="Chroma persistence directory.")

@@ -1,0 +1,321 @@
+# FPT-style question bank (issue 0025). Top-level mapping: canonical Skill -> ordered questions.
+# Each question carries difficulty (1–5), rubric.weights, scripted answers, expected_concepts, and
+# follow_up_seeds — same schema and fail-loud validation as the built-in bank. HITL: AI-authored draft.
+
+ml_fundamentals:
+  - question: >-
+      In your own words, what is overfitting, and how would you tell from the training and validation
+      numbers that a model is overfitting?
+    difficulty: 2
+    rubric:
+      weights: {correctness: 0.4, depth: 0.25, communication: 0.25, system_thinking: 0.1, mlops_awareness: 0.0}
+    answers:
+      - >-
+        Overfitting is when the model memorises the training data instead of learning the pattern, so
+        it does great on training but poorly on new data. I would see it as a low training error with a
+        much higher validation error — a wide gap between the two.
+    expected_concepts: [fpt_ml_overfitting_basics]
+    follow_up_seeds:
+      - Ask for one concrete fix and why it reduces the gap.
+
+  - question: >-
+      A client's defect-detection dataset is 99% good parts and 1% defects. Why is accuracy a bad
+      metric here, and what would you report instead?
+    difficulty: 4
+    rubric:
+      weights: {correctness: 0.4, depth: 0.3, communication: 0.2, system_thinking: 0.1, mlops_awareness: 0.0}
+    answers:
+      - >-
+        A model that predicts 'good' every time is 99% accurate but catches zero defects, so accuracy
+        hides total failure on the class we care about. I would report recall on the defect class
+        (are we catching defects), precision (how many flagged parts are real), and F1 or PR-AUC to
+        summarise the trade-off, then pick the threshold from the cost of a missed defect.
+    expected_concepts: [fpt_ml_evaluation_metrics]
+    follow_up_seeds:
+      - Ask whether they would optimise precision or recall for defect detection and why.
+
+  - question: >-
+      How would you split a dataset for training and evaluation, and what mistakes leak information from
+      the test set?
+    difficulty: 3
+    rubric:
+      weights: {correctness: 0.4, depth: 0.3, communication: 0.2, system_thinking: 0.1, mlops_awareness: 0.0}
+    answers:
+      - >-
+        I split into train, validation, and test, tuning on validation and touching test only once at
+        the end. Leakage happens if I fit scaling or feature selection on the whole dataset before
+        splitting, if duplicates cross the split, or with time series if I shuffle instead of splitting
+        by time.
+    expected_concepts: [fpt_ml_overfitting_basics]
+    follow_up_seeds:
+      - Ask for a concrete preprocessing step that leaks if fit before the split.
+
+  - question: >-
+      What is regularisation, and give one example of how it helps a model generalise better.
+    difficulty: 3
+    rubric:
+      weights: {correctness: 0.4, depth: 0.3, communication: 0.2, system_thinking: 0.1, mlops_awareness: 0.0}
+    answers:
+      - >-
+        Regularisation adds a penalty that discourages the model from becoming too complex, so it fits
+        the signal rather than the noise. L2 penalises large weights, shrinking them toward zero, which
+        smooths the function and lowers variance; I tune its strength with cross-validation.
+    expected_concepts: [fpt_ml_overfitting_basics]
+    follow_up_seeds:
+      - Ask how they would pick the regularisation strength.
+
+deep_learning:
+  - question: >-
+      Name two techniques to stop a neural network from overfitting, and explain how one of them works.
+    difficulty: 2
+    rubric:
+      weights: {correctness: 0.4, depth: 0.25, communication: 0.25, system_thinking: 0.1, mlops_awareness: 0.0}
+    answers:
+      - >-
+        Dropout and early stopping. Dropout randomly turns off a fraction of neurons each training step,
+        so the network cannot depend on any single unit and learns more robust, redundant features;
+        at inference all units are on but scaled.
+    expected_concepts: [fpt_dl_overfitting_control]
+    follow_up_seeds:
+      - Ask what happens to dropout at inference time.
+
+  - question: >-
+      You have only 2,000 labelled images for a classification task. Why would you use transfer
+      learning, and how would you set it up?
+    difficulty: 4
+    rubric:
+      weights: {correctness: 0.35, depth: 0.3, communication: 0.2, system_thinking: 0.15, mlops_awareness: 0.0}
+    answers:
+      - >-
+        With so little data, training from scratch overfits, so I take a model pre-trained on ImageNet
+        and reuse its learned features. I freeze the backbone, replace and train a new classification
+        head on my 2,000 images, then optionally unfreeze the top layers and fine-tune with a small
+        learning rate. Augmentation helps stretch the small set.
+    expected_concepts: [fpt_dl_transfer_learning]
+    follow_up_seeds:
+      - Ask which layers they freeze first and why.
+
+  - question: >-
+      What does a learning rate control, and what happens if it is too high or too low?
+    difficulty: 3
+    rubric:
+      weights: {correctness: 0.4, depth: 0.25, communication: 0.25, system_thinking: 0.1, mlops_awareness: 0.0}
+    answers:
+      - >-
+        The learning rate sets how big a step the optimiser takes on each update. Too high and training
+        overshoots and diverges or oscillates; too low and it crawls, taking forever or getting stuck.
+        I usually try a schedule that starts higher and decays.
+    expected_concepts: [fpt_dl_overfitting_control]
+    follow_up_seeds:
+      - Ask how they would find a good starting learning rate.
+
+  - question: >-
+      Explain the difference between a training set, a validation set, and how the loss curve on each
+      guides when to stop training.
+    difficulty: 5
+    rubric:
+      weights: {correctness: 0.35, depth: 0.35, communication: 0.2, system_thinking: 0.1, mlops_awareness: 0.0}
+    answers:
+      - >-
+        Training loss measures fit on the data the network updates on; validation loss measures fit on
+        held-out data it does not train on. Early in training both fall; when validation loss flattens
+        and starts rising while training loss keeps dropping, the network is beginning to overfit, so I
+        stop at the validation minimum — that is early stopping.
+    expected_concepts: [fpt_dl_overfitting_control]
+    follow_up_seeds:
+      - Ask what the diverging curves say about model capacity.
+
+mlops:
+  - question: >-
+      What does it mean for a training pipeline to be reproducible, and why do FPT-style teams insist on
+      it?
+    difficulty: 3
+    rubric:
+      weights: {correctness: 0.35, depth: 0.25, communication: 0.2, system_thinking: 0.1, mlops_awareness: 0.1}
+    answers:
+      - >-
+        Reproducible means anyone can rebuild the same model from the same inputs: pinned data version,
+        pinned code, fixed seeds, and logged hyper-parameters. Teams insist on it because a client model
+        must be auditable and rebuildable months later, and because it is the only way to tell whether a
+        change actually improved things.
+    expected_concepts: [fpt_mlops_pipeline_reproducibility]
+    follow_up_seeds:
+      - Ask what specifically they would version to reproduce a run.
+
+  - question: >-
+      A model works in your notebook but gives worse results in production. What are the likely causes
+      and how do you investigate?
+    difficulty: 5
+    rubric:
+      weights: {correctness: 0.3, depth: 0.3, communication: 0.15, system_thinking: 0.15, mlops_awareness: 0.1}
+    answers:
+      - >-
+        The usual cause is training-serving skew: the preprocessing or feature values differ between
+        notebook and production, or the input distribution has drifted. I would log the exact features
+        served, replay them offline, and compare against training; I would also check versions of data,
+        code, and dependencies, and confirm the same preprocessing runs in both places.
+    expected_concepts: [fpt_mlops_deployment_monitoring, fpt_mlops_pipeline_reproducibility]
+    follow_up_seeds:
+      - Ask for the single most likely source of train/prod divergence.
+
+  - question: >-
+      Once a model is deployed, what would you monitor to know it is still healthy?
+    difficulty: 3
+    rubric:
+      weights: {correctness: 0.3, depth: 0.25, communication: 0.2, system_thinking: 0.15, mlops_awareness: 0.1}
+    answers:
+      - >-
+        I watch input drift (are incoming features shifting from training), the prediction distribution,
+        latency and error rate, and — once true labels arrive — live accuracy versus the offline
+        baseline. I alert when any of these crosses a threshold so we can retrain or roll back.
+    expected_concepts: [fpt_mlops_deployment_monitoring]
+    follow_up_seeds:
+      - Ask what distinguishes a drift alert from an actual accuracy drop.
+
+  - question: >-
+      How would you roll out a new model version so that a bad model does not hurt all users at once?
+    difficulty: 4
+    rubric:
+      weights: {correctness: 0.3, depth: 0.3, communication: 0.15, system_thinking: 0.15, mlops_awareness: 0.1}
+    answers:
+      - >-
+        I would shadow the new model first (run it without serving its output), then canary it on a
+        small slice of traffic behind a feature flag, compare guardrail metrics against the current
+        model, and ramp up only if they hold. If a guardrail regresses I flip the flag back to the old
+        version, which I keep warm.
+    expected_concepts: [fpt_mlops_deployment_monitoring]
+    follow_up_seeds:
+      - Ask what metric would trigger an automatic rollback.
+
+system_design:
+  - question: >-
+      Design a simple REST API that serves predictions from a trained model. What are the main
+      components?
+    difficulty: 3
+    rubric:
+      weights: {correctness: 0.35, depth: 0.25, communication: 0.2, system_thinking: 0.15, mlops_awareness: 0.05}
+    answers:
+      - >-
+        A request handler validates and parses the input, a preprocessing step applies exactly the same
+        transforms as training, the model (kept warm in memory) runs inference, and the response is a
+        typed JSON with the prediction plus error handling and a timeout. I would add a health-check
+        endpoint and load the model once at startup, not per request.
+    expected_concepts: [fpt_sysdesign_api_design]
+    follow_up_seeds:
+      - Ask why preprocessing must match training exactly.
+
+  - question: >-
+      You need to build a training table from a warehouse. Write, in words, the SQL you would use and
+      explain how you avoid using future information.
+    difficulty: 4
+    rubric:
+      weights: {correctness: 0.35, depth: 0.3, communication: 0.2, system_thinking: 0.1, mlops_awareness: 0.05}
+    answers:
+      - >-
+        I would JOIN the entity table to the events table, GROUP BY the entity, and aggregate features
+        like counts and averages over a window ending at the prediction time. To avoid leakage I make
+        the aggregation point-in-time correct — only rows with a timestamp before the label's time are
+        included — so I never use information that would not exist at prediction time.
+    expected_concepts: [fpt_sysdesign_sql_data_access]
+    follow_up_seeds:
+      - Ask what point-in-time correctness means and why it matters.
+
+  - question: >-
+      What is the difference between a WHERE clause and a HAVING clause in SQL, and when would a feature
+      query need each?
+    difficulty: 2
+    rubric:
+      weights: {correctness: 0.45, depth: 0.25, communication: 0.2, system_thinking: 0.1, mlops_awareness: 0.0}
+    answers:
+      - >-
+        WHERE filters individual rows before grouping; HAVING filters groups after a GROUP BY
+        aggregation. For a feature query I use WHERE to keep only the relevant events (say, last 90
+        days), then GROUP BY the user, then HAVING to keep only users with, for example, more than five
+        events.
+    expected_concepts: [fpt_sysdesign_sql_data_access]
+    follow_up_seeds:
+      - Ask for a feature that needs HAVING specifically.
+
+  - question: >-
+      Your prediction API is getting more requests than it can handle. How do you keep it from falling
+      over?
+    difficulty: 5
+    rubric:
+      weights: {correctness: 0.3, depth: 0.25, communication: 0.15, system_thinking: 0.25, mlops_awareness: 0.05}
+    answers:
+      - >-
+        I put backpressure in front of the model: a bounded queue, admission control, and load shedding
+        so excess requests are rejected fast rather than piling up. I add a timeout with a cheaper
+        fallback (a cached or simpler response) past a deadline, batch requests where possible, and
+        scale horizontally behind a load balancer. The goal is to degrade predictably instead of
+        collapsing.
+    expected_concepts: [fpt_sysdesign_api_design]
+    follow_up_seeds:
+      - Ask what they shed first under sustained overload.
+
+vietnamese_nlp:
+  - question: >-
+      Please introduce yourself in English: your background, your strongest technical skills, and why
+      you want to work at an outsourcing company like FPT.
+    difficulty: 2
+    rubric:
+      weights: {correctness: 0.2, depth: 0.15, communication: 0.55, system_thinking: 0.1, mlops_awareness: 0.0}
+    answers:
+      - >-
+        My name is Minh. I recently graduated with a degree in artificial intelligence, where I focused
+        on machine learning and Vietnamese NLP. My strongest skills are Python, PyTorch, and building
+        end-to-end models from data cleaning to a simple serving API. I want to work at FPT because I
+        would learn from real client projects, improve my English in a professional setting, and grow
+        toward a machine learning engineer role.
+    expected_concepts: [fpt_vnlp_english_communication]
+    follow_up_seeds:
+      - Ask a simple follow-up about a project to keep them speaking English.
+
+  - question: >-
+      Why is word segmentation important for Vietnamese NLP, and how is Vietnamese different from
+      English here?
+    difficulty: 3
+    rubric:
+      weights: {correctness: 0.35, depth: 0.3, communication: 0.2, system_thinking: 0.15, mlops_awareness: 0.0}
+    answers:
+      - >-
+        In English, spaces already separate words, but Vietnamese puts spaces between syllables, so
+        'học máy' is two syllables that together mean one thing, machine learning. If I treat each
+        syllable as a word, I split concepts and named entities apart. Segmentation groups syllables
+        into words first, using a tool like VnCoreNLP, so downstream models see the right units.
+    expected_concepts: [fpt_vnlp_word_segmentation]
+    follow_up_seeds:
+      - Ask for a compound-word example that breaks if split by syllable.
+
+  - question: >-
+      Users type Vietnamese without diacritics, like 'toi di hoc'. Why is that a problem for an NLP
+      model and what would you do?
+    difficulty: 4
+    rubric:
+      weights: {correctness: 0.35, depth: 0.3, communication: 0.2, system_thinking: 0.15, mlops_awareness: 0.0}
+    answers:
+      - >-
+        Without diacritics one written form maps to several real words — 'ma' could be ma, má, mà, mã,
+        or mạ — so meaning collapses and downstream intent or entity models degrade. I would add a
+        diacritic-restoration step, a sequence model trained on accented text with synthetic
+        accent-stripping to make parallel data, before the main NLP model.
+    expected_concepts: [fpt_vnlp_word_segmentation]
+    follow_up_seeds:
+      - Ask how they would get training data for diacritic restoration.
+
+  - question: >-
+      For a Vietnamese text-classification task, would you use a Vietnamese-specific model like PhoBERT
+      or a multilingual model, and why?
+    difficulty: 5
+    rubric:
+      weights: {correctness: 0.4, depth: 0.3, communication: 0.2, system_thinking: 0.1, mlops_awareness: 0.0}
+    answers:
+      - >-
+        For a purely Vietnamese task I would start with PhoBERT because it is pre-trained on Vietnamese
+        and spends all its capacity on the language, so it usually beats a multilingual model on
+        Vietnamese NER, POS, and sentiment. It expects word-segmented input, so I run the same
+        segmentation at inference. I would only prefer a multilingual model if I needed cross-lingual
+        transfer.
+    expected_concepts: [fpt_vnlp_word_segmentation]
+    follow_up_seeds:
+      - Ask what preprocessing PhoBERT assumes on its input.

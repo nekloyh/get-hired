@@ -9,10 +9,10 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import AliasChoices, BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-type ProviderName = Literal["mimo", "groq"]
+type ProviderName = Literal["mimo", "groq", "openai"]
 
 
 class ProviderSettings(BaseModel):
@@ -39,25 +39,22 @@ class Settings(BaseSettings):
         populate_by_name=True,
     )
 
-    primary_provider: ProviderName = Field(
-        "mimo",
-        validation_alias=AliasChoices("PRIMARY_PROVIDER", "LLM_PRIMARY_PROVIDER", "LLM_PROVIDER"),
-    )
+    primary_provider: ProviderName = Field("mimo", validation_alias="PRIMARY_PROVIDER")
 
-    # MiMo keeps the old LLM_* aliases for backward compatibility with slice-0001/0005 .env files.
-    mimo_api_key: str = Field("", validation_alias=AliasChoices("MIMO_API_KEY", "LLM_API_KEY"))
-    mimo_base_url: str = Field("", validation_alias=AliasChoices("MIMO_BASE_URL", "LLM_BASE_URL"))
-    mimo_model: str = Field("", validation_alias=AliasChoices("MIMO_MODEL", "LLM_MODEL"))
+    mimo_api_key: str = Field("", validation_alias="MIMO_API_KEY")
+    mimo_base_url: str = Field("", validation_alias="MIMO_BASE_URL")
+    mimo_model: str = Field("", validation_alias="MIMO_MODEL")
 
-    groq_api_key: str = Field("", validation_alias=AliasChoices("GROQ_API_KEY", "LLM_GROQ_API_KEY"))
-    groq_base_url: str = Field(
-        "https://api.groq.com/openai/v1",
-        validation_alias=AliasChoices("GROQ_BASE_URL", "LLM_GROQ_BASE_URL"),
-    )
-    groq_model: str = Field("", validation_alias=AliasChoices("GROQ_MODEL", "LLM_GROQ_MODEL"))
+    groq_api_key: str = Field("", validation_alias="GROQ_API_KEY")
+    groq_base_url: str = Field("https://api.groq.com/openai/v1", validation_alias="GROQ_BASE_URL")
+    groq_model: str = Field("", validation_alias="GROQ_MODEL")
 
-    temperature: float = Field(0.2, validation_alias=AliasChoices("LLM_TEMPERATURE"))
-    timeout_seconds: float = Field(60.0, validation_alias=AliasChoices("LLM_TIMEOUT_SECONDS"))
+    openai_api_key: str = Field("", validation_alias="OPENAI_API_KEY")
+    openai_base_url: str = Field("https://api.openai.com/v1", validation_alias="OPENAI_BASE_URL")
+    openai_model: str = Field("", validation_alias="OPENAI_MODEL")
+
+    temperature: float = Field(0.2, validation_alias="LLM_TEMPERATURE")
+    timeout_seconds: float = Field(60.0, validation_alias="LLM_TIMEOUT_SECONDS")
 
     @field_validator("primary_provider", mode="before")
     @classmethod
@@ -68,25 +65,25 @@ class Settings(BaseSettings):
 
     @property
     def fallback_provider(self) -> ProviderName:
-        """The only other provider is the fallback for this MVP router."""
-        return "groq" if self.primary_provider == "mimo" else "mimo"
+        """The first other provider in preference order is the fallback for this MVP router."""
+        for candidate in ("groq", "mimo", "openai"):
+            if candidate != self.primary_provider:
+                return candidate
+        return "mimo"
 
     def provider_config(self, provider: ProviderName) -> ProviderSettings:
         """Return the normalized config for ``provider``."""
-        if provider == "mimo":
-            return ProviderSettings(
-                name="mimo",
-                api_key=self.mimo_api_key,
-                base_url=self.mimo_base_url,
-                model=self.mimo_model,
-                temperature=self.temperature,
-                timeout_seconds=self.timeout_seconds,
-            )
+        creds: dict[ProviderName, tuple[str, str, str]] = {
+            "mimo": (self.mimo_api_key, self.mimo_base_url, self.mimo_model),
+            "groq": (self.groq_api_key, self.groq_base_url, self.groq_model),
+            "openai": (self.openai_api_key, self.openai_base_url, self.openai_model),
+        }
+        api_key, base_url, model = creds[provider]
         return ProviderSettings(
-            name="groq",
-            api_key=self.groq_api_key,
-            base_url=self.groq_base_url,
-            model=self.groq_model,
+            name=provider,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
             temperature=self.temperature,
             timeout_seconds=self.timeout_seconds,
         )

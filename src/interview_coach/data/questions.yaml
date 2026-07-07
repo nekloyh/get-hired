@@ -6,6 +6,9 @@
 #
 # Each question carries:
 #   question:          the prompt put to the Candidate
+#   difficulty:        1–5 target level; the Topic Plan's target_difficulty picks the closest match
+#                      (optional, defaults to 3). Each Skill spreads its questions across levels so
+#                      an easy vs hard target lands on different prompts (issue 0025).
 #   rubric.weights:    per-dimension weights over the fixed 5 dimensions
 #                      (correctness, depth, communication, system_thinking, mlops_awareness).
 #                      Weight 0 disables a dimension so the Evaluator does not score it — e.g. a pure
@@ -36,6 +39,7 @@ ml_fundamentals:
       - >-
         Concretely: if I see train MSE 0.1 and validation MSE 0.9, that wide gap is high variance, so I
         add L2, gather more data, or reduce model capacity, and I confirm the gap narrows.
+    difficulty: 3
     expected_concepts: [ml_fundamentals_bias_variance]
     follow_up_seeds:
       - Push for a concrete numeric diagnosis from a train/validation error pair.
@@ -58,6 +62,7 @@ ml_fundamentals:
         I choose lambda with k-fold cross-validation over a log-spaced grid, picking the value where
         mean validation error is lowest; too large under-fits (bias rises), too small lets variance
         back in, so I look for the bottom of that validation curve.
+    difficulty: 2
     expected_concepts: [ml_fundamentals_l2_regularization]
     follow_up_seeds:
       - Probe the penalty-to-variance mechanism, not just "smaller weights".
@@ -76,6 +81,7 @@ ml_fundamentals:
         into training, so I use forward-chaining splits; with grouped or imbalanced data I use grouped
         or stratified folds; and any preprocessing fit on the whole set before splitting leaks
         information and inflates the score.
+    difficulty: 4
     expected_concepts: [ml_fundamentals_cv_leakage]
     follow_up_seeds:
       - Ask for a concrete leakage trap and the fold scheme that avoids it.
@@ -95,6 +101,7 @@ deep_learning:
         Concretely the skip path keeps the Jacobian close to identity, so gradients reach early layers
         without vanishing; but a wrong loss or leaked features still train a confidently wrong model —
         depth is no longer the bottleneck, the objective is.
+    difficulty: 3
     expected_concepts: [deep_learning_residual_connections]
     follow_up_seeds:
       - Ask for the gradient-flow mechanism in terms of the Jacobian.
@@ -112,6 +119,7 @@ deep_learning:
         With tiny or non-i.i.d. batches the batch statistics are noisy and train/inference skew
         appears, so I switch to group or layer norm; in RNNs and some fine-tuning regimes I freeze the
         running stats to stop them drifting away from the deployment distribution.
+    difficulty: 4
     expected_concepts: [deep_learning_batch_normalization]
     follow_up_seeds:
       - Probe the train/inference statistics mismatch and when it bites.
@@ -131,6 +139,7 @@ deep_learning:
         He/Xavier initialization keeps activation variance roughly constant across depth; normalization
         rescales activations; and clipping bounds the update norm so a rare huge gradient does not
         destabilize the run.
+    difficulty: 2
     expected_concepts: [deep_learning_residual_connections]
     follow_up_seeds:
       - Ask which single technique they would reach for first and why.
@@ -153,6 +162,7 @@ mlops:
         retraining on a measured drop in the delayed ground-truth metric versus its baseline, because
         covariate drift without an accuracy hit usually does not justify the retraining and
         redeployment risk.
+    difficulty: 3
     expected_concepts: [mlops_drift_monitoring]
     follow_up_seeds:
       - Ask what specifically gates retraining beyond a drift alert firing.
@@ -171,6 +181,7 @@ mlops:
         The rollback trigger is a guardrail metric (latency p99, error rate, and the business KPI proxy)
         breaching a preset threshold versus the control arm; I keep the previous version warm so the
         flag flips back instantly, and I log the canary verdict for the post-mortem.
+    difficulty: 2
     expected_concepts: [mlops_model_rollout]
     follow_up_seeds:
       - Ask for the exact metric and threshold that triggers an automatic rollback.
@@ -189,6 +200,7 @@ mlops:
         Concretely: version the dataset and feature definitions, log the features actually served and
         replay them offline to catch skew, and run a pre-promotion evaluation on a frozen holdout in CI
         so a regression is caught before traffic ever sees it.
+    difficulty: 4
     expected_concepts: [mlops_drift_monitoring, mlops_model_rollout]
     follow_up_seeds:
       - Probe the single most likely cause of train/prod divergence and the check for it.
@@ -210,6 +222,7 @@ system_design:
         and logging served feature values for point-in-time-correct training; freshness I bound with a
         TTL plus a staleness metric so a lagging stream surfaces as an alert rather than silently
         degrading ranking quality.
+    difficulty: 4
     expected_concepts: [system_design_feature_store]
     follow_up_seeds:
       - Ask how they guarantee point-in-time-correct features for training.
@@ -229,6 +242,7 @@ system_design:
         that falls back to a cheaper popularity ranker; the failure mode under load is a cold-cache
         stampede, so I add request coalescing and stale-while-revalidate rather than letting every miss
         hit the model.
+    difficulty: 3
     expected_concepts: [system_design_serving_latency]
     follow_up_seeds:
       - Ask what specifically breaks the p99 under a cold cache and how they prevent it.
@@ -248,6 +262,7 @@ system_design:
         degraded-but-fast response (cached or a lighter model) past a deadline, and use retry budgets
         so clients do not amplify the overload — the system sheds load predictably rather than
         collapsing.
+    difficulty: 2
     expected_concepts: [system_design_backpressure]
     follow_up_seeds:
       - Ask what they shed first and how they avoid a retry storm.
@@ -269,6 +284,7 @@ vietnamese_nlp:
         the entity; subword transformers learn the merge from data, yet a tokenizer trained mostly on
         English fragments Vietnamese badly, so in-domain subword vocab and diacritic-correct input still
         carry the result.
+    difficulty: 3
     expected_concepts: [vietnamese_nlp_word_segmentation, vietnamese_nlp_vncorenlp]
     follow_up_seeds:
       - Ask for a compound-word example where syllable splitting breaks an entity.
@@ -288,6 +304,7 @@ vietnamese_nlp:
         synthetic accent-stripping for parallel data; it matters because 'ma' maps to several words
         (ma, má, mà, mã, mạ), so skipping restoration pushes that ambiguity into every downstream
         classifier and degrades NER and intent detection.
+    difficulty: 2
     expected_concepts: [vietnamese_nlp_diacritic_restoration]
     follow_up_seeds:
       - Ask how they build parallel data for the restoration model.
@@ -307,6 +324,7 @@ vietnamese_nlp:
         same segmentation at inference to avoid train/serve mismatch; its in-domain vocabulary and
         monolingual data usually beat mBERT/XLM-R on Vietnamese NER, POS, and sentiment, though a
         multilingual model can still win when I need cross-lingual transfer.
+    difficulty: 4
     expected_concepts: [vietnamese_nlp_phobert]
     follow_up_seeds:
       - Ask why segmenting the input before PhoBERT matters.

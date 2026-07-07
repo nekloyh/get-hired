@@ -14,7 +14,10 @@ functions; this module imports nothing from the package at top level.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
 from importlib import resources
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import yaml
@@ -26,9 +29,22 @@ if TYPE_CHECKING:
 _DATA_PACKAGE = "interview_coach"
 _DATA_DIR = "data"
 
+# A YAML reader: filename -> parsed data. The built-in bank reads packaged resources; a pack reads a
+# filesystem directory. The loaders below are written against this so the validation is shared (0008).
+YamlReader = Callable[[str], Any]
+
 
 class BankError(ValueError):
     """A question/concept bank YAML file is malformed or internally inconsistent."""
+
+
+@dataclass(frozen=True)
+class Pack:
+    """A validated external content pack: questions + concept notes + metadata (ADR 0008)."""
+
+    concepts: tuple[ConceptNote, ...]
+    questions: dict[str, tuple[SeedQuestion, ...]]
+    metadata: dict[str, Any]
 
 
 def _read_yaml(filename: str) -> Any:
@@ -37,6 +53,21 @@ def _read_yaml(filename: str) -> Any:
         return yaml.safe_load(text)
     except yaml.YAMLError as err:  # pragma: no cover - exercised via malformed-file tests
         raise BankError(f"{filename} is not valid YAML: {err}") from err
+
+
+def _dir_reader(pack_dir: Path) -> YamlReader:
+    def read(filename: str) -> Any:
+        path = pack_dir / filename
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as err:
+            raise BankError(f"pack file {path} is unreadable: {err}") from err
+        try:
+            return yaml.safe_load(text)
+        except yaml.YAMLError as err:
+            raise BankError(f"{path} is not valid YAML: {err}") from err
+
+    return read
 
 
 def _require_str(value: Any, *, where: str, field: str) -> str:
@@ -54,11 +85,15 @@ def _str_tuple(value: Any, *, where: str, field: str) -> tuple[str, ...]:
 
 
 def load_concepts() -> tuple[ConceptNote, ...]:
-    """Parse ``data/concepts.yaml`` into validated :class:`ConceptNote` objects."""
+    """Parse the built-in ``data/concepts.yaml`` into validated :class:`ConceptNote` objects."""
+    return _load_concepts(_read_yaml)
+
+
+def _load_concepts(read: YamlReader) -> tuple[ConceptNote, ...]:
     from .concepts import ConceptNote
     from .diagnostic import SKILLS
 
-    data = _read_yaml("concepts.yaml")
+    data = read("concepts.yaml")
     if not isinstance(data, list):
         raise BankError("concepts.yaml must be a top-level list of concept notes")
 
@@ -96,13 +131,16 @@ def load_concepts() -> tuple[ConceptNote, ...]:
 
 
 def load_questions() -> dict[str, tuple[SeedQuestion, ...]]:
-    """Parse ``data/questions.yaml`` into validated :class:`SeedQuestion` objects, keyed by Skill."""
+    """Parse the built-in ``data/questions.yaml`` into validated :class:`SeedQuestion` objects."""
+    return _load_questions(_read_yaml, {note.id for note in load_concepts()})
+
+
+def _load_questions(read: YamlReader, concept_ids: set[str]) -> dict[str, tuple[SeedQuestion, ...]]:
     from .diagnostic import SKILLS
     from .rubric import Rubric
-    from .seeds import SeedQuestion
+    from .seeds import DEFAULT_DIFFICULTY, SeedQuestion
 
-    concept_ids = {note.id for note in load_concepts()}
-    data = _read_yaml("questions.yaml")
+    data = read("questions.yaml")
     if not isinstance(data, dict):
         raise BankError("questions.yaml must be a top-level mapping of Skill -> list of questions")
 
@@ -144,6 +182,10 @@ def load_questions() -> dict[str, tuple[SeedQuestion, ...]]:
             if dangling:
                 raise BankError(f"{where}: expected_concepts reference unknown concept id(s): {dangling}")
 
+            difficulty = raw.get("difficulty", DEFAULT_DIFFICULTY)
+            if isinstance(difficulty, bool) or not isinstance(difficulty, int) or not 1 <= difficulty <= 5:
+                raise BankError(f"{where}: 'difficulty' must be an integer on the 1–5 scale, got {difficulty!r}")
+
             try:
                 questions.append(
                     SeedQuestion(
@@ -151,6 +193,7 @@ def load_questions() -> dict[str, tuple[SeedQuestion, ...]]:
                         question=prompt,
                         rubric=rubric,
                         answers=tuple(answers),
+                        difficulty=difficulty,
                         expected_concepts=expected_concepts,
                         follow_up_seeds=_str_tuple(
                             raw.get("follow_up_seeds"), where=where, field="follow_up_seeds"
@@ -165,3 +208,31 @@ def load_questions() -> dict[str, tuple[SeedQuestion, ...]]:
     if missing:
         raise BankError(f"questions.yaml has no question for Skill(s): {missing}")
     return bank
+
+
+def load_pack(pack_dir: str | Path) -> Pack:
+    """Load + validate an external content pack directory (ADR 0008).
+
+    A pack is a directory holding ``questions.yaml`` + ``concepts.yaml`` (same schema and fail-loud
+    cross-referential validation as the built-in bank) plus a ``pack.yaml`` metadata file. Raises
+    :class:`BankError` with a named violation on anything malformed — the contract dies at lint time,
+    never mid-interview.
+    """
+    root = Path(pack_dir)
+    if not root.is_dir():
+        raise BankError(f"pack directory {root} does not exist or is not a directory")
+    read = _dir_reader(root)
+    concepts = _load_concepts(read)
+    questions = _load_questions(read, {note.id for note in concepts})
+    metadata = _load_pack_metadata(root)
+    return Pack(concepts=concepts, questions=questions, metadata=metadata)
+
+
+def _load_pack_metadata(pack_dir: Path) -> dict[str, Any]:
+    data = _dir_reader(pack_dir)("pack.yaml")
+    if not isinstance(data, dict):
+        raise BankError("pack.yaml must be a top-level mapping of pack metadata")
+    name = data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise BankError("pack.yaml: 'name' must be a non-empty string")
+    return data

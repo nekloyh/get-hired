@@ -26,20 +26,52 @@ or provider.
 
 ## Acceptance criteria
 
-- [ ] ≥20 golden cases with EN + VN paired answers, human labels on the 5-dim rubric, and
+- [x] ≥20 golden cases with EN + VN paired answers, human labels on the 5-dim rubric, and
       per-band anchors for ≥2 dimensions
-- [ ] `coach bench` runs live, writes the calibration report to `docs/audits/`, and exits
+- [x] `coach bench` runs live, writes the calibration report to `docs/audits/`, and exits
       non-zero on regression vs recorded ranges
-- [ ] Report covers per-dimension bias, weak/strong separation, EN/VN paired deltas, and
+- [x] Report covers per-dimension bias, weak/strong separation, EN/VN paired deltas, and
       confidence calibration
-- [ ] The prompt-injection adversarial case is retained and gets a VN twin
-- [ ] README documents the bench as the pre-merge gate for judge changes (ADR 0009)
+- [x] The prompt-injection adversarial case is retained and gets a VN twin
+- [x] README documents the bench as the pre-merge gate for judge changes (ADR 0009)
 
 ## Blocked by
 
 - 0015 (a working live provider is the whole point)
 - ADR 0009 (the gate policy this implements)
 
+## Done
+
+- `data/bench/cases.yaml`: 20 hand-labelled cases (10 EN/VN pairs) across five Skills, each with
+  per-dimension human labels and a weighted-score band, plus BARS per-band anchors for two dimensions
+  (`system_thinking`, `correctness`). The prompt-injection case is retained with a VN twin.
+- `bench.py`: `load_bench_data`, `run_bench`, and pure metric functions — `dimension_bias`,
+  `weak_strong_separation`, `language_deltas`, `confidence_calibration` — plus `render_bench_report`
+  (full Markdown) and `bench_passed` (the regression gate).
+- `coach bench [--cases --out]`: runs live against the configured provider, writes the report to
+  `docs/audits/calibration-bench-<date>.md`, and exits non-zero on any range regression.
+- README documents the bench as the pre-merge gate for every judge change (ADR 0009).
+- An OpenAI provider was wired (`config.py` / `llm.py`: `ProviderName` gained `openai`,
+  `OpenAIClient`) so the bench can run on `gpt-4o-mini` without spending Groq's free-tier TPD.
+
+## Verified (live, 2026-07-07 on gpt-4o-mini)
+
+- `PRIMARY_PROVIDER=openai uv run coach bench` — first real run. **17/20 within band** (report:
+  `docs/audits/calibration-bench-2026-07-07.md`), so the gate exits non-zero, as designed. Real
+  findings the bench surfaced: gpt-4o-mini failed the Evaluator's verbatim-evidence schema on 3
+  strong cases (`StructuredOutputError` after retries — a genuine judge limitation, honestly recorded,
+  not swallowed); a per-dimension bias of `correctness +0.53` / `system_thinking −0.53`; and an EN/VN
+  paired delta up to 1.60 (the VN weak bias-variance answer scored harder than its EN twin).
+
+## Verified (offline)
+
+- `uv run pytest tests/test_bench.py -q` — 8 passed: dataset is bilingual/paired across ≥2 Skills with
+  anchors + the injection VN twin; `dimension_bias`/`weak_strong_separation`/`language_deltas`/
+  `confidence_calibration` compute correctly; the report has every section; and `run_bench` +
+  `bench_passed` gate a regression and mark provider errors out-of-band.
+- Rendered the full report over the real 20-case dataset (fake judge) — all sections populate.
+- `uv run pytest -q` — 207 passed, `ruff check` clean.
+
 ## Status
 
-**Open.**
+**Closed.** Acceptance criteria are implemented, offline-tested, and live-validated on gpt-4o-mini.

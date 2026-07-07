@@ -34,7 +34,7 @@ from .microloop import (
     run_micro_loop,
 )
 from .resources import ResourceStore
-from .seeds import SeedQuestion, seed_count, select_seed_question
+from .seeds import QUESTION_BANK, QuestionBank, SeedQuestion, rotation_offset, seed_count, select_seed_question
 from .skill import SkillState, confidence_weight
 from .study_planner import plan_study
 
@@ -184,18 +184,33 @@ def build_session_graph(
     resource_store: ResourceStore | None = None,
     candidate_factory: Callable[[SeedQuestion], Candidate] | None = None,
     max_turns_per_question: int | None = None,
+    question_bank: QuestionBank | None = None,
     now: Callable[[], float] = time.time,
 ):
-    """Compile the StateGraph that runs one persisted multi-question Session."""
+    """Compile the StateGraph that runs one persisted multi-question Session.
+
+    ``question_bank`` overrides the built-in reference bank with a loaded pack (ADR 0008 / 0025); it
+    drives both question selection and the Supervisor's seed-availability rails.
+    """
     if max_turns_per_question is not None and max_turns_per_question < 1:
         raise ValueError("max_turns_per_question must be >= 1")
+    bank = question_bank if question_bank is not None else QUESTION_BANK
 
     def question_node(state: SessionState) -> dict[str, Any]:
         if state.get("status") == SessionStatus.COMPLETE.value:
             return {}
         skill = _next_skill(state)
         attempts_for_skill = sum(1 for item in state.get("transcript", []) if item["skill"] == skill)
-        seed = select_seed_question(skill, attempts_for_skill)
+        # target_difficulty from the Topic Plan actually drives selection now, and a per-Session
+        # rotation varies the sequence for a returning Candidate (0025).
+        span = seed_count(skill, bank=bank)
+        seed = select_seed_question(
+            skill,
+            attempts_for_skill,
+            target_difficulty=_target_difficulty_for(state, skill),
+            rotation=rotation_offset(state.get("session_id", ""), span),
+            bank=bank,
+        )
         candidate = candidate_factory(seed) if candidate_factory is not None else ScriptedCandidate(seed.answers)
         max_turns = (
             max_turns_per_question
@@ -254,7 +269,7 @@ def build_session_graph(
         }
 
     def supervisor_node(state: SessionState) -> dict[str, Any]:
-        decision = decide_next_move(client, state, now=now)
+        decision = decide_next_move(client, state, now=now, question_bank=bank)
         return _apply_supervisor_decision(state, decision, now=now)
 
     def study_plan_node(state: SessionState) -> dict[str, Any]:
@@ -290,8 +305,10 @@ def decide_next_move(
     state: SessionState,
     *,
     now: Callable[[], float] = time.time,
+    question_bank: QuestionBank | None = None,
 ) -> SupervisorDecision:
     """Run hard rails first, then ask the Supervisor's single LLM deviation question."""
+    bank = question_bank if question_bank is not None else QUESTION_BANK
     if state.get("question_count", 0) >= state.get("max_questions", DEFAULT_MAX_QUESTIONS):
         return SupervisorDecision(
             action=SupervisorAction.END_EARLY,
@@ -314,8 +331,8 @@ def decide_next_move(
 
     # Build the prompt/validators outside the guarded call so a bug in those pure helpers surfaces
     # loudly instead of being silently swallowed by the transport backstop below.
-    messages = _build_supervisor_messages(state)
-    validators = _make_supervisor_validators(state)
+    messages = _build_supervisor_messages(state, bank)
+    validators = _make_supervisor_validators(state, bank)
     try:
         return client.chat_json(messages, SupervisorDecision, validators=validators, max_retries=1)
     except StructuredOutputError as err:
@@ -434,8 +451,9 @@ def _deterministic_supervisor_fallback(
     )
 
 
-def _build_supervisor_messages(state: SessionState) -> list[Message]:
+def _build_supervisor_messages(state: SessionState, bank: QuestionBank | None = None) -> list[Message]:
     evidence = _evidence_summary(state)
+    seed_availability = _seed_availability_summary(state, bank)
     plan_lines = "\n".join(
         f"{i}. {item['skill']} difficulty={item['target_difficulty']} rationale={item['rationale']}"
         for i, item in enumerate(state.get("topic_plan", []))
@@ -448,7 +466,7 @@ def _build_supervisor_messages(state: SessionState) -> list[Message]:
         f"TOPIC PLAN:\n{plan_lines or '- empty'}\n\n"
         f"SKILL STATES:\n{_skill_state_summary(state)}\n\n"
         f"RESOLVED QUESTION EVIDENCE:\n{evidence}\n\n"
-        f"SEED AVAILABILITY (a Skill with 0 left cannot be probed again):\n{_seed_availability_summary(state)}\n\n"
+        f"SEED AVAILABILITY (a Skill with 0 left cannot be probed again):\n{seed_availability}\n\n"
         f"NEXT ACTION SEMANTICS:\n{_next_action_semantics(state)}\n\n"
         "Choose the next Macro-loop move. Prefer advance_plan unless the evidence justifies a "
         "deviation. A consistently strong Candidate may end early; weak or uncertain evidence may "
@@ -461,12 +479,12 @@ def _build_supervisor_messages(state: SessionState) -> list[Message]:
     ]
 
 
-def _make_supervisor_validators(state: SessionState) -> list[Validator]:
+def _make_supervisor_validators(state: SessionState, bank: QuestionBank | None = None) -> list[Validator]:
     skills = set(SKILLS)
     plan_len = len(state.get("topic_plan", []))
     attempts = _attempts_by_skill(state)
     last_skill = state.get("transcript", [{}])[-1].get("skill") if state.get("transcript") else None
-    extra_probe_required = _extra_probe_required(state, attempts)
+    extra_probe_required = _extra_probe_required(state, attempts, bank)
     expected_advance_skill = _advance_plan_target_skill(state)
 
     def validate(decision: SupervisorDecision) -> None:
@@ -498,13 +516,15 @@ def _make_supervisor_validators(state: SessionState) -> list[Validator]:
             )
         # Seed gate: a deviation that probes a Skill with no unused seed would only re-ask an
         # identical question, so it is rejected — the model must advance, switch elsewhere, or end.
-        if decision.action is SupervisorAction.EXTRA_QUESTION and not _has_unused_seed(last_skill, attempts):
+        if decision.action is SupervisorAction.EXTRA_QUESTION and not _has_unused_seed(last_skill, attempts, bank):
             raise ValueError(
                 f"extra_question is not available for {last_skill!r}: all "
-                f"{seed_count(last_skill) if last_skill else 0} seed(s) are used. Choose advance_plan, "
+                f"{seed_count(last_skill, bank=bank) if last_skill else 0} seed(s) are used. Choose advance_plan, "
                 "switch_skill to a Skill with an unused seed, or end_early."
             )
-        if decision.action is SupervisorAction.SWITCH_SKILL and not _has_unused_seed(decision.target_skill, attempts):
+        if decision.action is SupervisorAction.SWITCH_SKILL and not _has_unused_seed(
+            decision.target_skill, attempts, bank
+        ):
             raise ValueError(
                 f"switch_skill target {decision.target_skill!r} has no unused seed; pick a Skill that "
                 "still has an unused seed or choose advance_plan / end_early."
@@ -513,7 +533,9 @@ def _make_supervisor_validators(state: SessionState) -> list[Validator]:
     return [validate]
 
 
-def _extra_probe_required(state: SessionState, attempts: Mapping[str, int]) -> bool:
+def _extra_probe_required(
+    state: SessionState, attempts: Mapping[str, int], bank: QuestionBank | None = None
+) -> bool:
     """Whether advancing would discard unresolved, below-bar evidence while another seed remains."""
     if not state.get("transcript"):
         return False
@@ -521,7 +543,7 @@ def _extra_probe_required(state: SessionState, attempts: Mapping[str, int]) -> b
     if last.get("stop_reason") != StopReason.SAFETY_CAP.value:
         return False
     skill = last.get("skill")
-    if not _has_unused_seed(skill, attempts):
+    if not _has_unused_seed(skill, attempts, bank):
         return False
     evidence_bar = float(state.get("skill_metadata", {}).get(skill, {}).get("evidence_bar", 0))
     return float(last.get("resolved_weighted_score", 0)) < evidence_bar
@@ -580,11 +602,20 @@ def _attempts_by_skill(state: SessionState) -> dict[str, int]:
     return counts
 
 
-def _has_unused_seed(skill: str | None, attempts: Mapping[str, int]) -> bool:
+def _has_unused_seed(skill: str | None, attempts: Mapping[str, int], bank: QuestionBank | None = None) -> bool:
     """True when ``skill`` still has a seed question that has not been asked this Session."""
     if not skill:
         return False
-    return attempts.get(skill, 0) < seed_count(skill)
+    return attempts.get(skill, 0) < seed_count(skill, bank=bank)
+
+
+def _target_difficulty_for(state: SessionState, skill: str) -> int | None:
+    """The Topic Plan's target difficulty for a Skill, so it actually drives selection (0025)."""
+    for entry in state.get("topic_plan", []):
+        if entry.get("skill") == skill:
+            target = entry.get("target_difficulty")
+            return int(target) if target is not None else None
+    return None
 
 
 def _next_skill(state: SessionState) -> str:
@@ -692,12 +723,12 @@ def _evidence_summary(state: SessionState) -> str:
     return "\n".join(rows) or "- none"
 
 
-def _seed_availability_summary(state: SessionState) -> str:
+def _seed_availability_summary(state: SessionState, bank: QuestionBank | None = None) -> str:
     attempts = _attempts_by_skill(state)
     lines = []
     for skill in SKILLS:
         used = attempts.get(skill, 0)
-        total = seed_count(skill)
+        total = seed_count(skill, bank=bank)
         lines.append(f"- {skill}: probed {used}/{total} seeds ({max(0, total - used)} left)")
     return "\n".join(lines)
 
