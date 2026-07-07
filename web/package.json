@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "test": "vitest run",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "test:e2e:reconnect": "VITE_API_URL=http://127.0.0.1:8010 playwright test e2e/reconnect-flow.spec.ts --project=chromium"
   },
   "dependencies": {
     "lucide-react": "^0.561.0",
