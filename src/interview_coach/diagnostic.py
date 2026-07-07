@@ -210,6 +210,38 @@ def diagnose(
     return DiagnosticResult(topic_plan=plan, priors=priors, topic_plan_source=source)
 
 
+def diagnose_or_degrade(
+    profile: CandidateProfile,
+    client: LLMClient | None = None,
+    *,
+    ledger_priors: Mapping[str, float] | None = None,
+) -> DiagnosticResult:
+    """ADR 0005 backstop for the Diagnostic phase (issue 0030).
+
+    The Diagnostic runs *before* the LangGraph Session starts, so its LLM call has no node-level
+    transport backstop like ``question_node`` / ``study_plan_node`` / ``decide_next_move``. A
+    provider/transport failure here (timeout, rate limit, a 4xx after fallback exhaustion) — or a
+    schema-invalid plan after retry — must degrade to the deterministic Topic Plan instead of
+    crashing the run with a raw traceback. Runtime entry points (CLI/web) call this; benches and
+    tests that want the raw error keep calling :func:`diagnose` directly.
+
+    With ``client=None`` this is exactly :func:`diagnose` (the deterministic path never raises a
+    transport error, so there is nothing to degrade from). A genuine bug in the pure prep helpers
+    still surfaces loudly: it raises again on the deterministic retry, which is not caught.
+    """
+    try:
+        return diagnose(profile, client, ledger_priors=ledger_priors)
+    except Exception as err:  # noqa: BLE001 — pre-graph call site; degrade instead of crash (ADR 0005)
+        if client is None:
+            raise
+        logger.warning(
+            "Diagnostic LLM Topic Plan failed (%s: %s); degrading to the deterministic Topic Plan",
+            type(err).__name__,
+            err,
+        )
+        return diagnose(profile, None, ledger_priors=ledger_priors)
+
+
 def _diagnose_topic_plan(
     client: LLMClient,
     profile: CandidateProfile,

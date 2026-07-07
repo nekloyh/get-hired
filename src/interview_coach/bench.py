@@ -126,8 +126,13 @@ def run_bench(client: LLMClient, cases: Iterable[BenchCase]) -> list[BenchResult
 
 
 def bench_passed(results: Sequence[BenchResult]) -> bool:
-    """The regression gate: every case must land inside its recorded band."""
-    return all(result.within_band for result in results)
+    """The regression gate: at least one case ran, and every case lands inside its recorded band.
+
+    The non-empty guard matters because ``all([])`` is ``True``: without it a malformed or empty
+    ``cases.yaml`` (which yields zero results) would pass the gate vacuously and exit 0 green,
+    silently waving through the very judge change the bench is meant to block.
+    """
+    return bool(results) and all(result.within_band for result in results)
 
 
 # --- pure metrics over the results (offline-testable) -------------------------------------------

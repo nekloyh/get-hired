@@ -17,14 +17,28 @@ DIMENSIONS: tuple[str, ...] = (
     "mlops_awareness",
 )
 
-# Short 1↔5 anchors so the Evaluator scores against a shared scale rather than vibes.
+# Short 1↔5 anchors so the Evaluator scores against a shared scale rather than vibes. The
+# `correctness` and `system_thinking` anchors are spelled out at the 2/4 bands to mirror the BARS
+# exemplars the calibration bench (issue 0022) labels against — without them the judge inflated
+# correctness (+0.53) and under-credited system_thinking (−0.53), banking system-reasoning merit as
+# raw correctness. Keep these in sync with `data/bench/cases.yaml:anchors`.
 DIMENSION_GUIDE: dict[str, str] = {
-    "correctness": "Are the claims technically accurate? 1 = mostly wrong/misleading, 5 = precise.",
+    "correctness": (
+        "Are the claims technically accurate? 1 = mostly wrong/misleading; "
+        "2 = a real technical error or a vague half-right statement; "
+        "4 = accurate with the key mechanism stated correctly, even if not exhaustive; "
+        "5 = precise AND complete. Being merely correct is a 4, not a 5 — reserve 5 for no gaps."
+    ),
     "depth": "Beyond surface recall? 1 = shallow/keyword-level, 5 = mechanisms, trade-offs, edge cases.",
     "communication": "Clear and well-structured? 1 = rambling/confusing, 5 = crisp and well-scoped.",
     "system_thinking": (
-        "Reasons about the whole system & trade-offs? "
-        "1 = none, 5 = constraints, alternatives, consequences."
+        "Reasons about the whole system & trade-offs? Award 4 whenever the answer connects a "
+        "diagnosis to the trade-off it drives and a downstream consequence — credit this chain "
+        "generously even when stated briefly or implicitly; do not demand textbook phrasing. "
+        "5 = also weighs alternatives and constraints. Drop to 2 only when a fix is named in pure "
+        "isolation ('add data', 'use dropout') with no reasoning about why or what it costs; "
+        "1 = no systems reasoning at all. Err toward recognizing partial systems reasoning rather "
+        "than withholding credit."
     ),
     "mlops_awareness": (
         "Aware of production realities (serving, monitoring, drift, retraining)? "

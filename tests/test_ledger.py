@@ -124,6 +124,28 @@ def test_malformed_entry_degrades_to_cold_start(tmp_path):
     assert load_priors(path, "alice", now=0.0) is None
 
 
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity"])
+def test_non_finite_beta_params_degrade_to_cold_start_not_nan_priors(tmp_path, bad):
+    # json.loads accepts NaN/Infinity, and every comparison against NaN is False, so a naive
+    # `alpha <= 0` guard would let a non-finite param through into NaN seed priors — the exact
+    # outcome the module promises is impossible. It must degrade to cold start instead.
+    path = tmp_path / "ledger.json"
+    path.write_text(
+        f'{{"alice": {{"completed_at": 0.0, "skills": {{"mlops": {{"alpha": {bad}, "beta": 1.0}}}}}}}}',
+        encoding="utf-8",
+    )
+    assert load_priors(path, "alice", now=0.0) is None
+
+
+def test_non_finite_completed_at_degrades_to_cold_start(tmp_path):
+    path = tmp_path / "ledger.json"
+    path.write_text(
+        '{"alice": {"completed_at": NaN, "skills": {"mlops": {"alpha": 2.0, "beta": 1.0}}}}',
+        encoding="utf-8",
+    )
+    assert load_priors(path, "alice", now=0.0) is None
+
+
 # --- two-session invariant (ADR 0002 / 0006) ----------------------------------------------------
 
 

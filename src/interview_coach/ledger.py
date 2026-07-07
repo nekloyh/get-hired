@@ -88,6 +88,8 @@ def load_priors(path: str | Path, candidate_id: str, *, now: float) -> LedgerPri
         data = json.loads(raw)
         entry = data[candidate_id]
         completed_at = float(entry["completed_at"])
+        if not math.isfinite(completed_at):
+            raise ValueError("non-finite completed_at")
         skills = entry["skills"]
         raw_mastery: dict[str, float] = {}
         seed_means: dict[str, float] = {}
@@ -95,8 +97,11 @@ def load_priors(path: str | Path, candidate_id: str, *, now: float) -> LedgerPri
         for skill, params in skills.items():
             alpha = float(params["alpha"])
             beta = float(params["beta"])
-            if alpha <= 0 or beta <= 0:
-                raise ValueError(f"non-positive Beta params for {skill!r}")
+            # json.loads accepts NaN/Infinity, and every comparison against NaN is False, so the
+            # positivity check alone would let a non-finite param through into NaN seed priors —
+            # exactly the outcome this module promises is impossible. Reject non-finite explicitly.
+            if not (math.isfinite(alpha) and math.isfinite(beta)) or alpha <= 0 or beta <= 0:
+                raise ValueError(f"invalid Beta params for {skill!r} (must be finite and positive)")
             raw_mastery[skill] = alpha / (alpha + beta)
             d_alpha, d_beta = decay_beta(alpha, beta, days_elapsed)
             seed_means[skill] = d_alpha / (d_alpha + d_beta)

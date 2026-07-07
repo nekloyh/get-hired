@@ -26,7 +26,7 @@ from interview_coach.supervisor import build_session_graph, initial_session_stat
 
 @pytest.fixture
 def spy_diagnose(monkeypatch):
-    """Replace ``cli.diagnose`` with a spy that records the client it was handed."""
+    """Replace ``cli.diagnose_or_degrade`` with a spy that records the client it was handed."""
     captured: dict[str, object] = {}
 
     def _fake_diagnose(profile, client=None):
@@ -34,7 +34,7 @@ def spy_diagnose(monkeypatch):
         source = TopicPlanSource.LLM if client is not None else TopicPlanSource.DETERMINISTIC
         return DiagnosticResult(topic_plan=(), priors={}, topic_plan_source=source)
 
-    monkeypatch.setattr(cli, "diagnose", _fake_diagnose)
+    monkeypatch.setattr(cli, "diagnose_or_degrade", _fake_diagnose)
     return captured
 
 

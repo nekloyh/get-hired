@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field, ValidationError
 from .concepts import build_concept_store
 from .config import Settings, load_settings
 from .demo_llm import DemoLLMClient
-from .diagnostic import CandidateProfile, diagnose
+from .diagnostic import CandidateProfile, diagnose_or_degrade
 from .exporter import render_session_markdown
 from .ledger import load_priors, save_posteriors
 from .llm import LLMClient, build_client
@@ -336,7 +336,7 @@ def _run_session_thread(
                     claimed_skills=payload.claimed_skills,
                 )
                 carried = load_priors(api_state.ledger_db, payload.candidate_id, now=time.time())
-                diagnostic = diagnose(
+                diagnostic = diagnose_or_degrade(
                     profile,
                     client,
                     ledger_priors=carried.seed_means if carried else None,
