@@ -22,7 +22,7 @@ from .demo_llm import DemoLLMClient
 from .diagnostic import CandidateProfile, diagnose
 from .exporter import render_session_markdown
 from .llm import LLMClient, build_client
-from .microloop import CandidateInputUnavailable
+from .microloop import CandidateInputUnavailable, CandidateIntent
 from .resources import build_resource_store
 from .supervisor import (
     DEFAULT_MAX_ELAPSED_SECONDS,
@@ -64,6 +64,11 @@ class CancelSessionPayload(BaseModel):
 
 ClientPayload = StartSessionPayload | ResumeSessionPayload | CandidateAnswerPayload | CancelSessionPayload
 
+# ADR 0005: cancellation is a control signal, never data. A distinct sentinel object put on the
+# answers queue wakes a blocked read immediately and is unambiguous — a genuine empty-string answer
+# ("") now flows through as data, where before it was indistinguishable from a cancel.
+_CANCEL: Any = object()
+
 
 class QueueCandidate:
     """Candidate bridge: graph thread emits a question, then waits for browser input."""
@@ -71,7 +76,7 @@ class QueueCandidate:
     def __init__(
         self,
         emit: EventEmitter,
-        answers: queue.Queue[str],
+        answers: queue.Queue[Any],
         cancelled: threading.Event,
     ) -> None:
         self._emit = emit
@@ -80,12 +85,16 @@ class QueueCandidate:
 
     def answer(self, question: str) -> str:
         self._emit({"type": "question", "question": question})
-        while not self._cancelled.is_set():
+        while True:
+            if self._cancelled.is_set():
+                raise CandidateInputUnavailable("Session was cancelled while waiting for a Candidate answer.")
             try:
-                return self._answers.get(timeout=0.1)
+                item = self._answers.get(timeout=0.1)
             except queue.Empty:
                 continue
-        raise CandidateInputUnavailable("Session was cancelled while waiting for a Candidate answer.")
+            if item is _CANCEL:
+                raise CandidateInputUnavailable("Session was cancelled while waiting for a Candidate answer.")
+            return item
 
 
 @dataclass
@@ -94,7 +103,13 @@ class EventEmitter:
     outgoing: asyncio.Queue[dict[str, Any]]
 
     def __call__(self, event: dict[str, Any]) -> None:
-        self.loop.call_soon_threadsafe(self.outgoing.put_nowait, event)
+        try:
+            self.loop.call_soon_threadsafe(self.outgoing.put_nowait, event)
+        except RuntimeError:
+            # The socket's event loop is gone (client disconnected, server shutting down). A background
+            # graph thread unwinding a cancel/disconnect can reach here after teardown — the event has
+            # nowhere to go, so drop it rather than crashing the thread.
+            pass
 
 
 @dataclass
@@ -102,9 +117,16 @@ class RuntimeSession:
     session_id: str
     mode: str
     emit: EventEmitter
-    answers: queue.Queue[str] = field(default_factory=queue.Queue)
+    answers: queue.Queue[Any] = field(default_factory=queue.Queue)
     cancelled: threading.Event = field(default_factory=threading.Event)
     thread: threading.Thread | None = None
+
+    def reset_run_state(self) -> None:
+        # A single socket can run start -> cancel -> start again. Without a fresh queue and event the
+        # second run inherits a permanently-set cancelled flag (aborts instantly) and a stale sentinel
+        # left in the queue (consumed as the first answer). Reset before each run.
+        self.answers = queue.Queue()
+        self.cancelled = threading.Event()
 
     def start(self, target, *args: Any) -> None:
         self.thread = threading.Thread(target=target, args=args, daemon=True)
@@ -149,6 +171,14 @@ def create_app(
     @app.websocket("/api/sessions/{session_id}")
     async def session_socket(websocket: WebSocket, session_id: str) -> None:
         await websocket.accept()
+        # Defined behavior for two tabs on one session_id: reject the second so two graphs can't run
+        # concurrently against one checkpoint thread. One live socket per Session id.
+        if session_id in api_state.runtimes:
+            await websocket.send_json(
+                {"type": "session_error", "error": "This Session id already has an active connection."}
+            )
+            await websocket.close()
+            return
         outgoing: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         emit = EventEmitter(asyncio.get_running_loop(), outgoing)
         runtime = RuntimeSession(session_id=session_id, mode="pending", emit=emit)
@@ -166,6 +196,7 @@ def create_app(
                     if _is_running(runtime):
                         emit({"type": "session_error", "error": "A Session is already running on this socket."})
                         continue
+                    runtime.reset_run_state()
                     runtime.mode = _select_mode(payload.mode, api_state.settings)
                     runtime.start(
                         _run_session_thread,
@@ -178,6 +209,7 @@ def create_app(
                     if _is_running(runtime):
                         emit({"type": "session_error", "error": "A Session is already running on this socket."})
                         continue
+                    runtime.reset_run_state()
                     runtime.mode = _select_mode(payload.mode, api_state.settings)
                     runtime.start(
                         _run_session_thread,
@@ -189,15 +221,20 @@ def create_app(
                 elif isinstance(payload, CandidateAnswerPayload):
                     runtime.answers.put(payload.answer)
                 else:
+                    # Cancel is a control signal (ADR 0005): flag it and drop the sentinel so a blocked
+                    # QueueCandidate.answer() raises CandidateIntent. _run_session_thread emits the
+                    # terminal event; no "" is injected as a fake answer.
                     runtime.cancelled.set()
-                    runtime.answers.put("")
-                    emit({"type": "session_error", "error": "Session cancelled by client."})
+                    runtime.answers.put(_CANCEL)
         except WebSocketDisconnect:
             runtime.cancelled.set()
-            runtime.answers.put("")
+            runtime.answers.put(_CANCEL)
         finally:
             sender.cancel()
-            api_state.runtimes.pop(session_id, None)
+            # Only drop the map entry if it is still ours — a rejected second connection must not evict
+            # the live one, and a stale run must not evict a newer registration.
+            if api_state.runtimes.get(session_id) is runtime:
+                api_state.runtimes.pop(session_id, None)
 
     @app.get("/api/sessions/{session_id}/export.md", response_class=PlainTextResponse)
     def export_markdown(session_id: str) -> str:
@@ -307,6 +344,13 @@ def _run_session_thread(
         if final_state is not None:
             api_state.completed_sessions[runtime.session_id] = final_state
             runtime.emit({"type": "session_completed", "state": final_state})
+    except CandidateIntent as err:
+        # ADR 0005 / issue 0017: the Candidate asked to stop (web cancel/disconnect). This is intent,
+        # not an infrastructure failure — a distinct control-flow branch. The supervisor re-raises it
+        # past the per-question failure-isolation net, so the in-flight question is never recorded as a
+        # zero-evidence `failed` and the checkpoint stays resumable. Report it, don't score anything.
+        logger.info("Session %s cancelled by Candidate intent: %s", runtime.session_id, err)
+        runtime.emit({"type": "session_error", "error": f"Session cancelled: {err}"})
     except Exception as err:  # noqa: BLE001 - API boundary converts graph/provider failures to events
         logger.exception("Session %s failed", runtime.session_id)
         runtime.emit({"type": "session_error", "error": f"{type(err).__name__}: {err}"})
