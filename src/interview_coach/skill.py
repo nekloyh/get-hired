@@ -22,9 +22,15 @@ from .evaluator import Evaluation
 NEUTRAL_ALPHA = 1.0
 NEUTRAL_BETA = 1.0
 
-# Pseudo-observations one evaluation contributes. Deliberately small: a single answer is weak
-# evidence, but ADR 0002 wants direct evidence to overtake the weak prior "within an answer or two".
+# Pseudo-observations a *fully confident* evaluation contributes. Deliberately small: a single answer
+# is weak evidence, but ADR 0002 wants direct evidence to overtake the weak prior "within an answer or
+# two". Scaled down by Evaluator confidence via confidence_weight() below.
 EVIDENCE_WEIGHT = 2.0
+
+# Floor on the confidence multiplier (issue 0021): even a zero-confidence judgment is *weak* evidence,
+# not *no* evidence — a low-confidence answer still nudges the belief a little. Failed/degraded
+# questions apply no evidence at all, but that is handled upstream by skipping the update entirely.
+CONFIDENCE_WEIGHT_FLOOR = 0.25
 
 
 def _beta_variance(alpha: float, beta: float) -> float:
@@ -39,6 +45,22 @@ _NEUTRAL_VARIANCE = _beta_variance(NEUTRAL_ALPHA, NEUTRAL_BETA)
 def score_to_quality(weighted_score: float) -> float:
     """Map an Evaluator ``weighted_score`` (1–5) onto a Beta success probability in [0, 1]."""
     return (weighted_score - 1.0) / 4.0
+
+
+def confidence_weight(confidence: float) -> float:
+    """Evidence weight for one evaluation, scaled by the Evaluator's ``confidence`` in [0, 1] (0021).
+
+    The Beta updater already accepts a per-observation ``weight``; this feeds it the Evaluator's own
+    trustworthiness signal so a judgment the ``weighted_score`` cross-check (slice 0003) or Self-critique
+    lowered the confidence of moves the posterior less than a fully confident one at the *same* score —
+    the state the Supervisor steers by should not shift as hard on shaky evidence.
+
+    Linear in confidence with a floor, so it is monotonic increasing: lower confidence ⇒ strictly
+    smaller weight ⇒ strictly smaller posterior shift for an identical score. ``confidence == 1.0``
+    returns exactly ``EVIDENCE_WEIGHT`` — full-confidence behavior is unchanged from the fixed-weight era.
+    """
+    clamped = max(0.0, min(1.0, confidence))
+    return EVIDENCE_WEIGHT * (CONFIDENCE_WEIGHT_FLOOR + (1.0 - CONFIDENCE_WEIGHT_FLOOR) * clamped)
 
 
 @dataclass(frozen=True)
@@ -92,5 +114,12 @@ class SkillState:
 
 
 def apply_evaluation(state: SkillState, evaluation: Evaluation) -> SkillState:
-    """Update a Skill's belief from an Evaluator judgment (consumes slice 0001's output)."""
-    return state.observe(score_to_quality(evaluation.weighted_score))
+    """Update a Skill's belief from an Evaluator judgment (consumes slice 0001's output).
+
+    Evidence weight scales with the Evaluator's confidence (issue 0021): shaky judgments move the
+    posterior less than confident ones at the same score.
+    """
+    return state.observe(
+        score_to_quality(evaluation.weighted_score),
+        weight=confidence_weight(evaluation.confidence),
+    )

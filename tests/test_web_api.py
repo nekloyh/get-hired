@@ -78,6 +78,8 @@ def test_demo_websocket_start_answer_flow_and_export(tmp_path):
     assert export.status_code == 200
     assert "# Interview Session: demo-session" in export.text
     assert "## Study Plan" in export.text
+    # issue 0021: the confidence-scaled evidence weight is auditable per question in the export.
+    assert "evidence weight:" in export.text
 
 
 def test_live_mode_errors_when_provider_is_unconfigured(tmp_path):

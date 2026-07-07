@@ -94,6 +94,7 @@ def _append_transcript(lines: list[str], session_state: Mapping[str, Any]) -> No
             lines.append(
                 f"{score_label}: **{float(item.get('resolved_weighted_score', 0)):.2f}/5**; "
                 f"confidence: **{float(item.get('resolved_confidence', 0)):.2f}**; "
+                f"evidence weight: **{float(item.get('evidence_weight', 0)):.2f}**; "
                 f"stop: `{_md(_display_stop_reason(item.get('stop_reason')))}`."
             )
         lines.append("")

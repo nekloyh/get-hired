@@ -35,7 +35,7 @@ from .microloop import (
 )
 from .resources import ResourceStore
 from .seeds import SeedQuestion, seed_count, select_seed_question
-from .skill import SkillState
+from .skill import SkillState, confidence_weight
 from .study_planner import plan_study
 
 logger = logging.getLogger(__name__)
@@ -610,6 +610,7 @@ def _dump_failed_question(
         "stop_reason": StopReason.FAILED.value,
         "resolved_weighted_score": 0.0,
         "resolved_confidence": 0.0,
+        "evidence_weight": 0.0,  # a crash is not evidence (issue 0014/0021): prior kept, zero weight
         "skill_state": _dump_skill_state(prior),
         "turns": [],
         "error": f"{type(error).__name__}: {error}",
@@ -629,6 +630,9 @@ def _dump_micro_loop(result: MicroLoopResult, *, plan_index: int) -> dict[str, A
         "stop_reason": result.stop_reason.value,
         "resolved_weighted_score": result.resolved_evaluation.weighted_score,
         "resolved_confidence": result.resolved_evaluation.confidence,
+        # The evidence weight actually folded into the belief (issue 0021), so the confidence-scaling
+        # is auditable in the export. Same function apply_evaluation uses — single source of truth.
+        "evidence_weight": confidence_weight(result.resolved_evaluation.confidence),
         "skill_state": _dump_skill_state(result.skill_state),
         "turns": [
             {
