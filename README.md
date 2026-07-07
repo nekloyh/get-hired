@@ -126,6 +126,15 @@ says 0.9, is it right ~90% of the time?"). It exits non-zero on any range regres
 judge change the same way a failing test would. Reports are versioned in `docs/audits/` so judge
 quality has a history, not a vibe.
 
+The bench's companion is the **Simulated Candidate + Supervisor replay bench** (issue 0029,
+`interview_coach.replay`): where `coach bench` calibrates the *judge*, the replay bench calibrates the
+*loop*. A `Persona` with a ground-truth mastery profile drives a full unattended Session through the
+existing Candidate seam (`run_persona_session`), and the run asserts trajectory properties — the final
+posterior mastery ordering recovers the persona's ground truth, and the Supervisor does not burn budget
+on a Skill the persona is strong at. The trajectory is dumped as a versioned replay artifact so
+`replay_decision` can re-run the Supervisor's decision node over it with a different model — the seed of
+decision-level regression testing. Together they are the two halves of the eval stack.
+
 ## Test
 
 ```bash
