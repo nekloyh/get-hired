@@ -49,12 +49,12 @@ None — can start immediately.
   and tests that want the raw error keep calling it directly (see
   `test_diagnose_propagates_llm_failure_without_deterministic_fallback`). A genuine bug in the pure
   prep helpers still surfaces: it re-raises on the deterministic retry, which is not caught.
-- Wired the two unguarded CLI entry points (`_cmd_session`, `_cmd_diagnose`) through the backstop.
-- `web_api.py`'s Diagnostic call was already inside `_run_session_thread`'s outer
-  `except Exception` (the API boundary converts graph/provider failures to a `session_error`
-  event), so it never crashed the process — no raw-traceback gap exists there. Left as-is:
-  continuing the web session with a deterministic plan instead of erroring out is a possible future
-  UX enhancement, not part of this bug.
+- Wired all three runtime entry points through the backstop: the two CLI commands (`_cmd_session`,
+  `_cmd_diagnose`) and the web `_run_session_thread` (`web_api.py`). The web path already had an
+  outer `except Exception` that converted failures to a `session_error` event, so it never crashed
+  the *process* — but a Diagnostic transport error still aborted the whole session with an error
+  instead of degrading. Routing it through `diagnose_or_degrade` makes the web Diagnostic degrade
+  and continue, consistent with how the graph nodes already degrade on the web path (ADR 0005).
 
 ## Verified
 
