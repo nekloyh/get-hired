@@ -340,6 +340,17 @@ class GroqClient(_OpenAICompatibleClient):
     _supports_tools: bool = True
 
 
+class OpenAIClient(_OpenAICompatibleClient):
+    """OpenAI-compatible client for the OpenAI API itself (e.g. gpt-4o-mini).
+
+    The reference OpenAI-compatible implementation — no vendor quirks to quarantine. Native
+    function-calling is enabled so it can drive the Interviewer's tool path and the calibration bench.
+    """
+
+    provider_name: ProviderName = "openai"
+    _supports_tools: bool = True
+
+
 class LLMRouter(LLMClient):
     """Select the primary provider and fail over to the configured fallback on primary errors."""
 
@@ -439,6 +450,9 @@ def build_client(settings: Settings) -> LLMClient:
     groq = settings.provider_config("groq")
     if groq.configured:
         clients["groq"] = GroqClient(groq)
+    openai_cfg = settings.provider_config("openai")
+    if openai_cfg.configured:
+        clients["openai"] = OpenAIClient(openai_cfg)
     return LLMRouter(
         settings.primary_provider,
         clients,
