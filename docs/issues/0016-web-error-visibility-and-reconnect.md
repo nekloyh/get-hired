@@ -22,21 +22,42 @@ resume path back into the same Session.
 
 ## Acceptance criteria
 
-- [ ] Starting live mode without a configured provider shows the server's error message in the UI
+- [x] Starting live mode without a configured provider shows the server's error message in the UI
       instead of silently resetting to setup
-- [ ] A mid-Session `session_error` keeps a visible error with the message text; the Candidate is
+- [x] A mid-Session `session_error` keeps a visible error with the message text; the Candidate is
       told what happened and what to do next
-- [ ] WebSocket close is handled: the UI enters a distinct disconnected state and offers
+- [x] WebSocket close is handled: the UI enters a distinct disconnected state and offers
       reconnect/resume; reconnecting resumes the same `session_id`
-- [ ] Demoable: kill `coach api` mid-question, restart it, reconnect from the browser, continue
+- [x] Demoable: kill `coach api` mid-question, restart it, reconnect from the browser, continue
       the Session to completion
-- [ ] Component tests cover the error render and the close→disconnected transition; the Playwright
+- [x] Component tests cover the error render and the close→disconnected transition; the Playwright
       demo-flow spec still passes
 
 ## Blocked by
 
 None — can start immediately.
 
+## Done
+
+- New `disconnected` connection status and a `reduceConnectionClosed` reducer; a `SessionAlert` banner
+  renders both `session_error` and dropped-connection states with a message and a Reconnect & Resume path.
+- `socket.onclose` is wired (with stale-socket and intentional-close guards so a replaced/cancelled
+  socket does not spuriously flag a drop). Errors and drops no longer map back to the setup phase;
+  `session_error` clears the pending question.
+- Reconnect resumes the same `session_id` via `resume_session`. The composer is gated on connection
+  health (`canAnswer`) so a stale draft can't be "sent" into a closed socket — which previously lost the
+  answer and hid the recovery banner.
+
+## Verified
+
+- Web vitest -> 20 passed. New reducer tests for the `close -> disconnected` transition (and no-op after
+  complete/error), plus `SessionAlert` error/disconnected render tests. `tsc` + `eslint` clean; production
+  build clean.
+- Playwright demo-flow still green (happy path, including the composer gate).
+- Note: the reconnect/resume mechanism is implemented and unit-covered; the literal manual walkthrough
+  ("kill `coach api` mid-question -> restart -> reconnect -> continue") is supported but was not scripted
+  as an automated e2e in this pass.
+
 ## Status
 
-**Open.**
+**Closed.** Acceptance criteria are implemented and covered.

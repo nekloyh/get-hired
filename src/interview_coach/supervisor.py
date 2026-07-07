@@ -24,7 +24,15 @@ from typing_extensions import TypedDict
 from .concepts import ConceptStore
 from .diagnostic import SKILLS, DiagnosticResult
 from .llm import LLMClient, Message, StructuredOutputError, Validator
-from .microloop import DEFAULT_MAX_TURNS, Candidate, MicroLoopResult, ScriptedCandidate, StopReason, run_micro_loop
+from .microloop import (
+    DEFAULT_MAX_TURNS,
+    Candidate,
+    CandidateIntent,
+    MicroLoopResult,
+    ScriptedCandidate,
+    StopReason,
+    run_micro_loop,
+)
 from .resources import ResourceStore
 from .seeds import SeedQuestion, seed_count, select_seed_question
 from .skill import SkillState
@@ -144,6 +152,17 @@ def session_config(session_id: str) -> dict[str, dict[str, str]]:
     return {"configurable": {"thread_id": session_id}}
 
 
+def resumable_session_state(graph: Any, session_id: str) -> SessionState | None:
+    """Return the checkpointed state for ``session_id``, or ``None`` if no checkpoint exists (0019).
+
+    Lets a caller tell a genuine resume from an unknown ``--resume`` id — which otherwise surfaces
+    LangGraph's ``EmptyInputError`` as a bare traceback — and guard against silently restarting over
+    an in-flight Session. ``graph`` must have been compiled with a checkpointer.
+    """
+    snapshot = graph.get_state(session_config(session_id))
+    return dict(snapshot.values) if snapshot.values else None
+
+
 def build_session_graph(
     client: LLMClient,
     *,
@@ -180,6 +199,13 @@ def build_session_graph(
                 max_turns=max_turns,
                 concept_store=concept_store,
             )
+        except CandidateIntent:
+            # ADR 0005 / issue 0018: the Candidate asked to stop (EOF/Ctrl-D, a web cancel/disconnect,
+            # or a scripted Candidate with nothing left to say). Intent is not an infrastructure
+            # failure — it must propagate *past* the failure-isolation net below and abort the Session,
+            # never be recorded as a zero-evidence `failed` question. The CLI turns it into exit code 2;
+            # the web layer converts it into a session_error event.
+            raise
         except Exception as err:  # noqa: BLE001 — one bad question must not abort the Session (slice 0014)
             # A failure inside a single question (a malformed Evaluator output that survived its retry,
             # a provider blip, an unexpected tool error) must not discard every question resolved so
@@ -273,19 +299,35 @@ def decide_next_move(
             reasoning="The Topic Plan is exhausted.",
         )
 
+    # Build the prompt/validators outside the guarded call so a bug in those pure helpers surfaces
+    # loudly instead of being silently swallowed by the transport backstop below.
+    messages = _build_supervisor_messages(state)
+    validators = _make_supervisor_validators(state)
     try:
-        return client.chat_json(
-            _build_supervisor_messages(state),
-            SupervisorDecision,
-            validators=_make_supervisor_validators(state),
-            max_retries=1,
-        )
+        return client.chat_json(messages, SupervisorDecision, validators=validators, max_retries=1)
     except StructuredOutputError as err:
         fallback = _deterministic_supervisor_fallback(state)
         logger.warning(
             "Supervisor LLM decision failed validation after retry; using deterministic fallback %s: %s",
             fallback.action.value,
             err,
+        )
+        return fallback
+    except Exception as err:  # noqa: BLE001 — the only otherwise-unguarded macro-loop LLM call site
+        # A provider/transport failure (timeout, HTTP error after fallback exhaustion) is an
+        # infrastructure failure, not schema-invalid output. Per ADR 0005 the Supervisor degrades to
+        # the deterministic plan-following decision instead of crashing the whole Session — mirroring
+        # question_node (records `failed`) and study_plan_node (records `study_plan_error`). Logged and
+        # recorded distinctly from the schema-fallback path so the export shows the degrade honestly.
+        fallback = _deterministic_supervisor_fallback(
+            state, reason_prefix="Deterministic fallback after a provider transport error"
+        )
+        logger.warning(
+            "Supervisor LLM decision failed with a provider/transport error (%s: %s); using "
+            "deterministic fallback %s",
+            type(err).__name__,
+            err,
+            fallback.action.value,
         )
         return fallback
 
@@ -353,25 +395,29 @@ def _apply_supervisor_decision(
     }
 
 
-def _deterministic_supervisor_fallback(state: SessionState) -> SupervisorDecision:
+def _deterministic_supervisor_fallback(
+    state: SessionState, *, reason_prefix: str = "Deterministic fallback"
+) -> SupervisorDecision:
+    # ``reason_prefix`` lets the transport-error backstop (issue 0020) record a distinct reasoning
+    # string from the schema-invalid fallback while sharing the same deterministic decision logic.
     attempts = _attempts_by_skill(state)
     if _extra_probe_required(state, attempts):
         last_skill = state.get("transcript", [{}])[-1].get("skill")
         return SupervisorDecision(
             action=SupervisorAction.EXTRA_QUESTION,
             reasoning=(
-                f"Deterministic fallback: the last {last_skill} question stopped by safety_cap below "
+                f"{reason_prefix}: the last {last_skill} question stopped by safety_cap below "
                 "the evidence bar, and another seed remains."
             ),
         )
     if _advance_plan_target_skill(state) is None:
         return SupervisorDecision(
             action=SupervisorAction.END_EARLY,
-            reasoning="Deterministic fallback: the Topic Plan is exhausted.",
+            reasoning=f"{reason_prefix}: the Topic Plan is exhausted.",
         )
     return SupervisorDecision(
         action=SupervisorAction.ADVANCE_PLAN,
-        reasoning="Deterministic fallback: move to the next Topic Plan entry.",
+        reasoning=f"{reason_prefix}: move to the next Topic Plan entry.",
     )
 
 

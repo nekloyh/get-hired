@@ -208,6 +208,167 @@ def test_run_session_graph_prints_live_skill_state_updates(make_client, capsys):
     assert "mlops" in output
 
 
+def test_session_summary_prints_recorded_error_for_failed_question(capsys):
+    # Issue 0018: a genuinely failed question (issue 0014) must show its recorded error in the CLI
+    # summary so the reason is visible without opening the Markdown export.
+    state = {
+        "session_id": "s",
+        "status": "complete",
+        "question_count": 1,
+        "stop_reason": "max_questions",
+        "skill_states": {"mlops": {"skill": "mlops", "alpha": 1.0, "beta": 1.0}},
+        "skill_metadata": {"mlops": {"role_criticality": "must_have", "evidence_bar": 4}},
+        "transcript": [
+            {
+                "skill": "mlops",
+                "plan_index": 0,
+                "stop_reason": "failed",
+                "resolved_weighted_score": 0.0,
+                "resolved_confidence": 0.0,
+                "skill_state": {"skill": "mlops", "alpha": 1.0, "beta": 1.0},
+                "turns": [],
+                "error": "ValueError: interviewer received an unexpected tool call: 'lookup_conparameter'",
+            }
+        ],
+    }
+
+    cli._print_session_summary(state)
+
+    output = capsys.readouterr().out
+    assert "stop=failed_recorded_and_skipped" in output
+    assert "error: ValueError: interviewer received an unexpected tool call" in output
+
+
+def test_unknown_resume_message_hints_when_no_checkpoints(tmp_path):
+    # Issue 0019: an unknown --resume id fails with a friendly one-liner, not langgraph's raw
+    # EmptyInputError traceback.
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    with SqliteSaver.from_conn_string(str(tmp_path / "session.sqlite")) as checkpointer:
+        message = cli._unknown_session_message("ghost-id", checkpointer, "session.sqlite")
+
+    assert "ghost-id" in message
+    assert "No saved Sessions found" in message
+
+
+def _demo_diagnostic():
+    return diagnose(
+        CandidateProfile(
+            target_role="machine learning engineer",
+            claimed_skills={"ml_fundamentals": 4, "mlops": 2},
+            target_companies=("Viettel",),
+        )
+    )
+
+
+def _suspend_after_first_question(demo, db_path, session_id, *, max_elapsed_seconds=1800.0, started_at=0.0):
+    """Pre-seed a checkpoint with one resolved question, suspended before the Supervisor decides."""
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    with SqliteSaver.from_conn_string(str(db_path)) as checkpointer:
+        graph = build_session_graph(demo, checkpointer=checkpointer)
+        state = initial_session_state(
+            session_id,
+            _demo_diagnostic(),
+            max_questions=3,
+            max_elapsed_seconds=max_elapsed_seconds,
+            started_at=started_at,
+        )
+        partial = graph.invoke(state, session_config(session_id), interrupt_after=["run_question"])
+    assert len(partial["transcript"]) == 1
+
+
+def test_run_session_graph_does_not_replay_resumed_history_as_live(tmp_path, capsys):
+    # Issue 0019: resuming a live Session re-printed every historical question as a "LIVE UPDATE"
+    # because seen-questions started at 0. Passing already_seen=<resolved count> must suppress the
+    # replay. Reverting `seen_questions = already_seen` to 0 makes this fail.
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    from interview_coach.demo_llm import DemoLLMClient
+
+    demo = DemoLLMClient()
+    db_path = tmp_path / "replay.sqlite"
+    session_id = "replay-guard"
+    _suspend_after_first_question(demo, db_path, session_id)
+
+    capsys.readouterr()  # drop pre-seed output
+    with SqliteSaver.from_conn_string(str(db_path)) as checkpointer:
+        graph = build_session_graph(demo, checkpointer=checkpointer)
+        cli._run_session_graph(graph, None, session_config(session_id), live=True, already_seen=1)
+
+    output = capsys.readouterr().out
+    assert "QUESTION 1 RESOLVED" not in output  # the already-resolved Q1 is not replayed as live
+
+
+def test_session_refuses_to_restart_over_inflight_checkpoint(tmp_path, monkeypatch, capsys):
+    # Issue 0019: forgetting --resume while an in-flight (non-complete) Session exists must not
+    # silently restart over it. Deleting the guard makes this return 0 and overwrite progress.
+    from interview_coach.demo_llm import DemoLLMClient
+
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: DemoLLMClient())
+    monkeypatch.setattr(cli, "resumable_session_state", lambda graph, session_id: {"status": "active"})
+
+    rc = cli.main(
+        ["session", "--scripted", "--session-id", "busy", "--checkpoint-db", str(tmp_path / "c.sqlite")]
+    )
+
+    assert rc == 2
+    assert "already in progress" in capsys.readouterr().err
+
+
+def test_session_starts_fresh_when_prior_checkpoint_is_complete(tmp_path, monkeypatch, capsys):
+    # The in-flight guard is scoped to non-complete Sessions: a completed checkpoint may be started over.
+    from interview_coach.demo_llm import DemoLLMClient
+
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: DemoLLMClient())
+    monkeypatch.setattr(cli, "resumable_session_state", lambda graph, session_id: {"status": "complete"})
+
+    rc = cli.main(
+        [
+            "session",
+            "--scripted",
+            "--no-live",
+            "--max-questions",
+            "1",
+            "--session-id",
+            "done",
+            "--checkpoint-db",
+            str(tmp_path / "c.sqlite"),
+        ]
+    )
+
+    assert rc == 0
+    assert "already in progress" not in capsys.readouterr().err
+
+
+def test_cmd_session_resume_resets_clock_via_cli(tmp_path, monkeypatch, capsys):
+    # Issue 0019: the CLI resume path must reset the elapsed-time budget. Pre-seed a Session "created
+    # at epoch" with a 1s budget; resuming later force-completes on the stale wall-clock rail UNLESS
+    # the CLI resets started_at. Reverting cli.py's `graph.update_state({"started_at": ...})` makes
+    # this fail (stop_reason becomes max_elapsed_seconds).
+    from interview_coach.demo_llm import DemoLLMClient
+
+    demo = DemoLLMClient()
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: demo)
+
+    db_path = tmp_path / "clock.sqlite"
+    session_id = "gap-cli"
+    _suspend_after_first_question(demo, db_path, session_id, max_elapsed_seconds=1.0, started_at=0.0)
+
+    capsys.readouterr()
+    rc = cli.main(
+        ["session", "--resume", "--scripted", "--no-live", "--session-id", session_id, "--checkpoint-db", str(db_path)]
+    )
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert "RESUMING SESSION gap-cli" in output  # the recap is printed instead of replaying history
+    assert "stop_reason: max_elapsed_seconds" not in output  # the clock was reset; no stale force-complete
+
+
 def test_cli_prints_follow_up_unavailable_as_degrade(capsys):
     ev = Evaluation(
         dimensions={"correctness": DimensionScore(score=2, evidence="no evidence")},

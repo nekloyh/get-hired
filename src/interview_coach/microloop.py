@@ -33,12 +33,25 @@ logger = logging.getLogger(__name__)
 # earlier because the Evaluator stops recommending follow-ups.
 DEFAULT_MAX_TURNS = 4
 
-class CandidateExhausted(RuntimeError):
+class CandidateIntent(RuntimeError):
+    """Base class for Candidate-driven control signals (ADR 0005).
+
+    These represent the Candidate asking to *stop* — EOF/Ctrl-D on stdin, a web cancel or disconnect,
+    or a scripted Candidate with nothing left to say. Per ADR 0005 they must propagate *out of* every
+    failure-isolation net (issue 0014's per-question ``except``) and abort or suspend the Session:
+    human intent must never be converted into fake skill evidence. Infrastructure failures
+    (provider/tool/schema errors) are the opposite kind and stay eligible for the
+    record-`failed`-and-advance net. The classification lives on the exception taxonomy so every
+    transport — terminal, WebSocket, and future elicitation flows — is handled the same way.
+    """
+
+
+class CandidateExhausted(CandidateIntent):
     """A scripted Candidate was asked more questions than it has canned answers for."""
 
 
-class CandidateInputUnavailable(RuntimeError):
-    """An interactive Candidate could not read terminal input."""
+class CandidateInputUnavailable(CandidateIntent):
+    """An interactive Candidate could not read terminal input (EOF/Ctrl-D), or a web cancel/disconnect."""
 
 
 class Candidate(Protocol):

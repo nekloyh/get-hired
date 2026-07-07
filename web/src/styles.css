@@ -915,6 +915,68 @@ input[type="range"]::-webkit-slider-thumb:active {
   margin: 0;
 }
 
+/* Session error / dropped-connection banner (issue 0016). Spans the full workspace grid width. */
+.session-alert {
+  align-items: center;
+  background: linear-gradient(145deg, #ffffff, var(--danger-bg));
+  border: 1px solid rgba(255, 145, 159, 0.36);
+  border-radius: var(--r-lg);
+  box-shadow: var(--pressed);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  grid-column: 1 / -1;
+  justify-content: space-between;
+  padding: 18px 22px;
+}
+
+.session-alert.disconnected {
+  background: linear-gradient(145deg, #ffffff, #fdf1dc);
+  border-color: rgba(242, 184, 75, 0.4);
+}
+
+.session-alert-body {
+  align-items: center;
+  display: flex;
+  gap: 14px;
+  min-width: 0;
+}
+
+.session-alert-icon {
+  align-items: center;
+  color: #b4233d;
+  display: flex;
+}
+
+.session-alert.disconnected .session-alert-icon {
+  color: var(--accent-dark);
+}
+
+.session-alert-body strong {
+  display: block;
+  font-size: 15px;
+  font-weight: 800;
+}
+
+.session-alert-body p {
+  color: var(--ink-3);
+  font-size: 13.5px;
+  margin: 2px 0 0;
+  max-width: 60ch;
+}
+
+.session-alert-actions {
+  display: flex;
+  flex-shrink: 0;
+  gap: 10px;
+}
+
+.session-alert-actions button {
+  align-items: center;
+  display: inline-flex;
+  gap: 7px;
+}
+
 .workspace {
   align-items: start;
   display: grid;

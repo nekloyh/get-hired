@@ -8,7 +8,14 @@ export const SKILLS = [
 
 export type Skill = (typeof SKILLS)[number]
 export type SessionMode = 'auto' | 'demo' | 'live'
-export type ConnectionStatus = 'idle' | 'connecting' | 'active' | 'evaluating' | 'complete' | 'error'
+export type ConnectionStatus =
+  | 'idle'
+  | 'connecting'
+  | 'active'
+  | 'evaluating'
+  | 'complete'
+  | 'error'
+  | 'disconnected'
 
 export type SetupForm = {
   mode: SessionMode

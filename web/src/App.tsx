@@ -1,11 +1,18 @@
 import { Activity, BrainCircuit, ClipboardCheck, MessagesSquare, Radar, Send, Sparkles, Square } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { ReportView } from './components/ReportView'
+import { SessionAlert } from './components/SessionAlert'
 import { SetupPanel } from './components/SetupPanel'
 import { SkillBars } from './components/SkillBars'
 import { TopicPlan } from './components/TopicPlan'
 import { fetchHealth, sessionWebSocketUrl } from './lib/api'
-import { addCandidateAnswer, initialSession, reduceSessionEvent, validateSetup } from './lib/sessionReducer'
+import {
+  addCandidateAnswer,
+  initialSession,
+  reduceConnectionClosed,
+  reduceSessionEvent,
+  validateSetup,
+} from './lib/sessionReducer'
 import { SKILLS, type Health, type SessionEvent, type SetupForm } from './lib/types'
 
 const defaultForm: SetupForm = {
@@ -30,14 +37,23 @@ export function App() {
   const [draft, setDraft] = useState('')
   const [setupErrors, setSetupErrors] = useState<string[]>([])
   const socketRef = useRef<WebSocket | null>(null)
+  // Set right before a close we initiate (cancel, back-to-setup, unmount) so `onclose` does not
+  // mistake a deliberate close for a dropped connection.
+  const closingRef = useRef(false)
   const errors = useMemo(() => setupErrors, [setupErrors])
 
   const phase = useMemo(() => {
-    if (session.status === 'idle' || session.status === 'error') return 1
+    // Only a truly idle app returns to setup. Errors and dropped connections stay in the session view
+    // so their banner is visible and offers a resume path, instead of silently resetting to setup.
+    if (session.status === 'idle') return 1
     if (session.status === 'complete') return 3
-    return 2;
+    return 2
   }, [session.status])
 
+  // The Candidate may only answer when a question is pending on a healthy connection. Gating the
+  // composer on this (not just a non-empty draft) stops a leftover draft from being "sent" into a
+  // closed socket after a drop — which silently lost the answer and hid the recovery banner (0016).
+  const canAnswer = session.status === 'active' && Boolean(session.currentQuestion)
   const activePlanItem = session.state?.topic_plan[session.state.current_plan_index]
   const answeredCount = session.state?.question_count ?? 0
   const questionCap = session.state?.max_questions ?? form.maxQuestions
@@ -51,39 +67,22 @@ export function App() {
 
   useEffect(() => {
     fetchHealth().then(setHealth).catch(() => setSetupErrors(['Backend API is not reachable.']))
-    return () => socketRef.current?.close()
+    return () => {
+      closingRef.current = true
+      socketRef.current?.close()
+    }
   }, [])
 
-  const connect = (resume: boolean) => {
-    const nextErrors = validateSetup(form)
-    setSetupErrors(nextErrors)
-    if (nextErrors.length) return
-
-    socketRef.current?.close()
-    setSession({ ...initialSession, status: 'connecting', sessionId: form.sessionId })
-    const socket = new WebSocket(sessionWebSocketUrl(form.sessionId))
-    socketRef.current = socket
-    socket.onopen = () => {
-      if (resume) {
-        socket.send(JSON.stringify({ type: 'resume_session', mode: form.mode }))
-      } else {
-        socket.send(
-          JSON.stringify({
-            type: 'start_session',
-            mode: form.mode,
-            target_role: form.targetRole,
-            target_companies: form.targetCompanies
-              .split(',')
-              .map((company) => company.trim())
-              .filter(Boolean),
-            claimed_skills: Object.fromEntries(
-              SKILLS.map((skill) => [skill, form.claimedSkills[skill]]),
-            ),
-            max_questions: form.maxQuestions,
-          }),
-        )
-      }
+  const openSocket = (sessionId: string, firstMessage: object) => {
+    closingRef.current = false
+    const previous = socketRef.current
+    if (previous) {
+      previous.onclose = null // a socket we are replacing must not fire the disconnected banner
+      previous.close()
     }
+    const socket = new WebSocket(sessionWebSocketUrl(sessionId))
+    socketRef.current = socket
+    socket.onopen = () => socket.send(JSON.stringify(firstMessage))
     socket.onmessage = (message) => {
       const event = JSON.parse(message.data) as SessionEvent
       setSession((current) => reduceSessionEvent(current, event))
@@ -93,19 +92,69 @@ export function App() {
         reduceSessionEvent(current, { type: 'session_error', error: 'WebSocket connection failed.' }),
       )
     }
+    socket.onclose = () => {
+      // Ignore closes from a socket we already replaced or one we closed deliberately; anything else
+      // is a genuine drop (restarted backend, network sleep) that only fires onclose (issue 0016).
+      if (socketRef.current !== socket || closingRef.current) return
+      setSession((current) => reduceConnectionClosed(current))
+    }
+  }
+
+  const startMessage = (resume: boolean) =>
+    resume
+      ? { type: 'resume_session', mode: form.mode }
+      : {
+          type: 'start_session',
+          mode: form.mode,
+          target_role: form.targetRole,
+          target_companies: form.targetCompanies
+            .split(',')
+            .map((company) => company.trim())
+            .filter(Boolean),
+          claimed_skills: Object.fromEntries(SKILLS.map((skill) => [skill, form.claimedSkills[skill]])),
+          max_questions: form.maxQuestions,
+        }
+
+  const connect = (resume: boolean) => {
+    const nextErrors = validateSetup(form)
+    setSetupErrors(nextErrors)
+    if (nextErrors.length) return
+
+    setSession({ ...initialSession, status: 'connecting', sessionId: form.sessionId })
+    openSocket(form.sessionId, startMessage(resume))
+  }
+
+  const reconnect = () => {
+    // Resume the in-flight Session on the same id after an error or a dropped connection. The backend
+    // re-streams state and re-emits the pending question on resume, so the Candidate can continue.
+    const sessionId = session.sessionId || form.sessionId
+    setSession((current) => ({ ...current, status: 'connecting', error: null }))
+    openSocket(sessionId, { type: 'resume_session', mode: form.mode })
+  }
+
+  const backToSetup = () => {
+    closingRef.current = true
+    socketRef.current?.close()
+    setSession(initialSession)
+    setSetupErrors([])
   }
 
   const sendAnswer = () => {
     const answer = draft.trim()
-    if (!answer || !socketRef.current) return
-    socketRef.current.send(JSON.stringify({ type: 'candidate_answer', answer }))
+    const socket = socketRef.current
+    // Never send into a stale/closed socket: a CLOSED socket silently discards the payload (the
+    // answer is lost) yet the optimistic state flip would hide the disconnected/error banner (0016).
+    if (!answer || !canAnswer || !socket || socket.readyState !== WebSocket.OPEN) return
+    socket.send(JSON.stringify({ type: 'candidate_answer', answer }))
     setSession((current) => addCandidateAnswer(current, answer))
     setDraft('')
   }
 
   const cancel = () => {
+    closingRef.current = true
     socketRef.current?.send(JSON.stringify({ type: 'cancel_session' }))
     socketRef.current?.close()
+    setSession(initialSession)
   }
 
   return (
@@ -190,6 +239,12 @@ export function App() {
       
       {phase === 2 && (
         <section className="workspace">
+          <SessionAlert
+            error={session.error}
+            onBackToSetup={backToSetup}
+            onReconnect={reconnect}
+            status={session.status}
+          />
           <aside className="left-rail">
             <SkillBars state={session.state} />
           </aside>
@@ -228,19 +283,19 @@ export function App() {
             </div>
             <div className="composer">
               <textarea
-                disabled={!session.currentQuestion || session.status === 'complete'}
+                disabled={!canAnswer}
                 onChange={(event) => setDraft(event.target.value)}
                 onKeyDown={(event) => {
                   if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') sendAnswer()
                 }}
-                placeholder={session.currentQuestion ? 'Answer as the Candidate...' : 'Waiting for the Interviewer'}
+                placeholder={canAnswer ? 'Answer as the Candidate...' : 'Waiting for the Interviewer'}
                 value={draft}
               />
               <div className="composer-actions">
                 <button className="icon-button" onClick={cancel} title="Cancel Session" type="button">
                   <Square size={17} aria-hidden />
                 </button>
-                <button className="primary" disabled={!draft.trim()} onClick={sendAnswer} type="button">
+                <button className="primary" disabled={!canAnswer || !draft.trim()} onClick={sendAnswer} type="button">
                   <Send size={16} aria-hidden />
                   Send
                 </button>
