@@ -1,0 +1,100 @@
+# Concept notes for the FPT-style pack. Every question's expected_concepts must resolve to an id here,
+# and every canonical Skill needs at least one note (loader enforces both). HITL: draft content.
+
+- id: fpt_ml_overfitting_basics
+  skill: ml_fundamentals
+  title: Overfitting, underfitting, and the train/validation gap
+  content: >-
+    Overfitting is when a model memorises the training data and fails to generalise — low training
+    error, high validation error. Underfitting is the opposite: the model is too simple and both
+    errors stay high. The practical diagnostic is the gap between training and validation metrics, and
+    the practical fixes are more data, regularisation, or a simpler model.
+  tags: [overfitting, regularization, generalization]
+
+- id: fpt_ml_evaluation_metrics
+  skill: ml_fundamentals
+  title: Choosing a metric beyond accuracy
+  content: >-
+    Accuracy misleads on imbalanced data. Precision, recall, and F1 describe the positive-class
+    trade-off; ROC-AUC and PR-AUC summarise it across thresholds. The right metric follows the cost of
+    each error type — for fraud or defect detection, recall on the rare class usually matters most.
+  tags: [metrics, precision, recall, imbalance]
+
+- id: fpt_dl_overfitting_control
+  skill: deep_learning
+  title: Controlling overfitting in neural networks
+  content: >-
+    Deep networks overfit easily. Dropout randomly zeroes activations so the network cannot rely on
+    any single unit; early stopping halts when validation loss stops improving; data augmentation and
+    weight decay add regularisation. These are the first tools a practitioner reaches for before adding
+    capacity.
+  tags: [dropout, early-stopping, augmentation]
+
+- id: fpt_dl_transfer_learning
+  skill: deep_learning
+  title: Transfer learning and fine-tuning
+  content: >-
+    Transfer learning reuses a model pre-trained on a large dataset and adapts it to a smaller task by
+    fine-tuning some or all layers. It is the default for fresher projects with limited data and
+    compute: freeze the backbone, train a new head, then optionally unfreeze top layers with a low
+    learning rate.
+  tags: [transfer-learning, fine-tuning, pretraining]
+
+- id: fpt_mlops_pipeline_reproducibility
+  skill: mlops
+  title: Reproducible training pipelines
+  content: >-
+    A reproducible pipeline pins the data version, code version, and random seeds, and logs the
+    hyper-parameters and metrics of every run. Without this, a model that worked last week cannot be
+    rebuilt, and training-serving skew goes undetected. Experiment tracking and data versioning are the
+    baseline discipline.
+  tags: [reproducibility, versioning, experiment-tracking]
+
+- id: fpt_mlops_deployment_monitoring
+  skill: mlops
+  title: Deploying and monitoring a model in production
+  content: >-
+    Shipping a model means serving it behind an API, then watching input drift, prediction
+    distributions, latency, and — when labels arrive — live accuracy. A canary or shadow rollout limits
+    blast radius, and a guardrail metric with a preset threshold gives an automatic rollback path.
+  tags: [deployment, monitoring, drift, rollback]
+
+- id: fpt_sysdesign_api_design
+  skill: system_design
+  title: Designing a simple ML serving API
+  content: >-
+    A serving API validates the request, runs preprocessing identical to training, calls the model,
+    and returns a typed response with error handling and timeouts. Batching, a warm model in memory,
+    and a health-check endpoint are the practical basics interviewers probe for a junior role.
+  tags: [api, serving, preprocessing]
+
+- id: fpt_sysdesign_sql_data_access
+  skill: system_design
+  title: SQL and data access for ML features
+  content: >-
+    Most production features start as SQL over a warehouse: joins, GROUP BY aggregations, and window
+    functions build the training table. Point-in-time correctness (only using data available at
+    prediction time) prevents label leakage, and indexing plus avoiding SELECT * keep feature queries
+    fast.
+  tags: [sql, features, joins, leakage]
+
+- id: fpt_vnlp_word_segmentation
+  skill: vietnamese_nlp
+  title: Vietnamese word segmentation
+  content: >-
+    Vietnamese writes spaces between syllables, not words, so 'học máy' is two syllables but one
+    concept (machine learning). Word segmentation groups syllables into words before classical NLP, and
+    tools like VnCoreNLP or underthesea perform it. Getting it wrong splits entities and hurts
+    downstream tasks.
+  tags: [segmentation, tokenization, vncorenlp]
+  language: vi
+
+- id: fpt_vnlp_english_communication
+  skill: vietnamese_nlp
+  title: English communication in a bilingual interview
+  content: >-
+    FPT and similar outsourcing-heavy employers screen English because client-facing work is in
+    English. A self-introduction is judged on clarity, structure (background → skills → motivation), and
+    correctness, not on a native accent. Speaking in complete, well-organised sentences matters more
+    than vocabulary breadth.
+  tags: [english, communication, self-introduction]

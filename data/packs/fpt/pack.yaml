@@ -1,0 +1,21 @@
+# FPT-style content pack (issue 0025, ADR 0008).
+#
+# A process-heavy, practical pack modelled on public FPT Software / FPT.AI interview reports for
+# fresher/junior ML roles: emphasis on fundamentals explained clearly, production discipline, and an
+# English self-introduction item (FPT interviews commonly include an English-communication screen).
+#
+# NOTE on taxonomy: the engine's canonical Skills are ML-centric (ml_fundamentals, deep_learning,
+# mlops, system_design, vietnamese_nlp). This pack maps FPT's practical/OOP/SQL/English emphasis onto
+# those Skills (e.g. the English self-intro is scored as a vietnamese_nlp/communication item). A pack
+# with genuinely new Skills (OOP, SQL) would require extending the Skill taxonomy — out of scope here.
+#
+# HITL: questions, scripted answers, difficulty, and rubric weights are an AI-authored draft and need
+# human domain review before this pack is treated as calibrated content.
+
+name: FPT-style ML fresher pack
+role: machine learning engineer
+company_style: FPT Software / FPT.AI (process-heavy, practical, English-screen)
+language: bilingual (EN questions; VN NLP topics)
+description: >-
+  ~20 practical questions across the five canonical Skills, flavoured after public FPT interview
+  reports for fresher/junior ML positions, plus an English self-introduction item.

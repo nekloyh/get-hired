@@ -68,6 +68,9 @@ uv run python -m interview_coach diagnose --target-role "machine learning engine
 uv run python -m interview_coach diagnose --offline --target-role "machine learning engineer" --claim mlops=4   # force the deterministic offline path
 uv run python -m interview_coach session --max-questions 3 --export-markdown exports/session.md                 # interactive Candidate answers
 uv run python -m interview_coach session --scripted --max-questions 3                                           # deterministic demo Candidate
+uv run python -m interview_coach session --candidate alice --max-questions 3                                    # 0023: remember a returning Candidate across Sessions
+uv run python -m interview_coach pack lint data/packs/fpt                                                       # 0025: validate a content pack (fail-loud)
+uv run python -m interview_coach session --pack data/packs/fpt --scripted --max-questions 3                     # 0025: run a Session from a pack
 uv run python -m interview_coach eval-harness        # issue 0012: golden-answer Evaluator harness
 uv run python -m interview_coach ingest-concepts --persist-dir .chroma
 uv run python -m interview_coach ingest-resources --persist-dir .chroma
@@ -84,6 +87,26 @@ cd web && npm run dev
 
 Then open `http://127.0.0.1:5173`. Choose `demo` mode to run without credentials; choose `live` once
 `.env` has the selected provider configured.
+
+## Content packs (issue 0025 / ADR 0008)
+
+Interview content is external data, not code. A **pack** is a directory validated by a fail-loud
+contract (`coach pack lint <dir>`); the built-in `src/interview_coach/data/` bank is the reference
+pack, and `data/packs/fpt/` ships as a first FPT-style pack. A pack directory holds:
+
+- `questions.yaml` — top-level mapping `Skill -> [questions]`. Each question:
+  `question` (unique prompt), `difficulty` (1–5; the Topic Plan's `target_difficulty` selects the
+  closest match — optional, defaults to 3), `rubric.weights` (over the 5 fixed dimensions),
+  `answers` (scripted fixture replies; `answers[0]` answers the question, `answers[1:]` the
+  follow-ups), `expected_concepts` (must resolve to a concept id), and `follow_up_seeds`.
+- `concepts.yaml` — a list of concept notes (`id`, `skill`, `title`, `content`, optional `language`,
+  `tags`). Every canonical Skill needs at least one note, and every question's `expected_concepts`
+  must reference a note that exists.
+- `pack.yaml` — metadata (`name` required; e.g. `role`, `company_style`, `description`).
+
+`coach pack lint` dies with a named violation on anything malformed (unknown Skill, dangling concept
+reference, bad difficulty, missing name) and exits non-zero, so a broken pack fails at lint time,
+never mid-interview. `coach session --pack <dir>` then runs the whole Session from that pack.
 
 ## Test
 

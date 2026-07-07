@@ -398,7 +398,7 @@ def test_session_caps_micro_loop_to_scripted_seed_answers(make_client, monkeypat
         rubric=Rubric(weights={"correctness": 1.0}),
         answers=("partial answer",),
     )
-    monkeypatch.setattr(supervisor, "select_seed_question", lambda skill, question_number=0: one_answer_seed)
+    monkeypatch.setattr(supervisor, "select_seed_question", lambda skill, question_number=0, **kwargs: one_answer_seed)
     client, fake = make_client([_eval(2, follow_up=True), _plan("mlops", "system_design", "vietnamese_nlp")])
     state = initial_session_state("one-answer-session", _diagnostic(), max_questions=1, started_at=0)
 
@@ -418,7 +418,7 @@ def test_session_can_use_candidate_factory_for_interactive_answers(make_client, 
         rubric=Rubric(weights={"correctness": 1.0}),
         answers=("scripted answer",),
     )
-    monkeypatch.setattr(supervisor, "select_seed_question", lambda skill, question_number=0: seed)
+    monkeypatch.setattr(supervisor, "select_seed_question", lambda skill, question_number=0, **kwargs: seed)
     client, _ = make_client([_eval(5, follow_up=False), _plan("system_design", "vietnamese_nlp", "ml_fundamentals")])
     state = initial_session_state("factory-session", _diagnostic(), max_questions=1, started_at=0)
 
