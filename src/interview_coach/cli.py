@@ -30,7 +30,7 @@ from .bank import BankError, load_pack
 from .bench import bench_passed, load_bench_data, render_bench_report, run_bench
 from .concepts import SEED_CONCEPTS, ChromaConceptStore, InMemoryConceptStore, build_concept_store
 from .config import load_settings
-from .diagnostic import CandidateProfile, diagnose
+from .diagnostic import CandidateProfile, diagnose_or_degrade
 from .eval_harness import harness_passed, render_golden_answer_report, run_golden_answer_harness
 from .evaluator import Evaluation, evaluate
 from .exporter import export_session_markdown
@@ -194,7 +194,7 @@ def _cmd_diagnose(client: LLMClient | None, args: argparse.Namespace) -> int:
         target_companies=tuple(args.company),
         claimed_skills=dict(args.claim),
     )
-    result = diagnose(profile, client)
+    result = diagnose_or_degrade(profile, client)
     print(f"=== TOPIC PLAN (source: {result.topic_plan_source.value}) ===")
     for i, entry in enumerate(result.topic_plan, start=1):
         print(f"{i}. {entry.skill}  difficulty={entry.target_difficulty}  {entry.rationale}")
@@ -400,7 +400,7 @@ def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
                     claimed_skills=dict(args.claim),
                 )
                 carried = load_priors(args.ledger_db, args.candidate, now=time.time())
-                diagnostic = diagnose(
+                diagnostic = diagnose_or_degrade(
                     profile,
                     client,
                     ledger_priors=carried.seed_means if carried else None,

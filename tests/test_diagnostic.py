@@ -4,7 +4,13 @@ import json
 
 import pytest
 
-from interview_coach.diagnostic import CandidateProfile, RoleCriticality, TopicPlanSource, diagnose
+from interview_coach.diagnostic import (
+    CandidateProfile,
+    RoleCriticality,
+    TopicPlanSource,
+    diagnose,
+    diagnose_or_degrade,
+)
 from interview_coach.evaluator import Evaluation
 from interview_coach.skill import apply_evaluation
 
@@ -160,3 +166,39 @@ def test_diagnose_propagates_llm_failure_without_deterministic_fallback(make_cli
 
     with pytest.raises(RuntimeError):
         diagnose(profile, client)
+
+
+def test_diagnose_or_degrade_degrades_to_deterministic_on_provider_error(make_client):
+    # Issue 0030: the Diagnostic runs before the graph, so the runtime backstop (not diagnose itself)
+    # must catch a provider/transport error and degrade to the deterministic Topic Plan instead of
+    # crashing the run. This is the exact failure that crashed `coach session` live.
+    client, _ = make_client([RuntimeError("Groq 429: daily token limit reached")])
+    profile = CandidateProfile(target_role="machine learning engineer", claimed_skills={"mlops": 4})
+
+    result = diagnose_or_degrade(profile, client)
+
+    assert result.topic_plan_source is TopicPlanSource.DETERMINISTIC
+    assert result.topic_plan  # a usable plan, not a traceback
+    assert result.priors["mlops"].role_criticality is RoleCriticality.MUST_HAVE
+
+
+def test_diagnose_or_degrade_is_transparent_when_the_llm_succeeds(make_client):
+    # The backstop only engages on failure: a healthy provider still yields the LLM Topic Plan.
+    client, _ = make_client([_topic_plan_json()])
+    profile = CandidateProfile(target_role="machine learning engineer", claimed_skills={"mlops": 4})
+
+    result = diagnose_or_degrade(profile, client)
+
+    assert result.topic_plan_source is TopicPlanSource.LLM
+    assert [entry.skill for entry in result.topic_plan][0] == "mlops"
+
+
+def test_diagnose_or_degrade_offline_matches_plain_diagnose():
+    # With no client there is nothing to degrade from — identical to the deterministic diagnose path.
+    profile = CandidateProfile(target_role="research scientist", claimed_skills={"mlops": 5})
+
+    degraded = diagnose_or_degrade(profile, None)
+    plain = diagnose(profile, None)
+
+    assert degraded.topic_plan_source is TopicPlanSource.DETERMINISTIC
+    assert [e.skill for e in degraded.topic_plan] == [e.skill for e in plain.topic_plan]
