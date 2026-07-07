@@ -3,15 +3,21 @@ from __future__ import annotations
 import pytest
 
 from interview_coach.evaluator import Evaluation
-from interview_coach.skill import SkillState, apply_evaluation, score_to_quality
+from interview_coach.skill import (
+    EVIDENCE_WEIGHT,
+    SkillState,
+    apply_evaluation,
+    confidence_weight,
+    score_to_quality,
+)
 
 
-def _evaluation(weighted_score: float) -> Evaluation:
-    """A minimal Evaluation carrying just the weighted_score the updater reads."""
+def _evaluation(weighted_score: float, confidence: float = 0.9) -> Evaluation:
+    """A minimal Evaluation carrying just the weighted_score + confidence the updater reads."""
     return Evaluation(
         dimensions={},
         weighted_score=weighted_score,
-        confidence=0.9,
+        confidence=confidence,
         follow_up_recommended=False,
         follow_up_rationale="n/a",
     )
@@ -69,6 +75,33 @@ def test_update_is_deterministic_and_pure():
     b = apply_evaluation(before, _evaluation(4))
     assert (a.alpha, a.beta) == (b.alpha, b.beta)
     assert (before.alpha, before.beta) == (1.0, 1.0)  # frozen: original untouched
+
+
+def test_confidence_weight_is_parity_at_full_confidence():
+    # Full confidence must reproduce the fixed-weight era exactly (issue 0021: no silent recalibration).
+    assert confidence_weight(1.0) == pytest.approx(EVIDENCE_WEIGHT)
+
+
+def test_confidence_weight_is_strictly_monotonic():
+    assert confidence_weight(0.2) < confidence_weight(0.5) < confidence_weight(0.9) < confidence_weight(1.0)
+
+
+def test_confidence_weight_floor_is_weak_not_zero():
+    # A zero-confidence judgment is weak evidence, not no evidence — still positive, still < full.
+    assert 0.0 < confidence_weight(0.0) < confidence_weight(1.0)
+
+
+def test_confidence_weight_clamps_out_of_range():
+    assert confidence_weight(1.5) == pytest.approx(confidence_weight(1.0))
+    assert confidence_weight(-0.3) == pytest.approx(confidence_weight(0.0))
+
+
+def test_lower_confidence_moves_posterior_less_at_identical_score():
+    # The property issue 0021 promises: same score, lower confidence ⇒ strictly smaller posterior shift.
+    before = SkillState.neutral("ml_fundamentals")
+    high = apply_evaluation(before, _evaluation(5, confidence=0.95))
+    low = apply_evaluation(before, _evaluation(5, confidence=0.30))
+    assert high.mastery > low.mastery > before.mastery  # both raise mastery, high raises it more
 
 
 def test_observe_splits_weight_by_quality():

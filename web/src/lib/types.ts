@@ -20,6 +20,7 @@ export type ConnectionStatus =
 export type SetupForm = {
   mode: SessionMode
   sessionId: string
+  candidateId: string
   targetRole: string
   targetCompanies: string
   claimedSkills: Record<Skill, number>

@@ -18,6 +18,7 @@ import { SKILLS, type Health, type SessionEvent, type SetupForm } from './lib/ty
 const defaultForm: SetupForm = {
   mode: 'auto',
   sessionId: 'local-web-session',
+  candidateId: '',
   targetRole: 'machine learning engineer',
   targetCompanies: 'Viettel',
   claimedSkills: {
@@ -106,6 +107,7 @@ export function App() {
       : {
           type: 'start_session',
           mode: form.mode,
+          candidate_id: form.candidateId.trim(),
           target_role: form.targetRole,
           target_companies: form.targetCompanies
             .split(',')

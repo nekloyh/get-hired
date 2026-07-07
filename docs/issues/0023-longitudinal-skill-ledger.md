@@ -19,20 +19,49 @@ within an answer or two, and Role criticality still never moves the prior mean.
 
 ## Acceptance criteria
 
-- [ ] `coach session --candidate <id>` seeds priors from the ledger with decay; a first-ever
+- [x] `coach session --candidate <id>` seeds priors from the ledger with decay; a first-ever
       Session behaves exactly as today (cold start)
-- [ ] Decay math is unit-tested: older evidence counts strictly less; parameters and their
+- [x] Decay math is unit-tested: older evidence counts strictly less; parameters and their
       rationale documented next to the code
-- [ ] An end-to-end two-session fixture test asserts prior carryover *and* that fresh direct
+- [x] An end-to-end two-session fixture test asserts prior carryover *and* that fresh direct
       evidence still dominates the carried prior (ADR 0002 invariant)
-- [ ] Export + final report show per-Skill before → after across Sessions
-- [ ] A missing/corrupt ledger degrades to cold start with a logged warning — never a crash
-- [ ] Web setup can pass the candidate id so the ledger works from the UI too
+- [x] Export + final report show per-Skill before → after across Sessions
+- [x] A missing/corrupt ledger degrades to cold start with a logged warning — never a crash
+- [x] Web setup can pass the candidate id so the ledger works from the UI too
 
 ## Blocked by
 
 - ADR 0006 (mechanism decision). Independent of the provider situation — can start immediately.
 
+## Done
+
+- New `ledger.py`: a JSON store mapping `candidate_id -> {completed_at, skills: {alpha, beta}}`.
+  `save_posteriors` persists final posteriors on completion; `load_priors` returns a returning
+  Candidate's carried priors (raw last-Session means for display + `decay_beta`-decayed means for the
+  prior seam) or `None` for a first-ever/absent/corrupt ledger.
+- `decay_beta` decays Beta pseudo-counts toward the neutral prior by `0.5 ** (days / half_life)`
+  (`LEDGER_HALF_LIFE_DAYS = 30`), so older evidence is pulled toward mean 0.5 and counts strictly less
+  — warmer than a stranger, still probed. Pure arithmetic, no LLM (ADR 0006).
+- The decayed mean feeds the existing seam (`diagnostic._initial_mastery_means`); Role criticality
+  still sets prior strength + evidence bar via `_seed_prior` (ADR 0002 — role never moves the mean).
+- `coach session --candidate <id> [--ledger-db path]` loads/persists; `candidate_id` rides in
+  `SessionState` so a resumed Session also persists. Web `start_session` accepts `candidate_id` and the
+  React setup panel exposes a "Candidate id" field.
+- Export gets a "Since Previous Session" before → after table and the terminal summary a "SINCE LAST
+  SESSION" block, both only for a returning Candidate; cold start renders nothing.
+- Missing/corrupt/malformed ledgers degrade to cold start with a logged warning; write failures never
+  fail an otherwise-complete Session.
+
+## Verified
+
+- `uv run pytest tests/test_ledger.py -q` — 14 passed: decay identity/half-life/monotonicity/limit,
+  round-trip + multi-candidate merge, missing/unknown/corrupt/malformed → cold start, empty-id no-op,
+  the two-session carryover + fresh-evidence-dominates invariant, and the export delta block.
+- `uv run pytest tests/test_web_api.py -q` — 8 passed, including an end-to-end two-Session run for one
+  candidate through the real API (first cold, second carries `ledger_prior_mastery`).
+- `uv run pytest -q` — 189 passed, `ruff check` clean (cold-start paths unchanged). Web: `vitest` 20
+  passed, `tsc -b` clean.
+
 ## Status
 
-**Open.**
+**Closed.** Acceptance criteria are implemented and covered.

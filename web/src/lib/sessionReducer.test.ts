@@ -11,6 +11,7 @@ import type { SessionState, SetupForm } from './types'
 const form: SetupForm = {
   mode: 'demo',
   sessionId: 's1',
+  candidateId: '',
   targetRole: 'machine learning engineer',
   targetCompanies: '',
   claimedSkills: {

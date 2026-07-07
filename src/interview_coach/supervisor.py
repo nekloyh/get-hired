@@ -35,7 +35,7 @@ from .microloop import (
 )
 from .resources import ResourceStore
 from .seeds import SeedQuestion, seed_count, select_seed_question
-from .skill import SkillState
+from .skill import SkillState, confidence_weight
 from .study_planner import plan_study
 
 logger = logging.getLogger(__name__)
@@ -74,6 +74,8 @@ class SessionState(TypedDict, total=False):
     supervisor_decisions: list[dict[str, Any]]
     study_plan: dict[str, Any] | None
     study_plan_error: str | None
+    candidate_id: str  # cross-session ledger id (0023); "" for a one-shot cold-start Session
+    ledger_prior_mastery: dict[str, float]  # last Session's per-Skill mean; only for a returning Candidate (0023)
 
 
 class SupervisorDecision(BaseModel):
@@ -111,14 +113,21 @@ def initial_session_state(
     max_questions: int = DEFAULT_MAX_QUESTIONS,
     max_elapsed_seconds: float = DEFAULT_MAX_ELAPSED_SECONDS,
     started_at: float | None = None,
+    candidate_id: str = "",
+    ledger_prior_mastery: Mapping[str, float] | None = None,
 ) -> SessionState:
-    """Build the single LangGraph state object from the Diagnostic output."""
+    """Build the single LangGraph state object from the Diagnostic output.
+
+    ``ledger_prior_mastery`` (0023) carries a returning Candidate's *last-Session* per-Skill means so
+    the export/report can show a since-last-session delta; it is omitted entirely for a first-ever
+    Session (cold start), which then renders no delta block.
+    """
     if max_questions < 1:
         raise ValueError("max_questions must be >= 1")
     if max_elapsed_seconds <= 0:
         raise ValueError("max_elapsed_seconds must be > 0")
     topic_plan = [asdict(entry) for entry in diagnostic.topic_plan]
-    return {
+    state: SessionState = {
         "session_id": session_id,
         "topic_plan": topic_plan,
         "skill_states": {
@@ -144,7 +153,11 @@ def initial_session_state(
         "supervisor_decisions": [],
         "study_plan": None,
         "study_plan_error": None,
+        "candidate_id": candidate_id,
     }
+    if ledger_prior_mastery:
+        state["ledger_prior_mastery"] = dict(ledger_prior_mastery)
+    return state
 
 
 def session_config(session_id: str) -> dict[str, dict[str, str]]:
@@ -591,6 +604,14 @@ def _load_skill_state(state: SessionState, skill: str) -> SkillState:
     return SkillState(skill=str(raw["skill"]), alpha=float(raw["alpha"]), beta=float(raw["beta"]))
 
 
+def skill_states_from_state(state: Mapping[str, Any]) -> dict[str, SkillState]:
+    """Rehydrate every persisted Skill posterior — used to write the cross-session ledger (0023)."""
+    return {
+        skill: SkillState(skill=str(raw["skill"]), alpha=float(raw["alpha"]), beta=float(raw["beta"]))
+        for skill, raw in state.get("skill_states", {}).items()
+    }
+
+
 def _dump_skill_state(state: SkillState) -> dict[str, float | str]:
     return {"skill": state.skill, "alpha": state.alpha, "beta": state.beta}
 
@@ -610,6 +631,7 @@ def _dump_failed_question(
         "stop_reason": StopReason.FAILED.value,
         "resolved_weighted_score": 0.0,
         "resolved_confidence": 0.0,
+        "evidence_weight": 0.0,  # a crash is not evidence (issue 0014/0021): prior kept, zero weight
         "skill_state": _dump_skill_state(prior),
         "turns": [],
         "error": f"{type(error).__name__}: {error}",
@@ -629,6 +651,9 @@ def _dump_micro_loop(result: MicroLoopResult, *, plan_index: int) -> dict[str, A
         "stop_reason": result.stop_reason.value,
         "resolved_weighted_score": result.resolved_evaluation.weighted_score,
         "resolved_confidence": result.resolved_evaluation.confidence,
+        # The evidence weight actually folded into the belief (issue 0021), so the confidence-scaling
+        # is auditable in the export. Same function apply_evaluation uses — single source of truth.
+        "evidence_weight": confidence_weight(result.resolved_evaluation.confidence),
         "skill_state": _dump_skill_state(result.skill_state),
         "turns": [
             {

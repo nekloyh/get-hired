@@ -48,6 +48,14 @@ export function SetupPanel({ form, health, errors, onChange, onStart, onResume }
           <input value={form.sessionId} onChange={(event) => onChange({ ...form, sessionId: event.target.value })} />
         </label>
         <label>
+          Candidate id <span className="hint">(optional — remembers progress across sessions)</span>
+          <input
+            value={form.candidateId}
+            placeholder="e.g. your name"
+            onChange={(event) => onChange({ ...form, candidateId: event.target.value })}
+          />
+        </label>
+        <label>
           Target role
           <input value={form.targetRole} onChange={(event) => onChange({ ...form, targetRole: event.target.value })} />
         </label>
