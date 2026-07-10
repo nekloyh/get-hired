@@ -41,10 +41,42 @@ Vietnamese answer a very different score from its English twin despite identical
 - Provider: re-run the bench on Groq (`llama-3.3-70b-versatile`) to see whether the VN inconsistency
   is `gpt-4o-mini`-specific before investing in a prompt change.
 
+## Resolution progress
+
+A language-invariance instruction was added to the Evaluator `SYSTEM_PROMPT` (*"LANGUAGE MUST NOT
+AFFECT THE SCORE … score a Vietnamese answer exactly as you would its faithful English translation …
+a weak answer scores just as low in Vietnamese as in English"*). Gated by `coach bench` on
+`openai`/`gpt-4o-mini` — full report: `docs/audits/calibration-bench-2026-07-11-vn-consistency.md`.
+
+- [x] `dl_overfitting_strong_vi` now lands **in band** (4.00, was 3.00); every strong/medium pair is
+      consistent (Δ = 0.00). Per-dimension bias preserved (correctness +0.00, system_thinking −0.10);
+      the judge did **not** get more lenient (weak-mean 1.60).
+- [ ] `vnlp_segmentation_weak_vi` is **not** resolved — and it turns out this is not fixable here. The
+      clean prompt scores the English twin 1.00 (matching the label, in band) but the Vietnamese twin
+      a rock-solid 3.00 across all four prompt variants tried. Because the content is identical, the
+      VN 3.00 is a genuine `gpt-4o-mini` leniency error on a borderline Vietnamese answer, **not** a
+      mislabelled band — relabeling would bless a score the judge contradicts in English, and no
+      prompt wording moves the stable VN 3.00. A "fully consistent" lenient wording was rejected: it
+      reached EN≈VN only by inflating the English score over band (a worse judge).
+
+**Groq cross-check done (issue's third approach):**
+`docs/audits/calibration-bench-2026-07-11-vn-consistency-groq.md`. The residual is **not**
+`gpt-4o-mini`-specific — `llama-3.3-70b-versatile` scores `vnlp_segmentation_weak` **identically**
+(EN 1.00 ✅ / VN 3.00 ❌, Δ = 2.00). Two independent models over-scoring the same borderline
+Vietnamese answer by the same margin confirms a genuine **cross-model reliability limit on borderline
+Vietnamese input**, not a provider quirk and not a mislabelled band. Groq is also only 18/20 overall
+(harsher judge; a different near-miss on `dl_overfitting_strong_en` = 3.70), so a provider swap is not
+a win. Neither prompt tuning, a provider swap, nor relabeling properly resolves this one case.
+
 ## Blocked by
 
 None.
 
 ## Status
 
-**Open.**
+**Prompt fix landed (19/20 on the primary `gpt-4o-mini` path, VN consistency substantially improved:
+`dl_overfitting_strong_vi` fixed, all strong/medium pairs consistent).** The lone residual
+(`vnlp_segmentation_weak_vi`) is a documented, cross-model VN-reliability limit — tracked as a known
+limitation, not fixable by the means available on this bench. `coach bench` therefore stays exit 1
+until either a materially better VN judge exists or the case is retired; recommend leaving #35 open as
+that tracked limitation rather than closing it as fully resolved.
