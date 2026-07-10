@@ -468,7 +468,7 @@
     nhau: hỏng khớp từ điển, tách từ, cache, và tăng OOV cho tokenizer. Tiếng Việt còn có hai quy ước
     đặt dấu ("hoà" kiểu cũ, "hòa" kiểu mới). Chuẩn hoá NFC cộng thống nhất quy ước dấu phải chạy ngay
     đầu pipeline, và giống hệt nhau giữa lúc huấn luyện và lúc phục vụ.
-  tags: [unicode, nfc, nfd, tone_placement, preprocessing]
+  tags: [unicode, nfc, nfd, normalization, tone_placement, preprocessing]
 
 - id: vietnamese_nlp_teencode
   skill: vietnamese_nlp

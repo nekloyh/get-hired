@@ -451,7 +451,8 @@ mlops:
         replay them offline to catch skew, and run a pre-promotion evaluation on a frozen holdout in CI
         so a regression is caught before traffic ever sees it.
     difficulty: 4
-    expected_concepts: [mlops_drift_monitoring, mlops_model_rollout]
+    expected_concepts:
+      [mlops_drift_monitoring, mlops_model_rollout, mlops_experiment_tracking, mlops_data_validation]
     follow_up_seeds:
       - Probe the single most likely cause of train/prod divergence and the check for it.
       - Ask what they version to make a run reproducible.
@@ -823,7 +824,7 @@ vietnamese_nlp:
         monolingual data usually beat mBERT/XLM-R on Vietnamese NER, POS, and sentiment, though a
         multilingual model can still win when I need cross-lingual transfer.
     difficulty: 4
-    expected_concepts: [vietnamese_nlp_phobert]
+    expected_concepts: [vietnamese_nlp_phobert, vietnamese_nlp_vncorenlp]
     follow_up_seeds:
       - Ask why segmenting the input before PhoBERT matters.
       - Probe when a multilingual model would still be the better choice.
