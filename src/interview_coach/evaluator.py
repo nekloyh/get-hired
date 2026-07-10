@@ -92,6 +92,15 @@ class Evaluation(BaseModel):
     follow_up_rationale: str = Field(
         description="Whether one more probing question would reveal something not already known."
     )
+    evidence_degraded: bool = Field(
+        default=False,
+        description=(
+            "Derived, not model-authored (issue 0033): True when EVERY dimension's citation was "
+            "unverifiable and blanked to UNVERIFIABLE_EVIDENCE. The score is kept, but an entirely "
+            "fabricated audit trail is a hallucination signal, so confidence is capped and the "
+            "export/UI can surface 'scored, but citations unverifiable'."
+        ),
+    )
     self_critique: SelfCritiqueTrace | None = None
 
 
@@ -132,12 +141,21 @@ def _make_validators(rubric: Rubric, answer: str, *, include_evidence: bool = Tr
     return [check_dimensions, check_evidence] if include_evidence else [check_dimensions]
 
 
+# When EVERY citation is blanked, confidence is capped here — clearly "low", mirroring the
+# weighted-score cross-check ceiling (:data:`DIVERGENCE_CONFIDENCE_CEILING`). An entirely unverifiable
+# audit trail is a hallucination signal (issue 0033), so a full-confidence score must not stand;
+# min() means we only ever lower confidence, never raise it, and re-applying the guard is a no-op.
+EVIDENCE_DEGRADE_CONFIDENCE_CEILING = 0.4
+
+
 def _sanitize_unverifiable_evidence(evaluation: Evaluation, answer: str) -> Evaluation:
     """Blank any dimension evidence that isn't a verbatim quote, keeping the score intact.
 
     The degrade backstop: reached only after the enforced-with-retry evidence check has already
     failed, so we replace the unverifiable citation with :data:`UNVERIFIABLE_EVIDENCE` rather than
-    discard the whole (schema- and dimension-valid) judgment.
+    discard the whole (schema- and dimension-valid) judgment. Sets :attr:`Evaluation.evidence_degraded`
+    when *every* citation was blanked — an entirely fabricated audit trail (issue 0033); the matching
+    confidence haircut is applied in :func:`evaluate` so it caps the judgment actually kept.
     """
     changed = {
         dim: ds.model_copy(update={"evidence": UNVERIFIABLE_EVIDENCE})
@@ -146,12 +164,40 @@ def _sanitize_unverifiable_evidence(evaluation: Evaluation, answer: str) -> Eval
     }
     if not changed:
         return evaluation
+    entirely_degraded = len(changed) == len(evaluation.dimensions)
     logger.warning(
-        "evidence degrade: blanked %d unverifiable quote(s) to keep the score: %s",
+        "evidence degrade: blanked %d/%d unverifiable quote(s) to keep the score: %s%s",
         len(changed),
+        len(evaluation.dimensions),
         sorted(changed),
+        " (ALL citations unverifiable — flagging evidence_degraded)" if entirely_degraded else "",
     )
-    return evaluation.model_copy(update={"dimensions": {**evaluation.dimensions, **changed}})
+    return evaluation.model_copy(
+        update={
+            "dimensions": {**evaluation.dimensions, **changed},
+            "evidence_degraded": entirely_degraded,
+        }
+    )
+
+
+def apply_evidence_degrade_haircut(evaluation: Evaluation) -> Evaluation:
+    """Cap ``confidence`` low when the judgment's citations were *entirely* unverifiable.
+
+    Mirrors :func:`apply_cross_check`: it only ever lowers confidence (via ``min``) and is a no-op when
+    the evaluation is not degraded or is already below the ceiling. Applied to the judgment actually
+    kept, so a self-critique pass that restored verifiable evidence is not needlessly penalised.
+    """
+    if not evaluation.evidence_degraded:
+        return evaluation
+    capped = min(evaluation.confidence, EVIDENCE_DEGRADE_CONFIDENCE_CEILING)
+    if capped == evaluation.confidence:
+        return evaluation
+    logger.info(
+        "evidence degrade: every citation unverifiable; capping confidence %.2f -> %.2f",
+        evaluation.confidence,
+        capped,
+    )
+    return evaluation.model_copy(update={"confidence": capped})
 
 
 SYSTEM_PROMPT = (
@@ -341,7 +387,7 @@ def evaluate(client: LLMClient, question: str, answer: str, rubric: Rubric) -> E
     )
     triggers = _self_critique_triggers(first, rubric)
     if not triggers:
-        return first
+        return apply_evidence_degrade_haircut(first)
 
     second = apply_cross_check(
         _evaluate_once(
@@ -361,6 +407,7 @@ def evaluate(client: LLMClient, question: str, answer: str, rubric: Rubric) -> E
         second.confidence,
         kept_pass,
     )
+    kept = apply_evidence_degrade_haircut(kept)
     return kept.model_copy(
         update={
             "self_critique": SelfCritiqueTrace(
