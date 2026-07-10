@@ -65,8 +65,18 @@ a weak answer scores just as low in Vietnamese as in English"*). Gated by `coach
 (EN 1.00 ✅ / VN 3.00 ❌, Δ = 2.00). Two independent models over-scoring the same borderline
 Vietnamese answer by the same margin confirms a genuine **cross-model reliability limit on borderline
 Vietnamese input**, not a provider quirk and not a mislabelled band. Groq is also only 18/20 overall
-(harsher judge; a different near-miss on `dl_overfitting_strong_en` = 3.70), so a provider swap is not
-a win. Neither prompt tuning, a provider swap, nor relabeling properly resolves this one case.
+(harsher judge; a different near-miss on `dl_overfitting_strong_en` = 3.70), so a *same-tier* provider
+swap is not a win. Prompt tuning and relabeling were both ruled out.
+
+**Resolved by a stronger judge model — `gpt-5.4-mini`.**
+`docs/audits/calibration-bench-2026-07-11-gpt-5.4-mini.md`. Upgrading the judge from `gpt-4o-mini` to
+`gpt-5.4-mini` (still on the language-invariance prompt) takes the bench to **20/20, exit 0 (green)**:
+`vnlp_segmentation_weak_vi` now scores **2.00, in band**, matching its English twin (Δ = 0.00), and
+weak/strong separation improves to 2.83. This confirms the residual was a **small-model capability
+limit**, exactly the resolution this issue pointed to. `gpt-5.4-mini` sits in OpenAI's free
+2.5M-tokens/day tier, so the upgrade is $0 at dev volume. Follow-up (not blocking): the bench bands
+were labelled against `gpt-4o-mini`, and `gpt-5.4-mini` shows a `communication` bias of +0.65 and
+scores strong answers high — worth a future anchor re-review for the new judge.
 
 ## Blocked by
 
@@ -74,9 +84,7 @@ None.
 
 ## Status
 
-**Prompt fix landed (19/20 on the primary `gpt-4o-mini` path, VN consistency substantially improved:
-`dl_overfitting_strong_vi` fixed, all strong/medium pairs consistent).** The lone residual
-(`vnlp_segmentation_weak_vi`) is a documented, cross-model VN-reliability limit — tracked as a known
-limitation, not fixable by the means available on this bench. `coach bench` therefore stays exit 1
-until either a materially better VN judge exists or the case is retired; recommend leaving #35 open as
-that tracked limitation rather than closing it as fully resolved.
+**Closed — resolved by upgrading the judge to `gpt-5.4-mini`.** The language-invariance prompt fix
+(PR #41) fixed the VN consistency on all but one borderline case; that last case was a small-model
+capability limit (reproduced on `gpt-4o-mini` and Groq `llama-3.3-70b`), and the stronger
+`gpt-5.4-mini` judge scores it correctly — bench is now 20/20 green.

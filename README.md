@@ -53,9 +53,11 @@ cp .env.example .env    # then fill in your MiMo/Groq credentials
 cd web && npm install   # install the React UI toolchain
 ```
 
-`.env` keys: set `PRIMARY_PROVIDER=mimo` or `PRIMARY_PROVIDER=groq`, then fill that provider's
-`*_API_KEY`, `*_BASE_URL`, and `*_MODEL`. If both providers are configured, the non-primary provider
-is used as fallback.
+`.env` keys: set `PRIMARY_PROVIDER` to `openai`, `groq`, or `mimo`, then fill that provider's
+`*_API_KEY` and `*_MODEL` (plus `*_BASE_URL` for mimo). Any other configured provider is used as
+fallback. **The validated judge is `openai` / `gpt-5.4-mini`** — the configuration that passes
+`coach bench` 20/20 (issue 0031) and runs inside OpenAI's free daily tier; `gpt-4o-mini` and Groq
+`llama-3.3-70b` each leave one borderline Vietnamese case out of band (a small-model capability limit).
 
 ## Run
 
@@ -125,6 +127,11 @@ labels, weak/strong separation, EN-vs-VN paired deltas, and a confidence-calibra
 says 0.9, is it right ~90% of the time?"). It exits non-zero on any range regression, so it gates a
 judge change the same way a failing test would. Reports are versioned in `docs/audits/` so judge
 quality has a history, not a vibe.
+
+Current status: the bench is **green (20/20)** on the validated `gpt-4o-mini`→`gpt-5.4-mini` judge
+upgrade — latest report `docs/audits/calibration-bench-2026-07-11-gpt-5.4-mini.md`. The bands were
+originally labelled against `gpt-4o-mini`, so a re-anchor for the current judge is a tracked follow-up
+(`gpt-5.4-mini` over-rates `communication` by +0.65 and scores strong answers high).
 
 The bench's companion is the **Simulated Candidate + Supervisor replay bench** (issue 0029,
 `interview_coach.replay`): where `coach bench` calibrates the *judge*, the replay bench calibrates the
