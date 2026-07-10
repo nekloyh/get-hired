@@ -59,10 +59,14 @@ a weak answer scores just as low in Vietnamese as in English"*). Gated by `coach
       prompt wording moves the stable VN 3.00. A "fully consistent" lenient wording was rejected: it
       reached EN≈VN only by inflating the English score over band (a worse judge).
 
-**Recommended next step (issue's third approach):** re-run the bench on Groq
-(`llama-3.3-70b-versatile`) to confirm whether the residual is `gpt-4o-mini`-specific before investing
-further. Awaiting direction on whether to accept the residual as a tracked follow-up, run the Groq
-check, or revisit the label.
+**Groq cross-check done (issue's third approach):**
+`docs/audits/calibration-bench-2026-07-11-vn-consistency-groq.md`. The residual is **not**
+`gpt-4o-mini`-specific — `llama-3.3-70b-versatile` scores `vnlp_segmentation_weak` **identically**
+(EN 1.00 ✅ / VN 3.00 ❌, Δ = 2.00). Two independent models over-scoring the same borderline
+Vietnamese answer by the same margin confirms a genuine **cross-model reliability limit on borderline
+Vietnamese input**, not a provider quirk and not a mislabelled band. Groq is also only 18/20 overall
+(harsher judge; a different near-miss on `dl_overfitting_strong_en` = 3.70), so a provider swap is not
+a win. Neither prompt tuning, a provider swap, nor relabeling properly resolves this one case.
 
 ## Blocked by
 
@@ -70,5 +74,9 @@ None.
 
 ## Status
 
-**Prompt fix landed (19/20, VN consistency substantially improved); one `gpt-4o-mini`-specific
-residual (`vnlp_segmentation_weak_vi`) pending direction.**
+**Prompt fix landed (19/20 on the primary `gpt-4o-mini` path, VN consistency substantially improved:
+`dl_overfitting_strong_vi` fixed, all strong/medium pairs consistent).** The lone residual
+(`vnlp_segmentation_weak_vi`) is a documented, cross-model VN-reliability limit — tracked as a known
+limitation, not fixable by the means available on this bench. `coach bench` therefore stays exit 1
+until either a materially better VN judge exists or the case is retired; recommend leaving #35 open as
+that tracked limitation rather than closing it as fully resolved.
