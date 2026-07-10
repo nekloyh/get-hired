@@ -9,6 +9,7 @@ import pytest
 from interview_coach.config import load_settings
 from interview_coach.evaluator import (
     DIVERGENCE_CONFIDENCE_CEILING,
+    EVIDENCE_DEGRADE_CONFIDENCE_CEILING,
     SELF_CRITIQUE_CONFIDENCE_THRESHOLD,
     UNVERIFIABLE_EVIDENCE,
     WEIGHTED_SCORE_TOLERANCE,
@@ -156,11 +157,15 @@ def test_no_evidence_is_allowed(make_client):
 def _single_dim_eval(evidence: str) -> str:
     # One-dimension rubric keeps weighted_score == the dimension score (no cross-check, no critique),
     # so call_count isolates exactly whether the evidence gate accepted the quote on the first attempt.
+    return _single_dim_eval_conf(evidence, confidence=0.9)
+
+
+def _single_dim_eval_conf(evidence: str, *, confidence: float) -> str:
     return json.dumps(
         {
             "dimensions": {"correctness": {"score": 5, "evidence": evidence}},
             "weighted_score": 5.0,
-            "confidence": 0.9,
+            "confidence": confidence,
             "follow_up_recommended": False,
             "follow_up_rationale": "n/a",
         }
@@ -240,6 +245,86 @@ def test_persistently_unverifiable_evidence_degrades_instead_of_crashing(make_cl
     assert ev.dimensions["correctness"].score == 5  # score preserved
     assert ev.dimensions["correctness"].evidence == UNVERIFIABLE_EVIDENCE  # citation blanked, not crashed
     assert fake.call_count == 3  # 2 enforced attempts fail evidence, then 1 degrade pass without it
+
+
+# --- evidence-degrade confidence signal (issue 0033 / GH #37) ----------------------------------
+
+
+def _two_dim_eval(corr_evidence: str, depth_evidence: str, *, confidence: float = 0.9) -> str:
+    return json.dumps(
+        {
+            "dimensions": {
+                "correctness": {"score": 5, "evidence": corr_evidence},
+                "depth": {"score": 4, "evidence": depth_evidence},
+            },
+            "weighted_score": 4.6,
+            "confidence": confidence,
+            "follow_up_recommended": False,
+            "follow_up_rationale": "n/a",
+        }
+    )
+
+
+def test_entirely_unverifiable_evidence_flags_degraded_and_caps_confidence(make_client):
+    # The hardening for issue 0033: when EVERY citation is unverifiable and blanked, that is a strong
+    # hallucination signal. The score is still kept (a valid judgment must not be lost to a bad quote),
+    # but the judgment must no longer read as full-confidence — it carries evidence_degraded=True and
+    # its confidence is capped low, mirroring the weighted-score cross-check ceiling.
+    answer = "Bias is systematic error from too-simple assumptions."
+    rubric = Rubric(weights={"correctness": 1.0})
+    client, _ = make_client([_single_dim_eval("the model oversimplifies the data")])  # never verbatim
+
+    ev = evaluate(client, "Explain bias.", answer, rubric)
+
+    assert ev.dimensions["correctness"].score == 5  # score preserved
+    assert ev.dimensions["correctness"].evidence == UNVERIFIABLE_EVIDENCE
+    assert ev.evidence_degraded is True
+    assert ev.confidence <= EVIDENCE_DEGRADE_CONFIDENCE_CEILING  # full 0.9 confidence no longer stands
+
+
+def test_partial_citation_blanking_is_not_flagged_and_keeps_confidence(make_client):
+    # A judgment with SOME verifiable evidence still has a partial audit trail — the current
+    # "sanitize-and-keep" behavior is correct there. Only an *entirely* fabricated trail trips the
+    # degrade signal, so a partial blank must not flag or haircut.
+    answer = "Bias is systematic error from too-simple assumptions."
+    rubric = Rubric(weights={"correctness": 0.6, "depth": 0.4})
+    # correctness quotes verbatim; depth paraphrases -> the enforced check fails, then degrade blanks
+    # only depth. Two attempts fail the evidence gate, then one degrade pass runs without it.
+    verbatim = "systematic error from too-simple assumptions"
+    paraphrase = "the answer lacks nuance"
+    client, fake = make_client(
+        [_two_dim_eval(verbatim, paraphrase), _two_dim_eval(verbatim, paraphrase)]
+    )
+
+    ev = evaluate(client, "Explain bias.", answer, rubric)
+
+    assert ev.dimensions["correctness"].evidence == verbatim  # verifiable citation kept
+    assert ev.dimensions["depth"].evidence == UNVERIFIABLE_EVIDENCE  # only the bad one blanked
+    assert ev.evidence_degraded is False  # audit trail only partially unverifiable
+    assert ev.confidence == pytest.approx(0.9)  # not capped
+
+
+def test_happy_path_is_not_evidence_degraded(make_client):
+    # A judgment whose citations all verify carries evidence_degraded=False and keeps its confidence.
+    client, _ = make_client([_eval_json(_good_dimensions(), confidence=0.9)])
+    ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+
+    assert ev.evidence_degraded is False
+    assert ev.confidence == pytest.approx(0.9)
+
+
+def test_evidence_degrade_ceiling_only_lowers_confidence(make_client):
+    # The haircut uses min(): a judgment already less confident than the ceiling is left untouched,
+    # exactly like the cross-check guard — the degrade signal never raises confidence.
+    answer = "Bias is systematic error from too-simple assumptions."
+    rubric = Rubric(weights={"correctness": 1.0})
+    low = EVIDENCE_DEGRADE_CONFIDENCE_CEILING / 2
+    client, _ = make_client([_single_dim_eval_conf("the model oversimplifies", confidence=low)])
+
+    ev = evaluate(client, "Explain bias.", answer, rubric)
+
+    assert ev.evidence_degraded is True
+    assert ev.confidence == pytest.approx(low)  # already below the ceiling; unchanged
 
 
 # --- weighted_score cross-check guard (slice 0003) ---------------------------------------------

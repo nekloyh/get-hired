@@ -27,10 +27,29 @@ unchanged confidence. Nothing signals downstream that the citation trail was ent
 
 ## Acceptance criteria
 
-- [ ] A judgment whose evidence was entirely blanked no longer reads as full-confidence (via a
+- [x] A judgment whose evidence was entirely blanked no longer reads as full-confidence (via a
       confidence haircut or an explicit degrade flag)
-- [ ] The change is re-checked against `coach bench` (confidence-calibration table) so it does not
+- [x] The change is re-checked against `coach bench` (confidence-calibration table) so it does not
       regress the calibrated hit-rate
+
+## Resolution
+
+Both directions, together. `_sanitize_unverifiable_evidence` now sets a new `evidence_degraded` flag
+on the `Evaluation` when *every* dimension's citation was blanked (an entirely fabricated audit
+trail), and `apply_evidence_degrade_haircut` caps `confidence` at `EVIDENCE_DEGRADE_CONFIDENCE_CEILING`
+(0.4, mirroring the weighted-score cross-check ceiling) for that judgment — never raising confidence,
+idempotent, and applied to the pass actually kept so a self-critique that restored verifiable evidence
+is not penalised. A *partial* blank keeps today's behavior (score + confidence intact): only a wholly
+unverifiable trail is treated as the hallucination signal. The exporter surfaces a "scored, but
+citations unverifiable" warning so the audit gap is visible downstream.
+
+Verified against `coach bench` (ADR 0009) on `openai`/`gpt-4o-mini`:
+`docs/audits/calibration-bench-2026-07-11-evidence-degrade.md` — **18/20 within band**, unchanged from
+the 2026-07-07 baseline, per-dimension bias identical, and the haircut never fired on a calibrated
+case (bench answers only partially degrade, never wholly), so calibration is provably unaffected. The
+two remaining reds are the separate VN-consistency bug (issue 0031 / #35). Unit coverage in
+`tests/test_evaluator.py` (entirely-blanked ⇒ flag + cap; partial ⇒ neither; happy path ⇒ neither;
+min() never raises) and `tests/test_study_planner.py` (export surfacing).
 
 ## Blocked by
 
@@ -38,4 +57,4 @@ None. Not urgent — the current behavior is safe, just not maximally skeptical.
 
 ## Status
 
-**Open.**
+**Closed.**

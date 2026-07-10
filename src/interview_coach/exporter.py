@@ -162,6 +162,12 @@ def _append_evaluation(lines: list[str], evaluation: Mapping[str, Any]) -> None:
     )
     if rationale := evaluation.get("follow_up_rationale"):
         lines.append(f"Rationale: {_md(rationale)}")
+    if evaluation.get("evidence_degraded"):
+        # issue 0033: every citation was unverifiable — the score stands but its audit trail does not.
+        lines.append(
+            "> ⚠️ Evidence degraded: every citation was unverifiable, so the score is kept but its "
+            "audit trail is not — confidence has been capped."
+        )
 
 
 def _append_supervisor_decisions(lines: list[str], session_state: Mapping[str, Any]) -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from interview_coach.exporter import export_session_markdown
+from interview_coach.exporter import export_session_markdown, render_session_markdown
 from interview_coach.resources import InMemoryResourceStore, seed_resource_store
 from interview_coach.study_planner import plan_study, rank_study_targets
 
@@ -227,3 +227,16 @@ def test_session_export_markdown_includes_transcript_evaluations_and_plan(tmp_pa
     assert "I would retrain sometimes." in text
     assert "Weighted score: **2.00/5**" in text
     assert "https://developers.google.com/machine-learning/guides/rules-of-ml" in text
+
+
+def test_export_surfaces_evidence_degraded_warning():
+    # issue 0033: an entirely-unverifiable citation trail is flagged in the transcript, so the export
+    # surfaces "scored, but citations unverifiable" instead of silently presenting a full-trust score.
+    state = _state()
+    state["transcript"][0]["turns"][0]["evaluation"]["evidence_degraded"] = True
+    degraded = render_session_markdown(state)
+    assert "Evidence degraded" in degraded
+
+    state["transcript"][0]["turns"][0]["evaluation"]["evidence_degraded"] = False
+    clean = render_session_markdown(state)
+    assert "Evidence degraded" not in clean  # a normal judgment shows no warning
