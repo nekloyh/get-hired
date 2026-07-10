@@ -75,6 +75,17 @@ def test_evaluate_happy_path(make_client):
     assert fake.call_count == 1
 
 
+def test_system_prompt_enforces_language_invariance():
+    # issue 0031 / #35: the judge scored VN answers inconsistently from their EN twins. The fix is a
+    # prompt instruction that language must not affect the score; the calibration bench is the
+    # behavioral gate, and this offline check locks the contract so it can't be silently dropped.
+    from interview_coach.evaluator import SYSTEM_PROMPT
+
+    lowered = SYSTEM_PROMPT.lower()
+    assert "language must not affect the score" in lowered
+    assert "vietnamese" in lowered  # the instruction names the language it must not penalise
+
+
 def test_weight_zero_dimension_rejected_then_corrected(make_client):
     bad = _good_dimensions() | {"mlops_awareness": {"score": 3, "evidence": "no evidence"}}
     client, fake = make_client([_eval_json(bad), _eval_json(_good_dimensions())])

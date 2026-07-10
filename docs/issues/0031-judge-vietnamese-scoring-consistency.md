@@ -41,10 +41,34 @@ Vietnamese answer a very different score from its English twin despite identical
 - Provider: re-run the bench on Groq (`llama-3.3-70b-versatile`) to see whether the VN inconsistency
   is `gpt-4o-mini`-specific before investing in a prompt change.
 
+## Resolution progress
+
+A language-invariance instruction was added to the Evaluator `SYSTEM_PROMPT` (*"LANGUAGE MUST NOT
+AFFECT THE SCORE … score a Vietnamese answer exactly as you would its faithful English translation …
+a weak answer scores just as low in Vietnamese as in English"*). Gated by `coach bench` on
+`openai`/`gpt-4o-mini` — full report: `docs/audits/calibration-bench-2026-07-11-vn-consistency.md`.
+
+- [x] `dl_overfitting_strong_vi` now lands **in band** (4.00, was 3.00); every strong/medium pair is
+      consistent (Δ = 0.00). Per-dimension bias preserved (correctness +0.00, system_thinking −0.10);
+      the judge did **not** get more lenient (weak-mean 1.60).
+- [ ] `vnlp_segmentation_weak_vi` is **not** resolved — and it turns out this is not fixable here. The
+      clean prompt scores the English twin 1.00 (matching the label, in band) but the Vietnamese twin
+      a rock-solid 3.00 across all four prompt variants tried. Because the content is identical, the
+      VN 3.00 is a genuine `gpt-4o-mini` leniency error on a borderline Vietnamese answer, **not** a
+      mislabelled band — relabeling would bless a score the judge contradicts in English, and no
+      prompt wording moves the stable VN 3.00. A "fully consistent" lenient wording was rejected: it
+      reached EN≈VN only by inflating the English score over band (a worse judge).
+
+**Recommended next step (issue's third approach):** re-run the bench on Groq
+(`llama-3.3-70b-versatile`) to confirm whether the residual is `gpt-4o-mini`-specific before investing
+further. Awaiting direction on whether to accept the residual as a tracked follow-up, run the Groq
+check, or revisit the label.
+
 ## Blocked by
 
 None.
 
 ## Status
 
-**Open.**
+**Prompt fix landed (19/20, VN consistency substantially improved); one `gpt-4o-mini`-specific
+residual (`vnlp_segmentation_weak_vi`) pending direction.**
