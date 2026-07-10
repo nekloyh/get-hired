@@ -37,6 +37,79 @@
     regularization, more data, or a simpler model lowers variance. Learning curves tell the two apart.
   tags: [bias, variance, underfitting, overfitting, learning_curves]
 
+- id: ml_fundamentals_classification_metrics
+  skill: ml_fundamentals
+  title: Classification metrics under class imbalance
+  content: >-
+    Accuracy misleads when classes are imbalanced: with 1% positives, predicting all-negative scores
+    99%. Precision (TP/(TP+FP)) measures how many alerts are real; recall (TP/(TP+FN)) measures how
+    many positives are caught; F1 is their harmonic mean. ROC-AUC ranks over all thresholds but can
+    look optimistic under heavy imbalance because the false-positive rate divides by the huge negative
+    class; PR-AUC focuses on the positive class and is more informative for rare positives. Pick the
+    operating threshold from the precision-recall tradeoff the product actually needs.
+  tags: [metrics, precision_recall, f1, roc_auc, pr_auc, imbalance]
+
+- id: ml_fundamentals_class_imbalance
+  skill: ml_fundamentals
+  title: Handling class imbalance
+  content: >-
+    Standard levers: class weights in the loss, resampling (oversample the minority — e.g. SMOTE — or
+    undersample the majority), and threshold moving on calibrated probabilities after training.
+    Resampling belongs inside the training folds only — oversampling before the split leaks
+    near-copies of minority samples into validation and inflates the estimate. Evaluate with
+    PR-based metrics on an untouched, natural-distribution test set; stratified splits keep the
+    estimate stable.
+  tags: [imbalance, class_weights, resampling, smote, threshold_moving]
+
+- id: ml_fundamentals_feature_scaling
+  skill: ml_fundamentals
+  title: 'Feature scaling: which models need it'
+  content: >-
+    Scaling (standardization or min-max) matters for models driven by distances or by gradient steps
+    with a shared learning rate: kNN, SVM, k-means, PCA, regularized linear/logistic regression, and
+    neural networks — an unscaled feature dominates the distance metric or is penalized unfairly by
+    L1/L2. Tree-based models (random forest, gradient boosting) split on thresholds and are invariant
+    to monotone transforms, so they do not need it. Fit the scaler on the training split only and
+    apply it to validation/test — fitting on the full dataset leaks test statistics.
+  tags: [scaling, standardization, distance, trees, leakage]
+
+- id: ml_fundamentals_ensembles
+  skill: ml_fundamentals
+  title: Bagging vs boosting
+  content: >-
+    Bagging (random forest) trains high-variance learners independently on bootstrap samples and
+    averages them — it mainly cuts variance, parallelizes trivially, and is robust to noise; adding
+    trees rarely overfits. Boosting (gradient boosting, XGBoost/LightGBM) fits learners sequentially
+    to the current ensemble's residual errors — it cuts bias and usually wins on tabular data, but
+    chases label noise harder and is more hyperparameter-sensitive: trade learning rate against tree
+    count and early-stop on a validation set.
+  tags: [bagging, boosting, random_forest, gradient_boosting, early_stopping]
+
+- id: ml_fundamentals_cross_entropy
+  skill: ml_fundamentals
+  title: Why cross-entropy rather than squared error for classification
+  content: >-
+    Cross-entropy is the negative log-likelihood of the Bernoulli/categorical model — maximum
+    likelihood, and a proper scoring rule for probabilities. The optimization argument: with a
+    sigmoid/softmax output, the cross-entropy gradient with respect to the logits is (p − y), which
+    stays large when the model is confidently wrong; squared error's gradient carries an extra
+    sigmoid-derivative factor that vanishes exactly there, so learning stalls on the worst mistakes.
+    For linear models, cross-entropy in the logits is also convex where squared-error-on-sigmoid is
+    not.
+  tags: [cross_entropy, log_loss, mse, vanishing_gradient, mle]
+
+- id: ml_fundamentals_curse_dimensionality
+  skill: ml_fundamentals
+  title: Curse of dimensionality
+  content: >-
+    As dimensionality grows, data becomes exponentially sparse and pairwise distances concentrate —
+    the nearest and farthest neighbors end up nearly equidistant — so distance-based methods (kNN,
+    k-means) lose their contrast and degrade. Density estimation in raw high-dimensional space needs
+    a sample size that grows exponentially. Remedies: feature selection, regularization,
+    dimensionality reduction (PCA, learned embeddings), metric learning, or models whose structural
+    assumptions supply the missing signal.
+  tags: [high_dimensional, distance_concentration, knn, pca, embeddings]
+
 # --- deep_learning -------------------------------------------------------------------------------
 - id: deep_learning_residual_connections
   skill: deep_learning
@@ -62,6 +135,81 @@
     stats so they do not drift away from the deployment distribution.
   tags: [batch_norm, normalization, running_statistics, train_inference_skew]
 
+- id: deep_learning_optimizers
+  skill: deep_learning
+  title: Adam vs SGD, and what AdamW fixes
+  content: >-
+    Adam keeps per-parameter estimates of the gradient's first and second moments, giving adaptive
+    step sizes — a robust default with fast early progress and less learning-rate tuning. Well-tuned
+    SGD with momentum can still generalize slightly better on vision benchmarks. AdamW decouples
+    weight decay from the adaptive scaling: adding an L2 term to the loss inside Adam is not
+    equivalent to true weight decay, because the adaptive denominator rescales the penalty per
+    parameter. Typical transformer recipe: AdamW plus learning-rate warmup. Switching optimizers
+    means retuning the learning rate — Adam and SGD live at very different scales.
+  tags: [adam, sgd, adamw, momentum, weight_decay]
+
+- id: deep_learning_dropout
+  skill: deep_learning
+  title: Dropout at train vs inference time
+  content: >-
+    Dropout zeroes each activation with probability p during training and scales the survivors by
+    1/(1−p) (inverted dropout) so expected activations match inference, where dropout is off and the
+    network is deterministic. It regularizes by preventing co-adaptation — every forward pass trains
+    a random subnetwork, ensemble-style. It is less used next to batch norm in convnets but standard
+    in transformers and dense heads. The classic bug is forgetting eval mode at inference: dropout
+    keeps firing, predictions turn noisy, and identical evaluation runs return different metrics.
+  tags: [dropout, regularization, inverted_dropout, train_eval_mode]
+
+- id: deep_learning_attention
+  skill: deep_learning
+  title: Self-attention vs recurrence
+  content: >-
+    Self-attention connects every pair of positions directly, so the path between distant tokens is
+    O(1) instead of O(n) recurrent steps — gradients need not survive n multiplications for the model
+    to relate them, which is why long-range dependencies become learnable. Training also parallelizes
+    over the whole sequence, where an RNN is inherently sequential. The costs: attention is O(n²) in
+    sequence length in time and memory (the reason sparse/linear/sliding-window variants exist), and
+    it is permutation-invariant, so positional information must be injected explicitly.
+  tags: [attention, transformer, rnn, path_length, positional_encoding]
+
+- id: deep_learning_transfer_learning
+  skill: deep_learning
+  title: Fine-tuning vs feature extraction
+  content: >-
+    With little data and a similar domain, freeze the pretrained backbone and train only a head —
+    few parameters, low overfitting risk. With more data or a domain shift, fine-tune more of the
+    network at a low learning rate so the pretrained features are adapted rather than destroyed
+    (catastrophic forgetting). Middle grounds: gradual unfreezing, discriminative per-layer learning
+    rates, or parameter-efficient adapters (LoRA). Always reuse the backbone's own preprocessing and
+    tokenization — a mismatch there silently costs more than the freeze/fine-tune decision.
+  tags: [transfer_learning, fine_tuning, catastrophic_forgetting, lora, adapters]
+
+- id: deep_learning_lr_schedules
+  skill: deep_learning
+  title: Learning-rate schedules, warmup, and divergence
+  content: >-
+    The learning rate is the highest-leverage hyperparameter: too high and the loss spikes or goes
+    NaN, too low and training crawls. Warmup ramps the rate from near zero over the first steps,
+    stabilizing early training when gradient statistics (and Adam's moment estimates) are still
+    noisy — near-mandatory for transformers at large batch sizes. After warmup, decay (cosine, step,
+    or linear) lets the model settle into a lower-loss region. A loss that diverges in the first few
+    hundred steps points first at the peak rate, missing warmup, or absent gradient clipping — check
+    those before blaming the data.
+  tags: [learning_rate, warmup, cosine_decay, gradient_clipping, divergence]
+
+- id: deep_learning_generalization
+  skill: deep_learning
+  title: Generalization in over-parameterized networks
+  content: >-
+    Deep networks can memorize completely random labels, so parameter-count capacity alone cannot
+    explain why they generalize on real data. In practice, SGD's implicit bias, architectural priors
+    (e.g. convolutional locality), and explicit regularization steer training toward simple, flat
+    solutions when the data has structure. Double descent adds that test error can fall again as
+    models grow past the interpolation point. Practical upshot: do not shrink a model purely out of
+    overfitting fear — scale it, regularize properly, and trust measured validation error over
+    parameter-count intuition.
+  tags: [generalization, double_descent, implicit_regularization, flat_minima, memorization]
+
 # --- mlops ---------------------------------------------------------------------------------------
 - id: mlops_drift_monitoring
   skill: mlops
@@ -83,6 +231,82 @@
     flag can flip back instantly. The rollback trigger is a guardrail metric breaching a preset
     threshold against control; log the canary verdict for the post-mortem.
   tags: [rollout, canary, shadow, rollback, feature_flag]
+
+- id: mlops_experiment_tracking
+  skill: mlops
+  title: Experiment tracking, lineage, and the model registry
+  content: >-
+    Every training run should record its code version, data version, hyperparameters, environment,
+    metrics, and output artifacts, so any model is reproducible and comparable. A model registry
+    stages models (staging → production) with lineage back to the run that produced them; promotion
+    is a registry transition, not a file copy. The test of the setup is one question: "which data and
+    code produced the model currently in production?" — if that takes more than minutes to answer,
+    debugging and rollback are guesswork.
+  tags: [experiment_tracking, model_registry, lineage, reproducibility, versioning]
+
+- id: mlops_ci_cd_models
+  skill: mlops
+  title: CI/CD and continuous training for ML pipelines
+  content: >-
+    ML pipelines extend normal CI/CD with data validation, tests of the training pipeline itself, and
+    a pre-promotion evaluation gate: the candidate must beat or match the current champion on a
+    frozen holdout, including guardrails (latency, calibration, critical slices) — a model that wins
+    on average but regresses a key slice is rejected. Continuous training automates
+    retrain-on-trigger (drift alert, schedule, fresh labels), but every retrained model passes the
+    same gate. The pipeline is a versioned artifact: retraining should be one trigger, not a
+    notebook ritual.
+  tags: [ci_cd, continuous_training, evaluation_gate, promotion, slices]
+
+- id: mlops_data_validation
+  skill: mlops
+  title: Data validation at pipeline boundaries
+  content: >-
+    Most production ML incidents are data incidents: an upstream team renames a column, changes a
+    unit, or starts sending nulls, and the model degrades silently. Validate at every boundary —
+    ingestion, feature-pipeline output, serving input: schema (names, types, ranges), distributions
+    against a reference profile, and volume/freshness. Fail loud or quarantine the bad partition
+    before it reaches training or serving, and name the violated expectation in the alert.
+    Expectation suites (Great Expectations / TFDV style) live in version control next to the
+    pipeline.
+  tags: [data_validation, schema_checks, expectations, data_quality, quarantine]
+
+- id: mlops_online_evaluation
+  skill: mlops
+  title: Offline vs online evaluation
+  content: >-
+    Offline metrics on a holdout are necessary but not sufficient: logged data reflects what the old
+    policy chose to show or block (selection bias), proxy metrics can diverge from the business
+    outcome, and distributions shift. The trust hierarchy is A/B test > off-policy estimate > offline
+    holdout. Run A/B tests with guardrail metrics and adequate power; interleaving gives cheap
+    sensitivity for ranking changes; off-policy evaluation estimates online impact from logs when
+    experiments are too costly. When offline gains do not translate online, fix the offline metric's
+    alignment before iterating further against it.
+  tags: [ab_testing, interleaving, off_policy_evaluation, guardrails, selection_bias]
+
+- id: mlops_serving_modes
+  skill: mlops
+  title: 'Serving modes: batch, real-time, streaming'
+  content: >-
+    Batch inference precomputes predictions on a schedule and serves them from a table by key — the
+    simplest operationally, right whenever the product tolerates staleness up to the recompute
+    interval (nightly recommendations, churn scores). Real-time serving answers request-by-request
+    under a latency budget and is forced when key features only exist at request time (current
+    session, query text); it brings feature-freshness pipelines, autoscaling, and tail-latency work.
+    Streaming scores events as they arrive, in between. Choose by freshness requirement — and default
+    to batch until real-time earns its operational cost.
+  tags: [batch_inference, real_time_serving, streaming, freshness, latency_budget]
+
+- id: mlops_feedback_loops
+  skill: mlops
+  title: Delayed labels and model feedback loops
+  content: >-
+    Ground truth often arrives late (fraud chargebacks take weeks) and is censored by the model's own
+    actions — a blocked transaction never reveals whether it was actually fraud, an unapproved loan
+    never shows default. Evaluation windows must match label maturity, and naive retraining on the
+    model-filtered stream inherits the selection bias, drifting the model away from the full
+    distribution. Mitigations: keep a small exploration/holdout slice of traffic for unbiased labels,
+    use importance weighting, monitor early proxy signals while the real labels mature.
+  tags: [feedback_loops, delayed_labels, censoring, selection_bias, exploration]
 
 # --- system_design -------------------------------------------------------------------------------
 - id: system_design_backpressure
@@ -115,6 +339,79 @@
     coalescing plus stale-while-revalidate so a cold-cache stampede does not send every miss to the
     model.
   tags: [latency, p99, caching, hedging, cache_stampede]
+
+- id: system_design_streaming_pipelines
+  skill: system_design
+  title: Batch vs streaming data pipelines
+  content: >-
+    Batch pipelines recompute periodically with high throughput and easy correction (re-run the job);
+    their latency floor is the schedule interval. Streaming pipelines process events incrementally
+    for low latency but must handle event time vs processing time, late arrivals (watermarks), and
+    managed state. The lambda architecture keeps both a batch and a streaming path and pays for it
+    with duplicated logic that drifts apart; kappa-style designs keep one streaming codepath over a
+    replayable log (e.g. Kafka), so backfill is just replay.
+  tags: [batch, streaming, kafka, event_time, watermarks, kappa]
+
+- id: system_design_delivery_semantics
+  skill: system_design
+  title: Delivery semantics and idempotency
+  content: >-
+    At-least-once delivery means every retry can duplicate a message, and reordering is normal —
+    design every consumer assuming both. End-to-end exactly-once is not a broker checkbox; it is
+    engineered idempotency at the consumer: idempotency keys or natural keys with upsert/dedup
+    storage make retries safe. The transactional outbox pattern keeps a database write and its event
+    publish atomic, avoiding the dual-write inconsistency. Size the dedup window to the realistic
+    redelivery horizon.
+  tags: [idempotency, exactly_once, at_least_once, outbox, dedup]
+
+- id: system_design_scaling_basics
+  skill: system_design
+  title: Horizontal scaling and statelessness
+  content: >-
+    Scaling out means adding replicas behind a load balancer, which requires stateless services:
+    session and application state live in an external store so any replica can serve any request.
+    Autoscale on a saturation signal (CPU, queue depth, in-flight concurrency). The hard part is the
+    stateful tier the replicas push load onto — scale reads with replicas and caches, writes with
+    partitioning/sharding — and the first thing that breaks is usually the shared database, not the
+    stateless fleet.
+  tags: [horizontal_scaling, stateless, load_balancing, autoscaling, sharding]
+
+- id: system_design_vector_search
+  skill: system_design
+  title: Vector search and ANN serving
+  content: >-
+    Semantic retrieval embeds documents and queries and finds nearest neighbors; exact kNN over tens
+    of millions of vectors is too slow, so approximate indexes (HNSW, IVF) trade a little recall for
+    orders-of-magnitude latency — tuned as recall@k vs latency. Operational realities: the index must
+    be rebuilt or incrementally refreshed as content changes; metadata filtering interacts with the
+    ANN traversal; HNSW is memory-hungry; and the embedding model version must be pinned — vectors
+    from two model versions in one index do not share a geometry, so similarity silently breaks.
+  tags: [vector_search, ann, hnsw, embeddings, recall_latency, version_pinning]
+
+- id: system_design_rate_limiting
+  skill: system_design
+  title: Rate limiting
+  content: >-
+    Token bucket is the usual algorithm: the bucket's capacity allows short bursts while the refill
+    rate enforces the sustained limit (sliding-window counters are the main alternative). Enforce at
+    the edge or API gateway so excess load is rejected before it consumes backend resources, and
+    return 429 with Retry-After so well-behaved clients back off. Distributed enforcement needs
+    shared state (e.g. Redis) or per-node quotas with coordination. Pair server-side limits with
+    client retry budgets, or synchronized retries turn a blip into a storm.
+  tags: [rate_limiting, token_bucket, throttling, retry_budget, gateway]
+
+- id: system_design_replication_consistency
+  skill: system_design
+  title: Replication and consistency trade-offs
+  content: >-
+    Replication buys availability and read scale. Synchronous replication gives consistency at a
+    latency cost; asynchronous replication risks stale reads and lost writes on failover. CAP says
+    that under a network partition you choose consistency or availability; PACELC adds that even
+    without partitions you trade latency against consistency. Many ML systems tolerate eventual
+    consistency — slightly stale features — but the staleness must be bounded and observable (TTL
+    plus a staleness metric), and version skew between feature and model versions across replicas
+    watched, or the degradation masquerades as slow model decay.
+  tags: [replication, cap, pacelc, eventual_consistency, staleness, version_skew]
 
 # --- vietnamese_nlp ------------------------------------------------------------------------------
 - id: vietnamese_nlp_word_segmentation
@@ -159,3 +456,29 @@
     trên âm tiết, huấn luyện trên văn bản có dấu với dữ liệu song song tạo bằng cách bỏ dấu. Bỏ qua
     bước này sẽ đẩy sự nhập nhằng xuống mọi bộ phân loại phía sau và làm giảm chất lượng NER, intent.
   tags: [diacritics, restoration, noisy_text, sequence_labeling]
+
+- id: vietnamese_nlp_unicode_normalization
+  skill: vietnamese_nlp
+  title: Chuẩn hoá Unicode cho tiếng Việt
+  language: vi
+  content: >-
+    Cùng một chữ "ế" có thể được mã hoá dựng sẵn (NFC — một code point) hoặc tổ hợp (NFD — chữ gốc
+    cộng dấu rời); bộ gõ và nguồn dữ liệu khác nhau sinh ra dạng khác nhau, nên hai chuỗi trông giống
+    hệt nhau vẫn không bằng nhau khi so sánh. Không chuẩn hoá thì cùng một từ thành hai token khác
+    nhau: hỏng khớp từ điển, tách từ, cache, và tăng OOV cho tokenizer. Tiếng Việt còn có hai quy ước
+    đặt dấu ("hoà" kiểu cũ, "hòa" kiểu mới). Chuẩn hoá NFC cộng thống nhất quy ước dấu phải chạy ngay
+    đầu pipeline, và giống hệt nhau giữa lúc huấn luyện và lúc phục vụ.
+  tags: [unicode, nfc, nfd, tone_placement, preprocessing]
+
+- id: vietnamese_nlp_teencode
+  skill: vietnamese_nlp
+  title: Teencode và văn bản trộn Anh–Việt
+  language: vi
+  content: >-
+    Văn bản người dùng Việt (chat Zalo, bình luận) đầy teencode ("ko", "dc", "j", "bt"), viết tắt,
+    thiếu dấu và trộn Anh–Việt ("check giúp em cái order"). Pipeline cần bước chuẩn hoá: ánh xạ
+    teencode về từ chuẩn (từ điển cộng mô hình chuẩn hoá), khôi phục dấu, và giữ nguyên thuật ngữ
+    tiếng Anh thay vì cố dịch. Quan trọng nhất là miền dữ liệu: mô hình huấn luyện trên văn bản báo
+    chí sạch suy giảm mạnh trên chat thật, nên dữ liệu gán nhãn phải lấy từ đúng miền văn bản nhiễu
+    này — có thể tăng cường bằng cách teencode-hoá và bỏ dấu văn bản sạch.
+  tags: [teencode, code_switching, normalization, noisy_text, domain_mismatch]

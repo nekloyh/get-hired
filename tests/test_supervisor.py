@@ -490,14 +490,16 @@ def _transcript_item(skill: str, *, score: float = 3.0, stop_reason: str = "reso
 
 
 def _state_with_transcript(probed: list[str]):
-    state = initial_session_state("gate-session", _diagnostic(), max_questions=10, started_at=0)
+    # max_questions sits above the largest per-Skill seed count so the exhaustion gates below are
+    # what fires, not the session-length stop.
+    state = initial_session_state("gate-session", _diagnostic(), max_questions=40, started_at=0)
     state["transcript"] = [_transcript_item(skill) for skill in probed]
     state["question_count"] = len(probed)
     return state
 
 
 def test_seed_count_matches_bank():
-    assert seed_count("ml_fundamentals") == 3
+    assert seed_count("ml_fundamentals") == 9
     for skill in ("deep_learning", "mlops", "system_design", "vietnamese_nlp"):
         assert seed_count(skill) >= 2
 

@@ -86,6 +86,133 @@ ml_fundamentals:
     follow_up_seeds:
       - Ask for a concrete leakage trap and the fold scheme that avoids it.
 
+  - question: >-
+      Your fraud model reports 99% accuracy, but the business says it misses most fraud. Which
+      metrics do you look at instead, and why?
+    rubric:
+      weights: {correctness: 0.4, depth: 0.3, communication: 0.2, system_thinking: 0.1, mlops_awareness: 0.0}
+    answers:
+      - >-
+        With ~1% fraud, predicting everything as legitimate already scores 99% accuracy, so accuracy
+        says nothing. I look at recall — what fraction of actual fraud we catch — and precision —
+        what fraction of our alerts are real — plus F1 or PR-AUC to summarize the tradeoff, and I
+        choose the alert threshold from the cost of a missed fraud versus a false alarm.
+      - >-
+        I prefer PR-AUC over ROC-AUC here: the false-positive rate divides by the huge negative
+        class, so ROC-AUC can look excellent while precision is terrible. The precision-recall curve
+        shows what the review team actually experiences, and I pick the operating point that fills
+        their queue with the highest-recall mix they can handle.
+    difficulty: 2
+    expected_concepts: [ml_fundamentals_classification_metrics]
+    follow_up_seeds:
+      - Ask why ROC-AUC can look optimistic under heavy imbalance while PR-AUC does not.
+      - Push for how they would set the alert threshold given a fixed review-queue capacity.
+
+  - question: >-
+      You have a 1-to-100 imbalanced dataset. Walk me through training and evaluating a classifier on
+      it without fooling yourself.
+    rubric:
+      weights: {correctness: 0.4, depth: 0.3, communication: 0.2, system_thinking: 0.1, mlops_awareness: 0.0}
+    answers:
+      - >-
+        I use stratified splits so every fold sees the minority class, then either class weights in
+        the loss or resampling to balance training, and I evaluate with precision/recall and PR-AUC
+        rather than accuracy, tuning the decision threshold on validation.
+      - >-
+        The trap is where resampling happens: oversampling before the split leaks near-copies of
+        minority samples into validation and inflates the score. I resample inside the training folds
+        only, and I report final metrics on an untouched test set at the natural class distribution,
+        because that is the distribution production will see.
+    difficulty: 3
+    expected_concepts: [ml_fundamentals_class_imbalance, ml_fundamentals_classification_metrics]
+    follow_up_seeds:
+      - Probe where resampling belongs relative to the train/validation split, and why.
+
+  - question: >-
+      Which models need feature scaling and which do not? Give me the reasoning, not just the list.
+    rubric:
+      weights: {correctness: 0.4, depth: 0.3, communication: 0.2, system_thinking: 0.1, mlops_awareness: 0.0}
+    answers:
+      - >-
+        Models driven by distances or by gradient steps with one shared learning rate need scaling:
+        kNN, SVM, k-means, PCA, regularized linear models, neural nets — an unscaled feature
+        dominates the distance or gets penalized unfairly by L1/L2. Tree models split on thresholds,
+        which are invariant to monotone transforms, so forests and boosting do not care.
+      - >-
+        And the scaler is fit on the training split only, then applied to validation and test —
+        fitting it on the full dataset leaks test-set statistics into training, which is the same
+        leakage mistake as preprocessing before a cross-validation split.
+    difficulty: 1
+    expected_concepts: [ml_fundamentals_feature_scaling]
+    follow_up_seeds:
+      - Ask why tree ensembles are insensitive to monotone feature transforms.
+      - Probe where the scaler must be fit to avoid leakage.
+
+  - question: >-
+      Compare random forests and gradient boosting: how does each reduce error, and when would you
+      pick one over the other?
+    rubric:
+      weights: {correctness: 0.4, depth: 0.3, communication: 0.2, system_thinking: 0.1, mlops_awareness: 0.0}
+    answers:
+      - >-
+        A random forest bags: it trains trees independently on bootstrap samples and averages, which
+        cuts variance — robust, parallel, and more trees rarely overfit. Gradient boosting fits trees
+        sequentially to the current ensemble's residuals, which cuts bias and usually wins on tabular
+        data, but it is touchier to tune.
+      - >-
+        I reach for the forest when labels are noisy or I want a strong baseline with little tuning;
+        boosting when I need the extra accuracy and can pay for it — lower learning rate with more
+        trees, early stopping on validation, and care with noise, because sequential residual fitting
+        chases mislabeled points that bagging would average away.
+    difficulty: 3
+    expected_concepts: [ml_fundamentals_ensembles]
+    follow_up_seeds:
+      - Ask what boosting's sequential residual fitting means for label noise.
+
+  - question: >-
+      Why is cross-entropy preferred over squared error for training classifiers?
+    rubric:
+      weights: {correctness: 0.4, depth: 0.3, communication: 0.2, system_thinking: 0.1, mlops_awareness: 0.0}
+    answers:
+      - >-
+        Because it works better for classification. MSE is the loss for regression and cross-entropy
+        is the loss for classification — that is the standard pairing, and cross-entropy trains
+        faster in practice.
+      - >-
+        The mechanism: cross-entropy is the negative log-likelihood of the label under the model, and
+        with a sigmoid or softmax output its gradient with respect to the logits is just prediction
+        minus target — large exactly when the model is confidently wrong. Squared error's gradient
+        carries an extra sigmoid-derivative factor that vanishes in that same regime, so the network
+        stalls on its worst mistakes.
+      - >-
+        There is also an optimization-shape argument: for a linear model, cross-entropy in the logits
+        is convex, while squared error through a sigmoid is not, so gradient descent is much better
+        behaved on the cross-entropy surface.
+    difficulty: 4
+    expected_concepts: [ml_fundamentals_cross_entropy]
+    follow_up_seeds:
+      - Push past "it's the standard pairing" to the gradient behavior when the model is confidently wrong.
+
+  - question: >-
+      Your kNN classifier works well on 10 features but collapses on 1,000. What is happening
+      geometrically, and what do you do about it?
+    rubric:
+      weights: {correctness: 0.35, depth: 0.3, communication: 0.2, system_thinking: 0.15, mlops_awareness: 0.0}
+    answers:
+      - >-
+        That is the curse of dimensionality: in high dimensions the data is exponentially sparse and
+        pairwise distances concentrate — the nearest and farthest neighbors become nearly
+        equidistant — so the neighborhood that kNN votes over stops carrying signal.
+      - >-
+        Concretely, the ratio of nearest to farthest distance tends toward one as dimensions grow. I
+        would reduce to a space where distance means something: feature selection, PCA or a learned
+        embedding, or metric learning — or switch to a model whose structural assumptions supply the
+        signal instead of raw geometry.
+    difficulty: 5
+    expected_concepts: [ml_fundamentals_curse_dimensionality]
+    follow_up_seeds:
+      - Ask what happens to the ratio of nearest to farthest distances as dimensionality grows.
+
 deep_learning:
   - question: >-
       Explain why residual connections help train deep neural networks, and name one failure mode they
@@ -144,6 +271,129 @@ deep_learning:
     follow_up_seeds:
       - Ask which single technique they would reach for first and why.
       - Push for the role of initialization versus normalization.
+
+  - question: >-
+      When would you choose SGD with momentum over Adam, and what does AdamW change?
+    rubric:
+      weights: {correctness: 0.4, depth: 0.3, communication: 0.2, system_thinking: 0.1, mlops_awareness: 0.0}
+    answers:
+      - >-
+        Adam adapts the step size per parameter from first and second moment estimates, so it is the
+        robust default with fast early progress and little tuning. A well-tuned SGD with momentum can
+        still generalize slightly better on vision tasks, so I would consider it when I can afford a
+        schedule search. AdamW fixes weight decay: adding L2 to the loss inside Adam gets rescaled by
+        the adaptive denominator, so it is not true weight decay — AdamW applies decay directly.
+      - >-
+        Practically: transformers get AdamW plus warmup almost by default, and if I switch optimizer
+        families I retune the learning rate from scratch, because Adam and SGD operate at completely
+        different scales — carrying the rate across is a silent way to wreck a run.
+    difficulty: 3
+    expected_concepts: [deep_learning_optimizers]
+    follow_up_seeds:
+      - Ask why L2 regularization inside Adam is not equivalent to weight decay.
+
+  - question: >-
+      Explain how dropout behaves at training versus inference time. What bug does forgetting eval
+      mode cause?
+    rubric:
+      weights: {correctness: 0.4, depth: 0.3, communication: 0.2, system_thinking: 0.1, mlops_awareness: 0.0}
+    answers:
+      - >-
+        During training, dropout zeroes each activation with probability p and scales the survivors
+        by one over one-minus-p, so the expected activation matches inference; at inference it is
+        off and the network is deterministic. Each forward pass trains a random subnetwork, which
+        prevents co-adaptation and acts like an implicit ensemble.
+      - >-
+        If you forget to switch to eval mode, dropout keeps firing in production: predictions get
+        noisy, the same input returns different outputs, and evaluation metrics fluctuate between
+        identical runs — a classic hard-to-spot bug because nothing crashes.
+    difficulty: 1
+    expected_concepts: [deep_learning_dropout]
+    follow_up_seeds:
+      - Ask why the surviving activations are scaled by 1/(1−p) during training.
+
+  - question: >-
+      Why did attention replace recurrence for long sequences? Include the cost that came with it.
+    rubric:
+      weights: {correctness: 0.35, depth: 0.3, communication: 0.2, system_thinking: 0.15, mlops_awareness: 0.0}
+    answers:
+      - >-
+        Self-attention connects any two positions directly, so the path between distant tokens is
+        constant-length instead of n recurrent steps — the gradient no longer has to survive n
+        multiplications for the model to relate them, and training parallelizes across the whole
+        sequence instead of stepping through it. The price is quadratic time and memory in sequence
+        length, and attention is permutation-invariant, so position must be injected explicitly.
+      - >-
+        That quadratic cost is exactly why long-context work exists: sparse and sliding-window
+        attention, linear-attention approximations — they all trade some of the anywhere-to-anywhere
+        connectivity back for sub-quadratic scaling.
+    difficulty: 4
+    expected_concepts: [deep_learning_attention]
+    follow_up_seeds:
+      - Push for what "path length" means for gradient flow between distant tokens.
+
+  - question: >-
+      You have 2,000 labeled examples and a pretrained backbone. Do you fine-tune everything or
+      freeze it and train a head? How do you decide?
+    rubric:
+      weights: {correctness: 0.35, depth: 0.25, communication: 0.2, system_thinking: 0.15, mlops_awareness: 0.05}
+    answers:
+      - >-
+        With that little data and a domain close to pretraining, I freeze the backbone and train only
+        the head — few trainable parameters, low overfitting risk. If my domain is far from the
+        pretraining data, frozen features underfit, so I fine-tune deeper layers at a low learning
+        rate to adapt without destroying the pretrained representations — catastrophic forgetting is
+        the failure mode. Gradual unfreezing or adapters like LoRA are the middle ground.
+      - >-
+        One thing I always match is the backbone's own preprocessing — the same tokenizer or input
+        normalization it was pretrained with. A mismatch there silently costs more accuracy than the
+        freeze-versus-fine-tune decision itself.
+    difficulty: 2
+    expected_concepts: [deep_learning_transfer_learning]
+    follow_up_seeds:
+      - Ask what catastrophic forgetting is and which knob controls it.
+
+  - question: >-
+      Your transformer's training loss spikes to NaN within the first few hundred steps. What is your
+      debugging order?
+    rubric:
+      weights: {correctness: 0.35, depth: 0.25, communication: 0.2, system_thinking: 0.15, mlops_awareness: 0.05}
+    answers:
+      - >-
+        Optimization first: early divergence usually means the peak learning rate is too high or
+        warmup is missing — Adam's moment estimates are noisy in the first steps, which is exactly
+        when warmup protects the run — plus gradient clipping if it is absent. Then data: a corrupt
+        batch, bad labels, or a division by zero in the loss. Then numerics: mixed-precision overflow
+        and loss scaling.
+      - >-
+        To separate those quickly I log the gradient norm — a spike right before the NaN points at
+        optimization, not data — and I replay the exact batch where it blew up; if that batch is
+        innocent in isolation, it was the schedule, not the data.
+    difficulty: 3
+    expected_concepts: [deep_learning_lr_schedules]
+    follow_up_seeds:
+      - Ask why warmup specifically stabilizes Adam early in training.
+
+  - question: >-
+      Deep networks can memorize completely random labels, yet they generalize on real data. How do
+      you reconcile that, and what does it change in practice?
+    rubric:
+      weights: {correctness: 0.35, depth: 0.3, communication: 0.2, system_thinking: 0.15, mlops_awareness: 0.0}
+    answers:
+      - >-
+        The memorization result shows raw capacity cannot be what controls generalization. What fills
+        the gap is the training process and the architecture: SGD's implicit bias and priors like
+        convolutional locality steer learning toward simple, flat solutions when the data actually
+        has structure — memorization is the fallback when there is none to find.
+      - >-
+        Double descent sharpens it: test error can come back down as the model grows past the point
+        of fitting the training set. So in practice I do not shrink a model out of overfitting fear —
+        I scale it, regularize properly, and let measured validation error overrule parameter-count
+        intuition.
+    difficulty: 5
+    expected_concepts: [deep_learning_generalization]
+    follow_up_seeds:
+      - Ask what double descent implies for choosing model size.
 
 mlops:
   - question: >-
@@ -205,6 +455,132 @@ mlops:
     follow_up_seeds:
       - Probe the single most likely cause of train/prod divergence and the check for it.
       - Ask what they version to make a run reproducible.
+
+  - question: >-
+      A teammate asks "which data and code produced the model that is in production right now?" What
+      infrastructure makes that answerable in minutes?
+    rubric:
+      weights: {correctness: 0.3, depth: 0.25, communication: 0.15, system_thinking: 0.15, mlops_awareness: 0.15}
+    answers:
+      - >-
+        Experiment tracking plus a model registry. Every training run logs its git SHA, data version,
+        hyperparameters, environment, and metrics; the registry stages models and keeps lineage from
+        the production model back to the run that produced it. Without that lineage, debugging and
+        rollback are guesswork.
+      - >-
+        The flow that makes it work: promotion is a registry transition, never a file copy — the
+        deployed artifact carries its run ID, the run records the dataset snapshot hash and commit,
+        so the answer is one lookup. If answering takes archaeology, the incident response will too.
+    difficulty: 2
+    expected_concepts: [mlops_experiment_tracking]
+    follow_up_seeds:
+      - Ask what exactly gets logged per training run to make it reproducible.
+
+  - question: >-
+      What does CI/CD look like for an ML pipeline compared to a normal service, and where does
+      continuous training fit?
+    rubric:
+      weights: {correctness: 0.3, depth: 0.25, communication: 0.15, system_thinking: 0.15, mlops_awareness: 0.15}
+    answers:
+      - >-
+        Everything a service has, plus three ML-specific layers: data validation, tests of the
+        training pipeline itself, and a pre-promotion evaluation gate — the candidate model must beat
+        or match the champion on a frozen holdout before it ships. Continuous training automates
+        retraining on a trigger like drift, a schedule, or fresh labels, but every retrained model
+        still passes the same gate.
+      - >-
+        The gate checks more than the headline metric: guardrails like latency, calibration, and
+        performance on critical slices — a model that wins on average but regresses an important
+        slice gets rejected. And the pipeline is a versioned artifact, so a retrain is one trigger,
+        not a notebook ritual.
+    difficulty: 3
+    expected_concepts: [mlops_ci_cd_models]
+    follow_up_seeds:
+      - Ask what the promotion gate checks beyond the headline metric.
+
+  - question: >-
+      An upstream team changed a column's unit and your model quietly degraded for two weeks. What
+      should have caught it, and where?
+    rubric:
+      weights: {correctness: 0.3, depth: 0.25, communication: 0.15, system_thinking: 0.15, mlops_awareness: 0.15}
+    answers:
+      - >-
+        Data validation at the ingestion boundary: schema and distribution checks against a reference
+        profile — a unit change shows up immediately as a range and mean shift on that column. The
+        pipeline should fail loud or quarantine the partition, not let it flow into features. Most
+        production ML incidents are exactly this: data incidents, not model incidents.
+      - >-
+        I would put expectation checks at every boundary — ingestion, feature-pipeline output,
+        serving input — with feature-drift monitoring as the last line of defense, and the alert
+        must name the violated expectation and page the owning team, otherwise it is two weeks of
+        silence again.
+    difficulty: 2
+    expected_concepts: [mlops_data_validation, mlops_drift_monitoring]
+    follow_up_seeds:
+      - Ask which pipeline boundary the check belongs at and who gets paged.
+
+  - question: >-
+      Your offline metric improved by 3%, but the A/B test shows no business lift. What explains the
+      gap, and what do you trust?
+    rubric:
+      weights: {correctness: 0.3, depth: 0.25, communication: 0.15, system_thinking: 0.15, mlops_awareness: 0.15}
+    answers:
+      - >-
+        The offline evaluation ran on logged data that the old model chose to show, so it inherits
+        selection bias; on top of that the proxy metric may not track the business outcome, and the
+        distribution may have shifted since the log. The trust hierarchy is A/B test above off-policy
+        estimates above offline holdout — so I believe the A/B.
+      - >-
+        Before killing the model I check the test was adequately powered and the guardrails were
+        flat, and for ranking changes I would use interleaving for cheap sensitivity. Then the real
+        work: realign the offline metric with the online KPI, because iterating offline against a
+        misaligned metric just manufactures more phantom gains.
+    difficulty: 4
+    expected_concepts: [mlops_online_evaluation]
+    follow_up_seeds:
+      - Probe why evaluating on data logged under the old policy biases the offline estimate.
+
+  - question: >-
+      When is batch inference the right serving choice over a real-time endpoint?
+    rubric:
+      weights: {correctness: 0.3, depth: 0.25, communication: 0.15, system_thinking: 0.15, mlops_awareness: 0.15}
+    answers:
+      - >-
+        Whenever the product tolerates staleness up to the recompute interval: nightly
+        recommendations, churn scores, lead ranking. You precompute predictions on a schedule and
+        serve them from a table by key — no latency budget, no autoscaling, the simplest operational
+        surface. I default to batch until real-time earns its cost.
+      - >-
+        What forces real-time is a feature that only exists at request time — the current session,
+        the query text — or freshness that is product-critical. That switch buys you feature-freshness
+        pipelines, tail-latency work, and autoscaling, so it should be a deliberate trade, not the
+        default architecture.
+    difficulty: 1
+    expected_concepts: [mlops_serving_modes]
+    follow_up_seeds:
+      - Ask what forces a move from batch to real-time serving.
+
+  - question: >-
+      Your fraud model's labels arrive 60 days late, and the model itself decides which transactions
+      get blocked. What does this do to evaluation and retraining?
+    rubric:
+      weights: {correctness: 0.3, depth: 0.25, communication: 0.15, system_thinking: 0.15, mlops_awareness: 0.15}
+    answers:
+      - >-
+        Two problems compound. Label delay means today's quality is only measurable in 60 days, so
+        evaluation windows must match label maturity. Worse, the labels are censored by the model's
+        own actions: a blocked transaction never reveals whether it was actually fraud, so retraining
+        on the filtered stream inherits that selection bias — the model shapes its own future
+        training data.
+      - >-
+        The standard escape is paying for unbiased data: keep a small exploration or holdout slice of
+        traffic the model does not filter, use importance weighting when reusing logged decisions,
+        and monitor early proxy signals while the true labels mature so a regression is not invisible
+        for two months.
+    difficulty: 5
+    expected_concepts: [mlops_feedback_loops]
+    follow_up_seeds:
+      - Ask how they would get unbiased labels when the model blocks the very outcomes it needs to learn from.
 
 system_design:
   - question: >-
@@ -268,6 +644,128 @@ system_design:
       - Ask what they shed first and how they avoid a retry storm.
       - Probe the difference between queueing and load shedding under sustained overload.
 
+  - question: >-
+      Design the data pipeline feeding a fraud model whose features must be fresh within a minute.
+      Batch, streaming, or both — and why?
+    rubric:
+      weights: {correctness: 0.35, depth: 0.25, communication: 0.2, system_thinking: 0.15, mlops_awareness: 0.05}
+    answers:
+      - >-
+        The one-minute freshness bound forces a streaming path — a replayable log like Kafka into a
+        stream processor maintaining the recent aggregates — while heavy historical features can stay
+        batch. Streaming brings its own physics: event time versus processing time, late events
+        handled with watermarks, and state that must be managed and recovered.
+      - >-
+        I lean kappa rather than lambda: one streaming codepath over a replayable log, with backfill
+        done by replaying it. The lambda shape — duplicate batch and stream implementations of the
+        same feature — is the classic way the two silently drift and the model trains on one
+        definition while serving another.
+    difficulty: 3
+    expected_concepts: [system_design_streaming_pipelines]
+    follow_up_seeds:
+      - Ask how they handle late-arriving events without corrupting the aggregates.
+
+  - question: >-
+      Your payment events are delivered at-least-once. How do you keep duplicates from double-charging
+      customers downstream?
+    rubric:
+      weights: {correctness: 0.3, depth: 0.25, communication: 0.15, system_thinking: 0.25, mlops_awareness: 0.05}
+    answers:
+      - >-
+        Make the consumer idempotent instead of trusting delivery: every charge carries an idempotency
+        key, and the consumer upserts against it or checks a dedup store, so processing the same event
+        twice has no second effect. I design assuming duplicates and reordering are normal, because
+        under at-least-once they are.
+      - >-
+        End-to-end exactly-once is engineered, not switched on: broker-level exactly-once does not
+        survive into side effects like charging a card. For the write-plus-publish atomicity I use a
+        transactional outbox, and I size the dedup window to the realistic redelivery horizon.
+    difficulty: 4
+    expected_concepts: [system_design_delivery_semantics]
+    follow_up_seeds:
+      - Probe why "exactly-once delivery" from the broker alone does not save the consumer.
+
+  - question: >-
+      Traffic to your model API doubles every month. What has to be true about the service so you can
+      scale it by just adding replicas?
+    rubric:
+      weights: {correctness: 0.3, depth: 0.25, communication: 0.2, system_thinking: 0.2, mlops_awareness: 0.05}
+    answers:
+      - >-
+        It has to be stateless: any session or application state lives in an external store, so any
+        replica can serve any request and a load balancer can spread traffic freely. Then autoscaling
+        on a saturation signal — CPU, queue depth, or in-flight concurrency — handles the doubling.
+      - >-
+        The catch is that replicas just relocate the bottleneck: the shared database is usually what
+        breaks first. Reads scale with replicas and caches, writes need partitioning or sharding — the
+        stateless fleet is the easy tier; the stateful one is the actual design problem.
+    difficulty: 1
+    expected_concepts: [system_design_scaling_basics]
+    follow_up_seeds:
+      - Ask what breaks first when replicas scale but the database does not.
+
+  - question: >-
+      Design semantic search over 50 million documents with a 100ms latency budget. Why not exact
+      nearest neighbor, and what operational problems does the index bring?
+    rubric:
+      weights: {correctness: 0.35, depth: 0.25, communication: 0.2, system_thinking: 0.15, mlops_awareness: 0.05}
+    answers:
+      - >-
+        An exact scan over 50 million vectors cannot meet 100ms, so I use an approximate
+        nearest-neighbor index — HNSW or IVF — which trades a small recall loss for orders of
+        magnitude in latency, tuned as recall-at-k versus latency. Documents and queries are embedded
+        with the same model, and the index serves the top candidates for reranking.
+      - >-
+        Operationally the index is a living thing: it needs rebuild or incremental refresh as content
+        changes, HNSW is memory-hungry, metadata filters interact with the graph traversal, and the
+        embedding model version must be pinned — vectors from two model versions in one index do not
+        share a geometry, so similarity quietly stops meaning anything.
+    difficulty: 3
+    expected_concepts: [system_design_vector_search]
+    follow_up_seeds:
+      - Ask what goes wrong if two embedding-model versions write into one index.
+
+  - question: >-
+      Design rate limiting for a public API. Which algorithm, where does it live, and what does the
+      client experience?
+    rubric:
+      weights: {correctness: 0.3, depth: 0.25, communication: 0.2, system_thinking: 0.2, mlops_awareness: 0.05}
+    answers:
+      - >-
+        Token bucket: capacity allows short bursts, the refill rate enforces the sustained limit. It
+        lives at the edge — the API gateway — so excess load is rejected before it costs backend
+        resources. The client gets a 429 with Retry-After so well-behaved callers back off cleanly.
+      - >-
+        Distributed enforcement is the interesting part: either shared counters in something like
+        Redis, or per-node quotas with coordination, trading accuracy against a dependency on the
+        shared store. And server-side limits need client retry budgets to match, or synchronized
+        retries turn one blip into a storm.
+    difficulty: 2
+    expected_concepts: [system_design_rate_limiting]
+    follow_up_seeds:
+      - Ask how the limiter itself avoids becoming a single point of failure.
+
+  - question: >-
+      Your feature store is replicated across two regions and a network partition hits mid-traffic.
+      Walk me through the consistency choices and what your ranking model actually experiences.
+    rubric:
+      weights: {correctness: 0.3, depth: 0.25, communication: 0.15, system_thinking: 0.25, mlops_awareness: 0.05}
+    answers:
+      - >-
+        Under a partition, CAP forces the choice: stay available and serve possibly stale features, or
+        stay consistent and reject or time out. For ranking, bounded staleness is usually the right
+        trade — a slightly old feature beats an error page — so I serve stale and surface it. PACELC
+        adds that even without partitions, synchronous replication buys consistency at a latency cost.
+      - >-
+        The operational requirements: bound the staleness with a TTL and a staleness metric so the
+        degradation is observable, and watch version skew — a feature version in one region paired
+        with a model version trained on another. Silent stale features look exactly like slow model
+        decay, which is the worst possible failure signature.
+    difficulty: 5
+    expected_concepts: [system_design_replication_consistency, system_design_feature_store]
+    follow_up_seeds:
+      - Ask how bounded staleness is enforced and observed rather than assumed.
+
 vietnamese_nlp:
   - question: >-
       What makes Vietnamese word segmentation important for NLP models, and when might a subword
@@ -329,3 +827,67 @@ vietnamese_nlp:
     follow_up_seeds:
       - Ask why segmenting the input before PhoBERT matters.
       - Probe when a multilingual model would still be the better choice.
+
+  - question: >-
+      Two Vietnamese strings look identical on screen but fail equality checks and dictionary
+      lookups. What is going on, and where in the pipeline do you fix it?
+    rubric:
+      weights: {correctness: 0.35, depth: 0.25, communication: 0.2, system_thinking: 0.15, mlops_awareness: 0.05}
+    answers:
+      - >-
+        That is Unicode normalization: the same accented character can be encoded precomposed (NFC,
+        one code point) or decomposed (NFD, base letter plus combining mark), and different keyboards
+        and data sources produce different forms. Vietnamese also has two tone-placement conventions,
+        like "hoà" versus "hòa". I normalize to NFC and one tone convention at the very start of the
+        pipeline.
+      - >-
+        And that normalization has to run identically in training and serving — if only one side
+        normalizes, the same word becomes two different tokens: dictionary and cache lookups miss,
+        word segmentation splits differently, and the tokenizer's out-of-vocabulary rate quietly
+        inflates. It is a train/serve skew bug that never throws an error.
+    difficulty: 1
+    expected_concepts: [vietnamese_nlp_unicode_normalization]
+    follow_up_seeds:
+      - Ask why the normalization must run in both the training and serving paths.
+
+  - question: >-
+      You are building an intent classifier for Zalo-style chat messages full of teencode and mixed
+      Vietnamese-English. What do your preprocessing and data strategy look like?
+    rubric:
+      weights: {correctness: 0.35, depth: 0.25, communication: 0.2, system_thinking: 0.15, mlops_awareness: 0.05}
+    answers:
+      - >-
+        Preprocessing: normalize Unicode, map teencode to standard words with a dictionary plus a
+        learned normalizer for the long tail, restore missing diacritics, and keep English tech terms
+        as-is rather than translating them. But the bigger lever is data: the training set must come
+        from real noisy chat in this domain.
+      - >-
+        Domain mismatch dominates everything else — a model trained on clean news text collapses on
+        chat. So I collect and label real conversations, and augment by teencode-ifying and
+        accent-stripping clean text to synthesize more noisy examples. Given a limited budget I would
+        buy in-domain labels before more normalization rules.
+    difficulty: 3
+    expected_concepts: [vietnamese_nlp_teencode, vietnamese_nlp_diacritic_restoration]
+    follow_up_seeds:
+      - Ask which they would fund first with a limited budget — normalization rules or in-domain labels — and why.
+
+  - question: >-
+      Design the end-to-end NLP stack for a Vietnamese customer-support chatbot: normalization,
+      segmentation, model choice, and the noisy-input reality. Where do the risky bets hide?
+    rubric:
+      weights: {correctness: 0.3, depth: 0.25, communication: 0.2, system_thinking: 0.15, mlops_awareness: 0.1}
+    answers:
+      - >-
+        The pipeline: normalize first — NFC Unicode, teencode mapping, diacritic restoration — then
+        word segmentation consistent with the model's pretraining, then a PhoBERT fine-tune for
+        intent and entities, with a confidence threshold that hands low-certainty turns to a human.
+        The risky bets: a train/serve segmentation mismatch that silently degrades PhoBERT, and
+        training on formal text when production is noisy chat.
+      - >-
+        For operations I would evaluate on a held-out set of real chat, not synthetic examples, and
+        monitor the intent distribution over time — slang and teencode evolve, so the input drifts
+        under a model that looks frozen-perfect on its launch test set.
+    difficulty: 5
+    expected_concepts: [vietnamese_nlp_phobert, vietnamese_nlp_word_segmentation, vietnamese_nlp_teencode]
+    follow_up_seeds:
+      - Probe the train/serve segmentation mismatch and how it silently degrades PhoBERT.
