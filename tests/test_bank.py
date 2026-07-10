@@ -56,10 +56,28 @@ def test_some_questions_disable_a_dimension_with_weight_zero():
 
 
 def test_vietnamese_context_is_represented():
-    # 0013/0008: a light set of Vietnamese-context items, tagged to the vietnamese_nlp Skill.
-    assert len(load_questions()["vietnamese_nlp"]) >= 3
+    # 0013/0008: ~6 Vietnamese-context items, tagged to the vietnamese_nlp Skill.
+    assert len(load_questions()["vietnamese_nlp"]) >= 6
     vi_notes = [n for n in load_concepts() if n.language == "vi"]
-    assert len(vi_notes) >= 3
+    assert len(vi_notes) >= 6
+
+
+def test_bank_breadth_targets():
+    # 0013: >= 40 questions total with roughly even Skill coverage, and each Skill spreads its
+    # questions across difficulty levels so target_difficulty lands on different prompts.
+    questions = load_questions()
+    assert sum(len(items) for items in questions.values()) >= 40
+    for skill in SKILLS:
+        assert len(questions[skill]) >= 6, f"{skill} has fewer than 6 questions"
+        assert len({q.difficulty for q in questions[skill]}) >= 3, f"{skill} difficulty spread too narrow"
+
+
+def test_concept_notes_cover_each_skill_in_depth():
+    # 0008: real coverage means several notes per Skill, not the bare loader minimum of one.
+    concepts = load_concepts()
+    for skill in SKILLS:
+        notes = [n for n in concepts if n.skill == skill]
+        assert len(notes) >= 4, f"{skill} has only {len(notes)} concept note(s)"
 
 
 # --- fail-loud validation ----------------------------------------------------------------------

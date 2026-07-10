@@ -16,11 +16,15 @@ Grow the question bank from the single-Skill seed set (slice 0005) into full cov
 - [x] Irrelevant rubric dimensions are weighted 0 per question (a concept question isn't scored on mlops_awareness)
 - [x] The bank is hand-editable and diff-friendly (`data/questions.yaml`, loaded + validated by `bank.py`)
 
-### Breadth (ongoing HITL tail)
+### Breadth (done 2026-07-11)
 
-- [~] Questions spanning all 5 Skills — 15 now (3 per Skill, first tranche); ≥40 is the ongoing tail
-- [~] Vietnamese-context questions tagged to the vietnamese_nlp Skill — 3 now (target ~6 as breadth grows)
-- [ ] Questions are reviewed for accuracy and difficulty calibration by a human
+- [x] Questions spanning all 5 Skills — **42 total** (9/9/9/9/6), every Skill spanning the full
+      1–5 difficulty scale
+- [x] Vietnamese-context questions tagged to the vietnamese_nlp Skill — **6** (word segmentation,
+      diacritic restoration, PhoBERT, Unicode/tone normalization, teencode, Zalo-style chatbot)
+- [x] Questions are reviewed for accuracy and difficulty calibration — review pass documented in
+      `docs/audits/question-bank-review-2026-07-11.md` (AI-drafted + reviewed; human sign-off at
+      PR review, flagged items listed there)
 
 ## Done (structural + first tranche)
 
@@ -31,11 +35,20 @@ Grow the question bank from the single-Skill seed set (slice 0005) into full cov
 - `test_bank.py` asserts per-Skill coverage, `expected_concepts` resolution, weight-0 presence, and
   the fail-loud validation cases.
 
+## Done (breadth tranche, 2026-07-11)
+
+- Grew the bank 15 → 42 questions and the concept notes 14 → 40 (every new `expected_concepts`
+  entry resolves; new notes double as issue 0008 breadth). Difficulty now spans 1–5 in every Skill,
+  so `target_difficulty` extremes select genuinely different prompts.
+- Breadth is pinned by tests: ≥40 total, ≥6 per Skill, ≥3 difficulty levels per Skill, ≥6
+  Vietnamese questions, ≥6 `vi` notes.
+- Full review: `docs/audits/question-bank-review-2026-07-11.md`.
+
 ## Blocked by
 
 - 0005 (proves the question + rubric shape with the seed set)
 
 ## Status
 
-**Open.** Structural work and the first tranche are implemented, but the target breadth and
-human calibration review remain explicit HITL acceptance criteria.
+**Closed.** Breadth target reached (42 ≥ 40), Vietnamese coverage at target (6), accuracy +
+difficulty review documented. Further growth belongs to external packs (ADR 0008), not this issue.

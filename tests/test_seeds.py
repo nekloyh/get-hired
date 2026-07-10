@@ -69,11 +69,11 @@ def test_exhaustion_message_names_the_skill_and_counts():
 
 def test_target_difficulty_still_drives_selection():
     """Exhaustion guard must not disturb the difficulty-ranked ordering (0025)."""
-    # ml_fundamentals difficulties are [3, 2, 4]; the closest-to-target question leads the ranking.
+    # ml_fundamentals spreads difficulties 1–5 (0013 breadth), so extreme targets land exactly.
     easy = select_seed_question("ml_fundamentals", 0, target_difficulty=1)
     hard = select_seed_question("ml_fundamentals", 0, target_difficulty=5)
-    assert easy.difficulty == 2
-    assert hard.difficulty == 4
+    assert easy.difficulty == 1
+    assert hard.difficulty == 5
     assert easy.question != hard.question
 
 
