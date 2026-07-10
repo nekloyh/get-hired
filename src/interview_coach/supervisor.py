@@ -201,24 +201,28 @@ def build_session_graph(
             return {}
         skill = _next_skill(state)
         attempts_for_skill = sum(1 for item in state.get("transcript", []) if item["skill"] == skill)
-        # target_difficulty from the Topic Plan actually drives selection now, and a per-Session
-        # rotation varies the sequence for a returning Candidate (0025).
-        span = seed_count(skill, bank=bank)
-        seed = select_seed_question(
-            skill,
-            attempts_for_skill,
-            target_difficulty=_target_difficulty_for(state, skill),
-            rotation=rotation_offset(state.get("session_id", ""), span),
-            bank=bank,
-        )
-        candidate = candidate_factory(seed) if candidate_factory is not None else ScriptedCandidate(seed.answers)
-        max_turns = (
-            max_turns_per_question
-            if max_turns_per_question is not None
-            else (DEFAULT_MAX_TURNS if candidate_factory is not None else len(seed.answers))
-        )
         before = _load_skill_state(state, skill)
         try:
+            # Seed selection lives inside the isolation net (slice 0014): a selection failure — most
+            # notably SeedQuestionsExhausted when a plan over-subscribes a Skill past its seed count
+            # (issue 0032) — must record a visible FAILED question and let the Session advance, never
+            # re-serve a duplicate prompt or abort the run.
+            # target_difficulty from the Topic Plan actually drives selection now, and a per-Session
+            # rotation varies the sequence for a returning Candidate (0025).
+            span = seed_count(skill, bank=bank)
+            seed = select_seed_question(
+                skill,
+                attempts_for_skill,
+                target_difficulty=_target_difficulty_for(state, skill),
+                rotation=rotation_offset(state.get("session_id", ""), span),
+                bank=bank,
+            )
+            candidate = candidate_factory(seed) if candidate_factory is not None else ScriptedCandidate(seed.answers)
+            max_turns = (
+                max_turns_per_question
+                if max_turns_per_question is not None
+                else (DEFAULT_MAX_TURNS if candidate_factory is not None else len(seed.answers))
+            )
             result = run_micro_loop(
                 client,
                 seed,

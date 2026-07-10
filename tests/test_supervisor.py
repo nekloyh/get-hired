@@ -9,7 +9,7 @@ from interview_coach.diagnostic import CandidateProfile, diagnose
 from interview_coach.evaluator import DimensionScore, Evaluation
 from interview_coach.microloop import MicroLoopResult, ScriptedCandidate, StopReason, Turn
 from interview_coach.rubric import Rubric
-from interview_coach.seeds import SeedQuestion, seed_count
+from interview_coach.seeds import SeedQuestion, SeedQuestionsExhausted, seed_count
 from interview_coach.skill import SkillState, apply_evaluation
 from interview_coach.supervisor import (
     SessionStatus,
@@ -526,6 +526,29 @@ def test_extra_question_allowed_when_a_seed_remains(make_client):
 
     assert decision.action is SupervisorAction.EXTRA_QUESTION
     assert fake.call_count == 1
+
+
+def test_seed_exhaustion_is_isolated_as_a_failed_question_not_a_duplicate(make_client, monkeypatch):
+    # Backstop for issue 0032: an over-subscribed plan (unreachable via the diagnostic validator, but
+    # guarded) makes select_seed_question raise SeedQuestionsExhausted. The question_node
+    # failure-isolation net must record it as a visible FAILED question and let the Session complete —
+    # never re-serve a duplicate prompt or abort the run.
+    from interview_coach import supervisor
+
+    def _raise_exhausted(skill, question_number=0, **kwargs):
+        raise SeedQuestionsExhausted(skill, question_number, seed_count(skill))
+
+    monkeypatch.setattr(supervisor, "select_seed_question", _raise_exhausted)
+    client, _ = make_client([_plan("mlops", "system_design", "vietnamese_nlp")])
+    state = initial_session_state("exhausted-session", _diagnostic(), max_questions=1, started_at=0)
+
+    graph = build_session_graph(client, now=lambda: 1)
+    final = graph.invoke(state, session_config("exhausted-session"))
+
+    assert final["status"] == SessionStatus.COMPLETE.value
+    assert len(final["transcript"]) == 1  # one slot, recorded once — not a wrapped duplicate
+    assert final["transcript"][0]["stop_reason"] == StopReason.FAILED.value
+    assert "SeedQuestionsExhausted" in final["transcript"][0]["error"]
 
 
 def test_safety_cap_below_evidence_bar_requires_extra_question_when_seed_remains(make_client):
