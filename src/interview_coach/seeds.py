@@ -23,6 +23,33 @@ QuestionBank = dict[str, tuple["SeedQuestion", ...]]
 DEFAULT_DIFFICULTY = 3
 
 
+class SeedQuestionsExhausted(LookupError):
+    """A Skill has no distinct seed question left for the requested attempt (issue 0032 / GH #36).
+
+    ``select_seed_question`` serves ``seed_count`` distinct prompts across attempts ``0..n-1``. Asking
+    for attempt ``n`` or beyond used to silently wrap (``order[question_number % n]``) and re-serve an
+    already-asked prompt, quietly defeating the rotation's duplicate-avoidance intent. It now raises
+    this instead, so the caller can skip/stop that Skill rather than repeat a question.
+
+    In the live Session this is a backstop, not a hot path: a Topic Plan lists each Skill exactly once
+    (the diagnostic validator forbids duplicates) and the Supervisor's ``_has_unused_seed`` gate keeps
+    dynamic deviations (extra_question / switch_skill) strictly under ``seed_count`` — so a well-formed
+    run never asks past the seed count. The raise guards the fragile invariant loudly instead of
+    trusting the silent ``% n``; ``question_node``'s failure-isolation net records it as a visible
+    non-duplicate outcome if it ever fires. Subclasses ``LookupError`` to match the concept-lookup
+    convention (a caller can catch either).
+    """
+
+    def __init__(self, skill: str, requested: int, available: int) -> None:
+        self.skill = skill
+        self.requested = requested
+        self.available = available
+        super().__init__(
+            f"seed questions exhausted for Skill {skill!r}: attempt {requested} requested but only "
+            f"{available} distinct seed(s) exist (valid attempts are 0..{available - 1})"
+        )
+
+
 @dataclass(frozen=True)
 class SeedQuestion:
     """One question plus the fixture Candidate's scripted transcript for it."""
@@ -76,11 +103,16 @@ def select_seed_question(
     ``rotation`` so repeat Sessions vary; ``question_number`` (the Skill's attempt count) walks down
     that ranking so a repeat probe lands on a *different* prompt. Falls back to plain rotation when no
     target is given. ``bank`` overrides the built-in reference bank (a loaded pack, 0025).
+
+    Attempts ``0..n-1`` yield the ``n`` distinct prompts; asking past that raises
+    :class:`SeedQuestionsExhausted` rather than silently wrapping back to a duplicate (issue 0032).
     """
     questions = (bank if bank is not None else QUESTION_BANK).get(skill)
     if not questions:
         raise ValueError(f"no seed question available for Skill {skill!r}")
     n = len(questions)
+    if question_number >= n:
+        raise SeedQuestionsExhausted(skill, question_number, n)
 
     def rank(i: int) -> tuple[int, int]:
         rotated = (i + rotation) % n
@@ -89,7 +121,7 @@ def select_seed_question(
         return (abs(questions[i].difficulty - target_difficulty), rotated)
 
     order = sorted(range(n), key=rank)
-    return questions[order[question_number % n]]
+    return questions[order[question_number]]
 
 
 def seed_count(skill: str, *, bank: QuestionBank | None = None) -> int:
