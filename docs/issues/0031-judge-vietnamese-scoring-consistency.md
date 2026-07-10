@@ -74,9 +74,18 @@ None.
 
 ## Status
 
-**Prompt fix landed (19/20 on the primary `gpt-4o-mini` path, VN consistency substantially improved:
-`dl_overfitting_strong_vi` fixed, all strong/medium pairs consistent).** The lone residual
-(`vnlp_segmentation_weak_vi`) is a documented, cross-model VN-reliability limit — tracked as a known
-limitation, not fixable by the means available on this bench. `coach bench` therefore stays exit 1
-until either a materially better VN judge exists or the case is retired; recommend leaving #35 open as
-that tracked limitation rather than closing it as fully resolved.
+**Closed — won't-fix (model limitation).** The prompt fix landed (PR #41, 19/20 on the primary
+`gpt-4o-mini` path): VN consistency was substantially improved — `dl_overfitting_strong_vi` now lands
+in band and every strong/medium EN/VN pair is consistent (Δ = 0.00). The lone residual
+(`vnlp_segmentation_weak_vi`, a stable 3.00 over its 1.0–2.6 band while the identical-content English
+twin correctly scores 1.00) is **not fixable by the means available**: it reproduces identically on
+Groq `llama-3.3-70b-versatile` (so it is not provider-specific), no prompt wording moves the stable VN
+3.00, and relabeling would bless a judge error the English twin disproves. It is a **capability limit
+of small judge models on borderline low-resource-language (Vietnamese) discrimination** — the small
+model can't map "vague but not wrong" to a harsh score in Vietnamese as sharply as it does in English,
+so it defaults to a middling 3.
+
+Resolution is a **stronger judge model**, not more prompt/label work (see the closing note on the
+GitHub issue). Until the judge is upgraded, `coach bench` intentionally stays exit 1 on this one case
+— that red is expected, not a regression. Re-open / re-file if the judge model is upgraded and the
+case can be re-measured.
