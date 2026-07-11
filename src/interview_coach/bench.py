@@ -249,6 +249,52 @@ def mixed_mode_rows(results: Sequence[BenchResult]) -> list[dict[str, Any]]:
     return rows
 
 
+def trust_guard_rows(results: Sequence[BenchResult]) -> list[dict[str, Any]]:
+    """Per case where a deterministic trust signal moved (or would move) the judgment.
+
+    The rows surface what the saturated self-report cannot: blanked citations, holistic-vs-linear
+    divergence, and parse noise, next to the confidence actually kept after the graded caps.
+    """
+    rows = []
+    for result in results:
+        trust = result.evaluation.trust if result.evaluation is not None else None
+        if trust is None:
+            continue
+        signal = (
+            trust.unverifiable_fraction > 0
+            or trust.noise_events
+            or trust.divergence > 0.5
+            or result.confidence != trust.pre_guard_confidence
+        )
+        if not signal:
+            continue
+        rows.append(
+            {
+                "case_id": result.case.case_id,
+                "pre_guard": trust.pre_guard_confidence,
+                "final": result.confidence,
+                "unverifiable_fraction": trust.unverifiable_fraction,
+                "divergence": trust.divergence,
+                "noise_events": ", ".join(trust.noise_events) or "—",
+            }
+        )
+    return rows
+
+
+# The escalation thresholds the shadow analysis prices out. 0.5 is the live trigger; the higher
+# rungs answer "what would raising it buy / cost?" without paying for a single real escalation.
+SHADOW_TRIGGER_THRESHOLDS = (0.5, 0.6, 0.7)
+
+
+def shadow_trigger_counts(results: Sequence[BenchResult]) -> dict[float, int]:
+    """How many judgments would escalate at each candidate threshold, using guarded confidence."""
+    confidences = [r.confidence for r in results if r.confidence is not None]
+    return {
+        threshold: sum(1 for c in confidences if c < threshold)
+        for threshold in SHADOW_TRIGGER_THRESHOLDS
+    }
+
+
 def confidence_calibration(results: Sequence[BenchResult]) -> list[dict[str, Any]]:
     """Bucket cases by stated confidence; compare each bucket's mean confidence to its hit rate.
 
@@ -347,6 +393,26 @@ def render_bench_report(results: Sequence[BenchResult], *, anchors: Mapping[str,
     for row in confidence_calibration(results):
         lines.append(
             f"| {row['bucket']} | {row['n']} | {row['mean_confidence']:.2f} | {row['hit_rate']:.0%} |"
+        )
+
+    guard_rows = trust_guard_rows(results)
+    lines += ["", "## Trust guards (deterministic confidence caps)", ""]
+    if guard_rows:
+        lines += ["| case | self-reported | kept | unverifiable | divergence | noise |",
+                  "| --- | ---: | ---: | ---: | ---: | --- |"]
+        for row in guard_rows:
+            lines.append(
+                f"| {row['case_id']} | {row['pre_guard']:.2f} | {row['final']:.2f} "
+                f"| {row['unverifiable_fraction']:.0%} | {row['divergence']:.2f} | {row['noise_events']} |"
+            )
+    else:
+        lines.append("- no case tripped a deterministic trust signal this run")
+    shadow = shadow_trigger_counts(results)
+    if shadow:
+        lines.append("")
+        lines.append(
+            "- shadow escalations by trigger threshold (0.5 is live): "
+            + "; ".join(f"<{threshold:.1f} → {count}" for threshold, count in sorted(shadow.items()))
         )
 
     if telemetry_delta is not None:

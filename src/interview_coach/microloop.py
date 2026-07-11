@@ -21,7 +21,7 @@ from enum import StrEnum
 from typing import Protocol
 
 from .concepts import ConceptStore
-from .evaluator import Evaluation, evaluate
+from .evaluator import Evaluation, PanelBudget, evaluate
 from .interviewer import FollowUpUnavailable, generate_follow_up, render_seed_question
 from .language import DEFAULT_LANGUAGE_MODE, rubric_with_delivery
 from .llm import LLMClient
@@ -210,11 +210,16 @@ def run_micro_loop(
     is_follow_up = False
     grounding_concept_id: str | None = None
     grounding_concept_title: str | None = None
+    # One committee per question, not per turn: every turn of a collapsing exchange re-triggering
+    # the panel would pay 3 extra calls each time — the budget is the free-tier cost rail.
+    panel_budget = PanelBudget.per_question()
 
     while True:
         answer = candidate.answer(question)
         rubric = rubric_with_delivery(seed.rubric, language_mode, answer)
-        evaluation = evaluate(client, question, answer, rubric, language_mode=language_mode)
+        evaluation = evaluate(
+            client, question, answer, rubric, language_mode=language_mode, panel_budget=panel_budget
+        )
         turn = Turn(
             question=question,
             answer=answer,
