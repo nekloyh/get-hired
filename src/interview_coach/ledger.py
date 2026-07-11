@@ -116,6 +116,53 @@ def load_priors(path: str | Path, candidate_id: str, *, now: float) -> LedgerPri
     return LedgerPriors(raw_mastery=raw_mastery, seed_means=seed_means, days_elapsed=days_elapsed)
 
 
+def load_states(path: str | Path, candidate_id: str, *, now: float) -> dict[str, SkillState] | None:
+    """Load a Candidate's per-Skill Beta posteriors, decayed to ``now`` (issue 0026).
+
+    Unlike :func:`load_priors` — which deliberately exposes only *means* for the Diagnostic prior
+    seam — this rehydrates full :class:`SkillState` objects so reconstructed post-mortem evidence
+    can be fused through the sanctioned ``observe()`` seam. Decay is applied HERE, before any caller
+    observes new evidence: ``save_posteriors`` stamps a fresh ``completed_at`` for the whole record,
+    so saving un-decayed params back would silently un-decay stale evidence.
+
+    Never raises: missing/unknown/corrupt/non-finite ledgers degrade to ``None`` (cold start) with
+    the same discipline as :func:`load_priors`.
+    """
+    if not candidate_id:
+        return None
+    try:
+        raw = Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        logger.warning("Skill ledger unreadable at %s (%s); starting cold.", path, err)
+        return None
+    try:
+        data = json.loads(raw)
+        entry = data[candidate_id]
+        completed_at = float(entry["completed_at"])
+        if not math.isfinite(completed_at):
+            raise ValueError("non-finite completed_at")
+        days_elapsed = max(0.0, (now - completed_at) / SECONDS_PER_DAY)
+        states: dict[str, SkillState] = {}
+        for skill, params in entry["skills"].items():
+            alpha = float(params["alpha"])
+            beta = float(params["beta"])
+            # Same explicit non-finite rejection as load_priors: json.loads accepts NaN/Infinity and
+            # NaN defeats every comparison, so the positivity check alone is not enough.
+            if not (math.isfinite(alpha) and math.isfinite(beta)) or alpha <= 0 or beta <= 0:
+                raise ValueError(f"invalid Beta params for {skill!r} (must be finite and positive)")
+            d_alpha, d_beta = decay_beta(alpha, beta, days_elapsed)
+            states[skill] = SkillState(skill=skill, alpha=d_alpha, beta=d_beta)
+    except KeyError:
+        # File exists but has no record for this Candidate — a normal first-ever post-mortem for them.
+        return None
+    except (ValueError, TypeError, json.JSONDecodeError) as err:
+        logger.warning("Skill ledger for %r is malformed (%s); starting cold.", candidate_id, err)
+        return None
+    return states or None
+
+
 def save_posteriors(
     path: str | Path,
     candidate_id: str,

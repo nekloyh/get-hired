@@ -25,13 +25,13 @@ state — something the fixture pipeline never exercises.
 
 ## Acceptance criteria
 
-- [ ] `coach postmortem` completes an adaptive elicitation dialogue and emits a typed
+- [x] `coach postmortem` completes an adaptive elicitation dialogue and emits a typed
       reconstructed evaluation per probed Skill with explicit confidence
-- [ ] The ledger applies it at a reduced, documented evidence weight; the Study Plan regenerates
+- [x] The ledger applies it at a reduced, documented evidence weight; the Study Plan regenerates
       with a visible before/after delta
-- [ ] User abort mid-elicitation is handled as intent per ADR 0005 — clean exit, partial data
+- [x] User abort mid-elicitation is handled as intent per ADR 0005 — clean exit, partial data
       either discarded or saved explicitly, never silently fabricated into evidence
-- [ ] Offline fixture test covers the recollection → typed-evidence conversion end-to-end
+- [x] Offline fixture test covers the recollection → typed-evidence conversion end-to-end
 
 ## Blocked by
 
@@ -40,4 +40,10 @@ state — something the fixture pipeline never exercises.
 
 ## Status
 
-**Open.**
+**Closed.** Shipped as `src/interview_coach/postmortem.py` + `coach postmortem`: a 5–8 question
+adaptive elicitation loop (budget owned by Python, not the model), a validated
+`ReconstructedScorecard` fused through `SkillState.observe()` at the documented
+`POSTMORTEM_WEIGHT_RATIO = 0.5` on decayed ledger states (`ledger.load_states` decays before
+observing), and a deterministic before/after study-priority diff plus a best-effort regenerated
+Study Plan. `CandidateIntent` aborts exit 2 with the partial recollection discarded and the ledger
+file byte-identical (proven in `tests/test_postmortem.py`).

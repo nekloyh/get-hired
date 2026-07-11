@@ -47,9 +47,10 @@ from .microloop import (
     StopReason,
     run_micro_loop,
 )
+from .postmortem import PostmortemResult, export_postmortem_markdown, run_postmortem
 from .resources import SEED_RESOURCES, ChromaResourceStore, build_resource_store
 from .seeds import SEED_QUESTIONS
-from .skill import SkillState, apply_evaluation
+from .skill import POSTMORTEM_WEIGHT_RATIO, SkillState, apply_evaluation, confidence_weight
 from .supervisor import (
     DEFAULT_MAX_ELAPSED_SECONDS,
     DEFAULT_MAX_QUESTIONS,
@@ -446,6 +447,91 @@ def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_postmortem(result: PostmortemResult) -> None:
+    print(
+        f"=== POST-MORTEM DEBRIEF ({result.candidate_id}) — "
+        f"{len(result.transcript)} question(s) elicited ==="
+    )
+    print(
+        f"\n=== RECONSTRUCTED SCORECARD (second-hand evidence, fused at "
+        f"{POSTMORTEM_WEIGHT_RATIO:g}x live weight) ==="
+    )
+    for entry in result.scorecard.entries:
+        weight = POSTMORTEM_WEIGHT_RATIO * confidence_weight(entry.confidence)
+        print(
+            f"  {entry.skill:<18} estimated {entry.estimated_score:.1f}/5   "
+            f"confidence {entry.confidence:.2f}   evidence_weight {weight:.2f}"
+        )
+        print(f"    rationale: {entry.rationale}")
+        print(f"    recollection: {entry.recollection_evidence!r}")
+    # Deterministic diff layer — always shown, mirrors the SINCE LAST SESSION block (issue 0023).
+    print("\n=== STUDY PRIORITIES: BEFORE -> AFTER FUSION ===")
+    rank_before = {t.skill: i for i, t in enumerate(result.targets_before, start=1)}
+    before_by_skill = {t.skill: t for t in result.targets_before}
+    for rank, target in enumerate(result.targets_after, start=1):
+        before = before_by_skill.get(target.skill)
+        if before is None:
+            continue
+        print(
+            f"  {target.skill}: mastery {before.mastery:.2f} -> {target.mastery:.2f} "
+            f"({target.mastery - before.mastery:+.2f})   "
+            f"priority #{rank_before.get(target.skill, '—')} -> #{rank}"
+        )
+    if plan := result.study_plan:
+        print("\n=== REGENERATED STUDY PLAN ===")
+        print(f"readiness_estimate={plan['readiness_estimate']:.0%} — {plan['readiness_rationale']}")
+        for topic in plan.get("prioritized_topics", []):
+            resources = ", ".join(resource["id"] for resource in topic.get("resources", []))
+            print(
+                f"{topic['priority']}. {topic['skill']} "
+                f"(mastery={topic['mastery']:.0%}, criticality={topic['role_criticality']}): {resources}"
+            )
+    elif error := result.study_plan_error:
+        # The fusion still stands; only the optional regenerated plan was unavailable.
+        print(f"\n=== REGENERATED STUDY PLAN ===\n(planner unavailable: {error})")
+
+
+def _cmd_postmortem(client: LLMClient | None, args: argparse.Namespace) -> int:
+    if client is None:
+        raise RuntimeError("postmortem requires an LLM client")
+    resource_store = build_resource_store(
+        args.resource_store,
+        persist_dir=args.resource_persist_dir,
+        seed=not args.no_seed_resources,
+    )
+    candidate = (
+        ScriptedCandidate(args.scripted_recollection)
+        if args.scripted_recollection
+        else InteractiveCandidate()
+    )
+    try:
+        result = run_postmortem(
+            client,
+            candidate,
+            candidate_id=args.candidate,
+            ledger_db=args.ledger_db,
+            target_role=args.role,
+            companies=tuple(args.company),
+            resource_store=resource_store,
+        )
+    except CandidateIntent as err:
+        # ADR 0005 / issue 0026: the Candidate asked to stop mid-debrief. Abort cleanly with the
+        # designed exit code; the partial recollection is discarded — nothing was written to the
+        # ledger, and no reconstructed evidence is fabricated from an unfinished elicitation.
+        print(str(err), file=sys.stderr)
+        print(
+            "Post-mortem aborted; the partial recollection was discarded and the Skill ledger "
+            "was not touched.",
+            file=sys.stderr,
+        )
+        return 2
+    _print_postmortem(result)
+    if args.export_markdown:
+        path = export_postmortem_markdown(result, args.export_markdown)
+        print(f"\nExported post-mortem Markdown to {path}")
+    return 0
+
+
 def _cmd_pack_lint(client: LLMClient | None, args: argparse.Namespace) -> int:
     try:
         pack = load_pack(args.pack_dir)
@@ -721,6 +807,62 @@ def main(argv: list[str] | None = None) -> int:
         help="Export the LangGraph architecture PNG to this path and exit.",
     )
     session_parser.set_defaults(func=_cmd_session, requires_llm=True)
+
+    pm_parser = sub.add_parser(
+        "postmortem",
+        help="Issue 0026: debrief a real rejected interview and fuse the reconstructed scorecard "
+        "into the Skill ledger at reduced weight",
+    )
+    pm_parser.add_argument(
+        "--candidate",
+        required=True,
+        help="Candidate id whose Skill ledger (0023) the reconstructed evidence is fused into.",
+    )
+    pm_parser.add_argument(
+        "--ledger-db",
+        default=".skill-ledger.json",
+        help="JSON file holding per-Candidate decayed Beta priors (0023).",
+    )
+    pm_parser.add_argument(
+        "--role",
+        default="machine learning engineer",
+        help="Target role, used for Role-criticality metadata in the Study Plan diff.",
+    )
+    pm_parser.add_argument(
+        "--company",
+        action="append",
+        default=[],
+        help="Target company; may be passed multiple times.",
+    )
+    pm_parser.add_argument(
+        "--scripted-recollection",
+        action="append",
+        default=[],
+        help="Scripted recollection answer for non-interactive runs; repeat once per answer. "
+        "Omit to be debriefed interactively in the terminal.",
+    )
+    pm_parser.add_argument(
+        "--resource-store",
+        choices=["memory", "chroma"],
+        default="memory",
+        help="Resource store used by the regenerated Study Plan.",
+    )
+    pm_parser.add_argument(
+        "--resource-persist-dir",
+        default=".chroma",
+        help="Chroma persistence directory when --resource-store=chroma.",
+    )
+    pm_parser.add_argument(
+        "--no-seed-resources",
+        action="store_true",
+        help="Do not upsert the built-in learning resources before planning.",
+    )
+    pm_parser.add_argument(
+        "--export-markdown",
+        help="Write the post-mortem debrief (scorecard, ledger delta, regenerated plan) to this "
+        "Markdown path.",
+    )
+    pm_parser.set_defaults(func=_cmd_postmortem, requires_llm=True)
 
     harness_parser = sub.add_parser("eval-harness", help="Slice 0012: run Evaluator golden-answer checks")
     harness_parser.set_defaults(func=_cmd_eval_harness, requires_llm=True)

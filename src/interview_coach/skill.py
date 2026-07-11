@@ -32,6 +32,14 @@ EVIDENCE_WEIGHT = 2.0
 # questions apply no evidence at all, but that is handled upstream by skipping the update entirely.
 CONFIDENCE_WEIGHT_FLOOR = 0.25
 
+# Ratio applied to post-mortem reconstructed evidence (issue 0026): a scorecard rebuilt from the
+# Candidate's memory of a rejected interview is second-hand — filtered through recall, emotion, and
+# the missing interviewer's side — so it enters the ledger at half the weight the same score would
+# earn live. It multiplies confidence_weight(), so shaky reconstructions are discounted twice: once
+# for the reconstructor's own stated confidence, once for being second-hand at all. Documented here,
+# next to EVIDENCE_WEIGHT, because the issue demands the ratio be an explicit, visible contract.
+POSTMORTEM_WEIGHT_RATIO = 0.5
+
 
 def _beta_variance(alpha: float, beta: float) -> float:
     n = alpha + beta
