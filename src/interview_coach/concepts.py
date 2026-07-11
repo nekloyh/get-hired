@@ -12,7 +12,7 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from .bank import load_concepts
 
@@ -151,31 +151,44 @@ class ChromaConceptStore:
         collection_name: str = CONCEPT_COLLECTION,
         embedding_model: str = BGE_SMALL_EN,
     ) -> ChromaConceptStore:
+        prefixes = _EMBEDDING_PREFIXES.get(embedding_model)
         try:
             import chromadb
             from chromadb.utils import embedding_functions
+
+            if prefixes is not None:
+                from sentence_transformers import SentenceTransformer
         except ImportError as err:
             raise RuntimeError(
                 "Chroma concept retrieval requires optional packages: chromadb and sentence-transformers"
             ) from err
 
         client = chromadb.PersistentClient(path=str(persist_dir)) if persist_dir else chromadb.Client()
-        prefixes = _EMBEDDING_PREFIXES.get(embedding_model)
+        # The embedder id is stamped into the collection metadata: bge-small and e5-small are BOTH
+        # 384-dim, so Chroma would silently accept queries from the wrong model against a persisted
+        # collection and return confidently-scored garbage. One index config for both branches.
+        collection_kwargs: dict[str, Any] = {
+            "name": collection_name,
+            "metadata": {"hnsw:space": "cosine", "embedder": embedding_model},
+        }
+        encoder = None
         if prefixes is not None:
-            from sentence_transformers import SentenceTransformer
-
-            collection = client.get_or_create_collection(
-                name=collection_name,
-                metadata={"hnsw:space": "cosine"},
+            encoder = SentenceTransformer(embedding_model)
+        else:
+            collection_kwargs["embedding_function"] = embedding_functions.SentenceTransformerEmbeddingFunction(
+                model_name=embedding_model
             )
-            return cls(collection, encoder=SentenceTransformer(embedding_model), prefixes=prefixes)
-        embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=embedding_model)
-        collection = client.get_or_create_collection(
-            name=collection_name,
-            embedding_function=embedding_fn,
-            metadata={"hnsw:space": "cosine"},
-        )
-        return cls(collection)
+        collection = client.get_or_create_collection(**collection_kwargs)
+        stamped = (getattr(collection, "metadata", None) or {}).get("embedder")
+        if stamped is not None and stamped != embedding_model:
+            # get_or_create keeps an existing collection's metadata, so the stamp survives across
+            # runs; pre-stamp legacy collections (stamped None) cannot be verified and pass through.
+            raise RuntimeError(
+                f"collection {collection_name!r} was built with embedder {stamped!r} but "
+                f"{embedding_model!r} was requested — embeddings do not mix across models. "
+                "Re-ingest into a fresh persist dir (or delete the old collection) to switch."
+            )
+        return cls(collection, encoder=encoder, prefixes=prefixes)
 
     def _encode(self, texts: list[str], prefix: str) -> list[list[float]]:
         vectors = self._encoder.encode([f"{prefix}{text}" for text in texts], normalize_embeddings=True)

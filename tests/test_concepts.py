@@ -191,3 +191,12 @@ def test_unprefixed_store_keeps_chroma_text_path():
 
     assert "embeddings" not in collection.upserts[0]
     assert collection.queries[0]["query_texts"] == ["q"]
+
+
+def test_resource_store_refuses_prefixed_embedder():
+    # ChromaResourceStore has no prefix-aware path: accepting an e5 id would silently rank worse.
+    from interview_coach.concepts import E5_SMALL_MULTILINGUAL
+    from interview_coach.resources import ChromaResourceStore
+
+    with pytest.raises(RuntimeError, match="prefixes"):
+        ChromaResourceStore.create(embedding_model=E5_SMALL_MULTILINGUAL)
