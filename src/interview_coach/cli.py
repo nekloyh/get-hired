@@ -28,6 +28,7 @@ from pathlib import Path
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+from . import telemetry
 from .bank import BankError, load_pack
 from .bench import bench_passed, load_bench_data, render_bench_report, run_bench
 from .concepts import SEED_CONCEPTS, ChromaConceptStore, InMemoryConceptStore, build_concept_store
@@ -66,6 +67,7 @@ from .supervisor import (
     skill_states_from_state,
 )
 from .ui import render_skill_state_rows
+from .usage import daily_token_budget, remaining_today, usage_for_day
 
 ANSWERS = {"strong": STRONG_ANSWER, "weak": WEAK_ANSWER}
 
@@ -567,12 +569,35 @@ def _utc_date() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%d")
 
 
+# A 29-case bench run measures ~100–200k tokens including retries; starting one with less than
+# this in the day's budget risks dying mid-run on insufficient_quota with a half-written report.
+BENCH_MIN_BUDGET_TOKENS = 200_000
+
+
 def _cmd_bench(client: LLMClient | None, args: argparse.Namespace) -> int:
     if client is None:
         raise RuntimeError("bench requires an LLM client")
+    provider = getattr(client, "primary_provider", "unknown")
+    left = remaining_today(str(provider))
+    print(f"Daily budget check ({provider}): ~{left:,} of {daily_token_budget():,} tokens left by our count.")
+    if left < BENCH_MIN_BUDGET_TOKENS:
+        print(
+            f"WARNING: under {BENCH_MIN_BUDGET_TOKENS:,} tokens left — a full bench run may die "
+            "mid-run on insufficient_quota. Consider waiting for the daily reset (00:00 UTC).",
+            file=sys.stderr,
+        )
+    usage_before = usage_for_day().get(str(provider), {})
+    telemetry_before = telemetry.snapshot()
     data = load_bench_data(args.cases or None)
     results = run_bench(client, data.cases)
-    provider = getattr(client, "primary_provider", "unknown")
+    telemetry_after = telemetry.snapshot()
+    usage_after = usage_for_day().get(str(provider), {})
+    run_usage = {
+        str(provider): {
+            key: usage_after.get(key, 0) - usage_before.get(key, 0)
+            for key in ("prompt", "completion", "total", "calls")
+        }
+    }
     settings = load_settings()
     report = render_bench_report(
         results,
@@ -580,13 +605,36 @@ def _cmd_bench(client: LLMClient | None, args: argparse.Namespace) -> int:
         provider=str(provider),
         model=settings.primary_config.model or "unknown",
         date=_utc_date(),
+        telemetry_delta=telemetry.delta(telemetry_before, telemetry_after),
+        token_usage=run_usage,
     )
     out = Path(args.out) if args.out else Path("docs/audits") / f"calibration-bench-{_utc_date()}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(report, encoding="utf-8")
     within = sum(1 for r in results if r.within_band)
-    print(f"Bench: {within}/{len(results)} cases within band. Report written to {out}.")
+    spent = run_usage[str(provider)]["total"]
+    print(
+        f"Bench: {within}/{len(results)} cases within band. Report written to {out}. "
+        f"Run cost ~{spent:,} tokens; ~{remaining_today(str(provider)):,} left today."
+    )
     return 0 if bench_passed(results) else 1
+
+
+def _cmd_usage(client: LLMClient | None, args: argparse.Namespace) -> int:
+    """Today's client-side token ledger — the daily free-tier budget is invisible to the API."""
+    totals = usage_for_day()
+    if not totals:
+        print("No recorded usage today (ledger: logs/usage-ledger.jsonl).")
+    for provider, stats in sorted(totals.items()):
+        print(
+            f"{provider}: {stats['total']:,} tokens across {stats['calls']} call(s) "
+            f"({stats['prompt']:,} prompt + {stats['completion']:,} completion)"
+        )
+    budget = daily_token_budget()
+    settings = load_settings()
+    primary = settings.primary_provider
+    print(f"Primary ({primary}): ~{remaining_today(primary):,} of {budget:,} daily tokens left by our count.")
+    return 0
 
 
 def _cmd_forge(client: LLMClient | None, args: argparse.Namespace) -> int:
@@ -919,6 +967,9 @@ def main(argv: list[str] | None = None) -> int:
 
     harness_parser = sub.add_parser("eval-harness", help="Slice 0012: run Evaluator golden-answer checks")
     harness_parser.set_defaults(func=_cmd_eval_harness, requires_llm=True)
+
+    usage_parser = sub.add_parser("usage", help="Show today's token spend per provider (client-side daily ledger)")
+    usage_parser.set_defaults(func=_cmd_usage, requires_llm=False)
 
     bench_parser = sub.add_parser("bench", help="Issue 0022: bilingual Judge calibration bench")
     bench_parser.add_argument("--cases", default="", help="Path to a cases YAML (default: data/bench/cases.yaml).")

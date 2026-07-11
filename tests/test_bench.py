@@ -268,3 +268,54 @@ def test_delivery_miss_fails_the_gate_even_inside_the_technical_band():
     result = _result(case, dims={"correctness": 4, "english_delivery": 5}, weighted=4.0)
     assert result.within_band
     assert not bench_passed([result])
+
+
+# --- free-tier hardening: telemetry + token-usage report sections, panel escalation column -------
+
+
+def test_report_includes_telemetry_and_usage_sections():
+    results = [_result(_case("c1"), dims={"correctness": 3}, weighted=3.0)]
+    report = render_bench_report(
+        results,
+        telemetry_delta={"sanitizer.judgment_flattened_in_dimensions": 2, "transport.backoff.openai": 1},
+        token_usage={"openai": {"calls": 30, "prompt": 90_000, "completion": 12_000, "total": 102_000}},
+    )
+    assert "## Noise & transport telemetry (this run)" in report
+    assert "| sanitizer.judgment_flattened_in_dimensions | 2 |" in report
+    assert "## Token usage (this run)" in report
+    assert "| openai | 30 | 90000 | 12000 | 102000 |" in report
+
+
+def test_report_marks_clean_run_when_no_telemetry_moved():
+    results = [_result(_case("c1"), dims={"correctness": 3}, weighted=3.0)]
+    report = render_bench_report(results, telemetry_delta={})
+    assert "clean run: no sanitizer folds" in report
+
+
+def test_report_omits_sections_when_not_provided():
+    # Offline render calls (and old tests) pass nothing: the report shape must not change.
+    results = [_result(_case("c1"), dims={"correctness": 3}, weighted=3.0)]
+    report = render_bench_report(results)
+    assert "Noise & transport telemetry" not in report
+    assert "Token usage" not in report
+
+
+def test_report_escalation_column_shows_panel_triggers():
+    from interview_coach.evaluator import PanelOpinion, PanelTrace
+
+    base = _result(_case("c1"), dims={"correctness": 2}, weighted=2.0)
+    opinion = PanelOpinion(recommended_score=2.0, argument="argues", key_evidence="words")
+    panel = PanelTrace(
+        triggers=("low_confidence",),
+        skeptic=opinion,
+        advocate=opinion,
+        initial_score=2.0,
+        initial_confidence=0.4,
+        disagreement=0.0,
+    )
+    # panel is a derived field: attach via model_copy exactly like evaluate() does.
+    escalated = BenchResult(case=base.case, evaluation=base.evaluation.model_copy(update={"panel": panel}))
+
+    report = render_bench_report([escalated])
+
+    assert "panel: low_confidence" in report

@@ -20,12 +20,21 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from . import telemetry
 from .llm import LLMClient, Message, StructuredOutputError, Validator
 from .rubric import TECHNICAL_DIMENSIONS, Rubric
 
 logger = logging.getLogger(__name__)
 
 NO_EVIDENCE = "no evidence"
+
+# Structured-output retry budget for the JUDGE call specifically (free-tier hardening). The default
+# max_retries=1 proved too thin against gpt-5.4-mini's structural noise — one bad day went 24/29 red
+# on flakiness alone. A retry only costs a call when validation actually failed, so the extra
+# attempt is almost always free; the sanitizer telemetry (telemetry.py) is what makes NEW noise
+# modes visible before they exhaust even this budget. Panel voices keep the default: their schema
+# is three flat fields and each escalation already costs 3 extra calls.
+JUDGE_MAX_RETRIES = 2
 
 
 class EvidenceViolation(ValueError):
@@ -177,7 +186,8 @@ class Evaluation(BaseModel):
             return data
         data = {**data}
         for derived in ("evidence_degraded", "self_critique", "panel"):
-            data.pop(derived, None)
+            if data.pop(derived, None) is not None:
+                telemetry.incr("sanitizer.derived_field_echoed")
         dimensions = data.get("dimensions")
         if isinstance(dimensions, dict):
             dimensions = {**dimensions}
@@ -190,14 +200,21 @@ class Evaluation(BaseModel):
                 if top_level in dimensions:
                     stray = dimensions.pop(top_level)
                     data.setdefault(top_level, stray)
+                    telemetry.incr("sanitizer.judgment_flattened_in_dimensions")
             misplaced = dimensions.pop("delivery_fixes", None)
             if isinstance(misplaced, list) and not data.get("delivery_fixes"):
                 data["delivery_fixes"] = misplaced
+                telemetry.incr("sanitizer.delivery_fixes_misplaced")
             if "english_delivery" not in dimensions:
                 # No delivery score, no delivery advice — dropping stray fixes deterministically
                 # keeps the pure-VN "no phantom scores" guarantee without burning an LLM retry.
+                if data.get("delivery_fixes"):
+                    telemetry.incr("sanitizer.stray_delivery_fixes_dropped")
                 data["delivery_fixes"] = []
-        if not isinstance(data.get("delivery_fixes"), (list, tuple)):
+        if data.get("delivery_fixes") is not None and not isinstance(data["delivery_fixes"], (list, tuple)):
+            telemetry.incr("sanitizer.delivery_fixes_not_list")
+            data["delivery_fixes"] = []
+        if data.get("delivery_fixes") is None:
             data["delivery_fixes"] = []
         return data
 
@@ -285,6 +302,7 @@ def _sanitize_unverifiable_evidence(evaluation: Evaluation, answer: str) -> Eval
     }
     if not changed:
         return evaluation
+    telemetry.incr("evaluator.unverifiable_citations", len(changed))
     entirely_degraded = len(changed) == len(evaluation.dimensions)
     logger.warning(
         "evidence degrade: blanked %d/%d unverifiable quote(s) to keep the score: %s%s",
@@ -603,7 +621,7 @@ def _evaluate_once(client: LLMClient, messages: list[Message], answer: str, rubr
             messages,
             Evaluation,
             validators=_make_validators(rubric, answer),
-            max_retries=1,
+            max_retries=JUDGE_MAX_RETRIES,
         )
     except StructuredOutputError as err:
         if not isinstance(err.__cause__, EvidenceViolation):
@@ -618,11 +636,12 @@ def _evaluate_once(client: LLMClient, messages: list[Message], answer: str, rubr
         # stay enforced — and sanitize any unverifiable citation. If schema/dimensions themselves are
         # still broken, this re-raises, which is correct: that is genuinely unusable output.
         logger.warning("evaluation evidence check exhausted its retry; degrading to sanitize-and-keep")
+        telemetry.incr("evaluator.evidence_degrade_pass")
         degraded = client.chat_json(
             messages,
             Evaluation,
             validators=_make_validators(rubric, answer, include_evidence=False),
-            max_retries=1,
+            max_retries=JUDGE_MAX_RETRIES,
         )
         return _sanitize_unverifiable_evidence(degraded, answer)
 
