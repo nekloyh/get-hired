@@ -11,6 +11,8 @@
 - ``coach api`` (slice 0012): run the FastAPI/WebSocket backend for the React UI.
 - ``coach ingest-concepts`` (slice 0007): fill a Chroma ``concepts`` collection with seed notes.
 - ``coach ingest-resources`` (slice 0011): fill a Chroma ``resources`` collection with study materials.
+- ``coach forge`` (issue 0028): Writer + three ordered gates that queue new bank questions for
+  human review under ``data/forge/``.
 
 ``interview`` is the default so the bare command shows the newest slice.
 """
@@ -30,11 +32,12 @@ from .bank import BankError, load_pack
 from .bench import bench_passed, load_bench_data, render_bench_report, run_bench
 from .concepts import SEED_CONCEPTS, ChromaConceptStore, InMemoryConceptStore, build_concept_store
 from .config import load_settings
-from .diagnostic import CandidateProfile, diagnose_or_degrade
+from .diagnostic import SKILLS, CandidateProfile, diagnose_or_degrade
 from .eval_harness import harness_passed, render_golden_answer_report, run_golden_answer_harness
 from .evaluator import Evaluation, evaluate
 from .exporter import export_session_markdown
 from .fixtures import QUESTION, STRONG_ANSWER, WEAK_ANSWER
+from .forge import MAX_DRAFTS, ForgeError, render_forge_report, run_forge, write_forge_outputs
 from .language import DEFAULT_LANGUAGE_MODE, LANGUAGE_MODES
 from .ledger import load_priors, save_posteriors
 from .llm import LLMClient, build_client
@@ -49,7 +52,7 @@ from .microloop import (
 )
 from .postmortem import PostmortemResult, export_postmortem_markdown, run_postmortem
 from .resources import SEED_RESOURCES, ChromaResourceStore, build_resource_store
-from .seeds import SEED_QUESTIONS
+from .seeds import QUESTION_BANK, SEED_QUESTIONS
 from .skill import POSTMORTEM_WEIGHT_RATIO, SkillState, apply_evaluation, confidence_weight
 from .supervisor import (
     DEFAULT_MAX_ELAPSED_SECONDS,
@@ -586,6 +589,56 @@ def _cmd_bench(client: LLMClient | None, args: argparse.Namespace) -> int:
     return 0 if bench_passed(results) else 1
 
 
+def _cmd_forge(client: LLMClient | None, args: argparse.Namespace) -> int:
+    if client is None:
+        raise RuntimeError("forge requires an LLM client")
+    # Gate 2 must dedup across everything the merged install would serve: the built-in bank plus,
+    # when the drafts target a pack, that pack's questions. The pack's concept notes then also
+    # become valid Writer grounding / expected_concepts targets.
+    corpus = [q.question for questions in QUESTION_BANK.values() for q in questions]
+    concepts = list(SEED_CONCEPTS)
+    if args.pack:
+        pack = load_pack(args.pack)
+        corpus.extend(q.question for questions in pack.questions.values() for q in questions)
+        concepts.extend(pack.concepts)
+    try:
+        run = run_forge(client, args.skill, args.n, concepts=concepts, existing_prompts=corpus)
+    except ForgeError as err:
+        # Pipeline failure (the Writer produced nothing usable) — distinct from an honest
+        # zero-admissions run, which still exits 0 with a full report (0 admitted is information).
+        print(f"Forge FAILED: {err}", file=sys.stderr)
+        return 1
+    provider = getattr(client, "primary_provider", "unknown")
+    settings = load_settings()
+    model = settings.primary_config.model or "unknown"
+    date = _utc_date()
+    queue_path = Path(args.out) if args.out else Path(args.queue_dir) / f"review-queue-{date}.yaml"
+    queue, report = write_forge_outputs(
+        run, queue_path=queue_path, provider=str(provider), model=model, date=date
+    )
+    print(render_forge_report(run, provider=str(provider), model=model, date=date))
+    admitted = sum(1 for outcome in run.outcomes if outcome.admitted)
+    print(
+        f"Forge: {admitted}/{len(run.outcomes)} draft(s) admitted. "
+        f"Review queue written to {queue}; report to {report}."
+    )
+    return 0
+
+
+def _forge_batch_size(raw: str) -> int:
+    """argparse type for ``forge --n``: the cap is the free-tier budget rail (see forge.MAX_DRAFTS)."""
+    try:
+        n = int(raw)
+    except ValueError as err:
+        raise argparse.ArgumentTypeError(f"--n must be an integer, got {raw!r}") from err
+    if not 1 <= n <= MAX_DRAFTS:
+        raise argparse.ArgumentTypeError(
+            f"--n must be between 1 and {MAX_DRAFTS}: gate 3 spends ~4+ LLM calls per surviving "
+            "draft and there is no rate-limit backoff to lean on"
+        )
+    return n
+
+
 def _cmd_ingest_concepts(client: LLMClient | None, args: argparse.Namespace) -> int:
     store = ChromaConceptStore.create(persist_dir=args.persist_dir)
     count = store.ingest(SEED_CONCEPTS)
@@ -873,6 +926,38 @@ def main(argv: list[str] | None = None) -> int:
         "--out", default="", help="Report output path (default: docs/audits/calibration-bench-<date>.md)."
     )
     bench_parser.set_defaults(func=_cmd_bench, requires_llm=True)
+
+    forge_parser = sub.add_parser(
+        "forge", help="Issue 0028: Question Forge — draft, gate, and queue new bank questions for review"
+    )
+    forge_parser.add_argument(
+        "--skill",
+        required=True,
+        choices=SKILLS,
+        help="Canonical Skill the Writer drafts questions for.",
+    )
+    forge_parser.add_argument(
+        "--n",
+        type=_forge_batch_size,
+        default=5,
+        help=f"How many drafts the Writer produces (1–{MAX_DRAFTS}; the cap is the free-tier budget rail).",
+    )
+    forge_parser.add_argument(
+        "--pack",
+        default="",
+        help="Also dedup against (and ground expected_concepts in) this content pack directory.",
+    )
+    forge_parser.add_argument(
+        "--queue-dir",
+        default="data/forge",
+        help="Directory for the review queue + report (default: data/forge).",
+    )
+    forge_parser.add_argument(
+        "--out",
+        default="",
+        help="Explicit review-queue YAML path (default: <queue-dir>/review-queue-<date>.yaml).",
+    )
+    forge_parser.set_defaults(func=_cmd_forge, requires_llm=True)
 
     pack_parser = sub.add_parser("pack", help="Issue 0025: manage external content packs")
     pack_parser.set_defaults(func=_cmd_pack, requires_llm=False)
