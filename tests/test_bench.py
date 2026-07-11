@@ -319,3 +319,61 @@ def test_report_escalation_column_shows_panel_triggers():
     report = render_bench_report([escalated])
 
     assert "panel: low_confidence" in report
+
+
+# --- trust guards in the report (shadow escalation data) -----------------------------------------
+
+
+def _result_with_trust(case, *, confidence, pre_guard, fraction=0.0, divergence=0.0, noise=()):
+    from interview_coach.evaluator import TrustTrace
+
+    base = _result(case, dims={"correctness": 3}, weighted=3.0, confidence=confidence)
+    trust = TrustTrace(
+        pre_guard_confidence=pre_guard,
+        unverifiable_fraction=fraction,
+        divergence=divergence,
+        noise_events=tuple(noise),
+    )
+    return BenchResult(case=case, evaluation=base.evaluation.model_copy(update={"trust": trust}))
+
+
+def test_trust_guard_rows_surface_only_signalled_cases():
+    from interview_coach.bench import trust_guard_rows
+
+    quiet = _result_with_trust(_case("quiet"), confidence=0.95, pre_guard=0.95)
+    capped = _result_with_trust(
+        _case("capped"), confidence=0.7, pre_guard=0.95, fraction=0.5,
+        noise=("structured_output.invalid_reply",),
+    )
+    rows = trust_guard_rows([quiet, capped])
+
+    assert [row["case_id"] for row in rows] == ["capped"]
+    assert rows[0]["pre_guard"] == 0.95
+    assert rows[0]["final"] == 0.7
+
+
+def test_shadow_trigger_counts_price_out_thresholds():
+    from interview_coach.bench import shadow_trigger_counts
+
+    results = [
+        _result_with_trust(_case("a"), confidence=0.95, pre_guard=0.95),
+        _result_with_trust(_case("b"), confidence=0.65, pre_guard=0.95, fraction=0.5),
+        _result_with_trust(_case("c"), confidence=0.55, pre_guard=0.95, fraction=0.75),
+    ]
+    counts = shadow_trigger_counts(results)
+
+    assert counts[0.5] == 0  # nothing under the live trigger
+    assert counts[0.6] == 1
+    assert counts[0.7] == 2
+
+
+def test_report_renders_trust_guard_section():
+    capped = _result_with_trust(
+        _case("capped"), confidence=0.7, pre_guard=0.95, fraction=0.5, divergence=0.2,
+        noise=("sanitizer.judgment_flattened_in_dimensions",),
+    )
+    report = render_bench_report([capped])
+
+    assert "## Trust guards (deterministic confidence caps)" in report
+    assert "| capped | 0.95 | 0.70 | 50% | 0.20 | sanitizer.judgment_flattened_in_dimensions |" in report
+    assert "shadow escalations by trigger threshold" in report
