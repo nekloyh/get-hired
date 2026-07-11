@@ -135,10 +135,82 @@ def load_questions() -> dict[str, tuple[SeedQuestion, ...]]:
     return _load_questions(_read_yaml, {note.id for note in load_concepts()})
 
 
-def _load_questions(read: YamlReader, concept_ids: set[str]) -> dict[str, tuple[SeedQuestion, ...]]:
-    from .diagnostic import SKILLS
+def validate_question(
+    raw: Any,
+    *,
+    skill: str,
+    concept_ids: set[str],
+    seen_questions: set[str],
+    where: str,
+) -> SeedQuestion:
+    """Validate one raw question mapping into a :class:`SeedQuestion` — the single-entry bank contract.
+
+    Shared by the bank/pack loaders here and by the Question Forge's contract gate (issue 0028), so
+    "valid" means exactly one thing everywhere. ``seen_questions`` is the caller's running prompt set:
+    a prompt already present is a duplicate (questions carry no id — the prompt string IS the
+    identity), and a successfully validated prompt is added so batch callers get cross-entry duplicate
+    detection for free. Raises :class:`BankError` naming the violation.
+    """
     from .rubric import Rubric
     from .seeds import DEFAULT_DIFFICULTY, SeedQuestion
+
+    if not isinstance(raw, dict):
+        raise BankError(f"{where}: each question must be a mapping, got {raw!r}")
+    prompt = _require_str(raw.get("question"), where=where, field="question")
+    if prompt in seen_questions:
+        raise BankError(f"{where}: duplicate question prompt {prompt!r}")
+
+    weights = raw.get("rubric", {}).get("weights") if isinstance(raw.get("rubric"), dict) else None
+    if not isinstance(weights, dict):
+        raise BankError(f"{where}: 'rubric.weights' must be a mapping of dimension -> weight")
+    if "english_delivery" in weights:
+        # Issue 0024 / ADR 0007: delivery is Session state, not content. The micro-loop
+        # activates english_delivery per answer from language_mode; a pack that authored it
+        # would pin delivery scoring regardless of the Session's language.
+        raise BankError(
+            f"{where}: 'english_delivery' must not be authored in a pack — it is "
+            "activated per answer by the Session's language_mode"
+        )
+    try:
+        rubric = Rubric(weights={k: float(v) for k, v in weights.items()})
+    except (ValueError, TypeError) as err:
+        raise BankError(f"{where}: invalid rubric: {err}") from err
+
+    answers = raw.get("answers")
+    if (
+        not isinstance(answers, list)
+        or not answers
+        or not all(isinstance(a, str) and a.strip() for a in answers)
+    ):
+        raise BankError(f"{where}: 'answers' must be a non-empty list of non-empty strings")
+
+    expected_concepts = _str_tuple(raw.get("expected_concepts"), where=where, field="expected_concepts")
+    dangling = [cid for cid in expected_concepts if cid not in concept_ids]
+    if dangling:
+        raise BankError(f"{where}: expected_concepts reference unknown concept id(s): {dangling}")
+
+    difficulty = raw.get("difficulty", DEFAULT_DIFFICULTY)
+    if isinstance(difficulty, bool) or not isinstance(difficulty, int) or not 1 <= difficulty <= 5:
+        raise BankError(f"{where}: 'difficulty' must be an integer on the 1–5 scale, got {difficulty!r}")
+
+    try:
+        question = SeedQuestion(
+            skill=skill,
+            question=prompt,
+            rubric=rubric,
+            answers=tuple(answers),
+            difficulty=difficulty,
+            expected_concepts=expected_concepts,
+            follow_up_seeds=_str_tuple(raw.get("follow_up_seeds"), where=where, field="follow_up_seeds"),
+        )
+    except ValueError as err:
+        raise BankError(f"{where}: {err}") from err
+    seen_questions.add(prompt)
+    return question
+
+
+def _load_questions(read: YamlReader, concept_ids: set[str]) -> dict[str, tuple[SeedQuestion, ...]]:
+    from .diagnostic import SKILLS
 
     data = read("questions.yaml")
     if not isinstance(data, dict):
@@ -153,63 +225,15 @@ def _load_questions(read: YamlReader, concept_ids: set[str]) -> dict[str, tuple[
             raise BankError(f"questions.yaml[{skill}]: must be a non-empty list of questions")
         questions: list[SeedQuestion] = []
         for i, raw in enumerate(items):
-            where = f"questions.yaml[{skill}][{i}]"
-            if not isinstance(raw, dict):
-                raise BankError(f"{where}: each question must be a mapping, got {raw!r}")
-            prompt = _require_str(raw.get("question"), where=where, field="question")
-            if prompt in seen_questions:
-                raise BankError(f"{where}: duplicate question prompt {prompt!r}")
-            seen_questions.add(prompt)
-
-            weights = raw.get("rubric", {}).get("weights") if isinstance(raw.get("rubric"), dict) else None
-            if not isinstance(weights, dict):
-                raise BankError(f"{where}: 'rubric.weights' must be a mapping of dimension -> weight")
-            if "english_delivery" in weights:
-                # Issue 0024 / ADR 0007: delivery is Session state, not content. The micro-loop
-                # activates english_delivery per answer from language_mode; a pack that authored it
-                # would pin delivery scoring regardless of the Session's language.
-                raise BankError(
-                    f"{where}: 'english_delivery' must not be authored in a pack — it is "
-                    "activated per answer by the Session's language_mode"
+            questions.append(
+                validate_question(
+                    raw,
+                    skill=skill,
+                    concept_ids=concept_ids,
+                    seen_questions=seen_questions,
+                    where=f"questions.yaml[{skill}][{i}]",
                 )
-            try:
-                rubric = Rubric(weights={k: float(v) for k, v in weights.items()})
-            except (ValueError, TypeError) as err:
-                raise BankError(f"{where}: invalid rubric: {err}") from err
-
-            answers = raw.get("answers")
-            if (
-                not isinstance(answers, list)
-                or not answers
-                or not all(isinstance(a, str) and a.strip() for a in answers)
-            ):
-                raise BankError(f"{where}: 'answers' must be a non-empty list of non-empty strings")
-
-            expected_concepts = _str_tuple(raw.get("expected_concepts"), where=where, field="expected_concepts")
-            dangling = [cid for cid in expected_concepts if cid not in concept_ids]
-            if dangling:
-                raise BankError(f"{where}: expected_concepts reference unknown concept id(s): {dangling}")
-
-            difficulty = raw.get("difficulty", DEFAULT_DIFFICULTY)
-            if isinstance(difficulty, bool) or not isinstance(difficulty, int) or not 1 <= difficulty <= 5:
-                raise BankError(f"{where}: 'difficulty' must be an integer on the 1–5 scale, got {difficulty!r}")
-
-            try:
-                questions.append(
-                    SeedQuestion(
-                        skill=skill,
-                        question=prompt,
-                        rubric=rubric,
-                        answers=tuple(answers),
-                        difficulty=difficulty,
-                        expected_concepts=expected_concepts,
-                        follow_up_seeds=_str_tuple(
-                            raw.get("follow_up_seeds"), where=where, field="follow_up_seeds"
-                        ),
-                    )
-                )
-            except ValueError as err:
-                raise BankError(f"{where}: {err}") from err
+            )
         bank[skill] = tuple(questions)
 
     missing = [skill for skill in SKILLS if skill not in bank]
