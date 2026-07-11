@@ -155,10 +155,11 @@ says 0.9, is it right ~90% of the time?"). It exits non-zero on any range regres
 judge change the same way a failing test would. Reports are versioned in `docs/audits/` so judge
 quality has a history, not a vibe.
 
-Current status: the bench is **green (20/20)** on the validated `gpt-4o-mini`→`gpt-5.4-mini` judge
-upgrade — latest report `docs/audits/calibration-bench-2026-07-11-gpt-5.4-mini.md`. The bands were
-originally labelled against `gpt-4o-mini`, so a re-anchor for the current judge is a tracked follow-up
-(`gpt-5.4-mini` over-rates `communication` by +0.65 and scores strong answers high).
+Current status: the bench is **green (29/29)** after the gpt-5.4-mini re-anchor — latest report
+`docs/audits/calibration-bench-2026-07-11-reanchor.md`. All six dimensions now carry scored guide
+bands; residual biases are small (communication −0.10, depth −0.31). Known model behavior:
+confidence is saturated (~0.95 uniform), so panel escalation never fires naturally — a deliberate,
+documented non-change (the forced-escalation experiment showed the verdict never moves).
 
 The bench's companion is the **Simulated Candidate + Supervisor replay bench** (issue 0029,
 `interview_coach.replay`): where `coach bench` calibrates the *judge*, the replay bench calibrates the

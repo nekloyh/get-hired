@@ -33,6 +33,20 @@ anchors:
     "4": >-
       Technically accurate with the key mechanism stated correctly, even if not exhaustive (e.g. "L2
       penalises squared weights, trading a little fit for lower variance").
+  depth:
+    "2": >-
+      Names the relevant concepts but no mechanism — keyword-level recall ("use regularization,
+      cross-validation") without saying how or why they work.
+    "4": >-
+      States the mechanism and one real trade-off or failure mode, even briefly (e.g. "L2 shrinks
+      weights which lowers variance but raises bias"). Edge-case coverage is a 5, not a bar for 4.
+  communication:
+    "2": >-
+      Rambling or disorganized: the reader must reconstruct the argument's order themselves.
+      Fluency does not rescue it — organization is what is scored.
+    "4": >-
+      Ordered and well-scoped (claim, mechanism, example) with no filler. Merely fluent sentences
+      without that structure are a 3.
   english_delivery:
     "2": >-
       Frequent broken phrasing that obscures the meaning ("model is overfit when data less"); the

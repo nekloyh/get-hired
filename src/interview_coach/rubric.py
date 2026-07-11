@@ -36,8 +36,19 @@ DIMENSION_GUIDE: dict[str, str] = {
         "4 = accurate with the key mechanism stated correctly, even if not exhaustive; "
         "5 = precise AND complete. Being merely correct is a 4, not a 5 — reserve 5 for no gaps."
     ),
-    "depth": "Beyond surface recall? 1 = shallow/keyword-level, 5 = mechanisms, trade-offs, edge cases.",
-    "communication": "Clear and well-structured? 1 = rambling/confusing, 5 = crisp and well-scoped.",
+    "depth": (
+        "Beyond surface recall? 1 = shallow/keyword-level; 2 = names concepts without mechanisms; "
+        "4 = states the mechanism AND one real trade-off or failure mode — award 4 for that pair "
+        "even when brief; do NOT demand edge cases or exhaustive coverage for a 4; "
+        "5 = also covers edge cases or limits of the approach."
+    ),
+    "communication": (
+        "Clear and well-structured? Judge ORGANIZATION, not fluency: 1 = rambling/confusing; "
+        "3 = readable sentences but unscoped or meandering; 4 = ordered and well-scoped "
+        "(claim -> mechanism -> example), no filler; 5 = also concise with clear signposting. "
+        "Fluent phrasing alone is a 3, not a 4 — an eloquent but disorganized answer earns no "
+        "communication credit for its eloquence."
+    ),
     "system_thinking": (
         "Reasons about the whole system & trade-offs? Award 4 whenever the answer connects a "
         "diagnosis to the trade-off it drives and a downstream consequence — credit this chain "
