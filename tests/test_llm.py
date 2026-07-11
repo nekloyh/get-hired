@@ -357,3 +357,65 @@ def test_sdk_retries_disabled_so_backoff_is_singly_owned(monkeypatch):
     monkeypatch.setattr(llm_module, "OpenAI", _RecordingOpenAI)
     GroqClient(_provider("groq"))._openai()
     assert captured["max_retries"] == 0
+
+
+# --- strict json_schema constrained decoding (probed live on gpt-5.4-mini 2026-07-11) ------------
+
+
+def _openai_client(fake):
+    from interview_coach.llm import OpenAIClient
+
+    return OpenAIClient(_provider("openai"), client=fake)
+
+
+TINY_SCHEMA = {
+    "type": "object",
+    "properties": {"x": {"type": "integer"}, "label": {"type": "string"}},
+    "required": ["x", "label"],
+    "additionalProperties": False,
+}
+
+
+def test_json_schema_sent_as_strict_grammar_on_supporting_client(fake_openai_factory):
+    fake = fake_openai_factory(['{"x": 1, "label": "ok"}'])
+    client = _openai_client(fake)
+
+    client.chat_json([{"role": "user", "content": "go"}], Foo, json_schema=TINY_SCHEMA)
+
+    sent = fake.chat.completions.calls[0]["response_format"]
+    assert sent["type"] == "json_schema"
+    assert sent["json_schema"]["name"] == "foo"
+    assert sent["json_schema"]["strict"] is True
+    assert sent["json_schema"]["schema"] == TINY_SCHEMA
+
+
+def test_json_schema_ignored_on_unsupporting_client(fake_openai_factory):
+    fake = fake_openai_factory(['{"x": 1, "label": "ok"}'])
+    client = MimoClient(_provider("mimo"), client=fake)  # MiMo: not verified, opted out
+
+    client.chat_json([{"role": "user", "content": "go"}], Foo, json_schema=TINY_SCHEMA)
+
+    assert fake.chat.completions.calls[0]["response_format"] == {"type": "json_object"}
+
+
+def test_router_downgrades_grammar_for_schema_less_fallback(fake_openai_factory):
+    from interview_coach.llm import OpenAIClient
+
+    # Primary (openai, grammar-capable) dies; fallback (mimo) cannot enforce the grammar. The
+    # failover must downgrade to json_object rather than turn an outage into a 400.
+    fake_primary = fake_openai_factory([_rate_limited(message="quota: insufficient_quota")])
+    fake_fallback = fake_openai_factory(['{"x": 9, "label": "fallback"}'])
+    router = LLMRouter(
+        "openai",
+        {
+            "openai": OpenAIClient(_provider("openai"), client=fake_primary),
+            "mimo": MimoClient(_provider("mimo"), client=fake_fallback),
+        },
+        fallback_provider="mimo",
+    )
+
+    out = router.chat_json([{"role": "user", "content": "go"}], Foo, json_schema=TINY_SCHEMA)
+
+    assert out.x == 9
+    assert fake_primary.chat.completions.calls[0]["response_format"]["type"] == "json_schema"
+    assert fake_fallback.chat.completions.calls[0]["response_format"] == {"type": "json_object"}

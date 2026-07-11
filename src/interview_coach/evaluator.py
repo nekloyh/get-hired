@@ -18,7 +18,7 @@ import logging
 import os
 import unicodedata
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -572,6 +572,65 @@ _PANEL_SCHEMA_HINT = (
     '"key_evidence": "<the candidate\'s words you lean on>"}'
 )
 
+# Strict grammar for a panel voice (static — the shape never depends on the rubric).
+_PANEL_OPINION_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "recommended_score": {"type": "number", "minimum": 1, "maximum": 5},
+        "argument": {"type": "string"},
+        "key_evidence": {"type": "string"},
+    },
+    "required": ["recommended_score", "argument", "key_evidence"],
+    "additionalProperties": False,
+}
+
+
+def evaluation_json_schema(rubric: Rubric) -> dict:
+    """Strict decoding grammar for one judgment, built from the ACTIVE rubric dimensions.
+
+    This is the structural-noise fix at the source (probed live on gpt-5.4-mini 2026-07-11): with
+    ``additionalProperties: false`` on ``dimensions`` and the active dimensions as its only keys,
+    the model *cannot* flatten the judgment inside dimensions (~28% of live traffic per the
+    trust-guards audit), score a weight-0 dimension, nest ``delivery_fixes`` where a dimension
+    belongs, or emit fixes at all on a case that never scored delivery. Providers without
+    strict-grammar support ignore this and keep relying on the sanitizer + retry loop — which also
+    stays on here, as the safety net behind the grammar.
+    """
+    dimension = {
+        "type": "object",
+        "properties": {
+            "score": {"type": "integer", "minimum": 1, "maximum": 5},
+            "evidence": {"type": "string"},
+        },
+        "required": ["score", "evidence"],
+        "additionalProperties": False,
+    }
+    active = sorted(rubric.active)
+    properties: dict[str, Any] = {
+        "dimensions": {
+            "type": "object",
+            "properties": {name: dimension for name in active},
+            "required": active,
+            "additionalProperties": False,
+        },
+        "weighted_score": {"type": "number", "minimum": 1, "maximum": 5},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "follow_up_recommended": {"type": "boolean"},
+        "follow_up_rationale": {"type": "string"},
+    }
+    if "english_delivery" in rubric.active:
+        # Only a delivery-scored case may carry fixes. Strict mode makes every property required,
+        # so listing delivery_fixes unconditionally FORCED the model to invent fixes on cases that
+        # never scored delivery (15/29 stray-drop folds on the 2026-07-11 json-schema bench run) —
+        # the grammar must mirror the rubric exactly, like the prompt's schema hints already do.
+        properties["delivery_fixes"] = {"type": "array", "items": {"type": "string"}}
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+        "additionalProperties": False,
+    }
+
 
 def _panel_opinion(
     client: LLMClient,
@@ -598,6 +657,7 @@ def _panel_opinion(
         ],
         PanelOpinion,
         max_retries=1,
+        json_schema=_PANEL_OPINION_JSON_SCHEMA,
     )
 
 
@@ -728,6 +788,7 @@ def _evaluate_once(client: LLMClient, messages: list[Message], answer: str, rubr
             Evaluation,
             validators=_make_validators(rubric, answer),
             max_retries=JUDGE_MAX_RETRIES,
+            json_schema=evaluation_json_schema(rubric),
         )
     except StructuredOutputError as err:
         if not isinstance(err.__cause__, EvidenceViolation):
@@ -748,6 +809,7 @@ def _evaluate_once(client: LLMClient, messages: list[Message], answer: str, rubr
             Evaluation,
             validators=_make_validators(rubric, answer, include_evidence=False),
             max_retries=JUDGE_MAX_RETRIES,
+            json_schema=evaluation_json_schema(rubric),
         )
         return _sanitize_unverifiable_evidence(degraded, answer)
 

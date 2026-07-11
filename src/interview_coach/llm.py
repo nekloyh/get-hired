@@ -69,7 +69,8 @@ T = TypeVar("T", bound=BaseModel)
 # ``{"role": ..., "content": ...}`` messages remain valid (str is Any), so the other single-shot
 # agents are unaffected.
 Message = dict[str, Any]
-ResponseFormat = dict[str, str]
+# json_object mode is flat strings; json_schema mode nests the full grammar — hence Any values.
+ResponseFormat = dict[str, Any]
 Validator = Callable[[Any], None]
 ToolSpec = dict[str, Any]
 # Executes one tool call: receives the tool name and parsed JSON arguments, returns the result
@@ -106,6 +107,16 @@ class LLMClient(ABC):
     ) -> str:
         """Return raw assistant content for ``messages``."""
 
+    @property
+    def supports_json_schema(self) -> bool:
+        """Whether this client can enforce strict ``response_format: json_schema`` grammars.
+
+        Constrained decoding kills structural noise at the source — a model literally cannot
+        flatten the judgment into ``dimensions`` or score a weight-0 dimension when the grammar
+        forbids the keys. Off by default; only clients whose support is live-verified opt in.
+        """
+        return False
+
     def chat_json(
         self,
         messages: Sequence[Message],
@@ -114,13 +125,30 @@ class LLMClient(ABC):
         validators: Sequence[Validator] = (),
         max_retries: int = 1,
         disable_thinking: bool = False,
+        json_schema: Mapping[str, Any] | None = None,
     ) -> T:
         """Get a schema-valid ``response_model`` from the model.
 
         Parses the reply, validates it against the pydantic schema, then runs any extra
         ``validators``. On any schema/domain validation failure it feeds the error back and retries
         up to ``max_retries`` times before raising :class:`StructuredOutputError`.
+
+        ``json_schema`` (a bare JSON Schema dict) upgrades the request to strict constrained
+        decoding on clients that support it (probed live on gpt-5.4-mini 2026-07-11); everywhere
+        else it is ignored and the parse-and-repair loop stays the only guard. The pydantic +
+        validator pipeline still runs either way — the grammar is an upstream filter, not a
+        replacement for validation.
         """
+        response_format: dict[str, Any] = {"type": "json_object"}
+        if json_schema is not None and self.supports_json_schema:
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": response_model.__name__.lower(),
+                    "strict": True,
+                    "schema": dict(json_schema),
+                },
+            }
         convo = list(messages)
         last_error: Exception | None = None
         for attempt in range(max_retries + 1):
@@ -128,7 +156,7 @@ class LLMClient(ABC):
             try:
                 raw = self.chat(
                     convo,
-                    response_format={"type": "json_object"},
+                    response_format=response_format,
                     disable_thinking=disable_thinking,
                 )
                 parsed = response_model.model_validate_json(_extract_json(raw))
@@ -436,6 +464,12 @@ class OpenAIClient(_OpenAICompatibleClient):
     provider_name: ProviderName = "openai"
     _supports_tools: bool = True
 
+    @property
+    def supports_json_schema(self) -> bool:
+        # Live-probed on gpt-5.4-mini (2026-07-11): strict grammars accepted, including nested
+        # objects, arrays, and minimum/maximum bounds. Groq/MiMo stay opted out until verified.
+        return True
+
 
 class LLMRouter(LLMClient):
     """Select the primary provider and fail over to the configured fallback on primary errors."""
@@ -461,6 +495,10 @@ class LLMRouter(LLMClient):
     def fallback_provider(self) -> ProviderName:
         return self._fallback_provider
 
+    @property
+    def supports_json_schema(self) -> bool:
+        return self._clients[self._primary_provider].supports_json_schema
+
     def chat(
         self,
         messages: Sequence[Message],
@@ -485,6 +523,14 @@ class LLMRouter(LLMClient):
                     err,
                 )
                 raise
+            if (
+                response_format is not None
+                and response_format.get("type") == "json_schema"
+                and not fallback.supports_json_schema
+            ):
+                # A strict grammar the fallback cannot enforce must not turn an outage into a 400:
+                # downgrade to plain JSON mode and let parse-and-repair carry the schema burden.
+                response_format = {"type": "json_object"}
             telemetry.incr(f"router.failover.{self._primary_provider}")
             logger.warning(
                 "primary LLM provider %s failed; falling back to %s: %s",
