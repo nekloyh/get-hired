@@ -437,7 +437,7 @@ def test_session_caps_micro_loop_to_scripted_seed_answers(make_client, monkeypat
         skill="ml_fundamentals",
         question="One-answer fixture question?",
         rubric=Rubric(weights={"correctness": 1.0}),
-        answers=("partial answer",),
+        answers=("a partial answer missing the mechanism",),
     )
     monkeypatch.setattr(supervisor, "select_seed_question", lambda skill, question_number=0, **kwargs: one_answer_seed)
     client, fake = make_client([_eval(2, follow_up=True), _plan("mlops", "system_design", "vietnamese_nlp")])
@@ -457,7 +457,7 @@ def test_session_can_use_candidate_factory_for_interactive_answers(make_client, 
         skill="ml_fundamentals",
         question="Factory question?",
         rubric=Rubric(weights={"correctness": 1.0}),
-        answers=("scripted answer",),
+        answers=("a scripted answer naming the mechanism",),
     )
     monkeypatch.setattr(supervisor, "select_seed_question", lambda skill, question_number=0, **kwargs: seed)
     client, _ = make_client([_eval(5, follow_up=False), _plan("system_design", "vietnamese_nlp", "ml_fundamentals")])
@@ -465,14 +465,14 @@ def test_session_can_use_candidate_factory_for_interactive_answers(make_client, 
 
     graph = build_session_graph(
         client,
-        candidate_factory=lambda active_seed: ScriptedCandidate(["factory answer"]),
+        candidate_factory=lambda active_seed: ScriptedCandidate(["a factory answer naming the mechanism"]),
         max_turns_per_question=1,
         now=lambda: 1,
     )
     final = graph.invoke(state, session_config("factory-session"))
 
     assert final["transcript"][0]["turns"][0]["question"] == "Factory question?"
-    assert final["transcript"][0]["turns"][0]["answer"] == "factory answer"
+    assert final["transcript"][0]["turns"][0]["answer"] == "a factory answer naming the mechanism"
 
 
 def test_session_resumes_from_sqlite_checkpoint_by_session_id(tmp_path, make_client, monkeypatch):

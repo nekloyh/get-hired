@@ -22,6 +22,7 @@ from typing import Any
 import yaml
 
 from .evaluator import Evaluation, evaluate
+from .language import validate_language_mode
 from .llm import LLMClient
 from .rubric import Rubric
 
@@ -80,6 +81,27 @@ class BenchResult:
             and self.case.expected_min <= self.score <= self.case.expected_max
         )
 
+    # A judge may reasonably sit one point off a delivery label (BARS bands are coarse), but a
+    # 2-point miss means it is not measuring delivery at all — and delivery never gates via
+    # within_band (it is excluded from weighted_score by design), so without this check the
+    # bench would wave through a judge that scores english_delivery by coin flip.
+    DELIVERY_TOLERANCE = 1
+
+    @property
+    def delivery_within_band(self) -> bool:
+        """Whether the judged english_delivery score sits within tolerance of the human label.
+
+        Vacuously true for cases without an english_delivery label; false when the case is
+        labelled but the judgment errored or skipped the dimension.
+        """
+        label = self.case.labels.get("english_delivery")
+        if label is None:
+            return True
+        if self.evaluation is None or self.error is not None:
+            return False
+        judged = self.evaluation.dimensions.get("english_delivery")
+        return judged is not None and abs(judged.score - label) <= self.DELIVERY_TOLERANCE
+
 
 @dataclass(frozen=True)
 class BenchData:
@@ -109,7 +131,9 @@ def load_bench_data(path: str | Path | None = None) -> BenchData:
             labels={k: int(v) for k, v in c.get("labels", {}).items()},
             expected_min=float(c["expected_min"]),
             expected_max=float(c["expected_max"]),
-            language_mode=c.get("language_mode", "en"),
+            # Fail loudly at load time on the designed-in "vi" (answer language) vs "vn" (session
+            # mode) vocabulary clash — a typo'd mode would silently run an en-mode judge prompt.
+            language_mode=validate_language_mode(c.get("language_mode", "en")),
         )
         for c in raw_cases
     )
@@ -137,9 +161,13 @@ def bench_passed(results: Sequence[BenchResult]) -> bool:
 
     The non-empty guard matters because ``all([])`` is ``True``: without it a malformed or empty
     ``cases.yaml`` (which yields zero results) would pass the gate vacuously and exit 0 green,
-    silently waving through the very judge change the bench is meant to block.
+    silently waving through the very judge change the bench is meant to block. Delivery-labelled
+    cases (issue 0024) additionally gate on english_delivery accuracy — the technical band cannot
+    see that dimension by design, so it needs its own check.
     """
-    return bool(results) and all(result.within_band for result in results)
+    return bool(results) and all(
+        result.within_band and result.delivery_within_band for result in results
+    )
 
 
 # --- pure metrics over the results (offline-testable) -------------------------------------------
@@ -258,19 +286,22 @@ def render_bench_report(results: Sequence[BenchResult], *, anchors: Mapping[str,
         "",
         "## Per-case scores",
         "",
-        "| case | skill | lang | expected | score | conf | in-band |",
-        "| --- | --- | --- | --- | ---: | ---: | :---: |",
+        "| case | skill | lang | expected | score | conf | escalation | in-band |",
+        "| --- | --- | --- | --- | ---: | ---: | --- | :---: |",
     ]
     for r in results:
         score = "ERR" if r.score is None else f"{r.score:.2f}"
         conf = "ERR" if r.confidence is None else f"{r.confidence:.2f}"
         mark = "✅" if r.within_band else "❌"
+        escalation = "—"
+        if r.evaluation is not None and r.evaluation.self_critique is not None:
+            escalation = ", ".join(r.evaluation.self_critique.triggers)
         lines.append(
             f"| {r.case.case_id} | {r.case.skill} | {r.case.language} | {r.case.expected_range} "
-            f"| {score} | {conf} | {mark} |"
+            f"| {score} | {conf} | {escalation} | {mark} |"
         )
         if r.error:
-            lines.append(f"| | | | | | | `{r.error}` |")
+            lines.append(f"| | | | | | | | `{r.error}` |")
 
     lines += ["", "## Per-dimension bias (judge − human label)", "",
               "| dimension | bias | n |", "| --- | ---: | ---: |"]

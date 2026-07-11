@@ -264,6 +264,40 @@ def test_export_records_language_mode_and_delivery_fixes():
     assert "English delivery fixes:" not in clean
 
 
+def test_export_renders_committee_packet_for_panel_verdicts():
+    # issue 0027: an escalated question's export carries the committee packet — the triggers, the
+    # first pass → verdict movement, the disagreement, and each voice's one-paragraph scorecard.
+    state = _state()
+    state["transcript"][0]["turns"][0]["evaluation"]["panel"] = {
+        "triggers": ["low_confidence", "score_confidence_divergence"],
+        "skeptic": {
+            "recommended_score": 2.0,
+            "argument": "The answer never names a drift metric or a retraining trigger.",
+            "key_evidence": "I would retrain sometimes.",
+        },
+        "advocate": {
+            "recommended_score": 3.5,
+            "argument": "Retraining cadence shows real operational awareness.",
+            "key_evidence": "retrain sometimes",
+        },
+        "initial_score": 2.8,
+        "initial_confidence": 0.35,
+        "disagreement": 1.5,
+    }
+    report = render_session_markdown(state)
+    assert "Committee packet (panel verdict)" in report
+    assert "Escalated on `low_confidence, score_confidence_divergence`" in report
+    assert "first pass 2.80/5 (confidence 0.35)" in report
+    assert "committee disagreement 1.50 points" in report
+    assert "Skeptic (2/5): The answer never names a drift metric" in report
+    assert "Advocate (3.5/5): Retraining cadence shows real operational awareness." in report
+    assert "I would retrain sometimes." in report
+
+    del state["transcript"][0]["turns"][0]["evaluation"]["panel"]
+    clean = render_session_markdown(state)
+    assert "Committee packet" not in clean  # an unescalated judgment shows no packet
+
+
 def test_gap_query_and_evidence_exclude_english_delivery():
     # ADR 0007: a delivery gap must not steer the technical resource query or the planner's
     # technical-evidence view of a Skill.

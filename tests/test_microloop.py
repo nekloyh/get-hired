@@ -33,8 +33,9 @@ def _seed(answers, question="Explain the bias–variance tradeoff."):
 
 def _eval(score: int, *, follow_up: bool, confidence: float = 0.8) -> str:
     # weighted_score == the single technical dimension score, so the slice-0003 cross-check never
-    # trips here. english_delivery is scored because the en-mode loop activates it on every English
-    # answer (issue 0024); a 4 keeps the delivery-fixes validator quiet.
+    # trips here. english_delivery is scored because the en-mode loop activates it on every
+    # substantial (>= 5 words) English answer (issue 0024); a 4 keeps the delivery-fixes validator
+    # quiet. Scripted answers in these tests must therefore be >= 5 English words.
     return json.dumps(
         {
             "dimensions": {
@@ -132,8 +133,9 @@ def test_interactive_candidate_reports_eof_cleanly():
 
 def test_strong_answer_resolves_without_follow_up(make_client):
     # Evaluator does not recommend a follow-up -> one turn, no Interviewer call, resolved normally.
+    strong = "a strong answer about the bias variance tradeoff"
     client, fake = make_client([_eval(5, follow_up=False)])
-    result = run_micro_loop(client, _seed(["a strong answer"]), ScriptedCandidate(["a strong answer"]))
+    result = run_micro_loop(client, _seed([strong]), ScriptedCandidate([strong]))
     assert len(result.turns) == 1
     assert result.turns[0].is_follow_up is False
     assert result.stop_reason is StopReason.RESOLVED
@@ -151,7 +153,7 @@ def test_weak_answer_triggers_follow_up_then_resolves(make_client):
             _eval(4, follow_up=False),
         ]
     )
-    seed = _seed(["weak answer", "a better answer"])
+    seed = _seed(["a weak answer missing the mechanism", "a better answer naming the mechanism"])
     result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers))
     assert len(result.turns) == 2
     assert result.turns[0].is_follow_up is False
@@ -163,7 +165,8 @@ def test_weak_answer_triggers_follow_up_then_resolves(make_client):
     assert result.turns[0].trace.concept_hit_id == "ml_fundamentals_l2_regularization"
     assert result.turns[1].trace.stop_reason is StopReason.RESOLVED
     assert result.turns[1].question != seed.question  # not a re-ask of the original
-    assert result.turns[1].answer == "a better answer"  # the candidate answered the follow-up
+    # the candidate answered the follow-up
+    assert result.turns[1].answer == "a better answer naming the mechanism"
     assert result.stop_reason is StopReason.RESOLVED
     assert fake.call_count == 4  # eval, native lookup tool call, follow-up, eval
 
@@ -173,7 +176,7 @@ def test_question_resolves_to_the_last_score(make_client):
     client, _ = make_client(
         [_eval(2, follow_up=True), _tool(), _followup(), _eval(4, follow_up=False)]
     )
-    seed = _seed(["weak", "better"])
+    seed = _seed(["a weak answer missing the mechanism", "a better answer naming the mechanism"])
     result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers))
     assert result.resolved_evaluation is result.turns[-1].evaluation
     assert result.resolved_evaluation.weighted_score == pytest.approx(4.0)
@@ -185,7 +188,7 @@ def test_safety_cap_halts_pathological_loop_and_logs_a_guardrail_trip(make_clien
     client, fake = make_client(
         [_eval(2, follow_up=True), _tool(), _followup(), _eval(2, follow_up=True)]
     )
-    seed = _seed(["a1", "a2"])
+    seed = _seed(["the first answer stays weak throughout", "the second answer stays weak throughout"])
     with caplog.at_level(logging.INFO, logger="interview_coach.microloop"):
         result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers), max_turns=2)
     assert result.stop_reason is StopReason.SAFETY_CAP
@@ -202,7 +205,7 @@ def test_micro_loop_degrades_when_follow_up_tool_call_stays_garbled(make_tool_cl
     # One transient LLM glitch must not crash the question: the loop keeps the last score and resolves
     # with a distinct FOLLOW_UP_UNAVAILABLE stop reason (a degrade, not a normal resolution).
     client, fake = make_tool_client([_eval(2, follow_up=True), _garbled_tool()])
-    seed = _seed(["a weak answer"])
+    seed = _seed(["a weak answer missing the mechanism"])
     with caplog.at_level(logging.WARNING, logger="interview_coach.microloop"):
         result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers), max_turns=4)
 
@@ -217,7 +220,7 @@ def test_micro_loop_degrades_when_follow_up_tool_call_stays_garbled(make_tool_cl
 
 def test_cap_keeps_the_last_score_on_exit(make_client):
     client, _ = make_client([_eval(2, follow_up=True), _tool(), _followup(), _eval(2, follow_up=True)])
-    seed = _seed(["a1", "a2"])
+    seed = _seed(["the first answer stays weak throughout", "the second answer stays weak throughout"])
     result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers), max_turns=2)
     assert result.resolved_evaluation is result.turns[-1].evaluation
     assert result.skill_state.mastery < 0.5  # the kept weak score pulls mastery down
@@ -234,7 +237,13 @@ def test_micro_loop_does_not_override_evaluator_follow_up_decision(make_client):
             _tool(), _followup(), _eval(5, follow_up=True, confidence=0.9),  # FU2 -> cap
         ]
     )
-    seed = _seed(["ok-ish", "strong fu1", "strong fu2"])
+    seed = _seed(
+        [
+            "an okay answer with a real gap",
+            "a strong follow-up answer number one",
+            "a strong follow-up answer number two",
+        ]
+    )
     result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers), max_turns=3)
 
     assert result.stop_reason is StopReason.SAFETY_CAP
@@ -254,7 +263,7 @@ def test_strong_seed_follow_up_still_runs_until_evaluator_resolves(make_client):
             _eval(5, follow_up=False, confidence=0.9),  # the follow-up answer resolves naturally
         ]
     )
-    seed = _seed(["strong seed", "strong follow-up"])
+    seed = _seed(["a strong seed answer worth probing", "a strong follow-up answer that resolves"])
     result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers), max_turns=4)
 
     assert len(result.turns) == 2
@@ -267,7 +276,7 @@ def test_weak_follow_up_reaches_cap_when_evaluator_keeps_flagging(make_client):
     client, _ = make_client(
         [_eval(2, follow_up=True), _tool(), _followup(), _eval(2, follow_up=True, confidence=0.9)]
     )
-    seed = _seed(["weak", "still weak"])
+    seed = _seed(["a weak answer missing the mechanism", "an answer that is still weak"])
     result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers), max_turns=2)
 
     assert result.stop_reason is StopReason.SAFETY_CAP
@@ -277,29 +286,46 @@ def test_skill_state_is_updated_on_exit(make_client):
     # On loop exit the resolved score folds into the Skill state (slice 0002): mastery moves toward
     # the score and confidence rises off the neutral prior.
     client, _ = make_client([_eval(5, follow_up=False)])
-    seed = _seed(["strong"])
+    seed = _seed(["a strong answer about the tradeoff"])
     neutral = SkillState.neutral(seed.skill)
     result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers))
     assert result.skill_state.mastery > neutral.mastery
     assert result.skill_state.confidence > neutral.confidence
 
 
-def test_turn_trace_records_self_critique_trigger(make_client):
-    # The Evaluator self-critique trace is copied onto the transcript turn so a Session can be
-    # debugged without unpacking the raw Evaluation JSON.
-    client, fake = make_client([_eval(3, follow_up=False, confidence=0.3), _eval(4, follow_up=False, confidence=0.9)])
-    seed = _seed(["uncertain but sufficient"])
+def test_turn_trace_records_panel_triggers(make_client):
+    # The escalation triggers are copied onto the transcript turn so a Session can be debugged
+    # without unpacking the raw Evaluation JSON. A low-confidence first pass now escalates to the
+    # Panel Verdict (issue 0027): first pass, Skeptic, Advocate, then the Evaluator's verdict.
+    def _opinion(score: float) -> str:
+        return json.dumps(
+            {
+                "recommended_score": score,
+                "argument": "One-paragraph committee scorecard.",
+                "key_evidence": "an uncertain but mostly sufficient answer",
+            }
+        )
+
+    client, fake = make_client(
+        [
+            _eval(3, follow_up=False, confidence=0.3),
+            _opinion(2.5),
+            _opinion(3.5),
+            _eval(4, follow_up=False, confidence=0.9),
+        ]
+    )
+    seed = _seed(["an uncertain but mostly sufficient answer"])
     result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers))
     assert result.turns[0].trace.evaluator_self_critique_triggers == ("low_confidence",)
     assert result.turns[0].trace.stop_reason is StopReason.RESOLVED
-    assert fake.call_count == 2
+    assert fake.call_count == 4
 
 
 def test_incoming_skill_state_is_threaded(make_client):
     # A caller (the macro-loop, slice 0010) can pass an existing belief; the loop builds on it rather
     # than restarting from neutral.
     client, _ = make_client([_eval(5, follow_up=False)])
-    seed = _seed(["strong"])
+    seed = _seed(["a strong answer about the tradeoff"])
     prior = SkillState.neutral(seed.skill).observe(0.9)  # already some evidence
     result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers), prior)
     assert result.skill_state.alpha + result.skill_state.beta > prior.alpha + prior.beta

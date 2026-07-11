@@ -55,16 +55,26 @@ class _SimJudge(LLMClient):
             return json.dumps({"action": self.supervisor_action, "reasoning": "sim",
                                "target_skill": None, "target_plan_index": None})
         if "You are the Evaluator" in text:
-            match = re.search(r"A (strong|weak|moderate) answer", text)
+            # Anchor on the CANDIDATE ANSWER section: the 0024 judge system prompt itself contains
+            # "A weak answer scores just as low ...", which an unanchored search matches first.
+            match = re.search(r"CANDIDATE ANSWER:\nA (strong|weak|moderate) answer", text)
             score = {"strong": 5, "weak": 2, "moderate": 3}[match.group(1) if match else "moderate"]
+            # Score exactly the active dimensions the prompt lists — a short persona answer no
+            # longer activates english_delivery (the >= 5-word gate), so scoring all of DIMENSIONS
+            # blindly would trip the "do not score weight-0 dimensions" validator.
+            active = [
+                dim
+                for dim in DIMENSIONS
+                if re.search(rf"^- {re.escape(dim)} \((?:weight |assessed separately)", text, flags=re.MULTILINE)
+            ] or ["correctness"]
             payload = {
-                "dimensions": {dim: {"score": score, "evidence": "no evidence"} for dim in DIMENSIONS},
+                "dimensions": {dim: {"score": score, "evidence": "no evidence"} for dim in active},
                 "weighted_score": float(score),
                 "confidence": 0.9,
                 "follow_up_recommended": False,
                 "follow_up_rationale": "sim",
             }
-            if score <= 3:
+            if "english_delivery" in active and score <= 3:
                 # weak english_delivery needs >= 3 phrase fixes (issue 0024)
                 payload["delivery_fixes"] = ["fix one", "fix two", "fix three"]
             return json.dumps(payload)

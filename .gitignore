@@ -30,5 +30,8 @@ sessions.db
 # LangGraph SQLite checkpoints + their WAL/SHM sidecars are per-machine runtime state
 .session-checkpoints.sqlite*
 
+# Claude Code local state (agent worktrees, local settings)
+.claude/
+
 # OS
 .DS_Store

@@ -47,6 +47,21 @@ def score_to_quality(weighted_score: float) -> float:
     return (weighted_score - 1.0) / 4.0
 
 
+def panel_agreement_weight(disagreement: float) -> float:
+    """Evidence weight for a panel-escalated judgment, from committee disagreement (issue 0027).
+
+    On an escalated question the committee's agreement, not the judge's stated confidence, is the
+    evidence-quality signal: a verdict the Skeptic and Advocate converged on is trustworthy evidence
+    even though the *first pass* was shaky, while a verdict they split on should move the Beta less.
+    ``disagreement`` is |skeptic − advocate| in score points (0–4). Linear and strictly decreasing,
+    reusing the confidence-weight floor so a maximally split committee still counts as weak — not
+    zero — evidence, and full consensus restores exactly ``EVIDENCE_WEIGHT`` (parity with a
+    fully-confident unescalated judgment).
+    """
+    clamped = max(0.0, min(1.0, disagreement / 4.0))
+    return EVIDENCE_WEIGHT * (CONFIDENCE_WEIGHT_FLOOR + (1.0 - CONFIDENCE_WEIGHT_FLOOR) * (1.0 - clamped))
+
+
 def confidence_weight(confidence: float) -> float:
     """Evidence weight for one evaluation, scaled by the Evaluator's ``confidence`` in [0, 1] (0021).
 
@@ -113,13 +128,27 @@ class SkillState:
         )
 
 
+def evidence_weight_for(evaluation: Evaluation) -> float:
+    """THE evidence weight for one judgment — the single source of truth (issues 0021/0027).
+
+    Panel-escalated questions weigh by committee agreement; everything else by the Evaluator's
+    confidence. Both the belief update (:func:`apply_evaluation`) and the transcript's recorded
+    ``evidence_weight`` (supervisor's dump) must call this same function, or the export lies about
+    the weight that was actually applied.
+    """
+    if evaluation.panel is not None:
+        return panel_agreement_weight(evaluation.panel.disagreement)
+    return confidence_weight(evaluation.confidence)
+
+
 def apply_evaluation(state: SkillState, evaluation: Evaluation) -> SkillState:
     """Update a Skill's belief from an Evaluator judgment (consumes slice 0001's output).
 
-    Evidence weight scales with the Evaluator's confidence (issue 0021): shaky judgments move the
-    posterior less than confident ones at the same score.
+    Evidence weight scales with the Evaluator's confidence (issue 0021), or with committee
+    agreement on a panel-escalated question (issue 0027): shaky or contested judgments move the
+    posterior less than confident, consensual ones at the same score.
     """
     return state.observe(
         score_to_quality(evaluation.weighted_score),
-        weight=confidence_weight(evaluation.confidence),
+        weight=evidence_weight_for(evaluation),
     )

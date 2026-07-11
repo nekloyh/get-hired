@@ -169,6 +169,29 @@ def _append_evaluation(lines: list[str], evaluation: Mapping[str, Any]) -> None:
         lines.append("English delivery fixes:")
         for fix in fixes:
             lines.append(f"- {_md(fix)}")
+    if panel := evaluation.get("panel"):
+        # issue 0027: the committee packet — each voice's one-paragraph scorecard and the
+        # disagreement, the artifact a real hiring-committee debrief produces.
+        skeptic = panel.get("skeptic", {})
+        advocate = panel.get("advocate", {})
+        lines.append("")
+        lines.append("**Committee packet (panel verdict)**")
+        lines.append("")
+        lines.append(
+            f"- Escalated on `{_md(', '.join(panel.get('triggers', [])))}`: first pass "
+            f"{float(panel.get('initial_score', 0)):.2f}/5 (confidence "
+            f"{float(panel.get('initial_confidence', 0)):.2f}) → verdict "
+            f"{float(evaluation.get('weighted_score', 0)):.2f}/5; committee disagreement "
+            f"{float(panel.get('disagreement', 0)):.2f} points."
+        )
+        lines.append(
+            f"- Skeptic ({float(skeptic.get('recommended_score', 0)):g}/5): {_md(skeptic.get('argument'))} "
+            f"— evidence: {_md(skeptic.get('key_evidence'))}"
+        )
+        lines.append(
+            f"- Advocate ({float(advocate.get('recommended_score', 0)):g}/5): {_md(advocate.get('argument'))} "
+            f"— evidence: {_md(advocate.get('key_evidence'))}"
+        )
     if evaluation.get("evidence_degraded"):
         # issue 0033: every citation was unverifiable — the score stands but its audit trail does not.
         lines.append(

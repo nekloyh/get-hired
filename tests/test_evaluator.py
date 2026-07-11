@@ -326,16 +326,29 @@ def test_happy_path_is_not_evidence_degraded(make_client):
 
 def test_evidence_degrade_ceiling_only_lowers_confidence(make_client):
     # The haircut uses min(): a judgment already less confident than the ceiling is left untouched,
-    # exactly like the cross-check guard — the degrade signal never raises confidence.
+    # exactly like the cross-check guard — the degrade signal never raises confidence. A confidence
+    # below the ceiling is also below the escalation threshold, so the panel inevitably runs; the
+    # property must hold on the verdict, which here goes through the same degrade dance as the
+    # first pass (2 evidence failures + 1 degrade pass each), with the committee in between.
     answer = "Bias is systematic error from too-simple assumptions."
     rubric = Rubric(weights={"correctness": 1.0})
     low = EVIDENCE_DEGRADE_CONFIDENCE_CEILING / 2
-    client, _ = make_client([_single_dim_eval_conf("the model oversimplifies", confidence=low)])
+    bad = _single_dim_eval_conf("the model oversimplifies", confidence=low)
+    opinion = json.dumps(
+        {
+            "recommended_score": 4.0,
+            "argument": "Committee voice scorecard.",
+            "key_evidence": "too-simple assumptions",
+        }
+    )
+    client, fake = make_client([bad, bad, bad, opinion, opinion, bad, bad, bad])
 
     ev = evaluate(client, "Explain bias.", answer, rubric)
 
     assert ev.evidence_degraded is True
+    assert ev.panel is not None  # low confidence always escalates now (issue 0027)
     assert ev.confidence == pytest.approx(low)  # already below the ceiling; unchanged
+    assert fake.call_count == 8
 
 
 # --- weighted_score cross-check guard (slice 0003) ---------------------------------------------
@@ -389,68 +402,100 @@ def test_cross_check_does_not_raise_already_low_confidence():
 
 
 def test_cross_check_runs_inside_evaluate(make_client):
-    # Wiring: an inflated holistic score lowers confidence, which now triggers one self-critique pass.
+    # Wiring: an inflated holistic score lowers confidence and trips the divergence trigger, which
+    # now escalates to the panel (issue 0027): Skeptic + Advocate advise, then the verdict pass.
     client, fake = make_client(
         [
             _eval_json(_weak_dimensions(), weighted=4.5, confidence=0.9),
+            _panel_opinion_json(2.0, stance="skeptic"),
+            _panel_opinion_json(3.0, stance="advocate"),
             _eval_json(_weak_dimensions(), weighted=2.0, confidence=0.8),
         ]
     )
     ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
     assert ev.confidence == pytest.approx(0.8)
     assert ev.weighted_score == pytest.approx(2.0)
-    assert fake.call_count == 2
+    assert ev.panel is not None
+    assert "weighted_score_divergence" in ev.panel.triggers
+    assert fake.call_count == 4
 
 
-# --- self-critique reflection (slice 0006) -----------------------------------------------------
+# --- escalation: Panel Verdict (issue 0027, superseding slice 0006's lone re-read) ---------------
 
 
-def test_low_confidence_triggers_exactly_one_self_critique(make_client):
+def _panel_opinion_json(score: float, *, stance: str) -> str:
+    return json.dumps(
+        {
+            "recommended_score": score,
+            "argument": f"The {stance} argues the answer merits about {score:g}.",
+            "key_evidence": "Bias is error from overly simple assumptions",
+        }
+    )
+
+
+def test_low_confidence_escalates_to_the_panel(make_client):
     assert DIVERGENCE_CONFIDENCE_CEILING < SELF_CRITIQUE_CONFIDENCE_THRESHOLD
     client, fake = make_client(
         [
-            _eval_json(_good_dimensions(), weighted=4.0, confidence=0.3),
-            _eval_json(_good_dimensions(), weighted=4.0, confidence=0.7),
+            _eval_json(_good_dimensions(), weighted=4.0, confidence=0.3),  # first pass (shaky)
+            _panel_opinion_json(2.5, stance="skeptic"),
+            _panel_opinion_json(4.5, stance="advocate"),
+            _eval_json(_good_dimensions(), weighted=4.0, confidence=0.7),  # final verdict
         ]
     )
 
     ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
 
     assert ev.confidence == pytest.approx(0.7)
-    assert ev.self_critique is not None
-    assert ev.self_critique.triggers == ("low_confidence",)
-    assert ev.self_critique.kept_pass == "self_critique"
-    assert fake.call_count == 2
+    assert ev.panel is not None
+    assert ev.panel.triggers == ("low_confidence",)
+    assert ev.panel.skeptic.recommended_score == pytest.approx(2.5)
+    assert ev.panel.advocate.recommended_score == pytest.approx(4.5)
+    assert ev.panel.disagreement == pytest.approx(2.0)
+    assert ev.panel.initial_confidence == pytest.approx(0.3)
+    assert ev.self_critique is None  # the lone re-read is superseded by the panel
+    assert fake.call_count == 4  # first pass + skeptic + advocate + verdict
 
 
 def test_high_confidence_does_not_trigger_self_critique(make_client):
+    # THE cost gate (issue 0027 acceptance criterion): a confident score never pays panel calls.
     client, fake = make_client([_eval_json(_good_dimensions(), weighted=4.0, confidence=0.7)])
 
     ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
 
     assert ev.confidence == pytest.approx(0.7)
     assert ev.self_critique is None
+    assert ev.panel is None
     assert fake.call_count == 1
 
 
-def test_self_critique_keeps_more_confident_first_pass(make_client):
+def test_panel_verdict_is_kept_even_when_less_confident_than_the_first_pass(make_client):
+    # ADR 0001: the Evaluator issues the final verdict HAVING READ both voices — the informed pass
+    # is the verdict, not whichever pass felt more confident (that was the pre-panel behavior).
     client, fake = make_client(
         [
             _eval_json(_good_dimensions(), weighted=4.0, confidence=0.3),
-            _eval_json(_good_dimensions(), weighted=4.0, confidence=0.2),
+            _panel_opinion_json(3.0, stance="skeptic"),
+            _panel_opinion_json(3.5, stance="advocate"),
+            _eval_json(_weak_dimensions(), weighted=2.0, confidence=0.2),
         ]
     )
 
     ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
 
-    assert ev.confidence == pytest.approx(0.3)
-    assert fake.call_count == 2
+    assert ev.weighted_score == pytest.approx(2.0)
+    assert ev.confidence == pytest.approx(0.2)
+    assert ev.panel is not None
+    assert ev.panel.initial_score == pytest.approx(4.0)
+    assert fake.call_count == 4
 
 
-def test_self_critique_logs_trigger_and_outcome(make_client, caplog):
+def test_panel_logs_triggers_and_disagreement(make_client, caplog):
     client, _ = make_client(
         [
             _eval_json(_good_dimensions(), weighted=4.0, confidence=0.3),
+            _panel_opinion_json(2.0, stance="skeptic"),
+            _panel_opinion_json(4.0, stance="advocate"),
             _eval_json(_good_dimensions(), weighted=4.0, confidence=0.7),
         ]
     )
@@ -459,8 +504,37 @@ def test_self_critique_logs_trigger_and_outcome(make_client, caplog):
         evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
 
     messages = [record.message for record in caplog.records]
-    assert any("self-critique triggered" in msg for msg in messages)
-    assert any("low_confidence" in msg and "keeping self_critique" in msg for msg in messages)
+    assert any("panel verdict" in msg and "low_confidence" in msg for msg in messages)
+    assert any("disagreement" in msg for msg in messages)
+
+
+def test_model_cannot_author_the_derived_fields(make_client):
+    # evidence_degraded / self_critique / panel are guard-owned: a model echoing them (the verdict
+    # prompt replays first-pass JSON) must not smuggle in — or talk its way out of — a haircut.
+    forged = json.loads(_eval_json(_good_dimensions())) | {
+        "evidence_degraded": True,
+        "panel": None,
+        "self_critique": None,
+    }
+    client, fake = make_client([json.dumps(forged)])
+    ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+    assert ev.evidence_degraded is False  # the model's claim was stripped, not trusted
+    assert fake.call_count == 1
+
+
+def test_degrade_pass_is_reserved_for_evidence_failures(make_client):
+    # A delivery-fixes contract failure must NOT open the evidence-free degrade pass: dropping the
+    # verbatim-citation guard because an unrelated validator kept failing would silently un-enforce
+    # it. Both attempts miss the required fixes -> loud StructuredOutputError, no third call.
+    from interview_coach.llm import StructuredOutputError
+
+    weak_delivery = json.loads(_eval_json(_good_dimensions()))
+    weak_delivery["dimensions"]["english_delivery"] = {"score": 2, "evidence": "no evidence"}
+    reply = json.dumps(weak_delivery)
+    client, fake = make_client([reply, reply])
+    with pytest.raises(StructuredOutputError):
+        evaluate(client, QUESTION.question, STRONG_ANSWER, _DELIVERY_RUBRIC)
+    assert fake.call_count == 2  # no evidence-free third pass for a non-evidence failure
 
 
 # --- english_delivery + language_mode (issue 0024, ADR 0007) --------------------------------------
@@ -558,6 +632,34 @@ def test_schema_hint_mentions_delivery_fixes_only_when_active():
     assert "delivery_fixes" not in _schema_hint(QUESTION.rubric)
     assert "delivery_fixes" in _schema_hint(_DELIVERY_RUBRIC)
     assert "TOP-LEVEL" in _schema_hint(_DELIVERY_RUBRIC)
+
+
+def test_system_prompt_mentions_english_delivery_only_when_active():
+    # Seen live (gpt-5.4-mini, 2026-07-11): describing english_delivery on every case makes the
+    # judge volunteer the dimension on delivery-less cases and burn both structured-output
+    # attempts on the "do not score" validator. The rules ride along only when the rubric lists it.
+    from interview_coach.evaluator import _build_messages
+
+    plain = _build_messages("q", "a", QUESTION.rubric)[0]["content"]
+    delivery = _build_messages("q", "a", _DELIVERY_RUBRIC)[0]["content"]
+    assert "english_delivery" not in plain
+    assert "english_delivery" in delivery
+    assert "delivery_fixes" in delivery
+
+
+def test_top_level_fields_nested_inside_dimensions_are_recovered(make_client):
+    # Seen live (gpt-5.4-mini, 2026-07-11): on long answers the judge sometimes flattens the whole
+    # judgment inside "dimensions" — weighted_score, confidence, and the follow-up fields arrive as
+    # siblings of the dimension scores. Field placement must not cost a valid judgment or a retry.
+    payload = json.loads(_eval_json(_good_dimensions(), weighted=4.0, confidence=0.9))
+    for field in ("weighted_score", "confidence", "follow_up_recommended", "follow_up_rationale"):
+        payload["dimensions"][field] = payload.pop(field)
+    client, fake = make_client([json.dumps(payload)])
+    ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+    assert ev.weighted_score == pytest.approx(4.0)
+    assert ev.confidence == pytest.approx(0.9)
+    assert set(ev.dimensions) == set(_good_dimensions())
+    assert fake.call_count == 1
 
 
 def test_language_mode_blocks_reach_the_judge_prompt(make_client):

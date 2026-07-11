@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import pytest
 
-from interview_coach.evaluator import Evaluation
+from interview_coach.evaluator import Evaluation, PanelOpinion, PanelTrace
 from interview_coach.skill import (
+    CONFIDENCE_WEIGHT_FLOOR,
     EVIDENCE_WEIGHT,
     SkillState,
     apply_evaluation,
     confidence_weight,
+    evidence_weight_for,
+    panel_agreement_weight,
     score_to_quality,
 )
 
@@ -21,6 +24,27 @@ def _evaluation(weighted_score: float, confidence: float = 0.9) -> Evaluation:
         follow_up_recommended=False,
         follow_up_rationale="n/a",
     )
+
+
+def _opinion(score: float) -> PanelOpinion:
+    return PanelOpinion(recommended_score=score, argument="one-paragraph scorecard", key_evidence="quoted words")
+
+
+def _panel_evaluation(weighted_score: float, *, disagreement: float, confidence: float = 0.9) -> Evaluation:
+    """An escalated Evaluation with a committee trace attached the way evaluate() attaches it.
+
+    ``panel`` is a derived field: the before-validator strips it from constructor input, so it must
+    arrive via ``model_copy`` — same path as production (issue 0027).
+    """
+    trace = PanelTrace(
+        triggers=("low_confidence",),
+        skeptic=_opinion(2.0),
+        advocate=_opinion(min(5.0, 2.0 + disagreement)),
+        initial_score=weighted_score,
+        initial_confidence=confidence,
+        disagreement=disagreement,
+    )
+    return _evaluation(weighted_score, confidence).model_copy(update={"panel": trace})
 
 
 def test_neutral_prior_is_uniform():
@@ -121,3 +145,51 @@ def test_observe_rejects_out_of_range_inputs():
 def test_skill_state_rejects_nonpositive_params():
     with pytest.raises(ValueError):
         SkillState(skill="x", alpha=0.0, beta=1.0)
+
+
+def test_panel_agreement_weight_is_parity_at_consensus():
+    # Full committee consensus must weigh exactly like a fully-confident unescalated judgment
+    # (issue 0027: escalation itself is not a penalty — only a *split* committee is).
+    assert panel_agreement_weight(0.0) == pytest.approx(EVIDENCE_WEIGHT)
+
+
+def test_panel_agreement_weight_is_strictly_decreasing():
+    assert (
+        panel_agreement_weight(0.0)
+        > panel_agreement_weight(1.0)
+        > panel_agreement_weight(2.5)
+        > panel_agreement_weight(4.0)
+    )
+
+
+def test_panel_agreement_weight_floor_is_weak_not_zero():
+    # A maximally split committee is still *weak* evidence, not *no* evidence — the same floor
+    # philosophy as confidence_weight (issue 0021).
+    assert panel_agreement_weight(4.0) == pytest.approx(EVIDENCE_WEIGHT * CONFIDENCE_WEIGHT_FLOOR)
+    assert panel_agreement_weight(4.0) > 0.0
+
+
+def test_panel_agreement_weight_clamps_out_of_range():
+    assert panel_agreement_weight(6.0) == pytest.approx(panel_agreement_weight(4.0))
+    assert panel_agreement_weight(-1.0) == pytest.approx(panel_agreement_weight(0.0))
+
+
+def test_evidence_weight_for_dispatches_panel_over_confidence():
+    # The single source of truth (issues 0021/0027): a panel-escalated judgment weighs by committee
+    # agreement — even a confident verdict on a split committee weighs less; an unescalated one
+    # weighs by the Evaluator's confidence.
+    plain = _evaluation(4.0, confidence=0.6)
+    assert evidence_weight_for(plain) == pytest.approx(confidence_weight(0.6))
+
+    contested = _panel_evaluation(4.0, disagreement=4.0, confidence=1.0)
+    assert evidence_weight_for(contested) == pytest.approx(panel_agreement_weight(4.0))
+    assert evidence_weight_for(contested) < confidence_weight(1.0)
+
+
+def test_contested_verdict_moves_posterior_less_than_consensus_at_identical_score():
+    # The property issue 0027 promises: same verdict score, but a committee that split moves the
+    # Beta strictly less than one that converged.
+    before = SkillState.neutral("ml_fundamentals")
+    consensus = apply_evaluation(before, _panel_evaluation(5.0, disagreement=0.0))
+    contested = apply_evaluation(before, _panel_evaluation(5.0, disagreement=3.0))
+    assert consensus.mastery > contested.mastery > before.mastery

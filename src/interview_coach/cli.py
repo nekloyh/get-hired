@@ -173,6 +173,7 @@ def _cmd_interview(client: LLMClient | None, args: argparse.Namespace) -> int:
             ScriptedCandidate(seed.answers),
             max_turns=args.max_turns,
             concept_store=concept_store,
+            language_mode=args.language,
         )
         _print_micro_loop(result)
     return 0
@@ -388,6 +389,16 @@ def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
                 # The max_elapsed_seconds rail bounds a single sitting, so resuming after a gap
                 # restarts the time budget rather than force-completing on wall-clock since creation.
                 graph.update_state(config, {"started_at": time.time()})
+                checkpoint_mode = resumed.get("language_mode", DEFAULT_LANGUAGE_MODE)
+                if args.language is not None and args.language != checkpoint_mode:
+                    # language_mode is Session state (ADR 0007): a resume continues the recorded
+                    # mode; silently honoring a different flag mid-Session would be worse than
+                    # ignoring it, but ignoring it silently hides the mismatch — say so.
+                    print(
+                        f"note: resuming with the checkpoint's language_mode={checkpoint_mode!r}; "
+                        f"--language {args.language!r} is ignored on --resume",
+                        file=sys.stderr,
+                    )
                 _print_resume_recap(resumed)
                 final = _run_session_graph(
                     graph, None, config, live=not args.no_live, already_seen=len(resumed.get("transcript", []))
@@ -416,7 +427,7 @@ def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
                     max_elapsed_seconds=args.max_elapsed_seconds,
                     candidate_id=args.candidate,
                     ledger_prior_mastery=carried.raw_mastery if carried else None,
-                    language_mode=args.language,
+                    language_mode=args.language or DEFAULT_LANGUAGE_MODE,
                 )
                 final = _run_session_graph(graph, state, config, live=not args.no_live)
         except CandidateIntent as err:
@@ -554,6 +565,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Do not upsert the built-in seed concept notes before the interview.",
     )
+    iv_parser.add_argument(
+        "--language",
+        choices=list(LANGUAGE_MODES),
+        default=DEFAULT_LANGUAGE_MODE,
+        help="language_mode for the demo micro-loop (0024): en, vn, or mixed.",
+    )
     iv_parser.set_defaults(func=_cmd_interview, requires_llm=True)
 
     diag_parser = sub.add_parser("diagnose", help="Slice 0009: produce Topic Plan + seeded Skill priors")
@@ -621,10 +638,11 @@ def main(argv: list[str] | None = None) -> int:
     session_parser.add_argument(
         "--language",
         choices=list(LANGUAGE_MODES),
-        default=DEFAULT_LANGUAGE_MODE,
+        default=None,  # None = "not passed": lets --resume tell an explicit flag from the default
         help=(
             "Session language_mode (0024, ADR 0007): en = English interview; vn = Vietnamese; "
-            "mixed = Vietnamese with natural English code-switching, like a VNG/FPT round."
+            "mixed = Vietnamese with natural English code-switching, like a VNG/FPT round. "
+            f"Default: {DEFAULT_LANGUAGE_MODE}. Ignored on --resume (the checkpoint's mode wins)."
         ),
     )
     session_parser.add_argument("--max-questions", type=int, default=DEFAULT_MAX_QUESTIONS)
@@ -742,6 +760,7 @@ def main(argv: list[str] | None = None) -> int:
         concept_store="memory",
         concept_persist_dir=".chroma",
         no_seed_concepts=False,
+        language=DEFAULT_LANGUAGE_MODE,
         requires_llm=True,
     )
     args = parser.parse_args(argv)

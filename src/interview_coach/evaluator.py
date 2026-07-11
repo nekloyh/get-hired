@@ -27,6 +27,15 @@ logger = logging.getLogger(__name__)
 
 NO_EVIDENCE = "no evidence"
 
+
+class EvidenceViolation(ValueError):
+    """A citation failed the verbatim-quote check.
+
+    Typed so the degrade path can tell an evidence failure (eligible for sanitize-and-keep) apart
+    from a dimension/schema/delivery-contract failure — dropping the evidence guard because an
+    UNRELATED validator kept failing would silently un-enforce verbatim citations.
+    """
+
 # Degrade marker (issue 0030 follow-up / calibration bench): when the model cites a paraphrase we
 # cannot verify against the answer even after a retry, we blank that one citation to this marker and
 # keep the score, rather than crash the whole judgment. The evidence is an audit trail — a valid
@@ -72,12 +81,45 @@ class DimensionScore(BaseModel):
 
 
 class SelfCritiqueTrace(BaseModel):
-    """Trace of the Evaluator's one allowed self-critique pass."""
+    """Trace of the Evaluator's one allowed self-critique pass.
+
+    Retained for pre-0027 transcripts: on current escalations the single re-read is superseded by
+    the Panel Verdict (:class:`PanelTrace`), so new evaluations carry ``panel`` instead.
+    """
 
     triggers: tuple[str, ...]
     first_confidence: float = Field(ge=0, le=1)
     second_confidence: float = Field(ge=0, le=1)
     kept_pass: Literal["first_pass", "self_critique"]
+
+
+class PanelOpinion(BaseModel):
+    """One advisory voice in the Panel Verdict (issue 0027).
+
+    Advisory only: a panel voice recommends and argues, it never scores dimensions or issues the
+    verdict — ADR 0001's single-judge invariant stays intact.
+    """
+
+    recommended_score: float = Field(ge=1, le=5, description="This voice's holistic 1–5 read.")
+    argument: str = Field(min_length=1, description="One-paragraph scorecard for the export packet.")
+    key_evidence: str = Field(
+        min_length=1, description="The candidate's actual words this voice leans on."
+    )
+
+
+class PanelTrace(BaseModel):
+    """Trace of a committee escalation (issue 0027): who advised what, and how split they were.
+
+    ``disagreement`` (|skeptic − advocate| in score points) is the evidence-quality signal the
+    skill update consumes: a verdict the committee split on moves the Beta less (skill.py).
+    """
+
+    triggers: tuple[str, ...]
+    skeptic: PanelOpinion
+    advocate: PanelOpinion
+    initial_score: float = Field(ge=1, le=5)
+    initial_confidence: float = Field(ge=0, le=1)
+    disagreement: float = Field(ge=0, le=4)
 
 
 class Evaluation(BaseModel):
@@ -110,22 +152,44 @@ class Evaluation(BaseModel):
         ),
     )
     self_critique: SelfCritiqueTrace | None = None
+    panel: PanelTrace | None = None
 
     @model_validator(mode="before")
     @classmethod
-    def _coerce_delivery_fixes(cls, data: object) -> object:
-        """Absorb the delivery_fixes placements models actually produce (issue 0024, seen live).
+    def _sanitize_model_output(cls, data: object) -> object:
+        """Absorb structural noise models actually produce, and strip the derived fields.
 
         gpt-5.4-mini sometimes nests ``delivery_fixes`` inside ``dimensions`` (it reads like a
         dimension key in the schema hint) or emits ``{}``/``null`` instead of a list, and offers
-        stray fixes on answers where english_delivery is not even scored. Structural noise is
-        folded here so a valid judgment is never lost to field placement; the *semantic* rule —
-        weak delivery must carry >= 3 fixes — stays a hard validator that steers the retry.
+        stray fixes on answers where english_delivery is not even scored (issue 0024, seen live).
+        Structural noise is folded here so a valid judgment is never lost to field placement; the
+        *semantic* rule — weak delivery must carry >= 3 fixes — stays a hard validator that steers
+        the retry.
+
+        ``evidence_degraded``, ``self_critique``, and ``panel`` are DERIVED fields owned by the
+        deterministic guards, never model-authored: a model echoing ``evidence_degraded: true``
+        (the panel-verdict prompt replays the first-pass JSON, actively inviting the echo) must not
+        smuggle in a confidence haircut — or talk its way out of one. The guards attach these
+        fields via ``model_copy``, which bypasses validation. Inputs are shallow-copied before
+        mutation so a caller-owned payload dict is never edited in place.
         """
         if not isinstance(data, dict):
             return data
+        data = {**data}
+        for derived in ("evidence_degraded", "self_critique", "panel"):
+            data.pop(derived, None)
         dimensions = data.get("dimensions")
         if isinstance(dimensions, dict):
+            dimensions = {**dimensions}
+            data["dimensions"] = dimensions
+            # gpt-5.4-mini sometimes flattens the ENTIRE judgment inside "dimensions" on long
+            # answers (seen live 2026-07-11): the top-level fields arrive as siblings of the
+            # dimension scores. Relocating them is field placement, not judgment, so it is folded
+            # here; a genuinely missing field still fails schema validation and steers the retry.
+            for top_level in ("weighted_score", "confidence", "follow_up_recommended", "follow_up_rationale"):
+                if top_level in dimensions:
+                    stray = dimensions.pop(top_level)
+                    data.setdefault(top_level, stray)
             misplaced = dimensions.pop("delivery_fixes", None)
             if isinstance(misplaced, list) and not data.get("delivery_fixes"):
                 data["delivery_fixes"] = misplaced
@@ -173,7 +237,7 @@ def _make_validators(rubric: Rubric, answer: str, *, include_evidence: bool = Tr
     def check_evidence(ev: Evaluation) -> None:
         for dim, ds in ev.dimensions.items():
             if not _evidence_is_verbatim(ds.evidence, answer):
-                raise ValueError(
+                raise EvidenceViolation(
                     f"evidence for '{dim}' is not a verbatim quote from the answer: {ds.evidence.strip()!r}. "
                     f"{_EVIDENCE_RULE}\n"
                     f"Copy directly from this exact text — CANDIDATE ANSWER:\n{answer}"
@@ -257,7 +321,7 @@ def apply_evidence_degrade_haircut(evaluation: Evaluation) -> Evaluation:
     return evaluation.model_copy(update={"confidence": capped})
 
 
-SYSTEM_PROMPT = (
+_SYSTEM_PROMPT_CORE = (
     "You are the Evaluator in a mock technical interview. You are the single judge of answer "
     "quality: you score the candidate's answer against a rubric and decide whether a follow-up is "
     "warranted. You never ask questions and you never coach — you only judge.\n\n"
@@ -272,6 +336,12 @@ SYSTEM_PROMPT = (
     "as in English, and a strong one just as high — the same idea earns the same score in either "
     "language.\n"
     f"- For every dimension, {_EVIDENCE_RULE}\n"
+)
+
+# Shown only when the rubric actually lists english_delivery: describing the dimension on every
+# case made the live judge (gpt-5.4-mini, 2026-07-11) volunteer english_delivery scores on
+# delivery-less cases, burning both structured-output attempts on the "do not score" validator.
+_DELIVERY_SYSTEM_RULE = (
     "- If (and only if) the rubric lists 'english_delivery': score how clearly the answer is "
     "DELIVERED in English — wording, sentence structure, professional phrasing — entirely apart "
     "from the technical content. english_delivery NEVER moves 'weighted_score', and no technical "
@@ -280,8 +350,11 @@ SYSTEM_PROMPT = (
     "candidate's actual wording and giving a better phrasing (e.g. \"overfit happen when model "
     "memorize\" → \"overfitting happens when the model memorizes\"). Never say only 'improve your "
     "English'.\n"
-    "- 'weighted_score' (1–5) is your holistic, weight-aware aggregate of the TECHNICAL dimensions "
-    "only (english_delivery is excluded).\n"
+)
+
+_SYSTEM_PROMPT_TAIL = (
+    "- 'weighted_score' (1–5) is your holistic, weight-aware aggregate of the TECHNICAL "
+    "dimensions.\n"
     "- 'confidence' (0–1) is how sure you are of this judgment.\n"
     "- 'follow_up_recommended' is about MARGINAL INFORMATION GAIN — would one more probing question "
     "likely reveal something you do not already know about this candidate's skill? It is NOT a score "
@@ -291,6 +364,16 @@ SYSTEM_PROMPT = (
     "confident in the judgment, set follow_up_recommended=false instead of chasing minor nuance.\n"
     "- Respond with a single JSON object only — no prose, no code fences."
 )
+
+# The full prompt (delivery rules included) — what an active-delivery case sends.
+SYSTEM_PROMPT = _SYSTEM_PROMPT_CORE + _DELIVERY_SYSTEM_RULE + _SYSTEM_PROMPT_TAIL
+
+
+def _system_prompt(rubric: Rubric) -> str:
+    """The judge system prompt for this rubric: delivery rules ride along only when active."""
+    if "english_delivery" in rubric.active:
+        return SYSTEM_PROMPT
+    return _SYSTEM_PROMPT_CORE + _SYSTEM_PROMPT_TAIL
 
 _SCHEMA_HINT = (
     '{"dimensions": {"<dimension>": {"score": <1-5>, "evidence": "<verbatim quote|no evidence>"}}, '
@@ -332,12 +415,66 @@ _LANGUAGE_MODE_BLOCKS: dict[str, str] = {
 }
 
 
-# --- Self-critique reflection (slice 0006) -----------------------------------------------------
+# --- Self-critique reflection (slice 0006) → Panel Verdict (issue 0027) -------------------------
 
 # The weighted-score cross-check caps divergent judgments at 0.4, so the self-critique threshold must
-# sit above that ceiling. This keeps the trigger deterministic: a low-confidence first pass gets one
-# second look, then the higher-confidence judgment wins.
+# sit above that ceiling. The trigger stays deterministic; since issue 0027 a triggered judgment
+# escalates to the committee (Skeptic + Advocate advise, the Evaluator issues the final verdict)
+# instead of a lone re-read. The trigger condition is the entire cost gate: confident scores never
+# pay the extra panel calls.
 SELF_CRITIQUE_CONFIDENCE_THRESHOLD = 0.5
+
+
+_SKEPTIC_SYSTEM_PROMPT = (
+    "You are the Skeptic on a hiring-committee panel reviewing ONE interview answer. Argue the case "
+    "AGAINST the candidate: name every technical weakness, gap, overclaim, and risk the answer "
+    "carries, citing the candidate's actual words. Be concrete and fair — a skeptic who invents "
+    "flaws is useless to the committee. You advise only: a separate Evaluator issues the verdict; "
+    "you never score rubric dimensions.\n"
+    "Respond with a single JSON object only — no prose, no code fences."
+)
+
+_ADVOCATE_SYSTEM_PROMPT = (
+    "You are the Advocate on a hiring-committee panel reviewing ONE interview answer. Argue the case "
+    "FOR the candidate: name every genuine strength, correct mechanism, and sound judgment the "
+    "answer shows, citing the candidate's actual words. Be concrete and fair — an advocate who "
+    "inflates weak work is useless to the committee. You advise only: a separate Evaluator issues "
+    "the verdict; you never score rubric dimensions.\n"
+    "Respond with a single JSON object only — no prose, no code fences."
+)
+
+_PANEL_SCHEMA_HINT = (
+    '{"recommended_score": <1-5>, "argument": "<one-paragraph scorecard>", '
+    '"key_evidence": "<the candidate\'s words you lean on>"}'
+)
+
+
+def _panel_opinion(
+    client: LLMClient,
+    question: str,
+    answer: str,
+    rubric: Rubric,
+    first_pass: Evaluation,
+    *,
+    role: Literal["skeptic", "advocate"],
+) -> PanelOpinion:
+    system = _SKEPTIC_SYSTEM_PROMPT if role == "skeptic" else _ADVOCATE_SYSTEM_PROMPT
+    user = (
+        f"QUESTION:\n{question}\n\n"
+        f"CANDIDATE ANSWER:\n{answer}\n\n"
+        f"RUBRIC THE EVALUATOR SCORES AGAINST:\n{rubric.render()}\n\n"
+        f"THE EVALUATOR'S UNCERTAIN FIRST-PASS JUDGMENT:\n{first_pass.model_dump_json()}\n\n"
+        f"Give your {role}'s reading of this answer.\n"
+        f"Return JSON shaped like:\n{_PANEL_SCHEMA_HINT}"
+    )
+    return client.chat_json(
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        PanelOpinion,
+        max_retries=1,
+    )
 
 
 def _build_messages(
@@ -352,34 +489,41 @@ def _build_messages(
         + f"Return JSON shaped like:\n{_schema_hint(rubric)}"
     )
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": _system_prompt(rubric)},
         {"role": "user", "content": user},
     ]
 
 
-def _build_self_critique_messages(
+def _build_panel_verdict_messages(
     question: str,
     answer: str,
     rubric: Rubric,
     first_pass: Evaluation,
     triggers: tuple[str, ...],
+    skeptic: PanelOpinion,
+    advocate: PanelOpinion,
     language_mode: str = "en",
 ) -> list[Message]:
     base_user = _build_messages(question, answer, rubric, language_mode)[1]["content"]
-    critique = (
+    verdict = (
         f"{base_user}\n\n"
-        "SELF-CRITIQUE REQUIRED.\n"
+        "PANEL VERDICT REQUIRED.\n"
         f"Trigger(s): {', '.join(triggers)}.\n\n"
-        "Your first-pass judgment is below the confidence bar or failed the deterministic "
-        "weighted_score cross-check. Re-evaluate the SAME exchange from scratch. Check whether the "
-        "dimension scores, quoted evidence, weighted_score, confidence, and follow-up decision are "
-        "internally consistent. Keep the Evaluator role: judge only, do not ask or coach.\n\n"
+        "Your first-pass judgment was below the confidence bar or failed the deterministic "
+        "weighted_score cross-check, so a committee reviewed the exchange. The panel ADVISES; you, "
+        "the Evaluator, DECIDE. Re-evaluate the SAME exchange from scratch having read both voices — "
+        "adopt whatever each got right, discard whatever they got wrong. Keep the Evaluator role: "
+        "judge only, do not ask or coach.\n\n"
         f"FIRST-PASS JSON AFTER DETERMINISTIC GUARDS:\n{first_pass.model_dump_json()}\n\n"
+        f"SKEPTIC (recommends {skeptic.recommended_score:g}/5):\n{skeptic.argument}\n"
+        f"Key evidence: {skeptic.key_evidence}\n\n"
+        f"ADVOCATE (recommends {advocate.recommended_score:g}/5):\n{advocate.argument}\n"
+        f"Key evidence: {advocate.key_evidence}\n\n"
         f"Return JSON shaped like:\n{_schema_hint(rubric)}"
     )
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": critique},
+        {"role": "system", "content": _system_prompt(rubric)},
+        {"role": "user", "content": verdict},
     ]
 
 
@@ -461,7 +605,13 @@ def _evaluate_once(client: LLMClient, messages: list[Message], answer: str, rubr
             validators=_make_validators(rubric, answer),
             max_retries=1,
         )
-    except StructuredOutputError:
+    except StructuredOutputError as err:
+        if not isinstance(err.__cause__, EvidenceViolation):
+            # The retries died on schema, dimension coverage, or the delivery-fixes contract — not
+            # on citations. Sanitize-and-keep exists ONLY for the brittle verbatim-quote check;
+            # rerunning without the evidence guard here would silently un-enforce it for an
+            # unrelated failure. Genuinely unusable output stays a loud error.
+            raise
         # The verbatim-quote check survived the retry (the model kept paraphrasing its citation, as
         # gpt-4o-mini does on long strong answers). A valid score must not be lost to an audit-trail
         # quote, so make one more pass WITHOUT the hard evidence check — schema and dimension coverage
@@ -497,11 +647,14 @@ def evaluate(
     """Run the Evaluator on one question + answer and return a typed, validated judgment.
 
     The structured LLM call is followed by the deterministic cross-check (slice 0003), which may
-    lower ``confidence`` when the holistic and linear weighted scores disagree. Slice 0006 then runs
-    exactly one self-critique pass when the guarded first pass is low-confidence, keeping whichever
-    pass is more confident before control returns to the micro-loop. ``language_mode`` (issue 0024)
-    adds Session-mode context for vn/mixed Sessions; whether ``english_delivery`` is scored is the
-    caller's decision, made deterministically via the rubric (see ``language.rubric_with_delivery``).
+    lower ``confidence`` when the holistic and linear weighted scores disagree. When the guarded
+    first pass trips the escalation triggers, the Panel Verdict runs (issue 0027, superseding slice
+    0006's lone re-read): a Skeptic and an Advocate each argue the exchange, then the Evaluator
+    re-evaluates having read both and that verdict is kept — the panel advises, the Evaluator
+    decides (ADR 0001). The trigger condition is the entire cost gate: a confident first pass pays
+    zero extra calls. ``language_mode`` (issue 0024) adds Session-mode context for vn/mixed
+    Sessions; whether ``english_delivery`` is scored is the caller's decision, made
+    deterministically via the rubric (see ``language.rubric_with_delivery``).
     """
     first = apply_cross_check(
         _evaluate_once(
@@ -513,32 +666,42 @@ def evaluate(
     if not triggers:
         return apply_evidence_degrade_haircut(first)
 
-    second = apply_cross_check(
+    skeptic = _panel_opinion(client, question, answer, rubric, first, role="skeptic")
+    advocate = _panel_opinion(client, question, answer, rubric, first, role="advocate")
+    verdict = apply_cross_check(
         _evaluate_once(
             client,
-            _build_self_critique_messages(question, answer, rubric, first, triggers, language_mode),
+            _build_panel_verdict_messages(
+                question, answer, rubric, first, triggers, skeptic, advocate, language_mode
+            ),
             answer,
             rubric,
         ),
         rubric,
     )
-    kept = second if second.confidence > first.confidence else first
-    kept_pass: Literal["first_pass", "self_critique"] = "self_critique" if kept is second else "first_pass"
+    disagreement = abs(skeptic.recommended_score - advocate.recommended_score)
     logger.info(
-        "self-critique triggered (%s): first confidence %.2f, second confidence %.2f; keeping %s",
+        "panel verdict (%s): first %.2f (conf %.2f) -> verdict %.2f (conf %.2f); "
+        "skeptic %.1f vs advocate %.1f (disagreement %.1f)",
         ", ".join(triggers),
+        first.weighted_score,
         first.confidence,
-        second.confidence,
-        kept_pass,
+        verdict.weighted_score,
+        verdict.confidence,
+        skeptic.recommended_score,
+        advocate.recommended_score,
+        disagreement,
     )
-    kept = apply_evidence_degrade_haircut(kept)
-    return kept.model_copy(
+    verdict = apply_evidence_degrade_haircut(verdict)
+    return verdict.model_copy(
         update={
-            "self_critique": SelfCritiqueTrace(
+            "panel": PanelTrace(
                 triggers=triggers,
-                first_confidence=first.confidence,
-                second_confidence=second.confidence,
-                kept_pass=kept_pass,
+                skeptic=skeptic,
+                advocate=advocate,
+                initial_score=first.weighted_score,
+                initial_confidence=first.confidence,
+                disagreement=disagreement,
             )
         }
     )
