@@ -900,3 +900,50 @@ def test_panel_budget_per_question_reads_env(monkeypatch):
     assert PanelBudget.per_question().remaining == 3
     monkeypatch.setenv("PANEL_MAX_ESCALATIONS_PER_QUESTION", "junk")
     assert PanelBudget.per_question().remaining == 1
+
+
+# --- strict decoding grammar built from the rubric ------------------------------------------------
+
+
+def test_evaluation_json_schema_locks_active_dimensions():
+    from interview_coach.evaluator import evaluation_json_schema
+
+    schema = evaluation_json_schema(QUESTION.rubric)
+
+    dims = schema["properties"]["dimensions"]
+    assert set(dims["properties"]) == ACTIVE  # exactly the active dims — weight-0 keys cannot exist
+    assert set(dims["required"]) == ACTIVE
+    assert dims["additionalProperties"] is False  # the flatten mode is grammatically impossible
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["weighted_score"] == {"type": "number", "minimum": 1, "maximum": 5}
+    # Delivery inactive -> the grammar must FORBID delivery_fixes entirely: strict mode requires
+    # every listed property, so listing it here forced invented fixes on 15/29 live cases.
+    assert "delivery_fixes" not in schema["properties"]
+
+
+def test_evaluation_json_schema_carries_delivery_fixes_only_when_active():
+    from interview_coach.evaluator import evaluation_json_schema
+
+    schema = evaluation_json_schema(_DELIVERY_RUBRIC)
+
+    assert "delivery_fixes" in schema["properties"]
+    assert "delivery_fixes" in schema["required"]
+    assert "english_delivery" in schema["properties"]["dimensions"]["properties"]
+
+
+def test_judge_call_carries_the_rubric_grammar(fake_openai_factory):
+    from interview_coach.llm import OpenAIClient
+
+    fake = fake_openai_factory([_eval_json(_good_dimensions())])
+    client = OpenAIClient(
+        __import__("interview_coach.config", fromlist=["ProviderSettings"]).ProviderSettings(
+            name="openai", api_key="test", base_url="http://openai.test", model="gpt-5.4-mini"
+        ),
+        client=fake,
+    )
+
+    evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+
+    sent = fake.chat.completions.calls[0]["response_format"]
+    assert sent["type"] == "json_schema"
+    assert set(sent["json_schema"]["schema"]["properties"]["dimensions"]["properties"]) == ACTIVE
