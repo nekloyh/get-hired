@@ -1,0 +1,124 @@
+# PENDING HUMAN VALIDATION — not loaded by the bench until moved into cases.yaml.
+#
+# Why these exist: the bias table's two thinnest dimensions are statistically ungrounded —
+# english_delivery n=3 and mlops_awareness n=4 (mlops_awareness swung +0.00 → +0.50 between two
+# same-day green runs, exactly the instability BIAS_MIN_SAMPLES=8 now flags). These six drafts
+# raise both to n≥7 once validated.
+#
+# The `labels` and `expected_min/max` below are PROPOSED (drafted against the BARS anchors in
+# cases.yaml) and carry no authority until a human re-scores each answer against the anchors and
+# moves the case into cases.yaml. Adjust freely: the answers are the artifact; the labels are the
+# question under review. After validation, re-run `coach bench` — the gate must stay green before
+# the labels are trusted.
+#
+# Informational judge run (2026-07-11, gpt-5.4-mini, ~10k tokens): 6/6 in-band on the proposed
+# bands. weak 1.50 / strong 5.00 / medium 4.00 / broken-english 4.00 (delivery judged 2/2) /
+# mid-delivery 4.00 (delivery judged 3/3, 3 fixes) / strong-delivery 5.00 (delivery judged 5/5).
+# In-band coherence is NOT validation — the human label pass is still the authority.
+
+cases:
+  # --- mlops_awareness coverage (current labelled n=4) -------------------------------------------
+
+  - case_id: mlops_retraining_weak_en
+    paired_id: mlops_retraining_weak
+    skill: mlops
+    language: en
+    question: How would you decide when a deployed model needs retraining?
+    answer: >-
+      I would just retrain the model every week automatically so it always stays fresh. Retraining
+      often is best practice because data always changes. If the model is retrained on a schedule
+      you do not need to watch it so much, and the newest data is always in the model, so accuracy
+      stays high.
+    rubric: {correctness: 0.3, depth: 0.25, communication: 0.15, system_thinking: 0.15, mlops_awareness: 0.15}
+    labels: {correctness: 2, depth: 2, communication: 3, system_thinking: 2, mlops_awareness: 2}
+    expected_min: 1.0
+    expected_max: 2.8
+
+  - case_id: mlops_rollout_strong_en
+    paired_id: mlops_rollout_strong
+    skill: mlops
+    language: en
+    question: You have a new model version that beats the old one offline. How do you roll it out safely?
+    answer: >-
+      Offline wins do not guarantee online wins, so I stage the rollout. First shadow mode: the new
+      model scores live traffic but its predictions are logged, not served, which catches
+      training/serving skew and latency problems with zero user risk. Then a canary on a few percent
+      of traffic with predefined rollback criteria — business metric deltas and error rates, not
+      just model metrics — and automatic rollback if they trip. I keep the old model warm behind a
+      feature flag so rollback is a config change, not a redeploy, and I log every prediction with
+      the model version so incidents are attributable afterwards.
+    rubric: {correctness: 0.3, depth: 0.25, communication: 0.15, system_thinking: 0.15, mlops_awareness: 0.15}
+    labels: {correctness: 5, depth: 4, communication: 4, system_thinking: 4, mlops_awareness: 5}
+    expected_min: 3.8
+    expected_max: 5.0
+
+  - case_id: mlops_train_serve_skew_medium_en
+    paired_id: mlops_train_serve_skew_medium
+    skill: mlops
+    language: en
+    question: What is training/serving skew and how do you guard against it?
+    answer: >-
+      Training/serving skew is when the features the model sees in production are computed
+      differently from how they were computed in training, so the model underperforms even though
+      offline metrics looked fine. A feature store helps because the same feature definition is
+      used in both places. You can also log the features at serving time and compare them with the
+      training data to see if they match.
+    rubric: {correctness: 0.3, depth: 0.25, communication: 0.15, system_thinking: 0.15, mlops_awareness: 0.15}
+    labels: {correctness: 4, depth: 3, communication: 4, system_thinking: 3, mlops_awareness: 3}
+    expected_min: 2.8
+    expected_max: 4.2
+
+  # --- english_delivery coverage (current labelled n=3) ------------------------------------------
+
+  - case_id: en_dl_batchnorm_broken_english
+    paired_id: en_dl_batchnorm_broken_english
+    skill: deep_learning
+    language: en
+    language_mode: mixed
+    question: What does batch normalization do, and why does it help training?
+    answer: >-
+      Batch norm is normalize the activation inside network by mean and variance of mini-batch, so
+      each layer input have stable distribution. This make optimization more easy because gradient
+      not explode or vanish so much, and we can use bigger learning rate. It also have small
+      regularize effect because batch statistic is noisy. But careful in inference, we must use
+      running average statistic, not batch statistic, or result is wrong when batch size is one.
+    rubric: {correctness: 0.4, depth: 0.3, communication: 0.2, system_thinking: 0.1, english_delivery: 1.0}
+    labels: {correctness: 4, depth: 4, communication: 4, system_thinking: 3, english_delivery: 2}
+    expected_min: 3.4
+    expected_max: 5.0
+
+  - case_id: mixed_mlops_drift_mid_delivery
+    paired_id: mixed_mlops_drift_mid_delivery
+    skill: mlops
+    language: mixed
+    language_mode: mixed
+    question: How would you detect data drift for a model in production?
+    answer: >-
+      Mình sẽ monitor distribution của input features, so sánh với training data bằng statistical
+      test, for example KS test hoặc PSI. When the drift score go over threshold, system alert to
+      team. Nhưng mà drift alone not always mean model is bad, nên mình cũng track prediction
+      distribution và, khi có label thật, accuracy theo thời gian. Retrain chỉ khi metric thật sự
+      giảm, not just because drift alarm.
+    rubric: {correctness: 0.35, depth: 0.25, communication: 0.2, system_thinking: 0.2, mlops_awareness: 0.0, english_delivery: 1.0}
+    labels: {correctness: 4, depth: 4, communication: 4, system_thinking: 4, english_delivery: 3}
+    expected_min: 3.4
+    expected_max: 5.0
+
+  - case_id: en_sd_idempotency_strong_delivery
+    paired_id: en_sd_idempotency_strong_delivery
+    skill: system_design
+    language: en
+    language_mode: mixed
+    question: Why do idempotent APIs matter in a distributed system, and how do you implement one?
+    answer: >-
+      Networks fail in ways where the client cannot tell whether a request was applied, so clients
+      retry — and without idempotency, retries become duplicate side effects like double charges.
+      An idempotent endpoint makes retrying safe. The standard implementation is an idempotency
+      key: the client generates a unique key per logical operation, the server stores the result
+      keyed by it, and a retry with the same key returns the stored result instead of re-executing.
+      The subtle part is scoping and expiring those keys, and making the check-and-execute step
+      atomic — otherwise two concurrent retries can still both execute.
+    rubric: {correctness: 0.35, depth: 0.25, communication: 0.2, system_thinking: 0.2, english_delivery: 1.0}
+    labels: {correctness: 5, depth: 4, communication: 5, system_thinking: 4, english_delivery: 5}
+    expected_min: 3.8
+    expected_max: 5.0

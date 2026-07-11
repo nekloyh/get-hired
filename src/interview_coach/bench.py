@@ -191,6 +191,31 @@ def dimension_bias(results: Sequence[BenchResult]) -> dict[str, dict[str, float]
     }
 
 
+# Below this many labelled cases a per-dimension bias estimate is noise, not signal: on a 1–5
+# scale with n=3–4 a single case swings the mean by ±0.25–0.33 (mlops_awareness went +0.00 → +0.50
+# between two same-day green runs on n=4). The report still shows the number but marks it unstable,
+# and the tripwire ignores it.
+BIAS_MIN_SAMPLES = 8
+
+# |bias| beyond this on a sufficiently-sampled dimension means the judge and the human labels
+# disagree systematically — the signal that triggered the July-11 re-anchor worklist. A warning,
+# not a gate: bands still gate correctness; this catches drift while everything is still green.
+BIAS_TRIPWIRE = 0.5
+
+
+def bias_warnings(results: Sequence[BenchResult]) -> list[str]:
+    """Tripwire lines for dimensions whose bias is both statistically grounded and drifting."""
+    warnings = []
+    for dim, stats in sorted(dimension_bias(results).items()):
+        if stats["n"] >= BIAS_MIN_SAMPLES and abs(stats["bias"]) > BIAS_TRIPWIRE:
+            warnings.append(
+                f"{dim}: bias {stats['bias']:+.2f} over n={int(stats['n'])} exceeds ±{BIAS_TRIPWIRE:.1f} "
+                "— re-anchor the judge guide for this dimension (see the 2026-07-11 re-anchor audit "
+                "for the worklist pattern)"
+            )
+    return warnings
+
+
 def weak_strong_separation(results: Sequence[BenchResult]) -> dict[str, float | None]:
     """Mean weighted_score of weak-labelled vs strong-labelled cases, and the gap between them."""
     weak = [r.score for r in results if r.case.is_weak and r.score is not None]
@@ -354,9 +379,14 @@ def render_bench_report(results: Sequence[BenchResult], *, anchors: Mapping[str,
             lines.append(f"| | | | | | | | `{r.error}` |")
 
     lines += ["", "## Per-dimension bias (judge − human label)", "",
-              "| dimension | bias | n |", "| --- | ---: | ---: |"]
+              "| dimension | bias | n | stability |", "| --- | ---: | ---: | --- |"]
     for dim, stats in sorted(dimension_bias(results).items()):
-        lines.append(f"| {dim} | {stats['bias']:+.2f} | {int(stats['n'])} |")
+        stability = "ok" if stats["n"] >= BIAS_MIN_SAMPLES else f"⚠ n<{BIAS_MIN_SAMPLES} — unstable estimate"
+        lines.append(f"| {dim} | {stats['bias']:+.2f} | {int(stats['n'])} | {stability} |")
+    if tripwires := bias_warnings(results):
+        lines.append("")
+        for warning in tripwires:
+            lines.append(f"- **BIAS TRIPWIRE** — {warning}")
 
     sep = weak_strong_separation(results)
     lines += ["", "## Weak/strong separation", ""]

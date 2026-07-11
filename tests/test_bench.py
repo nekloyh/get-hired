@@ -377,3 +377,53 @@ def test_report_renders_trust_guard_section():
     assert "## Trust guards (deterministic confidence caps)" in report
     assert "| capped | 0.95 | 0.70 | 50% | 0.20 | sanitizer.judgment_flattened_in_dimensions |" in report
     assert "shadow escalations by trigger threshold" in report
+
+
+# --- bias statistical guards: n-threshold marking + tripwire warnings ----------------------------
+
+
+def test_bias_warnings_require_sufficient_samples():
+    from interview_coach.bench import BIAS_MIN_SAMPLES, bias_warnings
+
+    # 4 cases, all judged 2 above the label -> bias +2.0 but n=4 < 8: statistically ungrounded,
+    # so NO tripwire fires (this is exactly the mlops_awareness n=4 swing pattern).
+    small_sample = [
+        _result(_case(f"c{i}", labels={"mlops_awareness": 2}), dims={"mlops_awareness": 4}, weighted=3.0)
+        for i in range(BIAS_MIN_SAMPLES // 2)
+    ]
+    assert bias_warnings(small_sample) == []
+
+    # Same drift over n=8 IS a tripwire.
+    grounded = [
+        _result(_case(f"g{i}", labels={"correctness": 2}), dims={"correctness": 4}, weighted=3.0)
+        for i in range(BIAS_MIN_SAMPLES)
+    ]
+    warnings = bias_warnings(grounded)
+    assert len(warnings) == 1
+    assert "correctness" in warnings[0]
+    assert "+2.00" in warnings[0]
+
+
+def test_bias_warnings_ignore_small_in_band_bias():
+    from interview_coach.bench import BIAS_MIN_SAMPLES, bias_warnings
+
+    results = [
+        _result(_case(f"c{i}", labels={"correctness": 3}), dims={"correctness": 3}, weighted=3.0)
+        for i in range(BIAS_MIN_SAMPLES)
+    ]
+    assert bias_warnings(results) == []
+
+
+def test_report_marks_unstable_bias_rows_and_renders_tripwires():
+    from interview_coach.bench import BIAS_MIN_SAMPLES
+
+    thin = [_result(_case("thin", labels={"english_delivery": 2, "correctness": 2}),
+                    dims={"english_delivery": 2, "correctness": 4}, weighted=3.0)]
+    grounded = [
+        _result(_case(f"g{i}", labels={"correctness": 2}), dims={"correctness": 4}, weighted=3.0)
+        for i in range(BIAS_MIN_SAMPLES)
+    ]
+    report = render_bench_report(thin + grounded)
+
+    assert f"⚠ n<{BIAS_MIN_SAMPLES} — unstable estimate" in report  # english_delivery n=1
+    assert "BIAS TRIPWIRE" in report  # correctness drift over n=9
