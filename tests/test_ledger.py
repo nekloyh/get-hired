@@ -11,6 +11,7 @@ from interview_coach.ledger import (
     SECONDS_PER_DAY,
     decay_beta,
     load_priors,
+    load_states,
     save_posteriors,
 )
 from interview_coach.skill import NEUTRAL_ALPHA, NEUTRAL_BETA, SkillState, apply_evaluation
@@ -144,6 +145,43 @@ def test_non_finite_completed_at_degrades_to_cold_start(tmp_path):
         encoding="utf-8",
     )
     assert load_priors(path, "alice", now=0.0) is None
+
+
+# --- load_states: full decayed Beta params for the post-mortem fusion (issue 0026) ---------------
+
+
+def test_load_states_returns_decayed_beta_params(tmp_path):
+    # Unlike load_priors (means only), load_states rehydrates SkillStates — already decayed, so a
+    # caller observing new evidence cannot silently un-decay stale mass when save_posteriors
+    # restamps completed_at.
+    path = tmp_path / "ledger.json"
+    save_posteriors(path, "alice", {"mlops": SkillState("mlops", alpha=9.0, beta=1.0)}, now=0.0)
+
+    states = load_states(path, "alice", now=LEDGER_HALF_LIFE_DAYS * DAY)
+
+    assert states["mlops"].alpha == pytest.approx(NEUTRAL_ALPHA + (9.0 - NEUTRAL_ALPHA) * 0.5)
+    assert states["mlops"].beta == pytest.approx(NEUTRAL_BETA + (1.0 - NEUTRAL_BETA) * 0.5)
+
+
+def test_load_states_missing_unknown_or_empty_candidate_is_cold_start(tmp_path):
+    path = tmp_path / "ledger.json"
+    assert load_states(path, "alice", now=0.0) is None  # missing file
+    save_posteriors(path, "alice", {"mlops": SkillState("mlops", alpha=8.0, beta=2.0)}, now=0.0)
+    assert load_states(path, "stranger", now=0.0) is None  # unknown Candidate
+    assert load_states(path, "", now=0.0) is None  # empty id no-ops
+
+
+def test_load_states_corrupt_or_non_finite_degrades_to_cold_start(tmp_path):
+    # Same never-raise / isfinite discipline as load_priors: a broken ledger is a cold start,
+    # never a crash and never NaN Beta params.
+    path = tmp_path / "ledger.json"
+    path.write_text("{not valid json", encoding="utf-8")
+    assert load_states(path, "alice", now=0.0) is None
+    path.write_text(
+        '{"alice": {"completed_at": 0.0, "skills": {"mlops": {"alpha": NaN, "beta": 1.0}}}}',
+        encoding="utf-8",
+    )
+    assert load_states(path, "alice", now=0.0) is None
 
 
 # --- two-session invariant (ADR 0002 / 0006) ----------------------------------------------------
