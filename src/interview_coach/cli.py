@@ -30,7 +30,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 
 from . import telemetry
 from .bank import BankError, load_pack
-from .bench import bench_passed, load_bench_data, render_bench_report, run_bench
+from .bench import bench_passed, bias_warnings, load_bench_data, render_bench_report, run_bench
 from .concepts import SEED_CONCEPTS, ChromaConceptStore, InMemoryConceptStore, build_concept_store
 from .config import load_settings
 from .diagnostic import SKILLS, CandidateProfile, diagnose_or_degrade
@@ -617,6 +617,10 @@ def _cmd_bench(client: LLMClient | None, args: argparse.Namespace) -> int:
         f"Bench: {within}/{len(results)} cases within band. Report written to {out}. "
         f"Run cost ~{spent:,} tokens; ~{remaining_today(str(provider)):,} left today."
     )
+    for warning in bias_warnings(results):
+        # Drift warning, not a gate: the run stays green, but a systematically drifting dimension
+        # deserves a re-anchor pass before it starts costing in-band cases.
+        print(f"BIAS TRIPWIRE: {warning}", file=sys.stderr)
     return 0 if bench_passed(results) else 1
 
 
