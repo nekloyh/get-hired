@@ -398,3 +398,62 @@ def test_live_interviewer_uses_lookup_concept_tool():
     assert fu.concept_id == "l2"
     assert store.lookup_calls, "lookup_concept was not executed"
     assert fu.question.strip()
+
+
+# --- language preference decoupled from the shelf + graceful widening (issue 0008 follow-up) -----
+
+
+def test_preferred_lookup_language_derivation():
+    from interview_coach.interviewer import _preferred_lookup_language
+
+    # The model's own request wins.
+    assert _preferred_lookup_language("vi", "mlops", "en") == "vi"
+    # A vn/mixed Session prefers vi notes on ANY shelf — pre-fix this was vietnamese_nlp-only.
+    assert _preferred_lookup_language(None, "ml_fundamentals", "vn") == "vi"
+    assert _preferred_lookup_language(None, "system_design", "mixed") == "vi"
+    # The vi-native shelf keeps its default in an en Session.
+    assert _preferred_lookup_language(None, "vietnamese_nlp", "en") == "vi"
+    assert _preferred_lookup_language(None, "mlops", "en") is None
+
+
+def test_lookup_widens_to_any_language_when_shelf_has_no_vi_notes():
+    from interview_coach.concepts import InMemoryConceptStore
+    from interview_coach.interviewer import _lookup_with_widening
+
+    store = InMemoryConceptStore(
+        [ConceptNote(id="en_note", skill="mlops", title="drift", content="drift monitoring")]
+    )
+
+    lookup, applied = _lookup_with_widening(store, "drift", skill="mlops", language="vi")
+
+    assert lookup.note.id == "en_note"  # vi preference widened instead of failing the follow-up
+    assert applied is None  # the recorded filter reflects what actually ran
+    assert store.lookup_calls[-1]["language"] is None
+
+
+def test_lookup_keeps_language_filter_when_it_matches():
+    from interview_coach.concepts import InMemoryConceptStore
+    from interview_coach.interviewer import _lookup_with_widening
+
+    store = InMemoryConceptStore(
+        [
+            ConceptNote(id="vi_note", skill="mlops", title="giám sát drift", content="nội dung", language="vi"),
+            ConceptNote(id="en_note", skill="mlops", title="drift", content="drift monitoring"),
+        ]
+    )
+
+    lookup, applied = _lookup_with_widening(store, "drift", skill="mlops", language="vi")
+
+    assert lookup.note.id == "vi_note"
+    assert applied == "vi"
+
+
+def test_lookup_without_language_preference_raises_on_empty_shelf():
+    import pytest as _pytest
+
+    from interview_coach.concepts import InMemoryConceptStore
+    from interview_coach.interviewer import _lookup_with_widening
+
+    store = InMemoryConceptStore([])
+    with _pytest.raises(LookupError):
+        _lookup_with_widening(store, "q", skill="mlops", language=None)

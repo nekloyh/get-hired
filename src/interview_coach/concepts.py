@@ -20,6 +20,17 @@ logger = logging.getLogger(__name__)
 
 CONCEPT_COLLECTION = "concepts"
 BGE_SMALL_EN = "BAAI/bge-small-en-v1.5"
+# Candidate multilingual embedder (issue 0008 follow-up): same size-class as bge-small, actually
+# trained on Vietnamese. The e5 family REQUIRES asymmetric instruction prefixes — encoding a query
+# without "query: " silently degrades ranking, so the prefixes live next to the model id and the
+# store applies them itself.
+E5_SMALL_MULTILINGUAL = "intfloat/multilingual-e5-small"
+
+# model id -> (query prefix, passage prefix). Models absent from this map embed text as-is via
+# Chroma's stock SentenceTransformer embedding function.
+_EMBEDDING_PREFIXES: dict[str, tuple[str, str]] = {
+    E5_SMALL_MULTILINGUAL: ("query: ", "passage: "),
+}
 
 
 @dataclass(frozen=True)
@@ -119,10 +130,18 @@ class InMemoryConceptStore:
 
 
 class ChromaConceptStore:
-    """Chroma-backed concept store using the BGE small English embedder."""
+    """Chroma-backed concept store (BGE small English by default; e5-multilingual supported).
 
-    def __init__(self, collection) -> None:
+    Prefixed models (the e5 family) bypass Chroma's embedding function entirely: the store encodes
+    queries and passages itself with the required asymmetric prefixes and hands Chroma raw vectors —
+    Chroma's stock ``SentenceTransformerEmbeddingFunction`` cannot tell a query from a document, and
+    e5 without prefixes ranks silently worse.
+    """
+
+    def __init__(self, collection, *, encoder=None, prefixes: tuple[str, str] | None = None) -> None:
         self._collection = collection
+        self._encoder = encoder
+        self._query_prefix, self._passage_prefix = prefixes or ("", "")
 
     @classmethod
     def create(
@@ -140,8 +159,17 @@ class ChromaConceptStore:
                 "Chroma concept retrieval requires optional packages: chromadb and sentence-transformers"
             ) from err
 
-        embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=embedding_model)
         client = chromadb.PersistentClient(path=str(persist_dir)) if persist_dir else chromadb.Client()
+        prefixes = _EMBEDDING_PREFIXES.get(embedding_model)
+        if prefixes is not None:
+            from sentence_transformers import SentenceTransformer
+
+            collection = client.get_or_create_collection(
+                name=collection_name,
+                metadata={"hnsw:space": "cosine"},
+            )
+            return cls(collection, encoder=SentenceTransformer(embedding_model), prefixes=prefixes)
+        embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=embedding_model)
         collection = client.get_or_create_collection(
             name=collection_name,
             embedding_function=embedding_fn,
@@ -149,24 +177,34 @@ class ChromaConceptStore:
         )
         return cls(collection)
 
+    def _encode(self, texts: list[str], prefix: str) -> list[list[float]]:
+        vectors = self._encoder.encode([f"{prefix}{text}" for text in texts], normalize_embeddings=True)
+        return [vector.tolist() for vector in vectors]
+
     def ingest(self, notes: Iterable[ConceptNote]) -> int:
         batch = list(notes)
         if not batch:
             return 0
-        self._collection.upsert(
-            ids=[note.id for note in batch],
-            documents=[note.content for note in batch],
-            metadatas=[note.metadata() for note in batch],
-        )
+        upsert_kwargs: dict = {
+            "ids": [note.id for note in batch],
+            "documents": [note.content for note in batch],
+            "metadatas": [note.metadata() for note in batch],
+        }
+        if self._encoder is not None:
+            upsert_kwargs["embeddings"] = self._encode([note.content for note in batch], self._passage_prefix)
+        self._collection.upsert(**upsert_kwargs)
         return len(batch)
 
     def lookup(self, query: str, *, skill: str | None = None, language: str | None = None) -> ConceptLookup:
         where = _metadata_filter({"skill": skill, "language": language})
         query_kwargs = {
-            "query_texts": [query],
             "n_results": 1,
             "include": ["documents", "metadatas", "distances"],
         }
+        if self._encoder is not None:
+            query_kwargs["query_embeddings"] = self._encode([query], self._query_prefix)
+        else:
+            query_kwargs["query_texts"] = [query]
         if where is not None:
             query_kwargs["where"] = where
         result = self._collection.query(**query_kwargs)
@@ -214,12 +252,13 @@ def build_concept_store(
     *,
     persist_dir: str | Path | None = None,
     seed: bool = True,
+    embedding_model: str = BGE_SMALL_EN,
 ) -> ConceptStore:
     """Build the concept store used by the Interviewer."""
     if kind == "memory":
         store: ConceptStore = InMemoryConceptStore()
     elif kind == "chroma":
-        store = ChromaConceptStore.create(persist_dir=persist_dir)
+        store = ChromaConceptStore.create(persist_dir=persist_dir, embedding_model=embedding_model)
     else:
         raise ValueError(f"unknown concept store kind: {kind!r}")
     if seed:

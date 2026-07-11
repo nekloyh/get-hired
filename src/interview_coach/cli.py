@@ -30,7 +30,14 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from . import telemetry
 from .bank import BankError, load_pack
 from .bench import bench_passed, bias_warnings, load_bench_data, render_bench_report, run_bench
-from .concepts import SEED_CONCEPTS, ChromaConceptStore, InMemoryConceptStore, build_concept_store
+from .concepts import (
+    BGE_SMALL_EN,
+    E5_SMALL_MULTILINGUAL,
+    SEED_CONCEPTS,
+    ChromaConceptStore,
+    InMemoryConceptStore,
+    build_concept_store,
+)
 from .config import load_settings
 from .diagnostic import SKILLS, CandidateProfile, diagnose_or_degrade
 from .eval_harness import harness_passed, render_golden_answer_report, run_golden_answer_harness
@@ -69,6 +76,17 @@ from .ui import render_skill_state_rows
 from .usage import daily_token_budget, remaining_today, usage_for_day, utc_date
 
 ANSWERS = {"strong": STRONG_ANSWER, "weak": WEAK_ANSWER}
+
+# The A/B audit (docs/audits/concept-retrieval-embedder-ab-2026-07-11.md) recommends the
+# multilingual embedder for vn-mode practice; the default stays BGE because vectors are not
+# portable across embedders — an existing --persist-dir collection must be re-ingested when
+# switching. Only meaningful with --concept-store=chroma.
+_CONCEPT_EMBEDDER_HELP = (
+    f"SentenceTransformer model for the Chroma concept store (default: {BGE_SMALL_EN}). "
+    f"For Vietnamese-heavy practice use {E5_SMALL_MULTILINGUAL} (its query:/passage: prefixes are "
+    "applied automatically). Re-ingest any persisted collection after switching — embeddings from "
+    "different models do not mix."
+)
 
 
 def _display_stop_reason(stop_reason: str | None) -> str:
@@ -168,6 +186,7 @@ def _cmd_interview(client: LLMClient | None, args: argparse.Namespace) -> int:
         args.concept_store,
         persist_dir=args.concept_persist_dir,
         seed=not args.no_seed_concepts,
+        embedding_model=args.concept_embedder,
     )
     for n, seed in enumerate(SEED_QUESTIONS, start=1):
         print(f"\n========== SEED QUESTION {n}/{len(SEED_QUESTIONS)} (skill: {seed.skill}) ==========")
@@ -365,6 +384,7 @@ def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
             args.concept_store,
             persist_dir=args.concept_persist_dir,
             seed=not args.no_seed_concepts,
+            embedding_model=args.concept_embedder,
         )
     resource_store = build_resource_store(
         args.resource_store,
@@ -452,13 +472,9 @@ def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
 
 
 def _print_postmortem(result: PostmortemResult) -> None:
+    print(f"=== POST-MORTEM DEBRIEF ({result.candidate_id}) — {len(result.transcript)} question(s) elicited ===")
     print(
-        f"=== POST-MORTEM DEBRIEF ({result.candidate_id}) — "
-        f"{len(result.transcript)} question(s) elicited ==="
-    )
-    print(
-        f"\n=== RECONSTRUCTED SCORECARD (second-hand evidence, fused at "
-        f"{POSTMORTEM_WEIGHT_RATIO:g}x live weight) ==="
+        f"\n=== RECONSTRUCTED SCORECARD (second-hand evidence, fused at {POSTMORTEM_WEIGHT_RATIO:g}x live weight) ==="
     )
     for entry in result.scorecard.entries:
         weight = POSTMORTEM_WEIGHT_RATIO * confidence_weight(entry.confidence)
@@ -503,11 +519,7 @@ def _cmd_postmortem(client: LLMClient | None, args: argparse.Namespace) -> int:
         persist_dir=args.resource_persist_dir,
         seed=not args.no_seed_resources,
     )
-    candidate = (
-        ScriptedCandidate(args.scripted_recollection)
-        if args.scripted_recollection
-        else InteractiveCandidate()
-    )
+    candidate = ScriptedCandidate(args.scripted_recollection) if args.scripted_recollection else InteractiveCandidate()
     try:
         result = run_postmortem(
             client,
@@ -524,8 +536,7 @@ def _cmd_postmortem(client: LLMClient | None, args: argparse.Namespace) -> int:
         # ledger, and no reconstructed evidence is fabricated from an unfinished elicitation.
         print(str(err), file=sys.stderr)
         print(
-            "Post-mortem aborted; the partial recollection was discarded and the Skill ledger "
-            "was not touched.",
+            "Post-mortem aborted; the partial recollection was discarded and the Skill ledger was not touched.",
             file=sys.stderr,
         )
         return 2
@@ -575,9 +586,7 @@ def _utc_date() -> str:
 BENCH_MIN_BUDGET_TOKENS = 200_000
 
 
-def _usage_delta(
-    before: dict[str, dict[str, int]], after: dict[str, dict[str, int]]
-) -> dict[str, dict[str, int]]:
+def _usage_delta(before: dict[str, dict[str, int]], after: dict[str, dict[str, int]]) -> dict[str, dict[str, int]]:
     """Per-provider token deltas across one run — ALL providers, so failover spend counts too.
 
     Clamped at zero per stat: a run crossing UTC midnight diffs two different day buckets, and a
@@ -688,14 +697,11 @@ def _cmd_forge(client: LLMClient | None, args: argparse.Namespace) -> int:
     model = settings.primary_config.model or "unknown"
     date = _utc_date()
     queue_path = Path(args.out) if args.out else Path(args.queue_dir) / f"review-queue-{date}.yaml"
-    queue, report = write_forge_outputs(
-        run, queue_path=queue_path, provider=str(provider), model=model, date=date
-    )
+    queue, report = write_forge_outputs(run, queue_path=queue_path, provider=str(provider), model=model, date=date)
     print(render_forge_report(run, provider=str(provider), model=model, date=date))
     admitted = sum(1 for outcome in run.outcomes if outcome.admitted)
     print(
-        f"Forge: {admitted}/{len(run.outcomes)} draft(s) admitted. "
-        f"Review queue written to {queue}; report to {report}."
+        f"Forge: {admitted}/{len(run.outcomes)} draft(s) admitted. Review queue written to {queue}; report to {report}."
     )
     return 0
 
@@ -715,9 +721,11 @@ def _forge_batch_size(raw: str) -> int:
 
 
 def _cmd_ingest_concepts(client: LLMClient | None, args: argparse.Namespace) -> int:
-    store = ChromaConceptStore.create(persist_dir=args.persist_dir)
+    store = ChromaConceptStore.create(persist_dir=args.persist_dir, embedding_model=args.concept_embedder)
     count = store.ingest(SEED_CONCEPTS)
-    print(f"Ingested {count} concept notes into Chroma collection at {args.persist_dir!r}.")
+    print(
+        f"Ingested {count} concept notes into Chroma collection at {args.persist_dir!r} using {args.concept_embedder}."
+    )
     return 0
 
 
@@ -726,6 +734,7 @@ def _cmd_ingest_resources(client: LLMClient | None, args: argparse.Namespace) ->
     count = store.ingest(SEED_RESOURCES)
     print(f"Ingested {count} learning resources into Chroma collection at {args.persist_dir!r}.")
     return 0
+
 
 def _cmd_api(client: LLMClient | None, args: argparse.Namespace) -> int:
     import uvicorn
@@ -737,6 +746,7 @@ def _cmd_api(client: LLMClient | None, args: argparse.Namespace) -> int:
         reload=args.reload,
     )
     return 0
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Adaptive Interview Coach — slice demos.")
@@ -784,6 +794,11 @@ def main(argv: list[str] | None = None) -> int:
         choices=list(LANGUAGE_MODES),
         default=DEFAULT_LANGUAGE_MODE,
         help="language_mode for the demo micro-loop (0024): en, vn, or mixed.",
+    )
+    iv_parser.add_argument(
+        "--concept-embedder",
+        default=BGE_SMALL_EN,
+        help=_CONCEPT_EMBEDDER_HELP,
     )
     iv_parser.set_defaults(func=_cmd_interview, requires_llm=True)
 
@@ -893,6 +908,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Do not upsert the built-in seed concept notes before the Session.",
     )
     session_parser.add_argument(
+        "--concept-embedder",
+        default=BGE_SMALL_EN,
+        help=_CONCEPT_EMBEDDER_HELP,
+    )
+    session_parser.add_argument(
         "--resource-store",
         choices=["memory", "chroma"],
         default="memory",
@@ -987,8 +1007,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     pm_parser.add_argument(
         "--export-markdown",
-        help="Write the post-mortem debrief (scorecard, ledger delta, regenerated plan) to this "
-        "Markdown path.",
+        help="Write the post-mortem debrief (scorecard, ledger delta, regenerated plan) to this Markdown path.",
     )
     pm_parser.set_defaults(func=_cmd_postmortem, requires_llm=True)
 
@@ -1046,6 +1065,11 @@ def main(argv: list[str] | None = None) -> int:
 
     ingest_parser = sub.add_parser("ingest-concepts", help="Slice 0007: seed the Chroma concepts collection")
     ingest_parser.add_argument("--persist-dir", default=".chroma", help="Chroma persistence directory.")
+    ingest_parser.add_argument(
+        "--concept-embedder",
+        default=BGE_SMALL_EN,
+        help=_CONCEPT_EMBEDDER_HELP,
+    )
     ingest_parser.set_defaults(func=_cmd_ingest_concepts, requires_llm=False)
 
     resources_parser = sub.add_parser("ingest-resources", help="Slice 0011: seed the Chroma resources collection")
@@ -1066,6 +1090,7 @@ def main(argv: list[str] | None = None) -> int:
         concept_persist_dir=".chroma",
         no_seed_concepts=False,
         language=DEFAULT_LANGUAGE_MODE,
+        concept_embedder=BGE_SMALL_EN,
         requires_llm=True,
     )
     args = parser.parse_args(argv)
