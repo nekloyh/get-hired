@@ -40,7 +40,7 @@ ml_fundamentals:
         Concretely: if I see train MSE 0.1 and validation MSE 0.9, that wide gap is high variance, so I
         add L2, gather more data, or reduce model capacity, and I confirm the gap narrows.
     difficulty: 3
-    expected_concepts: [ml_fundamentals_bias_variance]
+    expected_concepts: [ml_fundamentals_bias_variance, ml_fundamentals_l2_regularization]
     follow_up_seeds:
       - Push for a concrete numeric diagnosis from a train/validation error pair.
       - Ask which fix they would try first and why, given a wide generalization gap.
