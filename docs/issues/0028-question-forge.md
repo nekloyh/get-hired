@@ -37,4 +37,10 @@ from day one. Batch sizes stay within free-tier limits.
 
 ## Status
 
-**Open.**
+**Closed (2026-07-11).** Implemented on the worktree-agent branch (commit 4da117b), integrated
+after 0026/0027. `forge.py` runs Writer drafts through three gates — contract (validators reused
+from `bank.validate_question`), novelty (Jaccard 0.6 vs bank + optional pack; embedding similarity
+pluggable), admission (the live Evaluator must score the golden strong answer >= 4 and the weak
+one <= 3) — and writes a human review queue, never merging into the bank itself. Live gate-3
+smoke on gpt-5.4-mini: 2/2 mlops drafts admitted (nearest-neighbor sim 0.17–0.20; strong 5.00 /
+weak 3.00). 344 offline tests green.
