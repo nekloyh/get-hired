@@ -21,7 +21,15 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_LEDGER_PATH = Path("logs/usage-ledger.jsonl")
+# Anchored to the repo root (the same parent-hop pattern bench._default_cases_path uses), NOT the
+# CWD: a CWD-relative ledger fragments per launch directory, and a fragmented ledger under-counts
+# the day's spend — silently defeating the pre-run budget check it exists to feed.
+DEFAULT_LEDGER_PATH = (Path(__file__).parent / ".." / ".." / "logs" / "usage-ledger.jsonl").resolve()
+
+
+def utc_date() -> str:
+    """Today's UTC day key — the one convention shared by the ledger, the bench, and the daily reset."""
+    return datetime.now(UTC).strftime("%Y-%m-%d")
 
 # gpt-5.4-mini's free daily allowance. A soft rail: crossing it does not block calls (the provider
 # 429s with insufficient_quota on its own) — it exists so callers can refuse to START a run that
@@ -75,7 +83,7 @@ def usage_for_day(day: str | None = None, *, path: Path | None = None) -> dict[s
     rest of the day's spend.
     """
     target = path or ledger_path()
-    day = day or datetime.now(UTC).strftime("%Y-%m-%d")
+    day = day or utc_date()
     totals: dict[str, dict[str, int]] = {}
     if not target.exists():
         return totals

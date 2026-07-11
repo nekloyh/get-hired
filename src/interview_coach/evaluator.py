@@ -149,6 +149,14 @@ class TrustTrace(BaseModel):
     unverifiable_fraction: float = Field(ge=0, le=1)
     divergence: float = Field(ge=0, description="|holistic − linear| weighted score gap.")
     noise_events: tuple[str, ...] = ()
+    panel_suppressed: bool = Field(
+        default=False,
+        description=(
+            "True when escalation triggers fired but the caller's PanelBudget was spent — the "
+            "committee was wanted but rationed. Without this a suppressed escalation is "
+            "indistinguishable from a confident pass in every transcript and report."
+        ),
+    )
 
 
 class Evaluation(BaseModel):
@@ -232,11 +240,11 @@ class Evaluation(BaseModel):
                 if data.get("delivery_fixes"):
                     telemetry.incr("sanitizer.stray_delivery_fixes_dropped")
                 data["delivery_fixes"] = []
-        if data.get("delivery_fixes") is not None and not isinstance(data["delivery_fixes"], (list, tuple)):
+        fixes = data.get("delivery_fixes")
+        if fixes is not None and not isinstance(fixes, (list, tuple)):
             telemetry.incr("sanitizer.delivery_fixes_not_list")
-            data["delivery_fixes"] = []
-        if data.get("delivery_fixes") is None:
-            data["delivery_fixes"] = []
+            fixes = None
+        data["delivery_fixes"] = [] if fixes is None else fixes
         return data
 
 
@@ -415,7 +423,7 @@ def apply_noise_haircut(evaluation: Evaluation, noise_events: tuple[str, ...]) -
 
 def _noise_events(before: dict[str, int], after: dict[str, int]) -> tuple[str, ...]:
     """Which noise counters moved between two telemetry snapshots (one judge call's attribution)."""
-    return tuple(sorted(key for key in NOISE_EVENT_KEYS if after.get(key, 0) > before.get(key, 0)))
+    return tuple(sorted(NOISE_EVENT_KEYS & telemetry.delta(before, after).keys()))
 
 
 @dataclass
@@ -436,6 +444,7 @@ class PanelBudget:
         try:
             return cls(remaining=int(raw)) if raw else cls(remaining=1)
         except ValueError:
+            logger.warning("PANEL_MAX_ESCALATIONS_PER_QUESTION=%r is not an integer; using default 1", raw)
             return cls(remaining=1)
 
     def try_consume(self) -> bool:
@@ -823,13 +832,31 @@ def _self_critique_triggers(evaluation: Evaluation, rubric: Rubric) -> tuple[str
     return tuple(triggers)
 
 
-def _trust_trace(evaluation: Evaluation, rubric: Rubric, *, pre_guard_confidence: float,
-                 noise_events: tuple[str, ...]) -> TrustTrace:
-    return TrustTrace(
-        pre_guard_confidence=pre_guard_confidence,
-        unverifiable_fraction=unverifiable_fraction(evaluation),
-        divergence=weighted_score_divergence(evaluation, rubric),
-        noise_events=noise_events,
+def _finalize(
+    evaluation: Evaluation,
+    rubric: Rubric,
+    *,
+    pre_guard_confidence: float,
+    noise_events: tuple[str, ...],
+    panel_suppressed: bool = False,
+) -> Evaluation:
+    """Apply the graded trust guards and attach the TrustTrace — one pipeline for BOTH paths.
+
+    The trace's fraction/divergence are read from the guarded evaluation, which is safe because the
+    guards only ever touch ``confidence``; if a future guard adjusts scores or evidence, compute
+    these signals before guarding and thread them through instead.
+    """
+    guarded = apply_noise_haircut(apply_evidence_degrade_haircut(evaluation), noise_events)
+    return guarded.model_copy(
+        update={
+            "trust": TrustTrace(
+                pre_guard_confidence=pre_guard_confidence,
+                unverifiable_fraction=unverifiable_fraction(guarded),
+                divergence=weighted_score_divergence(guarded, rubric),
+                noise_events=noise_events,
+                panel_suppressed=panel_suppressed,
+            )
+        }
     )
 
 
@@ -857,8 +884,9 @@ def evaluate(
 
     The kept judgment carries a :class:`TrustTrace` and its confidence passes the graded trust
     guards (evidence-degrade + structural-noise caps) — with the judge's self-report saturated at
-    ~0.95, those deterministic caps are what actually differentiate the evidence weight the Beta
-    update sees. The guards run AFTER the trigger decision on purpose: they inform the belief
+    ~0.95, those deterministic caps are what differentiate the evidence weight the Beta update sees
+    on non-escalated judgments (an escalated verdict weighs by committee agreement instead, per
+    issue 0027). The guards run AFTER the trigger decision on purpose: they inform the belief
     update, not the cost gate (#53's deliberate non-change — on this judge the committee does not
     move verdicts, so the trigger surface stays as-is until the shadow data argues otherwise).
     """
@@ -869,6 +897,7 @@ def evaluate(
     noise = _noise_events(noise_before, telemetry.snapshot())
     first = apply_cross_check(raw, rubric)
     triggers = _self_critique_triggers(first, rubric)
+    panel_suppressed = False
     if triggers and panel_budget is not None and not panel_budget.try_consume():
         telemetry.incr("evaluator.panel_budget_exhausted")
         logger.warning(
@@ -876,14 +905,14 @@ def evaluate(
             ", ".join(triggers),
         )
         triggers = ()
+        panel_suppressed = True
     if not triggers:
-        guarded = apply_noise_haircut(apply_evidence_degrade_haircut(first), noise)
-        return guarded.model_copy(
-            update={
-                "trust": _trust_trace(
-                    guarded, rubric, pre_guard_confidence=raw.confidence, noise_events=noise
-                )
-            }
+        return _finalize(
+            first,
+            rubric,
+            pre_guard_confidence=raw.confidence,
+            noise_events=noise,
+            panel_suppressed=panel_suppressed,
         )
 
     skeptic = _panel_opinion(client, question, answer, rubric, first, role="skeptic")
@@ -897,7 +926,9 @@ def evaluate(
         answer,
         rubric,
     )
-    verdict_noise = _noise_events(verdict_noise_before, telemetry.snapshot())
+    # The kept verdict inherits the FIRST pass's noise too: the exchange whose opening parse needed
+    # folds or retries is exactly the shaky case the shadow data must not record as clean.
+    verdict_noise = tuple(sorted({*noise, *_noise_events(verdict_noise_before, telemetry.snapshot())}))
     verdict = apply_cross_check(raw_verdict, rubric)
     disagreement = abs(skeptic.recommended_score - advocate.recommended_score)
     logger.info(
@@ -912,7 +943,9 @@ def evaluate(
         advocate.recommended_score,
         disagreement,
     )
-    verdict = apply_noise_haircut(apply_evidence_degrade_haircut(verdict), verdict_noise)
+    verdict = _finalize(
+        verdict, rubric, pre_guard_confidence=raw_verdict.confidence, noise_events=verdict_noise
+    )
     return verdict.model_copy(
         update={
             "panel": PanelTrace(
@@ -922,9 +955,6 @@ def evaluate(
                 initial_score=first.weighted_score,
                 initial_confidence=first.confidence,
                 disagreement=disagreement,
-            ),
-            "trust": _trust_trace(
-                verdict, rubric, pre_guard_confidence=raw_verdict.confidence, noise_events=verdict_noise
             ),
         }
     )

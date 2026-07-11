@@ -419,3 +419,16 @@ def test_router_downgrades_grammar_for_schema_less_fallback(fake_openai_factory)
     assert out.x == 9
     assert fake_primary.chat.completions.calls[0]["response_format"]["type"] == "json_schema"
     assert fake_fallback.chat.completions.calls[0]["response_format"] == {"type": "json_object"}
+
+
+def test_408_and_409_stay_retryable_after_sdk_retries_disabled(monkeypatch, fake_openai_factory):
+    # max_retries=0 moved retry ownership from the SDK to _create(); the SDK's default policy
+    # retried 408/409, so ours must too or hardening would silently narrow recovery.
+    monkeypatch.setattr(llm_module, "_sleep", lambda _wait: None)
+    timeout_408 = openai_sdk.APIStatusError(
+        "timeout", response=httpx.Response(408, request=_http_request()), body=None
+    )
+    fake = fake_openai_factory([timeout_408, '{"x": 4, "label": "recovered"}'])
+    client = MimoClient(_provider("mimo"), client=fake)
+    assert client.chat_json([{"role": "user", "content": "go"}], Foo).x == 4
+    assert fake.call_count == 2
