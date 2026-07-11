@@ -9,16 +9,58 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, TypeVar
 
+import openai
 from openai import OpenAI
 from pydantic import BaseModel, ValidationError
 
+from . import telemetry
 from .config import ProviderName, ProviderSettings, Settings
+from .usage import record_usage
 
 logger = logging.getLogger(__name__)
+
+# Transport-retry policy (free-tier hardening): 429s and transient 5xx/connection failures get a
+# bounded, explicit backoff HERE and nowhere else — the SDK's own hidden retries are disabled in
+# ``_openai()`` so retry ownership is single (no multiplicative retry stacking). The exception is
+# ``insufficient_quota``: when the daily allowance is spent, waiting cannot help, so it fails fast
+# and loud instead of burning the timeout budget.
+_TRANSPORT_ATTEMPTS = 4  # 1 call + up to 3 backed-off retries
+_BACKOFF_SECONDS = (2.0, 5.0, 10.0)
+_MAX_RETRY_AFTER_SECONDS = 30.0  # cap on a provider-suggested Retry-After
+
+_sleep = time.sleep  # module-level so tests can stub the wait out
+
+
+def _quota_exhausted(err: Exception) -> bool:
+    """A 429 backoff cannot fix: the provider says the day's token allowance is spent."""
+    return "insufficient_quota" in f"{getattr(err, 'code', '')} {err}"
+
+
+def _retryable_transport_error(err: Exception) -> bool:
+    if isinstance(err, openai.RateLimitError):
+        return not _quota_exhausted(err)
+    if isinstance(err, openai.APIConnectionError):  # includes APITimeoutError
+        return True
+    if isinstance(err, openai.APIStatusError):
+        return err.status_code >= 500
+    return False
+
+
+def _retry_wait(err: Exception, attempt: int) -> float:
+    """Provider's Retry-After when it sent one (capped), else the fixed backoff schedule."""
+    headers = getattr(getattr(err, "response", None), "headers", None)
+    raw = headers.get("retry-after") if headers is not None else None
+    if raw is not None:
+        try:
+            return min(max(float(raw), 0.0), _MAX_RETRY_AFTER_SECONDS)
+        except ValueError:
+            pass
+    return _BACKOFF_SECONDS[min(attempt, len(_BACKOFF_SECONDS) - 1)]
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -95,6 +137,7 @@ class LLMClient(ABC):
                 return parsed
             except (ValidationError, ValueError) as err:
                 last_error = err
+                telemetry.incr("structured_output.invalid_reply")
                 logger.warning("structured-output attempt %d failed: %s", attempt + 1, err)
                 if attempt < max_retries:
                     convo = [
@@ -182,6 +225,9 @@ class _OpenAICompatibleClient(LLMClient):
                 api_key=self._settings.api_key,
                 base_url=self._settings.base_url,
                 timeout=self._settings.timeout_seconds,
+                # Retries are owned by _create()'s explicit backoff; the SDK's hidden default
+                # (max_retries=2) would stack multiplicatively under it.
+                max_retries=0,
             )
         return self._client
 
@@ -208,7 +254,47 @@ class _OpenAICompatibleClient(LLMClient):
                 kwargs["tool_choice"] = tool_choice
         if extra_body := self._thinking_extra_body(disable_thinking):
             kwargs["extra_body"] = extra_body
-        return self._openai().chat.completions.create(**kwargs).choices[0].message
+        for attempt in range(_TRANSPORT_ATTEMPTS):
+            try:
+                completion = self._openai().chat.completions.create(**kwargs)
+            except Exception as err:
+                if isinstance(err, openai.RateLimitError) and _quota_exhausted(err):
+                    logger.error(
+                        "%s daily quota exhausted (insufficient_quota) — backoff cannot help; "
+                        "check today's spend in %s",
+                        self.provider_name,
+                        "logs/usage-ledger.jsonl",
+                    )
+                    raise
+                if attempt + 1 >= _TRANSPORT_ATTEMPTS or not _retryable_transport_error(err):
+                    raise
+                wait = _retry_wait(err, attempt)
+                telemetry.incr(f"transport.backoff.{self.provider_name}")
+                logger.warning(
+                    "%s transport error (attempt %d/%d): %s — backing off %.1fs",
+                    self.provider_name,
+                    attempt + 1,
+                    _TRANSPORT_ATTEMPTS,
+                    err,
+                    wait,
+                )
+                _sleep(wait)
+            else:
+                self._record_usage(completion)
+                return completion.choices[0].message
+        raise AssertionError("unreachable: transport retry loop always returns or raises")
+
+    def _record_usage(self, completion: Any) -> None:
+        """Append this call's token usage to the daily ledger (fakes without ``usage`` are skipped)."""
+        used = getattr(completion, "usage", None)
+        if used is None:
+            return
+        record_usage(
+            self.provider_name,
+            self._settings.model,
+            prompt_tokens=getattr(used, "prompt_tokens", 0) or 0,
+            completion_tokens=getattr(used, "completion_tokens", 0) or 0,
+        )
 
     def chat(
         self,
@@ -399,6 +485,7 @@ class LLMRouter(LLMClient):
                     err,
                 )
                 raise
+            telemetry.incr(f"router.failover.{self._primary_provider}")
             logger.warning(
                 "primary LLM provider %s failed; falling back to %s: %s",
                 self._primary_provider,

@@ -273,7 +273,9 @@ def confidence_calibration(results: Sequence[BenchResult]) -> list[dict[str, Any
 
 
 def render_bench_report(results: Sequence[BenchResult], *, anchors: Mapping[str, Mapping[str, str]] | None = None,
-                        provider: str = "unknown", model: str = "unknown", date: str = "unknown") -> str:
+                        provider: str = "unknown", model: str = "unknown", date: str = "unknown",
+                        telemetry_delta: Mapping[str, int] | None = None,
+                        token_usage: Mapping[str, Mapping[str, int]] | None = None) -> str:
     """Render the full Markdown calibration report written into docs/audits/."""
     total = len(results)
     passed = sum(1 for r in results if r.within_band)
@@ -294,7 +296,9 @@ def render_bench_report(results: Sequence[BenchResult], *, anchors: Mapping[str,
         conf = "ERR" if r.confidence is None else f"{r.confidence:.2f}"
         mark = "✅" if r.within_band else "❌"
         escalation = "—"
-        if r.evaluation is not None and r.evaluation.self_critique is not None:
+        if r.evaluation is not None and r.evaluation.panel is not None:
+            escalation = "panel: " + ", ".join(r.evaluation.panel.triggers)
+        elif r.evaluation is not None and r.evaluation.self_critique is not None:
             escalation = ", ".join(r.evaluation.self_critique.triggers)
         lines.append(
             f"| {r.case.case_id} | {r.case.skill} | {r.case.language} | {r.case.expected_range} "
@@ -344,6 +348,30 @@ def render_bench_report(results: Sequence[BenchResult], *, anchors: Mapping[str,
         lines.append(
             f"| {row['bucket']} | {row['n']} | {row['mean_confidence']:.2f} | {row['hit_rate']:.0%} |"
         )
+
+    if telemetry_delta is not None:
+        # Structural-noise telemetry (free-tier hardening): which sanitizer folds / retries /
+        # backoffs THIS run triggered. A new noise mode from the live model shows up here as a
+        # moving counter while the run is still green — before it ever costs an in-band case.
+        lines += ["", "## Noise & transport telemetry (this run)", ""]
+        if telemetry_delta:
+            lines += ["| event | count |", "| --- | ---: |"]
+            for key, count in sorted(telemetry_delta.items()):
+                lines.append(f"| {key} | {count} |")
+        else:
+            lines.append("- clean run: no sanitizer folds, retries, or transport backoffs")
+
+    if token_usage is not None:
+        lines += ["", "## Token usage (this run)", "",
+                  "| provider | calls | prompt | completion | total |",
+                  "| --- | ---: | ---: | ---: | ---: |"]
+        for prov, stats in sorted(token_usage.items()):
+            lines.append(
+                f"| {prov} | {stats.get('calls', 0)} | {stats.get('prompt', 0)} "
+                f"| {stats.get('completion', 0)} | {stats.get('total', 0)} |"
+            )
+        if not token_usage:
+            lines.append("| (none recorded) | 0 | 0 | 0 | 0 |")
 
     if anchors:
         lines += ["", "## BARS anchors used for labelling", ""]

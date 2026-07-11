@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import httpx
+import openai as openai_sdk
 import pytest
 from pydantic import BaseModel
 
+from interview_coach import llm as llm_module
+from interview_coach import telemetry
 from interview_coach.config import ProviderName, ProviderSettings, Settings
 from interview_coach.llm import (
     GroqClient,
@@ -13,6 +17,7 @@ from interview_coach.llm import (
     ToolCallingUnsupported,
     build_client,
 )
+from interview_coach.usage import usage_for_day
 
 
 class Foo(BaseModel):
@@ -243,3 +248,112 @@ def test_router_tool_transport_error_fails_over():
     assert out == "groq-result"
     assert primary.tool_calls == 1
     assert fallback.tool_calls == 1
+
+
+# --- transport backoff + usage ledger (free-tier hardening) --------------------------------------
+
+
+def _http_request() -> httpx.Request:
+    return httpx.Request("POST", "http://test/v1/chat/completions")
+
+
+def _rate_limited(message: str = "rate limited", headers: dict | None = None) -> Exception:
+    return openai_sdk.RateLimitError(
+        message, response=httpx.Response(429, headers=headers or {}, request=_http_request()), body=None
+    )
+
+
+def test_transport_backoff_retries_429_then_succeeds(monkeypatch, fake_openai_factory):
+    waits: list[float] = []
+    monkeypatch.setattr(llm_module, "_sleep", waits.append)
+    fake = fake_openai_factory([_rate_limited(), _rate_limited(), '{"x": 1, "label": "ok"}'])
+    client = MimoClient(_provider("mimo"), client=fake)
+
+    out = client.chat_json([{"role": "user", "content": "go"}], Foo)
+
+    assert out.x == 1
+    assert fake.call_count == 3
+    assert waits == [2.0, 5.0]  # the fixed schedule when the provider sends no Retry-After
+    assert telemetry.snapshot()["transport.backoff.mimo"] == 2
+
+
+def test_transport_backoff_honors_retry_after_header(monkeypatch, fake_openai_factory):
+    waits: list[float] = []
+    monkeypatch.setattr(llm_module, "_sleep", waits.append)
+    fake = fake_openai_factory([_rate_limited(headers={"retry-after": "1"}), '{"x": 1, "label": "ok"}'])
+    client = MimoClient(_provider("mimo"), client=fake)
+
+    client.chat_json([{"role": "user", "content": "go"}], Foo)
+
+    assert waits == [1.0]
+
+
+def test_insufficient_quota_fails_fast_without_backoff(monkeypatch, fake_openai_factory):
+    # When the DAY's allowance is spent, waiting cannot help — burn zero time and fail loudly.
+    waits: list[float] = []
+    monkeypatch.setattr(llm_module, "_sleep", waits.append)
+    fake = fake_openai_factory([_rate_limited(message="You exceeded your current quota: insufficient_quota")])
+    client = MimoClient(_provider("mimo"), client=fake)
+
+    with pytest.raises(openai_sdk.RateLimitError):
+        client.chat([{"role": "user", "content": "go"}])
+
+    assert fake.call_count == 1
+    assert waits == []
+
+
+def test_transport_backoff_gives_up_after_bounded_attempts(monkeypatch, fake_openai_factory):
+    monkeypatch.setattr(llm_module, "_sleep", lambda _wait: None)
+    fake = fake_openai_factory([_rate_limited()])  # the fake repeats its last scripted reply
+    client = MimoClient(_provider("mimo"), client=fake)
+
+    with pytest.raises(openai_sdk.RateLimitError):
+        client.chat([{"role": "user", "content": "go"}])
+
+    assert fake.call_count == llm_module._TRANSPORT_ATTEMPTS
+
+
+def test_5xx_is_retried_but_4xx_is_not(monkeypatch, fake_openai_factory):
+    monkeypatch.setattr(llm_module, "_sleep", lambda _wait: None)
+    server_err = openai_sdk.InternalServerError(
+        "boom", response=httpx.Response(500, request=_http_request()), body=None
+    )
+    fake = fake_openai_factory([server_err, '{"x": 2, "label": "recovered"}'])
+    client = MimoClient(_provider("mimo"), client=fake)
+    assert client.chat_json([{"role": "user", "content": "go"}], Foo).x == 2
+    assert fake.call_count == 2
+
+    bad_request = openai_sdk.BadRequestError(
+        "bad", response=httpx.Response(400, request=_http_request()), body=None
+    )
+    fake2 = fake_openai_factory([bad_request])
+    client2 = MimoClient(_provider("mimo"), client=fake2)
+    with pytest.raises(openai_sdk.BadRequestError):
+        client2.chat([{"role": "user", "content": "go"}])
+    assert fake2.call_count == 1
+
+
+def test_usage_recorded_to_daily_ledger(monkeypatch, tmp_path, fake_openai_factory):
+    ledger = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
+    fake = fake_openai_factory(
+        [{"content": '{"x": 1, "label": "ok"}', "usage": {"prompt_tokens": 100, "completion_tokens": 20}}]
+    )
+    client = MimoClient(_provider("mimo"), client=fake)
+
+    client.chat_json([{"role": "user", "content": "go"}], Foo)
+
+    totals = usage_for_day()
+    assert totals["mimo"] == {"prompt": 100, "completion": 20, "total": 120, "calls": 1}
+
+
+def test_sdk_retries_disabled_so_backoff_is_singly_owned(monkeypatch):
+    captured: dict = {}
+
+    class _RecordingOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(llm_module, "OpenAI", _RecordingOpenAI)
+    GroqClient(_provider("groq"))._openai()
+    assert captured["max_retries"] == 0

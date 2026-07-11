@@ -6,10 +6,12 @@ import unicodedata
 
 import pytest
 
+from interview_coach import telemetry
 from interview_coach.config import load_settings
 from interview_coach.evaluator import (
     DIVERGENCE_CONFIDENCE_CEILING,
     EVIDENCE_DEGRADE_CONFIDENCE_CEILING,
+    JUDGE_MAX_RETRIES,
     SELF_CRITIQUE_CONFIDENCE_THRESHOLD,
     UNVERIFIABLE_EVIDENCE,
     WEIGHTED_SCORE_TOLERANCE,
@@ -255,7 +257,8 @@ def test_persistently_unverifiable_evidence_degrades_instead_of_crashing(make_cl
 
     assert ev.dimensions["correctness"].score == 5  # score preserved
     assert ev.dimensions["correctness"].evidence == UNVERIFIABLE_EVIDENCE  # citation blanked, not crashed
-    assert fake.call_count == 3  # 2 enforced attempts fail evidence, then 1 degrade pass without it
+    # JUDGE_MAX_RETRIES + 1 enforced attempts fail evidence, then 1 degrade pass without it
+    assert fake.call_count == JUDGE_MAX_RETRIES + 2
 
 
 # --- evidence-degrade confidence signal (issue 0033 / GH #37) ----------------------------------
@@ -329,7 +332,8 @@ def test_evidence_degrade_ceiling_only_lowers_confidence(make_client):
     # exactly like the cross-check guard — the degrade signal never raises confidence. A confidence
     # below the ceiling is also below the escalation threshold, so the panel inevitably runs; the
     # property must hold on the verdict, which here goes through the same degrade dance as the
-    # first pass (2 evidence failures + 1 degrade pass each), with the committee in between.
+    # first pass (JUDGE_MAX_RETRIES+1 evidence failures + 1 degrade pass each), with the committee
+    # in between.
     answer = "Bias is systematic error from too-simple assumptions."
     rubric = Rubric(weights={"correctness": 1.0})
     low = EVIDENCE_DEGRADE_CONFIDENCE_CEILING / 2
@@ -341,14 +345,16 @@ def test_evidence_degrade_ceiling_only_lowers_confidence(make_client):
             "key_evidence": "too-simple assumptions",
         }
     )
-    client, fake = make_client([bad, bad, bad, opinion, opinion, bad, bad, bad])
+    first_pass = [bad] * (JUDGE_MAX_RETRIES + 2)
+    verdict_pass = [bad] * (JUDGE_MAX_RETRIES + 2)
+    client, fake = make_client([*first_pass, opinion, opinion, *verdict_pass])
 
     ev = evaluate(client, "Explain bias.", answer, rubric)
 
     assert ev.evidence_degraded is True
     assert ev.panel is not None  # low confidence always escalates now (issue 0027)
     assert ev.confidence == pytest.approx(low)  # already below the ceiling; unchanged
-    assert fake.call_count == 8
+    assert fake.call_count == 2 * (JUDGE_MAX_RETRIES + 2) + 2
 
 
 # --- weighted_score cross-check guard (slice 0003) ---------------------------------------------
@@ -525,16 +531,17 @@ def test_model_cannot_author_the_derived_fields(make_client):
 def test_degrade_pass_is_reserved_for_evidence_failures(make_client):
     # A delivery-fixes contract failure must NOT open the evidence-free degrade pass: dropping the
     # verbatim-citation guard because an unrelated validator kept failing would silently un-enforce
-    # it. Both attempts miss the required fixes -> loud StructuredOutputError, no third call.
+    # it. Every attempt misses the required fixes -> loud StructuredOutputError, no degrade pass.
     from interview_coach.llm import StructuredOutputError
 
     weak_delivery = json.loads(_eval_json(_good_dimensions()))
     weak_delivery["dimensions"]["english_delivery"] = {"score": 2, "evidence": "no evidence"}
     reply = json.dumps(weak_delivery)
-    client, fake = make_client([reply, reply])
+    client, fake = make_client([reply])  # the fake repeats its last scripted reply
     with pytest.raises(StructuredOutputError):
         evaluate(client, QUESTION.question, STRONG_ANSWER, _DELIVERY_RUBRIC)
-    assert fake.call_count == 2  # no evidence-free third pass for a non-evidence failure
+    # all enforced attempts burned, and no evidence-free extra pass for a non-evidence failure
+    assert fake.call_count == JUDGE_MAX_RETRIES + 1
 
 
 # --- english_delivery + language_mode (issue 0024, ADR 0007) --------------------------------------
@@ -696,3 +703,95 @@ def test_live_weak_scores_below_strong():
     weak = evaluate(client, QUESTION.question, WEAK_ANSWER, QUESTION.rubric)
     assert set(strong.dimensions) == ACTIVE
     assert weak.weighted_score < strong.weighted_score
+
+
+# --- free-tier hardening: judge retry budget + sanitizer noise telemetry -------------------------
+
+
+def test_judge_retry_budget_absorbs_two_bad_replies(make_client):
+    # The 24/29 red day was pure structural flakiness with max_retries=1. The judge call now
+    # carries JUDGE_MAX_RETRIES=2: two invalid replies and a clean third one must still land.
+    replies = ["not json", "still not json", _eval_json(_good_dimensions())]
+    client, fake = make_client(replies)
+
+    evaluation = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+
+    assert evaluation.weighted_score == 4.0
+    assert fake.call_count == JUDGE_MAX_RETRIES + 1
+    assert telemetry.snapshot()["structured_output.invalid_reply"] == 2
+
+
+def test_sanitizer_counts_flattened_judgment_and_derived_echo():
+    data = {
+        "dimensions": {
+            **_good_dimensions(),
+            # gpt-5.4-mini's flatten mode: top-level judgment fields arrive inside "dimensions".
+            "weighted_score": 4.0,
+            "confidence": 0.9,
+        },
+        "follow_up_recommended": False,
+        "follow_up_rationale": "resolved",
+        "evidence_degraded": True,  # model echoing a derived field must be stripped AND counted
+    }
+
+    evaluation = Evaluation.model_validate(data)
+
+    assert evaluation.weighted_score == 4.0
+    assert evaluation.evidence_degraded is False
+    snap = telemetry.snapshot()
+    assert snap["sanitizer.judgment_flattened_in_dimensions"] == 2
+    assert snap["sanitizer.derived_field_echoed"] == 1
+
+
+def test_sanitizer_counts_stray_delivery_fixes_dropped():
+    data = {
+        "dimensions": _good_dimensions(),  # english_delivery NOT active
+        "weighted_score": 4.0,
+        "confidence": 0.9,
+        "follow_up_recommended": False,
+        "follow_up_rationale": "resolved",
+        "delivery_fixes": ["said 'model is overfit' — say 'the model overfits'"],
+    }
+
+    evaluation = Evaluation.model_validate(data)
+
+    assert evaluation.delivery_fixes == ()
+    assert telemetry.snapshot()["sanitizer.stray_delivery_fixes_dropped"] == 1
+
+
+def test_sanitizer_counts_misplaced_delivery_fixes_and_keeps_them_when_active():
+    data = {
+        "dimensions": {
+            **_good_dimensions(),
+            "english_delivery": {"score": 5, "evidence": "no evidence"},
+            "delivery_fixes": ["a — b"],  # nested where a dimension key belongs
+        },
+        "weighted_score": 4.0,
+        "confidence": 0.9,
+        "follow_up_recommended": False,
+        "follow_up_rationale": "resolved",
+    }
+
+    evaluation = Evaluation.model_validate(data)
+
+    assert evaluation.delivery_fixes == ("a — b",)
+    assert telemetry.snapshot()["sanitizer.delivery_fixes_misplaced"] == 1
+
+
+def test_sanitizer_counts_non_list_delivery_fixes():
+    data = {
+        "dimensions": {
+            **_good_dimensions(),
+            "english_delivery": {"score": 5, "evidence": "no evidence"},
+        },
+        "weighted_score": 4.0,
+        "confidence": 0.9,
+        "follow_up_recommended": False,
+        "follow_up_rationale": "resolved",
+        "delivery_fixes": {"oops": "a dict, not a list"},
+    }
+
+    evaluation = Evaluation.model_validate(data)
+
+    assert evaluation.delivery_fixes == ()
+    assert telemetry.snapshot()["sanitizer.delivery_fixes_not_list"] == 1

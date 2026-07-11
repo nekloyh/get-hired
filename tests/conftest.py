@@ -10,8 +10,16 @@ import json
 
 import pytest
 
+from interview_coach import telemetry
 from interview_coach.config import ProviderSettings, Settings
 from interview_coach.llm import GroqClient, LLMRouter, MimoClient
+
+
+@pytest.fixture(autouse=True)
+def _reset_telemetry():
+    """Noise counters are process-global; every test starts from a clean slate."""
+    telemetry.reset()
+    yield
 
 
 class _FakeFunction:
@@ -45,9 +53,16 @@ class _FakeChoice:
         self.message = message
 
 
+class _FakeUsage:
+    def __init__(self, prompt_tokens: int, completion_tokens: int) -> None:
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+
+
 class _FakeResponse:
-    def __init__(self, message: _FakeMessage) -> None:
+    def __init__(self, message: _FakeMessage, usage: _FakeUsage | None = None) -> None:
         self.choices = [_FakeChoice(message)]
+        self.usage = usage
 
 
 class _FakeCompletions:
@@ -71,6 +86,10 @@ class _FakeCompletions:
                 for i, tc in enumerate(reply["tool_calls"])
             ]
             return _FakeResponse(_FakeMessage(content=reply.get("content"), tool_calls=calls))
+        if isinstance(reply, dict) and "usage" in reply:
+            # A scripted reply carrying token usage: exercises the client-side daily ledger.
+            usage = _FakeUsage(reply["usage"]["prompt_tokens"], reply["usage"]["completion_tokens"])
+            return _FakeResponse(_FakeMessage(content=reply.get("content", "")), usage=usage)
         content, reasoning = reply if isinstance(reply, tuple) else (reply, None)
         return _FakeResponse(_FakeMessage(content=content, reasoning_content=reasoning))
 
