@@ -463,6 +463,127 @@ def test_self_critique_logs_trigger_and_outcome(make_client, caplog):
     assert any("low_confidence" in msg and "keeping self_critique" in msg for msg in messages)
 
 
+# --- english_delivery + language_mode (issue 0024, ADR 0007) --------------------------------------
+
+_DELIVERY_RUBRIC = Rubric(
+    weights={**QUESTION.rubric.weights, "english_delivery": 1.0}
+)
+
+
+def _delivery_dimensions(delivery_score: int) -> dict:
+    return _good_dimensions() | {
+        "english_delivery": {"score": delivery_score, "evidence": "no evidence"}
+    }
+
+
+def test_system_prompt_separates_english_delivery_from_weighted_score():
+    # ADR 0007: delivery is scored apart from knowledge. Lock the prompt contract offline (the
+    # calibration bench remains the behavioral gate).
+    from interview_coach.evaluator import SYSTEM_PROMPT
+
+    lowered = SYSTEM_PROMPT.lower()
+    assert "english_delivery" in lowered
+    assert "never moves 'weighted_score'" in lowered
+    assert "technical dimensions" in lowered
+    assert "delivery_fixes" in lowered
+    assert "phrase-level" in lowered
+
+
+def test_linear_weighted_score_excludes_english_delivery():
+    # A terrible delivery score must not move the technical aggregate at all (ADR 0007).
+    with_delivery = _evaluation(
+        {"correctness": 4, "depth": 4, "communication": 4, "system_thinking": 4, "english_delivery": 1},
+        weighted=4.0,
+    )
+    assert linear_weighted_score(with_delivery.dimensions, _DELIVERY_RUBRIC) == pytest.approx(4.0)
+
+
+def test_weak_delivery_without_fixes_is_rejected_then_corrected(make_client):
+    bad = _eval_json(_delivery_dimensions(2))
+    good = json.dumps(
+        json.loads(_eval_json(_delivery_dimensions(2)))
+        | {"delivery_fixes": ['"model overfit" — "the model overfits"', "fix two", "fix three"]}
+    )
+    client, fake = make_client([bad, good])
+    ev = evaluate(client, QUESTION.question, STRONG_ANSWER, _DELIVERY_RUBRIC)
+    assert len(ev.delivery_fixes) >= 3
+    assert fake.call_count == 2  # retried after the missing-fixes violation
+
+
+def test_strong_delivery_needs_no_fixes(make_client):
+    client, fake = make_client([_eval_json(_delivery_dimensions(5))])
+    ev = evaluate(client, QUESTION.question, STRONG_ANSWER, _DELIVERY_RUBRIC)
+    assert ev.dimensions["english_delivery"].score == 5
+    assert ev.delivery_fixes == ()
+    assert fake.call_count == 1
+
+
+def test_stray_delivery_fixes_on_inactive_dimension_are_dropped_without_a_retry(make_client):
+    # Seen live: the judge volunteers delivery advice on cases where english_delivery is not scored.
+    # Structural noise is folded deterministically — no phantom advice, no burned retry.
+    stray = json.dumps(
+        json.loads(_eval_json(_good_dimensions())) | {"delivery_fixes": ["a", "b", "c"]}
+    )
+    client, fake = make_client([stray])
+    ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+    assert ev.delivery_fixes == ()
+    assert fake.call_count == 1
+
+
+def test_delivery_fixes_nested_inside_dimensions_are_recovered(make_client):
+    # Seen live: gpt-5.4-mini nests delivery_fixes inside "dimensions" — a valid judgment must not
+    # be lost to field placement.
+    payload = json.loads(_eval_json(_delivery_dimensions(2)))
+    payload["dimensions"]["delivery_fixes"] = ["fix one", "fix two", "fix three"]
+    client, fake = make_client([json.dumps(payload)])
+    ev = evaluate(client, QUESTION.question, STRONG_ANSWER, _DELIVERY_RUBRIC)
+    assert ev.delivery_fixes == ("fix one", "fix two", "fix three")
+    assert "delivery_fixes" not in ev.dimensions
+    assert fake.call_count == 1
+
+
+def test_delivery_fixes_wrong_type_is_coerced_to_empty(make_client):
+    # {} / null instead of a list (seen live) reads as "no fixes offered", which the semantic
+    # validator then handles: fine on a strong delivery, a retry-steering error on a weak one.
+    payload = json.loads(_eval_json(_delivery_dimensions(5))) | {"delivery_fixes": {}}
+    client, fake = make_client([json.dumps(payload)])
+    ev = evaluate(client, QUESTION.question, STRONG_ANSWER, _DELIVERY_RUBRIC)
+    assert ev.delivery_fixes == ()
+    assert fake.call_count == 1
+
+
+def test_schema_hint_mentions_delivery_fixes_only_when_active():
+    from interview_coach.evaluator import _schema_hint
+
+    assert "delivery_fixes" not in _schema_hint(QUESTION.rubric)
+    assert "delivery_fixes" in _schema_hint(_DELIVERY_RUBRIC)
+    assert "TOP-LEVEL" in _schema_hint(_DELIVERY_RUBRIC)
+
+
+def test_language_mode_blocks_reach_the_judge_prompt(make_client):
+    from interview_coach.evaluator import _build_messages
+
+    en = _build_messages("q", "a", QUESTION.rubric, "en")[1]["content"]
+    vn = _build_messages("q", "a", QUESTION.rubric, "vn")[1]["content"]
+    mixed = _build_messages("q", "a", QUESTION.rubric, "mixed")[1]["content"]
+    assert "SESSION LANGUAGE MODE" not in en  # en stays byte-identical to the pre-0024 prompt
+    assert "SESSION LANGUAGE MODE: vn" in vn
+    assert "SESSION LANGUAGE MODE: mixed" in mixed
+    assert "language-invariant" in mixed.lower() or "language-invariant" in vn.lower()
+
+
+def test_evaluate_threads_language_mode_into_the_prompt(make_client):
+    client, fake = make_client([_eval_json(_good_dimensions())])
+    evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric, language_mode="mixed")
+    sent = fake.chat.completions.calls[0]["messages"][-1]["content"]
+    assert "SESSION LANGUAGE MODE: mixed" in sent
+
+
+def test_delivery_rubric_renders_the_separation_marker():
+    rendered = _DELIVERY_RUBRIC.render()
+    assert "english_delivery (assessed separately — NEVER counts toward weighted_score)" in rendered
+
+
 @pytest.mark.live
 def test_live_weak_scores_below_strong():
     settings = load_settings()

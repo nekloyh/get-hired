@@ -154,6 +154,16 @@ def test_question_with_unknown_rubric_dimension_is_rejected(monkeypatch):
         load_questions()
 
 
+def test_question_authoring_english_delivery_is_rejected(monkeypatch):
+    # Issue 0024 / ADR 0007: delivery is Session state, not content — the micro-loop activates it
+    # per answer from language_mode, so a pack must not pin it.
+    questions = _valid_questions()
+    questions["mlops"][0]["rubric"]["weights"]["english_delivery"] = 1.0
+    _patch_yaml(monkeypatch, concepts=_valid_concepts(), questions=questions)
+    with pytest.raises(BankError, match="english_delivery"):
+        load_questions()
+
+
 def test_question_with_empty_answers_is_rejected(monkeypatch):
     questions = _valid_questions()
     questions["mlops"][0]["answers"] = []

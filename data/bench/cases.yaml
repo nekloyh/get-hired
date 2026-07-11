@@ -10,6 +10,12 @@
 #
 # HITL: answers, labels, bands, and anchors are an AI-authored DRAFT and need human review before this
 # bench is trusted to gate judge changes.
+#
+# Mixed-mode cases (issue 0024, ADR 0007) carry `language: mixed` and `language_mode: mixed` — the
+# judge is told the Session code-switches. Their `expected_min/max` band still gates the TECHNICAL
+# weighted_score only; english_delivery (active on English-dominant answers via rubric weight) is
+# labelled and reported separately, never banded. `language` is the answer's language; `language_mode`
+# is the Session mode the judge is told (en for every legacy case, keeping those prompts stable).
 
 anchors:
   system_thinking:
@@ -27,6 +33,14 @@ anchors:
     "4": >-
       Technically accurate with the key mechanism stated correctly, even if not exhaustive (e.g. "L2
       penalises squared weights, trading a little fit for lower variance").
+  english_delivery:
+    "2": >-
+      Frequent broken phrasing that obscures the meaning ("model is overfit when data less"); the
+      reader must re-read sentences to extract the idea. Judged on delivery only — the technical
+      content may still be strong.
+    "4": >-
+      Clear professional English with minor slips (an article or tense error) that never obscure
+      the technical point.
 
 cases:
   # --- ml_fundamentals: bias/variance, four quality levels ---
@@ -306,3 +320,78 @@ cases:
     labels: {correctness: 1, depth: 1, communication: 1, system_thinking: 1}
     expected_min: 1.0
     expected_max: 2.5
+
+  # --- mixed-mode cases (issue 0024, ADR 0007): the Session code-switches like a VNG/FPT round ---
+  # VN-dominant code-switched answers: english_delivery stays weight-0 (no phantom delivery scores).
+  - case_id: mixed_dl_dropout_strong_vnmix
+    paired_id: mixed_dl_dropout_strong
+    skill: deep_learning
+    language: mixed
+    language_mode: mixed
+    question: How does dropout regularize a network, and when would you avoid it?
+    answer: >-
+      Dropout tắt ngẫu nhiên một phần neuron mỗi bước train, nên các neuron không thể co-adapt — mỗi
+      sub-network phải tự học feature hữu ích, giống như ensemble của nhiều mạng con. Lúc inference thì
+      giữ nguyên toàn bộ neuron và scale activation theo keep probability để expectation khớp. Em sẽ
+      tránh dùng dropout mạnh trong conv layer vì spatial feature bị phá, và khi đã có batch norm thì
+      phải cẩn thận vì variance shift giữa train và inference có thể làm hai kỹ thuật đánh nhau.
+    rubric: {correctness: 0.4, depth: 0.3, communication: 0.2, system_thinking: 0.1, mlops_awareness: 0.0, english_delivery: 0.0}
+    labels: {correctness: 5, depth: 4, communication: 4, system_thinking: 4}
+    expected_min: 3.8
+    expected_max: 5.0
+
+  - case_id: mixed_dl_dropout_weak_vnmix
+    paired_id: mixed_dl_dropout_weak
+    skill: deep_learning
+    language: mixed
+    language_mode: mixed
+    question: How does dropout regularize a network, and when would you avoid it?
+    answer: >-
+      Dropout là tắt ngẫu nhiên neuron để model không bị overfit. Dùng dropout càng nhiều thì model
+      càng generalize tốt, nên em sẽ luôn thêm dropout vào mọi layer.
+    rubric: {correctness: 0.4, depth: 0.3, communication: 0.2, system_thinking: 0.1, mlops_awareness: 0.0, english_delivery: 0.0}
+    labels: {correctness: 2, depth: 1, communication: 3, system_thinking: 1}
+    expected_min: 1.0
+    expected_max: 2.6
+
+  # English-dominant answers in a mixed Session: english_delivery is active and labelled, but the
+  # band still gates the technical weighted_score only.
+  - case_id: mixed_sd_cache_strong_en_delivery
+    paired_id: mixed_sd_cache_strong
+    skill: system_design
+    language: mixed
+    language_mode: mixed
+    question: When would you add a read-through cache in front of a database, and what are the risks?
+    answer: >-
+      I would add a read-through cache when the workload is read-heavy with a skewed key distribution,
+      and the database is becoming the latency or cost bottleneck. The cache answers hot reads; on a
+      miss it loads from the database and stores the value with a TTL. The main risks are staleness —
+      writes must invalidate or update the cached entry, or readers see old data — and a cache
+      stampede: when a hot key expires, thousands of requests hit the database at once, so I would use
+      request coalescing or jittered TTLs. I would also size the TTL against how stale the product can
+      tolerate, because "cache it forever" quietly turns a latency fix into a correctness bug.
+    rubric: {correctness: 0.3, depth: 0.2, communication: 0.2, system_thinking: 0.3, mlops_awareness: 0.0, english_delivery: 1.0}
+    labels: {correctness: 4, depth: 4, communication: 4, system_thinking: 5, english_delivery: 5}
+    expected_min: 3.8
+    expected_max: 5.0
+
+  # The disentanglement proof case: strong technical content delivered in broken English. The
+  # technical band must stay high while english_delivery is labelled weak (>=3 phrase fixes required).
+  - case_id: mixed_ml_leakage_broken_english
+    paired_id: mixed_ml_leakage_strong
+    skill: ml_fundamentals
+    language: mixed
+    language_mode: mixed
+    question: What is data leakage, and how do you prevent it in a training pipeline?
+    answer: >-
+      Data leakage is happen when information from test set or from future go inside training. Example
+      is we fit the scaler or choose feature on all data before split, so statistics of test set leak
+      in train. Model look very good offline but fail in production, because that information is not
+      available at serving time. For prevent, we must to fit every preprocessing only on train fold
+      inside each cross-validation split, and we check feature that use future information, like
+      column that is proxy of label. Also monitor gap between offline metric and production metric,
+      big gap is signal of leakage.
+    rubric: {correctness: 0.4, depth: 0.3, communication: 0.2, system_thinking: 0.1, mlops_awareness: 0.0, english_delivery: 1.0}
+    labels: {correctness: 4, depth: 4, communication: 4, system_thinking: 4, english_delivery: 2}
+    expected_min: 3.4
+    expected_max: 5.0

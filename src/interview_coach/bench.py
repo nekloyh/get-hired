@@ -33,13 +33,17 @@ class BenchCase:
     case_id: str
     paired_id: str
     skill: str
-    language: str
+    language: str  # the language the ANSWER is written in: "en" | "vi" | "mixed"
     question: str
     answer: str
     rubric: Rubric
     labels: dict[str, int]  # human per-dimension scores (1–5) on the active dimensions
     expected_min: float
     expected_max: float
+    # The Session language_mode the judge is told (issue 0024): "en" | "vn" | "mixed". Distinct
+    # vocabulary from ``language`` above — a case can carry a Vietnamese answer inside an
+    # en-mode prompt (all legacy pairs do, keeping their prompts byte-identical to pre-0024 runs).
+    language_mode: str = "en"
 
     @property
     def expected_range(self) -> str:
@@ -105,6 +109,7 @@ def load_bench_data(path: str | Path | None = None) -> BenchData:
             labels={k: int(v) for k, v in c.get("labels", {}).items()},
             expected_min=float(c["expected_min"]),
             expected_max=float(c["expected_max"]),
+            language_mode=c.get("language_mode", "en"),
         )
         for c in raw_cases
     )
@@ -117,7 +122,9 @@ def run_bench(client: LLMClient, cases: Iterable[BenchCase]) -> list[BenchResult
     results: list[BenchResult] = []
     for case in cases:
         try:
-            evaluation = evaluate(client, case.question, case.answer, case.rubric)
+            evaluation = evaluate(
+                client, case.question, case.answer, case.rubric, language_mode=case.language_mode
+            )
         except Exception as err:  # noqa: BLE001 - the bench reports provider/schema failures as cases
             results.append(BenchResult(case=case, error=f"{type(err).__name__}: {err}"))
         else:
@@ -176,8 +183,41 @@ def language_deltas(results: Sequence[BenchResult]) -> list[dict[str, Any]]:
     rows = []
     for paired_id, langs in sorted(by_pair.items()):
         en, vi = langs.get("en"), langs.get("vi")
+        if en is None and vi is None:
+            # A mixed-language pair (issue 0024) has no EN/VN twin to diff — it is reported in its
+            # own mixed-mode section, not as an all-n/a delta row.
+            continue
         delta = abs(en - vi) if (en is not None and vi is not None) else None
         rows.append({"paired_id": paired_id, "en": en, "vi": vi, "delta": delta})
+    return rows
+
+
+def mixed_mode_rows(results: Sequence[BenchResult]) -> list[dict[str, Any]]:
+    """Per mixed-language case (issue 0024): technical score plus the english_delivery judgment.
+
+    english_delivery is reported apart from the banded technical score — the whole point of the
+    dimension (ADR 0007) is that the two never mix.
+    """
+    rows = []
+    for result in results:
+        if result.case.language != "mixed":
+            continue
+        delivery = None
+        fixes = 0
+        if result.evaluation is not None:
+            scored = result.evaluation.dimensions.get("english_delivery")
+            delivery = scored.score if scored is not None else None
+            fixes = len(result.evaluation.delivery_fixes)
+        rows.append(
+            {
+                "case_id": result.case.case_id,
+                "score": result.score,
+                "english_delivery": delivery,
+                "delivery_label": result.case.labels.get("english_delivery"),
+                "delivery_fixes": fixes,
+                "within_band": result.within_band,
+            }
+        )
     return rows
 
 
@@ -252,6 +292,20 @@ def render_bench_report(results: Sequence[BenchResult], *, anchors: Mapping[str,
     if finite:
         lines.append("")
         lines.append(f"- mean |Δ|: {sum(finite) / len(finite):.2f}; max |Δ|: {max(finite):.2f}")
+
+    mixed = mixed_mode_rows(results)
+    if mixed:
+        lines += ["", "## Mixed-mode cases (issue 0024)", "",
+                  "| case | technical score | english_delivery (judge/label) | fixes | in-band |",
+                  "| --- | ---: | :---: | ---: | :---: |"]
+        for row in mixed:
+            judged = "—" if row["english_delivery"] is None else str(row["english_delivery"])
+            label = "—" if row["delivery_label"] is None else str(row["delivery_label"])
+            mark = "✅" if row["within_band"] else "❌"
+            lines.append(
+                f"| {row['case_id']} | {_fmt(row['score'])} | {judged}/{label} "
+                f"| {row['delivery_fixes']} | {mark} |"
+            )
 
     lines += ["", "## Confidence calibration", "",
               "| confidence bucket | n | mean conf | hit rate |", "| --- | ---: | ---: | ---: |"]

@@ -93,13 +93,22 @@ class DemoLLMClient(LLMClient):
         active = self._active_dimensions(prompt)
         score = self._score_answer(answer)
         evidence = self._evidence(answer)
-        return {
+        payload: dict[str, Any] = {
             "dimensions": {dim: {"score": score, "evidence": evidence} for dim in active},
             "weighted_score": float(score),
             "confidence": 0.82 if answer.strip() else 0.7,
             "follow_up_recommended": False,
             "follow_up_rationale": "Demo Evaluator keeps the loop short so the web workflow can be reviewed.",
         }
+        if "english_delivery" in active and score <= 3:
+            # Issue 0024: a weak english_delivery score must carry >= 3 phrase-level fixes or the
+            # Evaluator's validator rejects the payload.
+            payload["delivery_fixes"] = [
+                'Demo fix: "model is overfit" — "the model is overfitting"',
+                'Demo fix: "it depend on data" — "it depends on the data"',
+                'Demo fix: "we should to monitor" — "we should monitor"',
+            ]
+        return payload
 
     def _study_plan_payload(self, prompt: str) -> dict[str, Any]:
         skills = self._priority_skills(prompt) or list(SKILLS[:3])
@@ -160,7 +169,9 @@ class DemoLLMClient(LLMClient):
     def _active_dimensions(self, prompt: str) -> list[str]:
         found = []
         for dim in DIMENSIONS:
-            if re.search(rf"^- {re.escape(dim)} \(weight ", prompt, flags=re.MULTILINE):
+            # english_delivery renders with an "assessed separately" marker instead of a weight
+            # (issue 0024), but the judge must still score it when listed.
+            if re.search(rf"^- {re.escape(dim)} \((?:weight |assessed separately)", prompt, flags=re.MULTILINE):
                 found.append(dim)
         return found or ["correctness"]
 

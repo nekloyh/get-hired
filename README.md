@@ -6,7 +6,20 @@ glossary.
 
 ## Status
 
-**Slices 0010–0012 — persisted Sessions, Study Planner, React UI/API, and Evaluator harness.**
+**Slice 0024 — bilingual VN/EN interview mode (ADR 0007).** A Session now carries an explicit
+`language_mode` (`en` | `vn` | `mixed`), chosen with `coach session --language ...` or the web
+setup control and threaded through the Session state into every prompt-bearing agent: the
+Interviewer renders bank questions and generates Follow-ups in the Session's language (a
+deterministic validator holds `vn` follow-ups to actual Vietnamese), the Evaluator is instructed
+per mode, the Study Planner writes vn/mixed plans in Vietnamese, and the export records the mode.
+English communication quality is scored in a dedicated `english_delivery` rubric dimension that is
+activated deterministically per answer (a Vietnamese-character detector — never the judge's call),
+excluded from `weighted_score` so the Beta skill posterior stays technical-only, and weak delivery
+must come with ≥3 concrete phrase-level fixes. The calibration bench gained four mixed-mode cases —
+including a broken-English/strong-content disentanglement proof — and stays green
+(`docs/audits/calibration-bench-2026-07-11-bilingual-mode.md`).
+
+Earlier slices: **0010–0012 — persisted Sessions, Study Planner, React UI/API, and Evaluator harness.**
 `coach session` still runs/resumes a multi-question interactive Session through LangGraph +
 `SqliteSaver` in the terminal. The local web MVP is now a Vite React + TypeScript app backed by
 `coach api`, a thin FastAPI/WebSocket layer over the same Python Session graph. The backend uses live
@@ -98,7 +111,8 @@ pack, and `data/packs/fpt/` ships as a first FPT-style pack. A pack directory ho
 
 - `questions.yaml` — top-level mapping `Skill -> [questions]`. Each question:
   `question` (unique prompt), `difficulty` (1–5; the Topic Plan's `target_difficulty` selects the
-  closest match — optional, defaults to 3), `rubric.weights` (over the 5 fixed dimensions),
+  closest match — optional, defaults to 3), `rubric.weights` (over the 5 technical dimensions;
+  `english_delivery` is Session-injected per answer, never authored in a pack),
   `answers` (scripted fixture replies; `answers[0]` answers the question, `answers[1:]` the
   follow-ups), `expected_concepts` (must resolve to a concept id), and `follow_up_seeds`.
 - `concepts.yaml` — a list of concept notes (`id`, `skill`, `title`, `content`, optional `language`,

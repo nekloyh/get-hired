@@ -317,6 +317,40 @@ def test_session_refuses_to_restart_over_inflight_checkpoint(tmp_path, monkeypat
     assert "already in progress" in capsys.readouterr().err
 
 
+def test_session_language_flag_reaches_the_summary(tmp_path, monkeypatch, capsys):
+    # Issue 0024: --language threads CLI -> initial_session_state -> final state -> summary/export.
+    from interview_coach.demo_llm import DemoLLMClient
+
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: DemoLLMClient())
+
+    rc = cli.main(
+        [
+            "session",
+            "--scripted",
+            "--no-live",
+            "--language",
+            "mixed",
+            "--max-questions",
+            "1",
+            "--session-id",
+            "lang-flag",
+            "--checkpoint-db",
+            str(tmp_path / "c.sqlite"),
+        ]
+    )
+
+    assert rc == 0
+    assert "language_mode: mixed" in capsys.readouterr().out
+
+
+def test_session_rejects_unknown_language_flag(tmp_path, capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["session", "--scripted", "--language", "vi", "--session-id", "bad-lang"])
+    assert excinfo.value.code == 2
+    assert "--language" in capsys.readouterr().err
+
+
 def test_session_starts_fresh_when_prior_checkpoint_is_complete(tmp_path, monkeypatch, capsys):
     # The in-flight guard is scoped to non-complete Sessions: a completed checkpoint may be started over.
     from interview_coach.demo_llm import DemoLLMClient

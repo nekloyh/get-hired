@@ -24,18 +24,20 @@ def _diagnostic():
 
 
 def _eval(score: int) -> str:
-    return json.dumps(
-        {
-            "dimensions": {
-                dim: {"score": score, "evidence": "no evidence"}
-                for dim in DIMENSIONS
-            },
-            "weighted_score": float(score),
-            "confidence": 0.8,
-            "follow_up_recommended": False,
-            "follow_up_rationale": "The answer is fully revealed.",
-        }
-    )
+    payload = {
+        "dimensions": {
+            dim: {"score": score, "evidence": "no evidence"}
+            for dim in DIMENSIONS
+        },
+        "weighted_score": float(score),
+        "confidence": 0.8,
+        "follow_up_recommended": False,
+        "follow_up_rationale": "The answer is fully revealed.",
+    }
+    if score <= 3:
+        # A weak english_delivery score must carry >= 3 phrase-level fixes (issue 0024).
+        payload["delivery_fixes"] = ["fix one", "fix two", "fix three"]
+    return json.dumps(payload)
 
 
 def _decision(

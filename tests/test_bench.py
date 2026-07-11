@@ -64,20 +64,45 @@ def _eval_json(score: int, dims: dict[str, int], confidence: float = 0.8) -> str
 def test_bench_dataset_is_bilingual_and_covers_multiple_skills():
     data = load_bench_data()
     assert len(data.cases) >= 20
-    assert {c.language for c in data.cases} == {"en", "vi"}
+    assert {c.language for c in data.cases} == {"en", "vi", "mixed"}
     assert len({c.skill for c in data.cases}) >= 2
-    # every case has a paired twin in the other language
+    # every en/vi case has a paired twin in the other language; mixed cases (0024) stand alone
     from collections import Counter
 
     pair_langs = {}
     for c in data.cases:
         pair_langs.setdefault(c.paired_id, set()).add(c.language)
-    assert all(langs == {"en", "vi"} for langs in pair_langs.values())
+    assert all(langs == {"en", "vi"} for langs in pair_langs.values() if langs & {"en", "vi"})
     # BARS anchors for >= 2 dimensions, each with a 2 and a 4 exemplar
     assert len(data.anchors) >= 2
     assert all({"2", "4"} <= set(bands) for bands in data.anchors.values())
     # the prompt-injection adversarial case is retained with a VN twin
     assert Counter(c.paired_id for c in data.cases)["prompt_injection"] == 2
+
+
+def test_bench_dataset_mixed_mode_cases_are_wired_for_0024():
+    """Mixed-mode cases (issue 0024): language_mode threads to the judge, delivery only on EN answers."""
+    from interview_coach.language import answer_is_english
+
+    data = load_bench_data()
+    mixed = [c for c in data.cases if c.language == "mixed"]
+    assert len(mixed) >= 4
+    assert all(c.language_mode == "mixed" for c in mixed)
+    # legacy en/vi cases keep byte-stable prompts: no language_mode override
+    assert all(c.language_mode == "en" for c in data.cases if c.language != "mixed")
+    # the delivery dimension is active exactly on the English-dominant answers
+    for c in mixed:
+        active = c.rubric.weights.get("english_delivery", 0.0) > 0
+        assert active == answer_is_english(c.answer)
+        if active:
+            assert "english_delivery" in c.labels
+    # english_delivery has a BARS anchor now that it is labelled
+    assert "english_delivery" in data.anchors
+    # at least one case proves disentanglement: weak delivery label on a technically-strong band
+    assert any(
+        c.labels.get("english_delivery", 5) <= 2 and c.expected_min >= 3.0
+        for c in mixed
+    )
 
 
 # --- pure metrics -------------------------------------------------------------------------------

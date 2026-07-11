@@ -35,6 +35,7 @@ from .eval_harness import harness_passed, render_golden_answer_report, run_golde
 from .evaluator import Evaluation, evaluate
 from .exporter import export_session_markdown
 from .fixtures import QUESTION, STRONG_ANSWER, WEAK_ANSWER
+from .language import DEFAULT_LANGUAGE_MODE, LANGUAGE_MODES
 from .ledger import load_priors, save_posteriors
 from .llm import LLMClient, build_client
 from .microloop import (
@@ -211,7 +212,10 @@ def _cmd_diagnose(client: LLMClient | None, args: argparse.Namespace) -> int:
 
 def _print_session_summary(state: dict) -> None:
     print(f"=== SESSION {state['session_id']} ({state['status']}) ===")
-    print(f"questions: {state['question_count']}   stop_reason: {state.get('stop_reason')}")
+    print(
+        f"questions: {state['question_count']}   stop_reason: {state.get('stop_reason')}   "
+        f"language_mode: {state.get('language_mode', 'en')}"
+    )
     print("\n=== SKILL STATES ===")
     for row in render_skill_state_rows(state):
         print(row)
@@ -412,6 +416,7 @@ def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
                     max_elapsed_seconds=args.max_elapsed_seconds,
                     candidate_id=args.candidate,
                     ledger_prior_mastery=carried.raw_mastery if carried else None,
+                    language_mode=args.language,
                 )
                 final = _run_session_graph(graph, state, config, live=not args.no_live)
         except CandidateIntent as err:
@@ -612,6 +617,15 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         default=[],
         help="Candidate self-assessment as skill=score on a 1–5 scale; may be repeated.",
+    )
+    session_parser.add_argument(
+        "--language",
+        choices=list(LANGUAGE_MODES),
+        default=DEFAULT_LANGUAGE_MODE,
+        help=(
+            "Session language_mode (0024, ADR 0007): en = English interview; vn = Vietnamese; "
+            "mixed = Vietnamese with natural English code-switching, like a VNG/FPT round."
+        ),
     )
     session_parser.add_argument("--max-questions", type=int, default=DEFAULT_MAX_QUESTIONS)
     session_parser.add_argument(

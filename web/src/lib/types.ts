@@ -8,6 +8,9 @@ export const SKILLS = [
 
 export type Skill = (typeof SKILLS)[number]
 export type SessionMode = 'auto' | 'demo' | 'live'
+// Session language_mode (issue 0024, ADR 0007): en = English interview; vn = Vietnamese;
+// mixed = Vietnamese with natural English code-switching, like a VNG/FPT round.
+export type LanguageMode = 'en' | 'vn' | 'mixed'
 export type ConnectionStatus =
   | 'idle'
   | 'connecting'
@@ -25,6 +28,7 @@ export type SetupForm = {
   targetCompanies: string
   claimedSkills: Record<Skill, number>
   maxQuestions: number
+  languageMode: LanguageMode
 }
 
 export type Health = {
@@ -48,6 +52,7 @@ export type Evaluation = {
   confidence: number
   follow_up_recommended: boolean
   follow_up_rationale: string
+  delivery_fixes?: string[]
   self_critique?: {
     triggers: string[]
     first_confidence: number
@@ -143,6 +148,7 @@ export type SessionState = {
   supervisor_decisions: SupervisorDecision[]
   study_plan?: StudyPlan | null
   study_plan_error?: string | null
+  language_mode?: LanguageMode
 }
 
 export type SessionEvent =

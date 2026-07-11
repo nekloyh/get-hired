@@ -57,13 +57,17 @@ class _SimJudge(LLMClient):
         if "You are the Evaluator" in text:
             match = re.search(r"A (strong|weak|moderate) answer", text)
             score = {"strong": 5, "weak": 2, "moderate": 3}[match.group(1) if match else "moderate"]
-            return json.dumps({
+            payload = {
                 "dimensions": {dim: {"score": score, "evidence": "no evidence"} for dim in DIMENSIONS},
                 "weighted_score": float(score),
                 "confidence": 0.9,
                 "follow_up_recommended": False,
                 "follow_up_rationale": "sim",
-            })
+            }
+            if score <= 3:
+                # weak english_delivery needs >= 3 phrase fixes (issue 0024)
+                payload["delivery_fixes"] = ["fix one", "fix two", "fix three"]
+            return json.dumps(payload)
         return json.dumps({"unsupported": True})  # Study Planner etc. degrade gracefully
 
 

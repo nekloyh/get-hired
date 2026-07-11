@@ -14,6 +14,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from .language import DEFAULT_LANGUAGE_MODE
 from .llm import LLMClient, Message, Validator
 from .resources import (
     InMemoryResourceStore,
@@ -264,9 +265,17 @@ def _build_study_planner_messages(
     for target in targets:
         rendered = "\n\n".join(match.render() for match in matches.get(target.skill, ()))
         resource_blocks.append(f"## {target.skill}\n{rendered or 'No resources retrieved.'}")
+    language_mode = str(session_state.get("language_mode", DEFAULT_LANGUAGE_MODE))
+    language_line = (
+        "- Write every plan text (titles, focus, rationales, milestones) in Vietnamese; keep "
+        "established English technical terms and the resource IDs/titles as they are.\n"
+        if language_mode in ("vn", "mixed")
+        else ""
+    )
     user = (
         f"SESSION:\n"
         f"- session_id: {session_state.get('session_id')}\n"
+        f"- language_mode: {language_mode}\n"
         f"- stop_reason: {session_state.get('stop_reason')}\n"
         f"- question_count: {session_state.get('question_count', 0)}\n\n"
         f"PRIORITY TARGETS (use these Skills in this exact order):\n{target_lines}\n\n"
@@ -275,6 +284,7 @@ def _build_study_planner_messages(
         "Produce the StudyPlan. The prioritized_topics array must contain exactly the priority "
         "target Skills above, in the same order, with priorities 1..N. The schedule must contain "
         "exactly days 1 through 14.\n"
+        f"{language_line}"
         f"Return JSON shaped like:\n{_STUDY_PLAN_SCHEMA_HINT}"
     )
     return [
@@ -424,6 +434,10 @@ def _gap_query(
                 dimensions.items(),
                 key=lambda kv: kv[1].get("score", 5) if isinstance(kv[1], Mapping) else 5,
             ):
+                # english_delivery is a delivery gap, not a knowledge gap (ADR 0007) — it must not
+                # steer the technical resource query for a Skill.
+                if dim == "english_delivery":
+                    continue
                 if isinstance(score, Mapping) and float(score.get("score", 5)) <= 3:
                     weak_dimensions.append(dim)
     details = " ".join([*weak_dimensions[:4], *rationales[:2]])
@@ -444,6 +458,8 @@ def _transcript_evidence(session_state: Mapping[str, Any]) -> str:
             evaluation = turn.get("evaluation", {})
             weak = []
             for dim, score in evaluation.get("dimensions", {}).items():
+                if dim == "english_delivery":  # delivery, not knowledge (ADR 0007)
+                    continue
                 if isinstance(score, Mapping) and float(score.get("score", 5)) <= 3:
                     weak.append(f"{dim}={score.get('score')}")
             if weak:

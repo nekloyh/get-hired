@@ -50,6 +50,7 @@ class StartSessionPayload(BaseModel):
     candidate_id: str = ""  # cross-session Skill ledger id (0023); empty = one-shot cold start
     max_questions: int = Field(DEFAULT_MAX_QUESTIONS, ge=1, le=10)
     max_elapsed_seconds: float = Field(DEFAULT_MAX_ELAPSED_SECONDS, gt=0)
+    language_mode: Literal["en", "vn", "mixed"] = "en"  # issue 0024, ADR 0007
 
 
 class ResumeSessionPayload(BaseModel):
@@ -348,6 +349,7 @@ def _run_session_thread(
                     max_elapsed_seconds=payload.max_elapsed_seconds,
                     candidate_id=payload.candidate_id,
                     ledger_prior_mastery=carried.raw_mastery if carried else None,
+                    language_mode=payload.language_mode,
                 )
             runtime.emit(
                 {

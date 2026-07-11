@@ -18,10 +18,10 @@ import logging
 import unicodedata
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .llm import LLMClient, Message, StructuredOutputError, Validator
-from .rubric import Rubric
+from .rubric import TECHNICAL_DIMENSIONS, Rubric
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +101,41 @@ class Evaluation(BaseModel):
             "export/UI can surface 'scored, but citations unverifiable'."
         ),
     )
+    delivery_fixes: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "Concrete phrase-level English fixes (issue 0024): each names the candidate's actual "
+            "wording and a better phrasing. Required (at least three) when english_delivery is "
+            "scored 3 or below; empty when english_delivery is inactive or strong."
+        ),
+    )
     self_critique: SelfCritiqueTrace | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_delivery_fixes(cls, data: object) -> object:
+        """Absorb the delivery_fixes placements models actually produce (issue 0024, seen live).
+
+        gpt-5.4-mini sometimes nests ``delivery_fixes`` inside ``dimensions`` (it reads like a
+        dimension key in the schema hint) or emits ``{}``/``null`` instead of a list, and offers
+        stray fixes on answers where english_delivery is not even scored. Structural noise is
+        folded here so a valid judgment is never lost to field placement; the *semantic* rule —
+        weak delivery must carry >= 3 fixes — stays a hard validator that steers the retry.
+        """
+        if not isinstance(data, dict):
+            return data
+        dimensions = data.get("dimensions")
+        if isinstance(dimensions, dict):
+            misplaced = dimensions.pop("delivery_fixes", None)
+            if isinstance(misplaced, list) and not data.get("delivery_fixes"):
+                data["delivery_fixes"] = misplaced
+            if "english_delivery" not in dimensions:
+                # No delivery score, no delivery advice — dropping stray fixes deterministically
+                # keeps the pure-VN "no phantom scores" guarantee without burning an LLM retry.
+                data["delivery_fixes"] = []
+        if not isinstance(data.get("delivery_fixes"), (list, tuple)):
+            data["delivery_fixes"] = []
+        return data
 
 
 def _evidence_is_verbatim(quote: str, answer: str) -> bool:
@@ -111,6 +145,13 @@ def _evidence_is_verbatim(quote: str, answer: str) -> bool:
         return True
     needle = _normalize_evidence(quote)
     return bool(needle) and needle in _normalize_evidence(answer)
+
+
+# Issue 0024: an english_delivery score at or below this is "weak delivery" and must come with
+# concrete phrase-level fixes — the product's differentiated feedback ("here are the three phrases
+# to fix"), enforced as a validator so the retry self-corrects a bare "improve your English".
+WEAK_DELIVERY_THRESHOLD = 3
+MIN_DELIVERY_FIXES = 3
 
 
 def _make_validators(rubric: Rubric, answer: str, *, include_evidence: bool = True) -> list[Validator]:
@@ -138,7 +179,23 @@ def _make_validators(rubric: Rubric, answer: str, *, include_evidence: bool = Tr
                     f"Copy directly from this exact text — CANDIDATE ANSWER:\n{answer}"
                 )
 
-    return [check_dimensions, check_evidence] if include_evidence else [check_dimensions]
+    def check_delivery_fixes(ev: Evaluation) -> None:
+        # Issue 0024: weak-delivery feedback must name concrete phrase fixes, never just "improve
+        # your English". (Stray fixes on an inactive dimension are dropped structurally by the
+        # Evaluation model itself.)
+        delivery = ev.dimensions.get("english_delivery")
+        if delivery is None:
+            return
+        if delivery.score <= WEAK_DELIVERY_THRESHOLD and len(ev.delivery_fixes) < MIN_DELIVERY_FIXES:
+            raise ValueError(
+                f"english_delivery is {delivery.score}/5 (weak): provide at least "
+                f"{MIN_DELIVERY_FIXES} concrete phrase-level fixes in the TOP-LEVEL "
+                "'delivery_fixes' array (not inside 'dimensions'), each quoting the candidate's "
+                "actual wording and giving a better phrasing"
+            )
+
+    validators = [check_dimensions, check_evidence] if include_evidence else [check_dimensions]
+    return [*validators, check_delivery_fixes]
 
 
 # When EVERY citation is blanked, confidence is capped here — clearly "low", mirroring the
@@ -215,7 +272,16 @@ SYSTEM_PROMPT = (
     "as in English, and a strong one just as high — the same idea earns the same score in either "
     "language.\n"
     f"- For every dimension, {_EVIDENCE_RULE}\n"
-    "- 'weighted_score' (1–5) is your holistic, weight-aware aggregate of the dimensions.\n"
+    "- If (and only if) the rubric lists 'english_delivery': score how clearly the answer is "
+    "DELIVERED in English — wording, sentence structure, professional phrasing — entirely apart "
+    "from the technical content. english_delivery NEVER moves 'weighted_score', and no technical "
+    "dimension ever moves for language quality. When you score english_delivery 3 or below, "
+    "'delivery_fixes' must list at least three concrete phrase-level fixes, each quoting the "
+    "candidate's actual wording and giving a better phrasing (e.g. \"overfit happen when model "
+    "memorize\" → \"overfitting happens when the model memorizes\"). Never say only 'improve your "
+    "English'.\n"
+    "- 'weighted_score' (1–5) is your holistic, weight-aware aggregate of the TECHNICAL dimensions "
+    "only (english_delivery is excluded).\n"
     "- 'confidence' (0–1) is how sure you are of this judgment.\n"
     "- 'follow_up_recommended' is about MARGINAL INFORMATION GAIN — would one more probing question "
     "likely reveal something you do not already know about this candidate's skill? It is NOT a score "
@@ -232,6 +298,39 @@ _SCHEMA_HINT = (
     '"follow_up_recommended": <true|false>, "follow_up_rationale": "<text>"}'
 )
 
+# Shown only when english_delivery is active: advertising delivery_fixes on every case made the
+# live judge offer stray fixes on Vietnamese answers and nest the field inside "dimensions".
+_DELIVERY_SCHEMA_HINT = (
+    '{"dimensions": {"<dimension>": {"score": <1-5>, "evidence": "<verbatim quote|no evidence>"}}, '
+    '"weighted_score": <1-5>, "confidence": <0-1>, '
+    '"follow_up_recommended": <true|false>, "follow_up_rationale": "<text>", '
+    '"delivery_fixes": ["<actual wording — better phrasing>", ...]} '
+    "(delivery_fixes is a TOP-LEVEL array, never a key inside dimensions; use [] when "
+    "english_delivery is 4 or 5)"
+)
+
+
+def _schema_hint(rubric: Rubric) -> str:
+    return _DELIVERY_SCHEMA_HINT if "english_delivery" in rubric.active else _SCHEMA_HINT
+
+# Session-mode context for the judge (issue 0024 / ADR 0007). Only vn/mixed add a block — the en
+# default keeps the prompt byte-identical to the pre-0024 judge for every legacy bench case, so the
+# calibration gate isolates exactly the changes under test. Technical scoring stays
+# language-invariant in every mode; the block steers only the *feedback* language.
+_LANGUAGE_MODE_BLOCKS: dict[str, str] = {
+    "vn": (
+        "SESSION LANGUAGE MODE: vn — a Vietnamese-language interview. Write "
+        "'follow_up_rationale' in Vietnamese (English technical terms are fine). Technical scores "
+        "remain language-invariant as above."
+    ),
+    "mixed": (
+        "SESSION LANGUAGE MODE: mixed — a Vietnamese interview with natural English "
+        "code-switching, like a VNG/FPT round. The candidate may answer in Vietnamese, English, or "
+        "a mix; score the technical content language-invariantly as above. Write "
+        "'follow_up_rationale' in Vietnamese with English technical terms."
+    ),
+}
+
 
 # --- Self-critique reflection (slice 0006) -----------------------------------------------------
 
@@ -241,12 +340,16 @@ _SCHEMA_HINT = (
 SELF_CRITIQUE_CONFIDENCE_THRESHOLD = 0.5
 
 
-def _build_messages(question: str, answer: str, rubric: Rubric) -> list[Message]:
+def _build_messages(
+    question: str, answer: str, rubric: Rubric, language_mode: str = "en"
+) -> list[Message]:
+    mode_block = _LANGUAGE_MODE_BLOCKS.get(language_mode)
     user = (
         f"QUESTION:\n{question}\n\n"
         f"CANDIDATE ANSWER:\n{answer}\n\n"
         f"RUBRIC — score exactly these dimensions:\n{rubric.render()}\n\n"
-        f"Return JSON shaped like:\n{_SCHEMA_HINT}"
+        + (f"{mode_block}\n\n" if mode_block else "")
+        + f"Return JSON shaped like:\n{_schema_hint(rubric)}"
     )
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -260,8 +363,9 @@ def _build_self_critique_messages(
     rubric: Rubric,
     first_pass: Evaluation,
     triggers: tuple[str, ...],
+    language_mode: str = "en",
 ) -> list[Message]:
-    base_user = _build_messages(question, answer, rubric)[1]["content"]
+    base_user = _build_messages(question, answer, rubric, language_mode)[1]["content"]
     critique = (
         f"{base_user}\n\n"
         "SELF-CRITIQUE REQUIRED.\n"
@@ -271,7 +375,7 @@ def _build_self_critique_messages(
         "dimension scores, quoted evidence, weighted_score, confidence, and follow-up decision are "
         "internally consistent. Keep the Evaluator role: judge only, do not ask or coach.\n\n"
         f"FIRST-PASS JSON AFTER DETERMINISTIC GUARDS:\n{first_pass.model_dump_json()}\n\n"
-        f"Return JSON shaped like:\n{_SCHEMA_HINT}"
+        f"Return JSON shaped like:\n{_schema_hint(rubric)}"
     )
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -297,16 +401,19 @@ DIVERGENCE_CONFIDENCE_CEILING = 0.4
 
 
 def linear_weighted_score(dimensions: dict[str, DimensionScore], rubric: Rubric) -> float:
-    """The mechanical weighted mean of the dimension scores (1–5), normalized by the active weights.
+    """The mechanical weighted mean of the TECHNICAL dimension scores (1–5).
 
     This is the deterministic counterpart to the Evaluator's holistic ``weighted_score``; the gap
     between the two is the cross-check signal. Expects ``dimensions`` to be a validated evaluation's
     scores (keys are exactly the rubric's active dimensions, so every weight here is > 0).
+    ``english_delivery`` is excluded on both sides (issue 0024, ADR 0007): the aggregate that feeds
+    the Beta skill posterior must never move on delivery quality.
     """
-    total_weight = sum(rubric.weights[d] for d in dimensions)
+    technical = {d: ds for d, ds in dimensions.items() if d in TECHNICAL_DIMENSIONS}
+    total_weight = sum(rubric.weights[d] for d in technical)
     if total_weight <= 0:
-        raise ValueError("cannot cross-check: active rubric weights sum to 0")
-    return sum(rubric.weights[d] * ds.score for d, ds in dimensions.items()) / total_weight
+        raise ValueError("cannot cross-check: active technical rubric weights sum to 0")
+    return sum(rubric.weights[d] * ds.score for d, ds in technical.items()) / total_weight
 
 
 def weighted_score_divergence(evaluation: Evaluation, rubric: Rubric) -> float:
@@ -379,16 +486,27 @@ def _self_critique_triggers(evaluation: Evaluation, rubric: Rubric) -> tuple[str
     return tuple(triggers)
 
 
-def evaluate(client: LLMClient, question: str, answer: str, rubric: Rubric) -> Evaluation:
+def evaluate(
+    client: LLMClient,
+    question: str,
+    answer: str,
+    rubric: Rubric,
+    *,
+    language_mode: str = "en",
+) -> Evaluation:
     """Run the Evaluator on one question + answer and return a typed, validated judgment.
 
     The structured LLM call is followed by the deterministic cross-check (slice 0003), which may
     lower ``confidence`` when the holistic and linear weighted scores disagree. Slice 0006 then runs
     exactly one self-critique pass when the guarded first pass is low-confidence, keeping whichever
-    pass is more confident before control returns to the micro-loop.
+    pass is more confident before control returns to the micro-loop. ``language_mode`` (issue 0024)
+    adds Session-mode context for vn/mixed Sessions; whether ``english_delivery`` is scored is the
+    caller's decision, made deterministically via the rubric (see ``language.rubric_with_delivery``).
     """
     first = apply_cross_check(
-        _evaluate_once(client, _build_messages(question, answer, rubric), answer, rubric),
+        _evaluate_once(
+            client, _build_messages(question, answer, rubric, language_mode), answer, rubric
+        ),
         rubric,
     )
     triggers = _self_critique_triggers(first, rubric)
@@ -398,7 +516,7 @@ def evaluate(client: LLMClient, question: str, answer: str, rubric: Rubric) -> E
     second = apply_cross_check(
         _evaluate_once(
             client,
-            _build_self_critique_messages(question, answer, rubric, first, triggers),
+            _build_self_critique_messages(question, answer, rubric, first, triggers, language_mode),
             answer,
             rubric,
         ),
