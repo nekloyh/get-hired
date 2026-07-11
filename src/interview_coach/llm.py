@@ -47,7 +47,9 @@ def _retryable_transport_error(err: Exception) -> bool:
     if isinstance(err, openai.APIConnectionError):  # includes APITimeoutError
         return True
     if isinstance(err, openai.APIStatusError):
-        return err.status_code >= 500
+        # 408/409 are transient (request timeout / conflict) — the SDK's own default retry policy
+        # covered them before max_retries=0 moved retry ownership here, so they stay retryable.
+        return err.status_code >= 500 or err.status_code in (408, 409)
     return False
 
 

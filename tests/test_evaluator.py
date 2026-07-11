@@ -868,6 +868,9 @@ def test_panel_budget_exhausted_keeps_guarded_first_pass(make_client):
     assert ev.panel is None
     assert ev.confidence == pytest.approx(0.2)
     assert telemetry.snapshot()["evaluator.panel_budget_exhausted"] == 1
+    # The rationing is recorded on the judgment itself — a suppressed escalation must never read
+    # as a confident pass in transcripts and reports.
+    assert ev.trust is not None and ev.trust.panel_suppressed is True
 
 
 def test_panel_budget_allows_one_escalation_then_stops(make_client):
@@ -947,3 +950,24 @@ def test_judge_call_carries_the_rubric_grammar(fake_openai_factory):
     sent = fake.chat.completions.calls[0]["response_format"]
     assert sent["type"] == "json_schema"
     assert set(sent["json_schema"]["schema"]["properties"]["dimensions"]["properties"]) == ACTIVE
+
+
+def test_panel_verdict_inherits_first_pass_noise(make_client):
+    from interview_coach.evaluator import NOISE_CONFIDENCE_CEILING
+
+    # The shaky exchange: first parse burns a retry, lands at low confidence, panel convenes, and
+    # the verdict parses cleanly. The kept verdict must still carry (and be capped by) the FIRST
+    # pass's noise — otherwise every escalated case reads as a clean parse in the shadow data.
+    low = _eval_json(_good_dimensions(), confidence=0.2)
+    opinion = json.dumps(
+        {"recommended_score": 4.0, "argument": "Committee voice.", "key_evidence": "learning curves"}
+    )
+    clean_verdict = _eval_json(_good_dimensions(), confidence=0.9)
+    client, fake = make_client(["not json", low, opinion, opinion, clean_verdict])
+
+    ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+
+    assert ev.panel is not None
+    assert ev.trust is not None
+    assert "structured_output.invalid_reply" in ev.trust.noise_events
+    assert ev.confidence == pytest.approx(NOISE_CONFIDENCE_CEILING)
