@@ -29,6 +29,7 @@ const defaultForm: SetupForm = {
     vietnamese_nlp: 2,
   },
   maxQuestions: 3,
+  languageMode: 'en',
 }
 
 export function App() {
@@ -115,6 +116,7 @@ export function App() {
             .filter(Boolean),
           claimed_skills: Object.fromEntries(SKILLS.map((skill) => [skill, form.claimedSkills[skill]])),
           max_questions: form.maxQuestions,
+          language_mode: form.languageMode,
         }
 
   const connect = (resume: boolean) => {

@@ -32,10 +32,15 @@ def _seed(answers, question="Explain the bias–variance tradeoff."):
 
 
 def _eval(score: int, *, follow_up: bool, confidence: float = 0.8) -> str:
-    # weighted_score == the single dimension score, so the slice-0003 cross-check never trips here.
+    # weighted_score == the single technical dimension score, so the slice-0003 cross-check never
+    # trips here. english_delivery is scored because the en-mode loop activates it on every English
+    # answer (issue 0024); a 4 keeps the delivery-fixes validator quiet.
     return json.dumps(
         {
-            "dimensions": {"correctness": {"score": score, "evidence": "no evidence"}},
+            "dimensions": {
+                "correctness": {"score": score, "evidence": "no evidence"},
+                "english_delivery": {"score": 4, "evidence": "no evidence"},
+            },
             "weighted_score": float(score),
             "confidence": confidence,
             "follow_up_recommended": follow_up,
@@ -307,6 +312,89 @@ def test_max_turns_must_be_positive(make_client):
         run_micro_loop(client, seed, ScriptedCandidate(seed.answers), max_turns=0)
 
 
+# --- language_mode threading (issue 0024, ADR 0007) -----------------------------------------------
+
+_VN_ANSWER = "Bias là khi mô hình sai, còn variance là khi nó thay đổi nhiều theo dữ liệu train."
+_VN_RENDERED = json.dumps({"question": "Hãy giải thích trade-off giữa bias và variance."})
+
+
+def _eval_technical_only(score: int, *, follow_up: bool) -> str:
+    # A Vietnamese answer never activates english_delivery, so only the technical dimension is scored.
+    return json.dumps(
+        {
+            "dimensions": {"correctness": {"score": score, "evidence": "no evidence"}},
+            "weighted_score": float(score),
+            "confidence": 0.8,
+            "follow_up_recommended": follow_up,
+            "follow_up_rationale": "n/a",
+        }
+    )
+
+
+def test_vn_mode_renders_the_seed_question_and_never_scores_delivery(make_client):
+    # Reply 1: the Vietnamese rendering of the seed question; reply 2: the technical-only evaluation.
+    client, fake = make_client([_VN_RENDERED, _eval_technical_only(4, follow_up=False)])
+    seed = _seed([_VN_ANSWER])
+    result = run_micro_loop(
+        client, seed, ScriptedCandidate(seed.answers), language_mode="vn"
+    )
+    assert result.turns[0].question == "Hãy giải thích trade-off giữa bias và variance."
+    assert "english_delivery" not in result.turns[0].evaluation.dimensions  # no phantom scores
+    assert fake.call_count == 2
+    # the judge was told the session mode
+    eval_prompt = fake.chat.completions.calls[1]["messages"][-1]["content"]
+    assert "SESSION LANGUAGE MODE: vn" in eval_prompt
+
+
+def test_vn_mode_rendering_failure_degrades_to_the_english_original(make_client, caplog):
+    # An all-English "rendering" fails the deterministic Vietnamese check twice -> the loop asks the
+    # English original instead of crashing the question (infrastructure degrades, ADR 0005).
+    english = json.dumps({"question": "Explain the bias-variance tradeoff."})
+    client, fake = make_client([english, english, _eval_technical_only(4, follow_up=False)])
+    seed = _seed([_VN_ANSWER])
+    with caplog.at_level(logging.WARNING):
+        result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers), language_mode="vn")
+    assert result.turns[0].question == seed.question
+    assert any("seed-question rendering failed" in r.message for r in caplog.records)
+
+
+def test_en_mode_asks_the_seed_verbatim_with_no_rendering_call(make_client):
+    client, fake = make_client([_eval(5, follow_up=False)])
+    seed = _seed(["A strong English answer about the bias-variance tradeoff."])
+    result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers))
+    assert result.turns[0].question == seed.question
+    assert fake.call_count == 1  # evaluation only — en mode never pays a rendering call
+
+
+def test_mixed_mode_scores_delivery_only_on_english_answers(make_client):
+    # Turn 1: an English answer (delivery scored, flagged for follow-up); the follow-up tool loop;
+    # turn 2: a Vietnamese answer (delivery not scored).
+    client, fake = make_client(
+        [
+            _VN_RENDERED,  # mixed mode renders the seed question too
+            _eval(3, follow_up=True),  # EN answer -> english_delivery active (scored 4 in _eval)
+            _tool(),
+            _followup(),
+            _eval_technical_only(4, follow_up=False),  # VN answer -> technical only
+        ]
+    )
+    seed = _seed(
+        ["The model overfits when it memorizes noise.", _VN_ANSWER],
+        question="Explain overfitting.",
+    )
+    result = run_micro_loop(
+        client, seed, ScriptedCandidate(seed.answers), language_mode="mixed"
+    )
+    first, second = result.turns
+    assert "english_delivery" in first.evaluation.dimensions
+    assert "english_delivery" not in second.evaluation.dimensions
+    # the follow-up generation was told to code-switch (the block rides in the tool-loop user turn)
+    follow_up_messages = " ".join(
+        str(m.get("content")) for m in fake.chat.completions.calls[3]["messages"]
+    )
+    assert "SESSION LANGUAGE MODE: mixed" in follow_up_messages
+
+
 def test_default_cap_is_one_question_plus_three_follow_ups():
     assert DEFAULT_MAX_TURNS == 4
 
@@ -325,6 +413,26 @@ def test_live_strong_seed_resolves_high():
     assert result.turns[0].is_follow_up is False
     assert result.turns[0].evaluation.weighted_score >= 4  # a genuinely strong answer scores high
     assert result.skill_state.mastery > 0.5
+
+
+@pytest.mark.live
+def test_live_vn_mode_renders_the_question_in_vietnamese():
+    # Issue 0024: a vn Session asks in Vietnamese — the seed rendering and the delivery-free rubric
+    # are exercised against the real provider.
+    from interview_coach.language import answer_is_english
+
+    settings = load_settings()
+    if not settings.configured:
+        pytest.skip("LLM primary provider not configured — set PRIMARY_PROVIDER and provider credentials")
+    client = build_client(settings)
+    seed = _seed(
+        ["Bias là khi mô hình sai có hệ thống, còn variance là khi nó dao động mạnh theo dữ liệu train."],
+    )
+    result = run_micro_loop(
+        client, seed, ScriptedCandidate(seed.answers), max_turns=1, language_mode="vn"
+    )
+    assert not answer_is_english(result.turns[0].question)  # actually asked in Vietnamese
+    assert "english_delivery" not in result.turns[0].evaluation.dimensions
 
 
 @pytest.mark.live

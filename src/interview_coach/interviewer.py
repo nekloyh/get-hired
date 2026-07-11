@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from .concepts import ConceptLookup, ConceptStore, lookup_concept, seed_concept_store
 from .evaluator import Evaluation
+from .language import answer_is_english
 from .llm import LLMClient, Message, ToolCallingUnsupported, ToolSpec, Validator
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,24 @@ _TOOL_SCHEMA_HINT = (
 )
 _FOLLOW_UP_SCHEMA_HINT = '{"question": "<one focused follow-up>", "targets": "<the gap it probes>"}'
 
+# Issue 0024 / ADR 0007: how the Interviewer speaks per Session language_mode. Injected into the
+# user turn (not the system constants) so the en default stays byte-identical to pre-0024 prompts.
+_LANGUAGE_INSTRUCTIONS: dict[str, str] = {
+    "vn": (
+        "SESSION LANGUAGE MODE: vn — ask your question in natural Vietnamese; established English "
+        "technical terms may stay in English."
+    ),
+    "mixed": (
+        "SESSION LANGUAGE MODE: mixed — ask the way a Vietnamese interviewer code-switches in a "
+        "VNG/FPT round: Vietnamese sentence structure with English technical terms kept in English."
+    ),
+}
+
+
+def _language_block(language_mode: str) -> str:
+    instruction = _LANGUAGE_INSTRUCTIONS.get(language_mode)
+    return f"{instruction}\n\n" if instruction else ""
+
 
 def _format_assessment(evaluation: Evaluation) -> str:
     """Render the Evaluator's per-dimension scores (weakest first) plus its follow-up rationale.
@@ -154,12 +173,14 @@ def _build_follow_up_messages(
     answer: str,
     evaluation: Evaluation,
     lookup: ConceptLookup,
+    language_mode: str = "en",
 ) -> list[Message]:
     user = (
         f"ORIGINAL QUESTION:\n{original_question}\n\n"
         f"CANDIDATE'S LATEST ANSWER:\n{answer}\n\n"
         f"EVALUATOR'S ASSESSMENT (weakest dimensions first):\n{_format_assessment(evaluation)}\n\n"
         f"RETRIEVED CONCEPT NOTE FROM lookup_concept:\n{lookup.render()}\n\n"
+        f"{_language_block(language_mode)}"
         "Generate one follow-up that targets the weakest area above and cannot be answered by "
         f"repeating the answer.\nReturn JSON shaped like:\n{_FOLLOW_UP_SCHEMA_HINT}"
     )
@@ -182,6 +203,7 @@ def _grounding_terms(lookup: ConceptLookup) -> set[str]:
 def _make_validators(
     original_question: str,
     get_lookup: Callable[[], ConceptLookup | None],
+    language_mode: str = "en",
 ) -> list[Validator]:
     """Quality gates a generated Follow-up must clear (the chat_json retry self-corrects on failure).
 
@@ -217,7 +239,20 @@ def _make_validators(
                 "mechanism, failure mode, or term from lookup_concept in the question or targets"
             )
 
-    return [reject_reask, require_grounding]
+    def require_vietnamese(fu: FollowUp) -> None:
+        # Issue 0024: a vn-mode Session must be conducted in Vietnamese. The deterministic detector
+        # keeps this honest — English technical terms are fine, an all-English question is not.
+        # mixed mode is deliberately unchecked: legitimate code-switching can swing English-heavy.
+        if answer_is_english(fu.question):
+            raise ValueError(
+                "this is a Vietnamese-language (vn) session: ask the follow-up in Vietnamese "
+                "(established English technical terms may stay in English)"
+            )
+
+    validators = [reject_reask, require_grounding]
+    if language_mode == "vn":
+        validators.append(require_vietnamese)
+    return validators
 
 
 LOOKUP_CONCEPT_TOOL: ToolSpec = {
@@ -275,12 +310,14 @@ def _build_native_user(
     answer: str,
     evaluation: Evaluation,
     skill: str | None,
+    language_mode: str = "en",
 ) -> str:
     return (
         f"ORIGINAL QUESTION:\n{original_question}\n\n"
         f"TARGET SKILL:\n{skill or 'unknown'}\n\n"
         f"CANDIDATE'S LATEST ANSWER:\n{answer}\n\n"
         f"EVALUATOR'S ASSESSMENT (weakest dimensions first):\n{_format_assessment(evaluation)}\n\n"
+        f"{_language_block(language_mode)}"
         "Call lookup_concept to fetch the most useful concept note, then write the follow-up."
     )
 
@@ -298,6 +335,7 @@ def _native_follow_up_attempt(
     original_question: str,
     skill: str | None,
     store: ConceptStore,
+    language_mode: str = "en",
 ) -> FollowUp:
     """One lookup_concept tool round-trip.
 
@@ -334,7 +372,7 @@ def _native_follow_up_attempt(
         tool_executor=execute,
         response_model=FollowUp,
         final_instruction=_NATIVE_FINAL_INSTRUCTION,
-        validators=_make_validators(original_question, lambda: captured.get("lookup")),
+        validators=_make_validators(original_question, lambda: captured.get("lookup"), language_mode),
         tool_choice={"type": "function", "function": {"name": "lookup_concept"}},
         max_retries=1,
         disable_thinking=True,
@@ -380,6 +418,7 @@ def _generate_follow_up_native(
     evaluation: Evaluation,
     skill: str | None,
     store: ConceptStore,
+    language_mode: str = "en",
 ) -> FollowUp:
     """Generate a Follow-up via a real provider-level tool call (one lookup_concept round-trip).
 
@@ -394,7 +433,10 @@ def _generate_follow_up_native(
     """
     messages = [
         {"role": "system", "content": NATIVE_TOOL_SYSTEM_PROMPT},
-        {"role": "user", "content": _build_native_user(original_question, answer, evaluation, skill)},
+        {
+            "role": "user",
+            "content": _build_native_user(original_question, answer, evaluation, skill, language_mode),
+        },
     ]
     last_error: UnknownToolCall | None = None
     for attempt in range(_NATIVE_TOOL_ATTEMPTS):
@@ -405,6 +447,7 @@ def _generate_follow_up_native(
                 original_question=original_question,
                 skill=skill,
                 store=store,
+                language_mode=language_mode,
             )
         except UnknownToolCall as err:
             last_error = err
@@ -429,6 +472,7 @@ def _generate_follow_up_json(
     evaluation: Evaluation,
     skill: str | None,
     store: ConceptStore,
+    language_mode: str = "en",
 ) -> FollowUp:
     """Generate a Follow-up by emulating the tool call as two JSON turns (no native function-calling).
 
@@ -458,9 +502,9 @@ def _generate_follow_up_json(
             f"question without a follow-up. Last error: {err}"
         ) from err
     follow_up = client.chat_json(
-        _build_follow_up_messages(original_question, answer, evaluation, lookup),
+        _build_follow_up_messages(original_question, answer, evaluation, lookup, language_mode),
         FollowUp,
-        validators=_make_validators(original_question, lambda: lookup),
+        validators=_make_validators(original_question, lambda: lookup, language_mode),
         max_retries=1,
         disable_thinking=True,
     )
@@ -491,13 +535,16 @@ def generate_follow_up(
     evaluation: Evaluation,
     skill: str | None = None,
     concept_store: ConceptStore | None = None,
+    language_mode: str = "en",
 ) -> FollowUp:
     """Generate one grounded Follow-up using the Interviewer's lookup_concept tool.
 
     Uses a real provider-level tool call when the client supports it. Clients with no native tool
     interface can still use the JSON tool-plan path for offline fakes, but a native-tool provider
     that fails or declines the forced tool call is allowed to fail loudly; silently degrading would
-    hide the exact integration issue this slice is meant to prove.
+    hide the exact integration issue this slice is meant to prove. ``language_mode`` (issue 0024)
+    makes the Interviewer ask in the Session's language; in ``vn`` mode a deterministic validator
+    rejects an all-English follow-up.
     """
     store = concept_store or seed_concept_store()
     if client.supports_tool_calls:
@@ -508,6 +555,7 @@ def generate_follow_up(
             evaluation=evaluation,
             skill=skill,
             store=store,
+            language_mode=language_mode,
         )
     return _generate_follow_up_json(
         client,
@@ -516,4 +564,71 @@ def generate_follow_up(
         evaluation=evaluation,
         skill=skill,
         store=store,
+        language_mode=language_mode,
     )
+
+
+# --- Seed-question rendering (issue 0024) --------------------------------------------------------
+
+
+class RenderedSeedQuestion(BaseModel):
+    """The seed question re-voiced in the Session's language."""
+
+    question: str = Field(min_length=1, description="The question as the Interviewer will ask it.")
+
+
+SEED_RENDER_SYSTEM_PROMPT = (
+    "You are the Interviewer in a mock technical interview. You never judge, score, or coach. Your "
+    "one job right now: re-voice the given interview question in the Session's language, preserving "
+    "its exact technical meaning and difficulty. Do not add hints, examples, or sub-questions. "
+    "Respond with a single JSON object only — no prose, no code fences."
+)
+
+_SEED_RENDER_SCHEMA_HINT = '{"question": "<the question in the session language>"}'
+
+
+def render_seed_question(client: LLMClient, question: str, language_mode: str = "en") -> str:
+    """Re-voice a bank question for a vn/mixed Session; ``en`` passes through with no LLM call.
+
+    The bank is English-authored, so a vn/mixed Session renders each seed question in the Session's
+    language before asking it ("the Interviewer asks in the right language/mix" — issue 0024). A
+    deterministic validator requires actual Vietnamese in the rendering. Any rendering failure
+    degrades to asking the English original — a worse experience, never a crashed question
+    (infrastructure degrades, ADR 0005).
+    """
+    instruction = _LANGUAGE_INSTRUCTIONS.get(language_mode)
+    if instruction is None:
+        return question
+
+    def require_vietnamese(rendered: RenderedSeedQuestion) -> None:
+        if answer_is_english(rendered.question):
+            raise ValueError(
+                "the rendered question must actually be in Vietnamese (established English "
+                "technical terms may stay in English)"
+            )
+
+    user = (
+        f"QUESTION (English original):\n{question}\n\n"
+        f"{instruction}\n\n"
+        f"Return JSON shaped like:\n{_SEED_RENDER_SCHEMA_HINT}"
+    )
+    try:
+        rendered = client.chat_json(
+            [
+                {"role": "system", "content": SEED_RENDER_SYSTEM_PROMPT},
+                {"role": "user", "content": user},
+            ],
+            RenderedSeedQuestion,
+            validators=[require_vietnamese],
+            max_retries=1,
+            disable_thinking=True,
+        )
+    except Exception as err:  # noqa: BLE001 — any rendering failure degrades to the EN original
+        logger.warning(
+            "seed-question rendering failed for language_mode=%s; asking the English original: %s",
+            language_mode,
+            err,
+        )
+        return question
+    logger.info("seed question rendered for language_mode=%s", language_mode)
+    return rendered.question

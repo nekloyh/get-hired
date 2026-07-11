@@ -77,6 +77,17 @@ export function SetupPanel({ form, health, errors, onChange, onStart, onResume }
             onChange={(event) => onChange({ ...form, maxQuestions: Number(event.target.value) })}
           />
         </label>
+        <label>
+          Interview language
+          <select
+            value={form.languageMode}
+            onChange={(event) => onChange({ ...form, languageMode: event.target.value as SetupForm['languageMode'] })}
+          >
+            <option value="en">English</option>
+            <option value="vn">Tiếng Việt</option>
+            <option value="mixed">Mixed (VN + EN terms)</option>
+          </select>
+        </label>
       </div>
       <div className="setup-section-title">
         <CircleGauge size={16} aria-hidden />

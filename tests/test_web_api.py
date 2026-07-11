@@ -49,6 +49,7 @@ def test_demo_websocket_start_answer_flow_and_export(tmp_path):
                 "target_companies": ["Viettel"],
                 "claimed_skills": {"mlops": 3, "ml_fundamentals": 4},
                 "max_questions": 1,
+                "language_mode": "en",
             }
         )
         started = ws.receive_json()
@@ -84,6 +85,29 @@ def test_demo_websocket_start_answer_flow_and_export(tmp_path):
     assert "## Study Plan" in export.text
     # issue 0021: the confidence-scaled evidence weight is auditable per question in the export.
     assert "evidence weight:" in export.text
+    # issue 0024: the export records the Session's language mode.
+    assert "- Language mode: `en`" in export.text
+
+
+def test_web_session_threads_language_mode_into_state(tmp_path):
+    # issue 0024: the setup control reaches SessionState (and therefore state_update events + export).
+    client = _test_client(tmp_path)
+    with client.websocket_connect("/api/sessions/mixed-session") as ws:
+        ws.send_json(
+            {"type": "start_session", "mode": "demo", "max_questions": 1, "language_mode": "mixed"}
+        )
+        _receive_until(ws, "question")
+        ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+        completed = _receive_until(ws, "session_completed")
+        assert completed["state"]["language_mode"] == "mixed"
+
+
+def test_web_rejects_unknown_language_mode(tmp_path):
+    client = _test_client(tmp_path)
+    with client.websocket_connect("/api/sessions/bad-mode-session") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "language_mode": "vi"})
+        event = _receive_until(ws, "session_error")
+        assert "language_mode" in event["error"]
 
 
 def test_live_mode_errors_when_provider_is_unconfigured(tmp_path):

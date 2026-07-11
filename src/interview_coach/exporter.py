@@ -37,6 +37,7 @@ def render_session_markdown(session_state: Mapping[str, Any]) -> str:
     lines.append(f"- Status: `{_md(session_state.get('status', 'unknown'))}`")
     lines.append(f"- Stop reason: `{_md(session_state.get('stop_reason', 'n/a'))}`")
     lines.append(f"- Questions: `{session_state.get('question_count', 0)}`")
+    lines.append(f"- Language mode: `{_md(session_state.get('language_mode', 'en'))}`")
     lines.append("")
     _append_skill_states(lines, session_state)
     _append_ledger_deltas(lines, session_state)
@@ -162,6 +163,12 @@ def _append_evaluation(lines: list[str], evaluation: Mapping[str, Any]) -> None:
     )
     if rationale := evaluation.get("follow_up_rationale"):
         lines.append(f"Rationale: {_md(rationale)}")
+    if fixes := evaluation.get("delivery_fixes"):
+        # issue 0024: weak English delivery comes with concrete phrase-level fixes.
+        lines.append("")
+        lines.append("English delivery fixes:")
+        for fix in fixes:
+            lines.append(f"- {_md(fix)}")
     if evaluation.get("evidence_degraded"):
         # issue 0033: every citation was unverifiable — the score stands but its audit trail does not.
         lines.append(

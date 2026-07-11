@@ -15,7 +15,14 @@ DIMENSIONS: tuple[str, ...] = (
     "communication",
     "system_thinking",
     "mlops_awareness",
+    "english_delivery",
 )
+
+# The five knowledge dimensions. ``english_delivery`` (issue 0024, ADR 0007) is scored like any
+# other dimension but is excluded from every weighted_score aggregation: the Beta skill posterior
+# must move on technical evidence only, or an English-communication gap re-entangles with a
+# knowledge gap — the exact misread of VN candidates the ADR separates.
+TECHNICAL_DIMENSIONS: tuple[str, ...] = tuple(d for d in DIMENSIONS if d != "english_delivery")
 
 # Short 1↔5 anchors so the Evaluator scores against a shared scale rather than vibes. The
 # `correctness` and `system_thinking` anchors are spelled out at the 2/4 bands to mirror the BARS
@@ -44,6 +51,13 @@ DIMENSION_GUIDE: dict[str, str] = {
         "Aware of production realities (serving, monitoring, drift, retraining)? "
         "1 = none, 5 = strong and concrete."
     ),
+    "english_delivery": (
+        "How clearly is the answer DELIVERED in English — wording, sentence structure, "
+        "professional phrasing? Judge delivery only, never the technical content (that is what the "
+        "other dimensions are for). 1 = very hard to follow; 2 = frequent broken phrasing that "
+        "obscures the meaning; 3 = understandable but consistently awkward; 4 = clear professional "
+        "English with minor slips; 5 = crisp, natural, well-structured."
+    ),
 }
 
 
@@ -59,8 +73,10 @@ class Rubric(BaseModel):
             raise ValueError(f"unknown rubric dimensions: {sorted(unknown)}")
         if any(w < 0 for w in self.weights.values()):
             raise ValueError("rubric weights must be >= 0")
-        if not self.active:
-            raise ValueError("at least one dimension must have weight > 0")
+        if not self.active_technical:
+            # english_delivery alone cannot carry a question: weighted_score aggregates technical
+            # dimensions only (ADR 0007), so a delivery-only rubric would have no score to keep.
+            raise ValueError("at least one technical dimension must have weight > 0")
         return self
 
     @property
@@ -68,8 +84,19 @@ class Rubric(BaseModel):
         """Dimensions to score, in canonical order (weight > 0)."""
         return [d for d in DIMENSIONS if self.weights.get(d, 0.0) > 0]
 
+    @property
+    def active_technical(self) -> list[str]:
+        """Active dimensions that feed weighted_score — everything except english_delivery."""
+        return [d for d in TECHNICAL_DIMENSIONS if self.weights.get(d, 0.0) > 0]
+
     def render(self) -> str:
         """Human-readable active rubric for the Evaluator prompt."""
-        return "\n".join(
-            f"- {d} (weight {self.weights[d]:g}): {DIMENSION_GUIDE[d]}" for d in self.active
-        )
+        lines = []
+        for d in self.active:
+            marker = (
+                " (assessed separately — NEVER counts toward weighted_score)"
+                if d == "english_delivery"
+                else f" (weight {self.weights[d]:g})"
+            )
+            lines.append(f"- {d}{marker}: {DIMENSION_GUIDE[d]}")
+        return "\n".join(lines)

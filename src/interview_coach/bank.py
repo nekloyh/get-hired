@@ -164,6 +164,14 @@ def _load_questions(read: YamlReader, concept_ids: set[str]) -> dict[str, tuple[
             weights = raw.get("rubric", {}).get("weights") if isinstance(raw.get("rubric"), dict) else None
             if not isinstance(weights, dict):
                 raise BankError(f"{where}: 'rubric.weights' must be a mapping of dimension -> weight")
+            if "english_delivery" in weights:
+                # Issue 0024 / ADR 0007: delivery is Session state, not content. The micro-loop
+                # activates english_delivery per answer from language_mode; a pack that authored it
+                # would pin delivery scoring regardless of the Session's language.
+                raise BankError(
+                    f"{where}: 'english_delivery' must not be authored in a pack — it is "
+                    "activated per answer by the Session's language_mode"
+                )
             try:
                 rubric = Rubric(weights={k: float(v) for k, v in weights.items()})
             except (ValueError, TypeError) as err:

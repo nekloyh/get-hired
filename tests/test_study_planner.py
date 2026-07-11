@@ -240,3 +240,67 @@ def test_export_surfaces_evidence_degraded_warning():
     state["transcript"][0]["turns"][0]["evaluation"]["evidence_degraded"] = False
     clean = render_session_markdown(state)
     assert "Evidence degraded" not in clean  # a normal judgment shows no warning
+
+
+def test_export_records_language_mode_and_delivery_fixes():
+    # issue 0024: the export records the Session's language_mode, and weak-delivery feedback lists
+    # the concrete phrase fixes. A pre-0024 state (no language_mode key) renders the en default.
+    state = _state()
+    assert "- Language mode: `en`" in render_session_markdown(state)
+
+    state["language_mode"] = "mixed"
+    state["transcript"][0]["turns"][0]["evaluation"]["delivery_fixes"] = [
+        '"model is overfit" — "the model is overfitting"',
+        '"it depend on data" — "it depends on the data"',
+        '"we should to monitor" — "we should monitor"',
+    ]
+    report = render_session_markdown(state)
+    assert "- Language mode: `mixed`" in report
+    assert "English delivery fixes:" in report
+    assert '"we should to monitor" — "we should monitor"' in report
+
+    state["transcript"][0]["turns"][0]["evaluation"]["delivery_fixes"] = []
+    clean = render_session_markdown(state)
+    assert "English delivery fixes:" not in clean
+
+
+def test_gap_query_and_evidence_exclude_english_delivery():
+    # ADR 0007: a delivery gap must not steer the technical resource query or the planner's
+    # technical-evidence view of a Skill.
+    from interview_coach.skill import SkillState
+    from interview_coach.study_planner import _gap_query, _transcript_evidence
+
+    state = _state()
+    evaluation = state["transcript"][0]["turns"][0]["evaluation"]
+    evaluation["dimensions"]["english_delivery"] = {"score": 2, "evidence": "no evidence"}
+
+    query = _gap_query(state, "mlops", SkillState.neutral("mlops"), "must_have")
+    assert "english_delivery" not in query
+    evidence = _transcript_evidence(state)
+    assert "english_delivery" not in evidence
+
+
+def test_planner_prompt_carries_language_mode(make_client):
+    # ADR 0007 names the Study Planner as a prompt-bearing agent: a vn/mixed Session's plan text is
+    # requested in Vietnamese.
+
+    from interview_coach.resources import InMemoryResourceStore, seed_resource_store
+    from interview_coach.study_planner import (
+        _build_study_planner_messages,
+        rank_study_targets,
+        retrieve_resource_matches,
+    )
+
+    state = _state()
+    state["language_mode"] = "vn"
+    store = seed_resource_store(InMemoryResourceStore())
+    targets = rank_study_targets(state)[:2]
+    matches = retrieve_resource_matches(store, state, targets)
+    user = _build_study_planner_messages(state, targets, matches)[1]["content"]
+    assert "language_mode: vn" in user
+    assert "in Vietnamese" in user
+
+    state["language_mode"] = "en"
+    user_en = _build_study_planner_messages(state, targets, matches)[1]["content"]
+    assert "language_mode: en" in user_en
+    assert "in Vietnamese" not in user_en

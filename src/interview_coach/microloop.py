@@ -22,7 +22,8 @@ from typing import Protocol
 
 from .concepts import ConceptStore
 from .evaluator import Evaluation, evaluate
-from .interviewer import FollowUpUnavailable, generate_follow_up
+from .interviewer import FollowUpUnavailable, generate_follow_up, render_seed_question
+from .language import DEFAULT_LANGUAGE_MODE, rubric_with_delivery
 from .llm import LLMClient
 from .seeds import SeedQuestion
 from .skill import SkillState, apply_evaluation
@@ -177,12 +178,15 @@ def run_micro_loop(
     *,
     max_turns: int = DEFAULT_MAX_TURNS,
     concept_store: ConceptStore | None = None,
+    language_mode: str = DEFAULT_LANGUAGE_MODE,
 ) -> MicroLoopResult:
     """Resolve one question end-to-end, returning the exchange and the updated Skill state.
 
     ``state`` is the Skill's belief coming in (a Session threads it across questions in the macro-loop,
     slice 0010); it defaults to the neutral prior. The Evaluator scores *every* turn and the last score
-    is what the question resolves to — even when the safety cap fires.
+    is what the question resolves to — even when the safety cap fires. ``language_mode`` (issue 0024)
+    renders the seed question in the Session's language, makes follow-ups speak it, and activates
+    ``english_delivery`` per answer — deterministically, so a vn Session can never score delivery.
     """
     if max_turns < 1:
         raise ValueError(f"max_turns must be >= 1, got {max_turns}")
@@ -190,14 +194,15 @@ def run_micro_loop(
         state = SkillState.neutral(seed.skill)
 
     turns: list[Turn] = []
-    question = seed.question
+    question = render_seed_question(client, seed.question, language_mode)
     is_follow_up = False
     grounding_concept_id: str | None = None
     grounding_concept_title: str | None = None
 
     while True:
         answer = candidate.answer(question)
-        evaluation = evaluate(client, question, answer, seed.rubric)
+        rubric = rubric_with_delivery(seed.rubric, language_mode, answer)
+        evaluation = evaluate(client, question, answer, rubric, language_mode=language_mode)
         turn = Turn(
             question=question,
             answer=answer,
@@ -241,6 +246,7 @@ def run_micro_loop(
                 evaluation=evaluation,
                 skill=seed.skill,
                 concept_store=concept_store,
+                language_mode=language_mode,
             )
         except FollowUpUnavailable as err:
             # The Evaluator wanted a follow-up but the Interviewer could not produce one (a persistent

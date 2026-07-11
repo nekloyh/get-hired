@@ -40,9 +40,13 @@ def _decision(
 
 
 def _eval(score: int, *, follow_up: bool) -> str:
+    # english_delivery rides along because the en-mode loop activates it on English answers (0024).
     return json.dumps(
         {
-            "dimensions": {"correctness": {"score": score, "evidence": "no evidence"}},
+            "dimensions": {
+                "correctness": {"score": score, "evidence": "no evidence"},
+                "english_delivery": {"score": 4, "evidence": "no evidence"},
+            },
             "weighted_score": float(score),
             "confidence": 0.8,
             "follow_up_recommended": follow_up,
@@ -113,7 +117,7 @@ def _diagnostic():
 
 
 def _fake_micro_loop(score: float):
-    def _run(client, seed, candidate, state=None, *, max_turns=4, concept_store=None):
+    def _run(client, seed, candidate, state=None, *, max_turns=4, concept_store=None, language_mode="en"):
         before = state or SkillState.neutral(seed.skill)
         ev = Evaluation(
             dimensions={"correctness": DimensionScore(score=round(score), evidence="no evidence")},
@@ -144,7 +148,7 @@ def _failing_then_resolving_micro_loop(score: float, *, fail_times: int = 1):
     base = _fake_micro_loop(score)
     calls = {"n": 0}
 
-    def _run(client, seed, candidate, state=None, *, max_turns=4, concept_store=None):
+    def _run(client, seed, candidate, state=None, *, max_turns=4, concept_store=None, language_mode="en"):
         calls["n"] += 1
         if calls["n"] <= fail_times:
             raise RuntimeError("evaluator blew up on this question")
@@ -189,6 +193,43 @@ def test_question_failure_is_isolated_and_session_continues(make_client, monkeyp
     assert final["question_count"] == 2
     assert final["study_plan"] is not None  # the run completed and still produced a plan
     assert fake.call_count == 2  # one Supervisor advance after the failure + the Planner
+
+
+def test_language_mode_threads_from_state_into_the_micro_loop(make_client, monkeypatch):
+    # Issue 0024: the mode chosen at setup rides the SessionState into every run_micro_loop call.
+    from interview_coach import supervisor
+
+    seen: list[str] = []
+    base = _fake_micro_loop(4.0)
+
+    def _capture(client, seed, candidate, state=None, *, max_turns=4, concept_store=None, language_mode="en"):
+        seen.append(language_mode)
+        return base(client, seed, candidate, state, max_turns=max_turns, concept_store=concept_store)
+
+    monkeypatch.setattr(supervisor, "run_micro_loop", _capture)
+    client, _ = make_client(
+        [
+            _decision("end_early", "Evidence is decisive after one question; end the session."),
+            _plan("mlops", "system_design", "vietnamese_nlp"),
+        ]
+    )
+    state = initial_session_state(
+        "language-thread-session", _diagnostic(), max_questions=1, started_at=0, language_mode="mixed"
+    )
+    assert state["language_mode"] == "mixed"
+
+    graph = build_session_graph(client, now=lambda: 1)
+    final = graph.invoke(state, session_config("language-thread-session"))
+
+    assert seen == ["mixed"]
+    assert final["language_mode"] == "mixed"  # survives to the final state for export/web
+
+
+def test_initial_session_state_rejects_unknown_language_mode():
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="unknown language_mode"):
+        initial_session_state("bad-mode", _diagnostic(), language_mode="vi")
 
 
 def test_candidate_intent_aborts_session_and_is_not_recorded_as_failed(make_client):

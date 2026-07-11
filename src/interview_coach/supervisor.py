@@ -23,6 +23,7 @@ from typing_extensions import TypedDict
 
 from .concepts import ConceptStore
 from .diagnostic import SKILLS, DiagnosticResult
+from .language import DEFAULT_LANGUAGE_MODE, validate_language_mode
 from .llm import LLMClient, Message, StructuredOutputError, Validator
 from .microloop import (
     DEFAULT_MAX_TURNS,
@@ -76,6 +77,7 @@ class SessionState(TypedDict, total=False):
     study_plan_error: str | None
     candidate_id: str  # cross-session ledger id (0023); "" for a one-shot cold-start Session
     ledger_prior_mastery: dict[str, float]  # last Session's per-Skill mean; only for a returning Candidate (0023)
+    language_mode: str  # en|vn|mixed (0024, ADR 0007); absent in pre-0024 checkpoints — read with .get(..., "en")
 
 
 class SupervisorDecision(BaseModel):
@@ -115,17 +117,20 @@ def initial_session_state(
     started_at: float | None = None,
     candidate_id: str = "",
     ledger_prior_mastery: Mapping[str, float] | None = None,
+    language_mode: str = DEFAULT_LANGUAGE_MODE,
 ) -> SessionState:
     """Build the single LangGraph state object from the Diagnostic output.
 
     ``ledger_prior_mastery`` (0023) carries a returning Candidate's *last-Session* per-Skill means so
     the export/report can show a since-last-session delta; it is omitted entirely for a first-ever
-    Session (cold start), which then renders no delta block.
+    Session (cold start), which then renders no delta block. ``language_mode`` (0024, ADR 0007) is
+    validated here so a typo fails at setup, not as a silently-English Session.
     """
     if max_questions < 1:
         raise ValueError("max_questions must be >= 1")
     if max_elapsed_seconds <= 0:
         raise ValueError("max_elapsed_seconds must be > 0")
+    language_mode = validate_language_mode(language_mode)
     topic_plan = [asdict(entry) for entry in diagnostic.topic_plan]
     state: SessionState = {
         "session_id": session_id,
@@ -154,6 +159,7 @@ def initial_session_state(
         "study_plan": None,
         "study_plan_error": None,
         "candidate_id": candidate_id,
+        "language_mode": language_mode,
     }
     if ledger_prior_mastery:
         state["ledger_prior_mastery"] = dict(ledger_prior_mastery)
@@ -230,6 +236,7 @@ def build_session_graph(
                 before,
                 max_turns=max_turns,
                 concept_store=concept_store,
+                language_mode=state.get("language_mode", DEFAULT_LANGUAGE_MODE),
             )
         except CandidateIntent:
             # ADR 0005 / issue 0018: the Candidate asked to stop (EOF/Ctrl-D, a web cancel/disconnect,
