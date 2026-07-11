@@ -6,7 +6,20 @@ glossary.
 
 ## Status
 
-**Slice 0024 — bilingual VN/EN interview mode (ADR 0007).** A Session now carries an explicit
+**Slice 0027 — Panel Verdict: cost-gated committee debrief.** When the Evaluator's own signals say
+a score is shaky — the deterministic escalation triggers from slice 0006 (confidence < 0.5, or the
+weighted-score cross-check tripping) — the judgment now escalates to a committee instead of a lone
+re-read: a **Skeptic** and an **Advocate** each argue the exchange citing the candidate's actual
+words, then the Evaluator re-evaluates having read both and that verdict is kept (the panel
+advises, the Evaluator decides — ADR 0001). Committee disagreement replaces judge confidence as
+the evidence weight on escalated questions, so a verdict the committee split on moves the Beta
+posterior less, and the Markdown export gains a **committee packet** — triggers, first pass →
+verdict, disagreement, and both scorecards. The triggers are the entire cost gate: a confident
+first pass pays zero extra calls. The 29-case calibration bench is green and a forced-escalation
+experiment records what the debate actually buys on this judge
+(`docs/audits/calibration-bench-2026-07-11-panel-verdict.md`).
+
+Earlier slice: **0024 — bilingual VN/EN interview mode (ADR 0007).** A Session now carries an explicit
 `language_mode` (`en` | `vn` | `mixed`), chosen with `coach session --language ...` or the web
 setup control and threaded through the Session state into every prompt-bearing agent: the
 Interviewer renders bank questions and generates Follow-ups in the Session's language (a

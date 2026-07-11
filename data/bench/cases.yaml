@@ -395,3 +395,98 @@ cases:
     labels: {correctness: 4, depth: 4, communication: 4, system_thinking: 4, english_delivery: 2}
     expected_min: 3.4
     expected_max: 5.0
+
+  # --- borderline cases (issue 0027): eloquent-but-fatally-wrong answers built to provoke the
+  # holistic-vs-linear divergence trigger, so panel escalation is measurable on the bench. Bands are
+  # deliberately wide (neither is_weak nor is_strong) — these cases measure escalation behavior,
+  # not the weak/strong separation stats.
+  - case_id: panel_sd_retry_storm_en
+    paired_id: panel_sd_retry_storm
+    skill: system_design
+    language: en
+    question: A downstream payment service starts timing out under load. What is your mitigation plan?
+    answer: >-
+      The cleanest mitigation is to be aggressive about draining the backlog: I would configure every
+      client to retry failed calls immediately in a tight loop, remove the rate limiter in front of
+      the payment service so the queued requests can flow through faster, and scale the callers
+      horizontally so more workers push the retries. I would pair this with dashboards on p99 latency
+      and error rate so we can watch the backlog drain in real time, and add an alert when the error
+      rate returns to baseline. Once traffic normalizes we can do a proper post-mortem with the
+      timeline the dashboards captured.
+    rubric: {correctness: 0.3, depth: 0.2, communication: 0.2, system_thinking: 0.3, mlops_awareness: 0.0}
+    labels: {correctness: 2, depth: 4, communication: 5, system_thinking: 2}
+    expected_min: 1.0
+    expected_max: 3.2
+
+  - case_id: panel_sd_retry_storm_vi
+    paired_id: panel_sd_retry_storm
+    skill: system_design
+    language: vi
+    question: A downstream payment service starts timing out under load. What is your mitigation plan?
+    answer: >-
+      Cách xử lý gọn nhất là quyết liệt xả hết backlog: em sẽ cấu hình mọi client retry ngay lập tức
+      các call bị lỗi trong vòng lặp sát nhau, gỡ rate limiter trước payment service để request đang
+      xếp hàng được chảy qua nhanh hơn, và scale ngang phía caller để nhiều worker cùng đẩy retry.
+      Em sẽ kèm dashboard theo dõi p99 latency và error rate để quan sát backlog được xả theo thời
+      gian thực, và thêm alert khi error rate quay về baseline. Khi traffic ổn định lại thì làm
+      post-mortem đầy đủ với timeline mà dashboard đã ghi lại.
+    rubric: {correctness: 0.3, depth: 0.2, communication: 0.2, system_thinking: 0.3, mlops_awareness: 0.0}
+    labels: {correctness: 2, depth: 4, communication: 5, system_thinking: 2}
+    expected_min: 1.0
+    expected_max: 3.2
+
+  - case_id: panel_ml_eval_on_train_en
+    paired_id: panel_ml_eval_on_train
+    skill: ml_fundamentals
+    language: en
+    question: How do you get a trustworthy estimate of a model's real-world performance before deploying it?
+    answer: >-
+      The key principle is that a performance estimate is only as reliable as the amount of data
+      behind it, so I evaluate on the largest set available: the full dataset including the training
+      portion, since restricting to a small held-out slice throws away most of the signal and makes
+      the estimate noisy. I stratify that evaluation by class so minority classes are represented,
+      report a confidence interval instead of a point estimate, and track the same metric after
+      deployment so we can compare production behavior against the offline number. This gives a
+      statistically stronger estimate than a tiny test split would.
+    rubric: {correctness: 0.4, depth: 0.3, communication: 0.2, system_thinking: 0.1, mlops_awareness: 0.0}
+    labels: {correctness: 2, depth: 4, communication: 5, system_thinking: 3}
+    expected_min: 1.2
+    expected_max: 3.4
+
+  - case_id: panel_ml_eval_on_train_vi
+    paired_id: panel_ml_eval_on_train
+    skill: ml_fundamentals
+    language: vi
+    question: How do you get a trustworthy estimate of a model's real-world performance before deploying it?
+    answer: >-
+      Nguyên tắc chính là ước lượng hiệu năng chỉ đáng tin khi có nhiều dữ liệu đứng sau, nên em
+      đánh giá trên tập lớn nhất có thể: toàn bộ dataset bao gồm cả phần train, vì nếu chỉ giới hạn
+      ở một lát held-out nhỏ thì vứt đi phần lớn tín hiệu và ước lượng bị nhiễu. Em stratify theo
+      class để các class thiểu số được đại diện, báo cáo khoảng tin cậy thay vì một con số điểm, và
+      theo dõi cùng metric đó sau khi deploy để so sánh hành vi production với con số offline. Cách
+      này cho ước lượng mạnh hơn về mặt thống kê so với một test split bé.
+    rubric: {correctness: 0.4, depth: 0.3, communication: 0.2, system_thinking: 0.1, mlops_awareness: 0.0}
+    labels: {correctness: 2, depth: 4, communication: 5, system_thinking: 3}
+    expected_min: 1.2
+    expected_max: 3.4
+
+  # en-session coverage of the delivery-active prompt shape (the default production shape after
+  # 0024: an English Session, english_delivery active, no SESSION LANGUAGE MODE block). Stands
+  # alone — its "twin" concept is the mixed-mode broken-english case above.
+  - case_id: en_ml_leakage_broken_english
+    paired_id: en_ml_leakage_broken_english
+    skill: ml_fundamentals
+    language: en
+    question: What is data leakage, and how do you prevent it in a training pipeline?
+    answer: >-
+      Data leakage is happen when information from test set or from future go inside training. Example
+      is we fit the scaler or choose feature on all data before split, so statistics of test set leak
+      in train. Model look very good offline but fail in production, because that information is not
+      available at serving time. For prevent, we must to fit every preprocessing only on train fold
+      inside each cross-validation split, and we check feature that use future information, like
+      column that is proxy of label. Also monitor gap between offline metric and production metric,
+      big gap is signal of leakage.
+    rubric: {correctness: 0.4, depth: 0.3, communication: 0.2, system_thinking: 0.1, mlops_awareness: 0.0, english_delivery: 1.0}
+    labels: {correctness: 4, depth: 4, communication: 4, system_thinking: 4, english_delivery: 2}
+    expected_min: 3.4
+    expected_max: 5.0

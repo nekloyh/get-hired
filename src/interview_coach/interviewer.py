@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field, field_validator
 from .concepts import ConceptLookup, ConceptStore, lookup_concept, seed_concept_store
 from .evaluator import Evaluation
 from .language import answer_is_english
-from .llm import LLMClient, Message, ToolCallingUnsupported, ToolSpec, Validator
+from .llm import LLMClient, Message, StructuredOutputError, ToolCallingUnsupported, ToolSpec, Validator
 
 logger = logging.getLogger(__name__)
 
@@ -138,11 +138,15 @@ def _format_assessment(evaluation: Evaluation) -> str:
     """Render the Evaluator's per-dimension scores (weakest first) plus its follow-up rationale.
 
     Feeding the weak dimensions and their verbatim evidence is what lets the Interviewer aim the
-    follow-up at the gap rather than re-asking the question.
+    follow-up at the gap rather than re-asking the question. ``english_delivery`` is excluded
+    (ADR 0007): a delivery gap is not a knowledge gap — its feedback channel is ``delivery_fixes``,
+    and a follow-up probing "your English" instead of the weakest technical dimension would steer
+    the micro-loop at the wrong target.
     """
     lines = [
         f"- {dim}: {ds.score}/5 (evidence: {ds.evidence!r})"
         for dim, ds in sorted(evaluation.dimensions.items(), key=lambda kv: kv[1].score)
+        if dim != "english_delivery"
     ]
     lines.append(f"- evaluator's follow-up rationale: {evaluation.follow_up_rationale}")
     return "\n".join(lines)
@@ -547,8 +551,18 @@ def generate_follow_up(
     rejects an all-English follow-up.
     """
     store = concept_store or seed_concept_store()
-    if client.supports_tool_calls:
-        return _generate_follow_up_native(
+    try:
+        if client.supports_tool_calls:
+            return _generate_follow_up_native(
+                client,
+                original_question=original_question,
+                answer=answer,
+                evaluation=evaluation,
+                skill=skill,
+                store=store,
+                language_mode=language_mode,
+            )
+        return _generate_follow_up_json(
             client,
             original_question=original_question,
             answer=answer,
@@ -557,15 +571,15 @@ def generate_follow_up(
             store=store,
             language_mode=language_mode,
         )
-    return _generate_follow_up_json(
-        client,
-        original_question=original_question,
-        answer=answer,
-        evaluation=evaluation,
-        skill=skill,
-        store=store,
-        language_mode=language_mode,
-    )
+    except StructuredOutputError as err:
+        # A follow-up that persistently fails its quality validators (re-ask, grounding, or the
+        # vn-mode Vietnamese check) is the same situation as a persistently garbled tool call: the
+        # turn already holds a valid score, so the question must resolve on it rather than crash
+        # into a zero-evidence FAILED record (slice 0014 / ADR 0005 — infrastructure degrades).
+        raise FollowUpUnavailable(
+            f"follow-up generation exhausted its retries ({err}); resolving the question without "
+            "a follow-up"
+        ) from err
 
 
 # --- Seed-question rendering (issue 0024) --------------------------------------------------------
@@ -623,7 +637,12 @@ def render_seed_question(client: LLMClient, question: str, language_mode: str = 
             max_retries=1,
             disable_thinking=True,
         )
-    except Exception as err:  # noqa: BLE001 — any rendering failure degrades to the EN original
+    except StructuredOutputError as err:
+        # Only a rendering-QUALITY failure degrades (the model couldn't produce valid Vietnamese
+        # after its retry) — asking the English original is a worse experience, not a crash. Hard
+        # provider/config errors deliberately propagate: swallowing them here would silently
+        # de-Vietnamize the whole Session and defer the loud failure until after the candidate has
+        # already typed an answer.
         logger.warning(
             "seed-question rendering failed for language_mode=%s; asking the English original: %s",
             language_mode,

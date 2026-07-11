@@ -66,13 +66,17 @@ def test_bench_dataset_is_bilingual_and_covers_multiple_skills():
     assert len(data.cases) >= 20
     assert {c.language for c in data.cases} == {"en", "vi", "mixed"}
     assert len({c.skill for c in data.cases}) >= 2
-    # every en/vi case has a paired twin in the other language; mixed cases (0024) stand alone
+    # a multi-case pair touching en/vi must be a complete en+vi twin set; single-case entries
+    # (mixed-mode and en-solo delivery-coverage cases, 0024/0027) legitimately stand alone
     from collections import Counter
 
-    pair_langs = {}
+    pair_cases: dict[str, list] = {}
     for c in data.cases:
-        pair_langs.setdefault(c.paired_id, set()).add(c.language)
-    assert all(langs == {"en", "vi"} for langs in pair_langs.values() if langs & {"en", "vi"})
+        pair_cases.setdefault(c.paired_id, []).append(c)
+    for cases in pair_cases.values():
+        langs = {c.language for c in cases}
+        if len(cases) > 1 and langs & {"en", "vi"}:
+            assert langs == {"en", "vi"}
     # BARS anchors for >= 2 dimensions, each with a 2 and a 4 exemplar
     assert len(data.anchors) >= 2
     assert all({"2", "4"} <= set(bands) for bands in data.anchors.values())
@@ -208,3 +212,59 @@ def test_empty_bench_does_not_pass_the_gate_vacuously():
     # all([]) is True, so a malformed/empty cases.yaml (zero results) must not wave the gate through
     # green — a bench that evaluated nothing has not passed.
     assert not bench_passed([])
+
+
+# --- english_delivery gate (issue 0024) ----------------------------------------------------------
+
+
+def _delivery_case(label: int | None):
+    labels = {"correctness": 4}
+    weights = {"correctness": 1.0}
+    if label is not None:
+        labels["english_delivery"] = label
+        weights["english_delivery"] = 0.0  # assessed separately, excluded from weighted_score
+    return BenchCase(
+        case_id="delivery",
+        paired_id="delivery",
+        skill="ml_fundamentals",
+        language="mixed",
+        question="q?",
+        answer="a",
+        rubric=Rubric(weights=weights),
+        labels=labels,
+        expected_min=3.0,
+        expected_max=5.0,
+        language_mode="mixed",
+    )
+
+
+def test_delivery_within_band_is_vacuous_without_a_label():
+    result = _result(_delivery_case(None), dims={"correctness": 4}, weighted=4.0)
+    assert result.delivery_within_band
+
+
+def test_delivery_within_band_tolerates_one_point_and_rejects_two():
+    case = _delivery_case(2)
+    near = _result(case, dims={"correctness": 4, "english_delivery": 3}, weighted=4.0)
+    assert near.delivery_within_band
+    far = _result(case, dims={"correctness": 4, "english_delivery": 4}, weighted=4.0)
+    assert not far.delivery_within_band
+
+
+def test_delivery_within_band_fails_when_labelled_but_unjudged_or_errored():
+    case = _delivery_case(2)
+    # judgment skipped the dimension entirely
+    skipped = _result(case, dims={"correctness": 4}, weighted=4.0)
+    assert not skipped.delivery_within_band
+    # the case errored — a labelled dimension that never got judged cannot pass
+    errored = BenchResult(case=case, error="StructuredOutputError: boom")
+    assert not errored.delivery_within_band
+
+
+def test_delivery_miss_fails_the_gate_even_inside_the_technical_band():
+    # The whole point of the second gate: english_delivery is excluded from weighted_score, so a
+    # coin-flip delivery judge would sail through within_band without this check.
+    case = _delivery_case(2)
+    result = _result(case, dims={"correctness": 4, "english_delivery": 5}, weighted=4.0)
+    assert result.within_band
+    assert not bench_passed([result])

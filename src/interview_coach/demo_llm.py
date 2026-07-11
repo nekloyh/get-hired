@@ -86,6 +86,25 @@ class DemoLLMClient(LLMClient):
                 "question": "Using the retrieved mechanism, what concrete failure mode would you watch for?",
                 "targets": "mechanism and failure-mode depth from the retrieved concept note",
             }
+        if name == "RenderedSeedQuestion":
+            # Issue 0024: a vn/mixed demo Session must actually ask in Vietnamese — falling through
+            # to {} would silently degrade every demo question to English. The framing carries
+            # enough Vietnamese-specific characters to clear the deterministic rendering validator.
+            original = self._section(text, "QUESTION (English original)", "SESSION LANGUAGE MODE")
+            return {
+                "question": (
+                    "Bạn hãy trình bày và giải thích thật rõ ràng (giữ nguyên thuật ngữ tiếng Anh): "
+                    f"{original or 'câu hỏi phỏng vấn ở trên'}"
+                )
+            }
+        if name == "PanelOpinion":
+            # Issue 0027: demo confidence never dips below the escalation bar, but a payload case
+            # keeps demo mode schema-complete if a panel is ever reached.
+            return {
+                "recommended_score": 3.0,
+                "argument": "Demo panel voice: the answer shows real mechanism but leaves the trade-off implicit.",
+                "key_evidence": "the opening sentences of the answer",
+            }
         return {}
 
     def _evaluation_payload(self, prompt: str) -> dict[str, Any]:

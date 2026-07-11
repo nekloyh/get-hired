@@ -110,6 +110,18 @@ class InteractiveCandidate:
             lines.append(line)
 
 
+def _escalation_triggers(evaluation: Evaluation) -> tuple[str, ...]:
+    """The deterministic triggers that escalated this judgment, wherever the trace lives.
+
+    New escalations carry a PanelTrace (issue 0027); pre-panel checkpoints carry SelfCritiqueTrace.
+    """
+    if evaluation.panel is not None:
+        return evaluation.panel.triggers
+    if evaluation.self_critique is not None:
+        return evaluation.self_critique.triggers
+    return ()
+
+
 class StopReason(StrEnum):
     """Why the micro-loop stopped — a normal resolution vs. a guardrail trip (see acceptance crit.)."""
 
@@ -210,11 +222,7 @@ def run_micro_loop(
             is_follow_up=is_follow_up,
             grounding_concept_id=grounding_concept_id,
             grounding_concept_title=grounding_concept_title,
-            trace=TurnTrace(
-                evaluator_self_critique_triggers=(
-                    evaluation.self_critique.triggers if evaluation.self_critique is not None else ()
-                )
-            ),
+            trace=TurnTrace(evaluator_self_critique_triggers=_escalation_triggers(evaluation)),
         )
 
         if not evaluation.follow_up_recommended:

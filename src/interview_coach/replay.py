@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from .diagnostic import SKILLS, CandidateProfile, diagnose
+from .language import DEFAULT_LANGUAGE_MODE
 from .llm import LLMClient, Message
 from .seeds import SeedQuestion
 from .skill import SkillState
@@ -102,17 +103,21 @@ def run_persona_session(
     max_questions: int = 5,
     checkpointer: Any | None = None,
     now: Callable[[], float] = time.time,
+    language_mode: str = DEFAULT_LANGUAGE_MODE,
 ) -> dict[str, Any]:
     """Drive a full unattended Session with the persona answering; return the final state.
 
     ``judge_client`` scores answers and runs the Supervisor; ``candidate_client`` (default: the judge
     client) generates the persona's answers. The Topic Plan is the deterministic offline plan so the
-    trajectory depends only on the persona and the judge.
+    trajectory depends only on the persona and the judge. ``language_mode`` (0024) lets a replay
+    exercise a vn/mixed trajectory — without it the loop-level bench would be structurally en-only.
     """
     factory = persona_candidate_factory(candidate_client or judge_client, persona)
     graph = build_session_graph(judge_client, checkpointer=checkpointer, candidate_factory=factory, now=now)
     diagnostic = diagnose(persona.profile(), None)
-    state = initial_session_state(session_id, diagnostic, max_questions=max_questions, started_at=now())
+    state = initial_session_state(
+        session_id, diagnostic, max_questions=max_questions, started_at=now(), language_mode=language_mode
+    )
     return graph.invoke(state, session_config(session_id))
 
 

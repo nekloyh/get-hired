@@ -94,6 +94,16 @@ export function ReportView({ state }: { state: SessionState | null }) {
                     </span>
                   ))}
                 </div>
+                {turn.evaluation.delivery_fixes?.length ? (
+                  <div className="delivery-fixes">
+                    <strong>English delivery fixes</strong>
+                    <ul>
+                      {turn.evaluation.delivery_fixes.map((fix) => (
+                        <li key={fix}>{fix}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
                 <small>{turn.evaluation.follow_up_rationale}</small>
               </div>
             ))}

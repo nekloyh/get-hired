@@ -36,7 +36,7 @@ from .microloop import (
 )
 from .resources import ResourceStore
 from .seeds import QUESTION_BANK, QuestionBank, SeedQuestion, rotation_offset, seed_count, select_seed_question
-from .skill import SkillState, confidence_weight
+from .skill import SkillState, evidence_weight_for
 from .study_planner import plan_study
 
 logger = logging.getLogger(__name__)
@@ -693,9 +693,9 @@ def _dump_micro_loop(result: MicroLoopResult, *, plan_index: int) -> dict[str, A
         "stop_reason": result.stop_reason.value,
         "resolved_weighted_score": result.resolved_evaluation.weighted_score,
         "resolved_confidence": result.resolved_evaluation.confidence,
-        # The evidence weight actually folded into the belief (issue 0021), so the confidence-scaling
-        # is auditable in the export. Same function apply_evaluation uses — single source of truth.
-        "evidence_weight": confidence_weight(result.resolved_evaluation.confidence),
+        # The evidence weight actually folded into the belief (issues 0021/0027), so the scaling is
+        # auditable in the export. Same function apply_evaluation uses — single source of truth.
+        "evidence_weight": evidence_weight_for(result.resolved_evaluation),
         "skill_state": _dump_skill_state(result.skill_state),
         "turns": [
             {
