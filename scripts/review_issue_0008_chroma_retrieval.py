@@ -11,20 +11,24 @@ the Interviewer would look up mid-session. Each seed, plus its question text (th
 Interviewer has), goes through `lookup_concept` with the Skill filter applied; a lookup is a **hit**
 when the returned note is one of that question's `expected_concepts` (hand-labelled ground truth).
 
-Run: ``uv run python scripts/review_issue_0008_chroma_retrieval.py`` (prints a Markdown report to
-stdout). Exits 2 with a clear message when chromadb/sentence-transformers are not installed;
-exits 1 on store errors. The embedder downloads on first use.
+Run: ``uv run python scripts/review_issue_0008_chroma_retrieval.py [--embedding-model ID]``
+(prints a Markdown report to stdout; default embedder is bge-small-en-v1.5, pass
+``--embedding-model intfloat/multilingual-e5-small`` for the multilingual A/B arm). Exits 2 with a
+clear message when chromadb/sentence-transformers are not installed; exits 1 on store errors. The
+embedder downloads on first use.
 """
 
 from __future__ import annotations
 
+import argparse
+
 from interview_coach.bank import load_questions
-from interview_coach.concepts import SEED_CONCEPTS, build_concept_store, lookup_concept
+from interview_coach.concepts import BGE_SMALL_EN, SEED_CONCEPTS, build_concept_store, lookup_concept
 
 
-def main() -> int:
+def main(embedding_model: str = BGE_SMALL_EN) -> int:
     try:
-        store = build_concept_store("chroma", seed=True)
+        store = build_concept_store("chroma", seed=True, embedding_model=embedding_model)
     except RuntimeError as err:
         print(f"skipped: {err}")
         return 2
@@ -36,7 +40,7 @@ def main() -> int:
 
     print("# Concept retrieval review — real Chroma store (issue 0008 follow-up)")
     print()
-    print(f"Store: ChromaConceptStore + bge-small-en-v1.5; notes: {len(SEED_CONCEPTS)}.")
+    print(f"Store: ChromaConceptStore + {embedding_model}; notes: {len(SEED_CONCEPTS)}.")
     print()
     for skill, seeds in sorted(questions.items()):
         for question in seeds:
@@ -98,4 +102,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--embedding-model",
+        default=BGE_SMALL_EN,
+        help="SentenceTransformer model id (e5-family ids get their query:/passage: prefixes applied).",
+    )
+    args = parser.parse_args()
+    raise SystemExit(main(args.embedding_model))

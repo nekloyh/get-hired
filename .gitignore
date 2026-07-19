@@ -35,3 +35,6 @@ sessions.db
 
 # OS
 .DS_Store
+
+# Claude Code local state (agent worktrees, local settings)
+.claude/

@@ -123,3 +123,80 @@ def test_chroma_concepts_collection_ingests_and_queries_seed_notes(tmp_path):
 
     assert filtered_hit.note.skill == "vietnamese_nlp"
     assert filtered_hit.note.language == "vi"
+
+
+# --- e5 prefix wiring (asymmetric query:/passage: instructions) ----------------------------------
+
+
+class _FakeVector:
+    def __init__(self, values):
+        self._values = values
+
+    def tolist(self):
+        return self._values
+
+
+class _FakeEncoder:
+    def __init__(self):
+        self.encoded: list[list[str]] = []
+
+    def encode(self, texts, normalize_embeddings=False):
+        self.encoded.append(list(texts))
+        return [_FakeVector([0.0, 1.0]) for _ in texts]
+
+
+class _FakeCollection:
+    def __init__(self):
+        self.upserts: list[dict] = []
+        self.queries: list[dict] = []
+
+    def upsert(self, **kwargs):
+        self.upserts.append(kwargs)
+
+    def query(self, **kwargs):
+        self.queries.append(kwargs)
+        return {
+            "ids": [["n1"]],
+            "documents": [["content"]],
+            "metadatas": [[{"id": "n1", "skill": "mlops", "title": "t", "language": "en"}]],
+            "distances": [[0.1]],
+        }
+
+
+def test_prefixed_store_encodes_passages_and_queries_asymmetrically():
+    from interview_coach.concepts import ChromaConceptStore
+
+    encoder = _FakeEncoder()
+    collection = _FakeCollection()
+    store = ChromaConceptStore(collection, encoder=encoder, prefixes=("query: ", "passage: "))
+
+    store.ingest([ConceptNote(id="n1", skill="mlops", title="t", content="drift monitoring")])
+    store.lookup("how to detect drift", skill="mlops")
+
+    assert encoder.encoded[0] == ["passage: drift monitoring"]  # ingest side
+    assert encoder.encoded[1] == ["query: how to detect drift"]  # query side
+    assert "embeddings" in collection.upserts[0]
+    assert "query_embeddings" in collection.queries[0]
+    assert "query_texts" not in collection.queries[0]
+
+
+def test_unprefixed_store_keeps_chroma_text_path():
+    from interview_coach.concepts import ChromaConceptStore
+
+    collection = _FakeCollection()
+    store = ChromaConceptStore(collection)
+
+    store.ingest([ConceptNote(id="n1", skill="mlops", title="t", content="c")])
+    store.lookup("q", skill="mlops")
+
+    assert "embeddings" not in collection.upserts[0]
+    assert collection.queries[0]["query_texts"] == ["q"]
+
+
+def test_resource_store_refuses_prefixed_embedder():
+    # ChromaResourceStore has no prefix-aware path: accepting an e5 id would silently rank worse.
+    from interview_coach.concepts import E5_SMALL_MULTILINGUAL
+    from interview_coach.resources import ChromaResourceStore
+
+    with pytest.raises(RuntimeError, match="prefixes"):
+        ChromaResourceStore.create(embedding_model=E5_SMALL_MULTILINGUAL)

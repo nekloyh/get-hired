@@ -332,6 +332,44 @@ def _build_native_user(
 _NATIVE_TOOL_ATTEMPTS = 2
 
 
+def _preferred_lookup_language(
+    request_language: str | None, lookup_skill: str | None, language_mode: str
+) -> str | None:
+    """The vi-note preference for one lookup: model's own request > Session mode > vi-native shelf.
+
+    Pre-fix, the filter was bound to the vietnamese_nlp shelf alone, so a vn-mode Session asking
+    about any other Skill could never reach a Vietnamese note even if one existed. The preference is
+    soft — :func:`_lookup_with_widening` retries without it — so shelves that carry no vi notes yet
+    keep working.
+    """
+    if request_language:
+        return request_language
+    if language_mode in ("vn", "mixed"):
+        return "vi"
+    return "vi" if lookup_skill == "vietnamese_nlp" else None
+
+
+def _lookup_with_widening(
+    store: ConceptStore, query: str, *, skill: str | None, language: str | None
+) -> tuple[ConceptLookup, str | None]:
+    """Lookup with the language preference, widening to any language when nothing matches.
+
+    Returns the lookup plus the language filter actually applied (None when widened), so the
+    recorded trace never claims a filter that was dropped. The language preference must stay a
+    preference: most shelves carry only English notes today, and a vn-mode Session on them should
+    ground its follow-up in an English note rather than resolve without one.
+    """
+    try:
+        return lookup_concept(store, query, skill=skill, language=language), language
+    except LookupError:
+        if language is None:
+            raise
+        logger.info(
+            "no %r-language note on shelf %r; widening the lookup to any language", language, skill
+        )
+        return lookup_concept(store, query, skill=skill, language=None), None
+
+
 def _native_follow_up_attempt(
     client: LLMClient,
     *,
@@ -353,9 +391,11 @@ def _native_follow_up_attempt(
             raise UnknownToolCall(f"interviewer received an unexpected tool call: {name!r}")
         request = ConceptToolRequest.model_validate({"reason": "tool call", **args})
         lookup_skill = skill or request.skill
-        lookup_language = request.language or ("vi" if lookup_skill == "vietnamese_nlp" else None)
+        lookup_language = _preferred_lookup_language(request.language, lookup_skill, language_mode)
         try:
-            lookup = lookup_concept(store, request.query, skill=lookup_skill, language=lookup_language)
+            lookup, lookup_language = _lookup_with_widening(
+                store, request.query, skill=lookup_skill, language=lookup_language
+            )
         except LookupError as err:
             # No concept note matches this Skill/language filter. Do NOT let this surface as an
             # exception out of the executor: the provider router would read it as a transport failure
@@ -490,9 +530,9 @@ def _generate_follow_up_json(
         disable_thinking=True,
     )
     lookup_skill = skill or tool_request.skill
-    lookup_language = tool_request.language or ("vi" if lookup_skill == "vietnamese_nlp" else None)
+    lookup_language = _preferred_lookup_language(tool_request.language, lookup_skill, language_mode)
     try:
-        lookup = lookup_concept(
+        lookup, lookup_language = _lookup_with_widening(
             store,
             tool_request.query,
             skill=lookup_skill,

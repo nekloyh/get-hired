@@ -148,6 +148,17 @@ class ChromaResourceStore:
         collection_name: str = RESOURCE_COLLECTION,
         embedding_model: str = BGE_SMALL_EN,
     ) -> ChromaResourceStore:
+        from .concepts import _EMBEDDING_PREFIXES
+
+        if embedding_model in _EMBEDDING_PREFIXES:
+            # The resource store has no prefix-aware encoding path yet: silently accepting an
+            # e5-family id here would embed queries without their required "query: " prefix and
+            # degrade ranking with no error — the exact bug the concept store just fixed.
+            raise RuntimeError(
+                f"{embedding_model!r} needs asymmetric query/passage prefixes, which the resource "
+                "store does not implement yet — use the default embedder here, or port the concept "
+                "store's prefix-aware path first"
+            )
         try:
             import chromadb
             from chromadb.utils import embedding_functions
