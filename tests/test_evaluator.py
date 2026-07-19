@@ -6,10 +6,12 @@ import unicodedata
 
 import pytest
 
+from interview_coach import telemetry
 from interview_coach.config import load_settings
 from interview_coach.evaluator import (
     DIVERGENCE_CONFIDENCE_CEILING,
     EVIDENCE_DEGRADE_CONFIDENCE_CEILING,
+    JUDGE_MAX_RETRIES,
     SELF_CRITIQUE_CONFIDENCE_THRESHOLD,
     UNVERIFIABLE_EVIDENCE,
     WEIGHTED_SCORE_TOLERANCE,
@@ -255,7 +257,8 @@ def test_persistently_unverifiable_evidence_degrades_instead_of_crashing(make_cl
 
     assert ev.dimensions["correctness"].score == 5  # score preserved
     assert ev.dimensions["correctness"].evidence == UNVERIFIABLE_EVIDENCE  # citation blanked, not crashed
-    assert fake.call_count == 3  # 2 enforced attempts fail evidence, then 1 degrade pass without it
+    # JUDGE_MAX_RETRIES + 1 enforced attempts fail evidence, then 1 degrade pass without it
+    assert fake.call_count == JUDGE_MAX_RETRIES + 2
 
 
 # --- evidence-degrade confidence signal (issue 0033 / GH #37) ----------------------------------
@@ -293,26 +296,30 @@ def test_entirely_unverifiable_evidence_flags_degraded_and_caps_confidence(make_
     assert ev.confidence <= EVIDENCE_DEGRADE_CONFIDENCE_CEILING  # full 0.9 confidence no longer stands
 
 
-def test_partial_citation_blanking_is_not_flagged_and_keeps_confidence(make_client):
-    # A judgment with SOME verifiable evidence still has a partial audit trail — the current
-    # "sanitize-and-keep" behavior is correct there. Only an *entirely* fabricated trail trips the
-    # degrade signal, so a partial blank must not flag or haircut.
+def test_partial_citation_blanking_takes_a_graded_haircut(make_client):
+    # Trust guards: with self-reported confidence saturated (~0.95 on every live case), a judgment
+    # with HALF its citations blanked must not read as trustworthy as a spotless one. The cap slides
+    # linearly toward the full-degrade ceiling; the binary evidence_degraded flag stays reserved for
+    # an *entirely* fabricated trail.
     answer = "Bias is systematic error from too-simple assumptions."
     rubric = Rubric(weights={"correctness": 0.6, "depth": 0.4})
     # correctness quotes verbatim; depth paraphrases -> the enforced check fails, then degrade blanks
-    # only depth. Two attempts fail the evidence gate, then one degrade pass runs without it.
+    # only depth.
     verbatim = "systematic error from too-simple assumptions"
     paraphrase = "the answer lacks nuance"
-    client, fake = make_client(
-        [_two_dim_eval(verbatim, paraphrase), _two_dim_eval(verbatim, paraphrase)]
-    )
+    client, fake = make_client([_two_dim_eval(verbatim, paraphrase)])
 
     ev = evaluate(client, "Explain bias.", answer, rubric)
 
     assert ev.dimensions["correctness"].evidence == verbatim  # verifiable citation kept
     assert ev.dimensions["depth"].evidence == UNVERIFIABLE_EVIDENCE  # only the bad one blanked
     assert ev.evidence_degraded is False  # audit trail only partially unverifiable
-    assert ev.confidence == pytest.approx(0.9)  # not capped
+    # 1 of 2 citations blanked -> ceiling = 1 - (1 - 0.4) * 0.5 = 0.7
+    expected_cap = 1.0 - (1.0 - EVIDENCE_DEGRADE_CONFIDENCE_CEILING) * 0.5
+    assert ev.confidence == pytest.approx(expected_cap)
+    assert ev.trust is not None
+    assert ev.trust.pre_guard_confidence == pytest.approx(0.9)
+    assert ev.trust.unverifiable_fraction == pytest.approx(0.5)
 
 
 def test_happy_path_is_not_evidence_degraded(make_client):
@@ -329,7 +336,8 @@ def test_evidence_degrade_ceiling_only_lowers_confidence(make_client):
     # exactly like the cross-check guard — the degrade signal never raises confidence. A confidence
     # below the ceiling is also below the escalation threshold, so the panel inevitably runs; the
     # property must hold on the verdict, which here goes through the same degrade dance as the
-    # first pass (2 evidence failures + 1 degrade pass each), with the committee in between.
+    # first pass (JUDGE_MAX_RETRIES+1 evidence failures + 1 degrade pass each), with the committee
+    # in between.
     answer = "Bias is systematic error from too-simple assumptions."
     rubric = Rubric(weights={"correctness": 1.0})
     low = EVIDENCE_DEGRADE_CONFIDENCE_CEILING / 2
@@ -341,14 +349,16 @@ def test_evidence_degrade_ceiling_only_lowers_confidence(make_client):
             "key_evidence": "too-simple assumptions",
         }
     )
-    client, fake = make_client([bad, bad, bad, opinion, opinion, bad, bad, bad])
+    first_pass = [bad] * (JUDGE_MAX_RETRIES + 2)
+    verdict_pass = [bad] * (JUDGE_MAX_RETRIES + 2)
+    client, fake = make_client([*first_pass, opinion, opinion, *verdict_pass])
 
     ev = evaluate(client, "Explain bias.", answer, rubric)
 
     assert ev.evidence_degraded is True
     assert ev.panel is not None  # low confidence always escalates now (issue 0027)
     assert ev.confidence == pytest.approx(low)  # already below the ceiling; unchanged
-    assert fake.call_count == 8
+    assert fake.call_count == 2 * (JUDGE_MAX_RETRIES + 2) + 2
 
 
 # --- weighted_score cross-check guard (slice 0003) ---------------------------------------------
@@ -525,16 +535,17 @@ def test_model_cannot_author_the_derived_fields(make_client):
 def test_degrade_pass_is_reserved_for_evidence_failures(make_client):
     # A delivery-fixes contract failure must NOT open the evidence-free degrade pass: dropping the
     # verbatim-citation guard because an unrelated validator kept failing would silently un-enforce
-    # it. Both attempts miss the required fixes -> loud StructuredOutputError, no third call.
+    # it. Every attempt misses the required fixes -> loud StructuredOutputError, no degrade pass.
     from interview_coach.llm import StructuredOutputError
 
     weak_delivery = json.loads(_eval_json(_good_dimensions()))
     weak_delivery["dimensions"]["english_delivery"] = {"score": 2, "evidence": "no evidence"}
     reply = json.dumps(weak_delivery)
-    client, fake = make_client([reply, reply])
+    client, fake = make_client([reply])  # the fake repeats its last scripted reply
     with pytest.raises(StructuredOutputError):
         evaluate(client, QUESTION.question, STRONG_ANSWER, _DELIVERY_RUBRIC)
-    assert fake.call_count == 2  # no evidence-free third pass for a non-evidence failure
+    # all enforced attempts burned, and no evidence-free extra pass for a non-evidence failure
+    assert fake.call_count == JUDGE_MAX_RETRIES + 1
 
 
 # --- english_delivery + language_mode (issue 0024, ADR 0007) --------------------------------------
@@ -650,14 +661,18 @@ def test_system_prompt_mentions_english_delivery_only_when_active():
 def test_top_level_fields_nested_inside_dimensions_are_recovered(make_client):
     # Seen live (gpt-5.4-mini, 2026-07-11): on long answers the judge sometimes flattens the whole
     # judgment inside "dimensions" — weighted_score, confidence, and the follow-up fields arrive as
-    # siblings of the dimension scores. Field placement must not cost a valid judgment or a retry.
+    # siblings of the dimension scores. Field placement must not cost a valid judgment or a retry;
+    # since the trust guards it DOES cost a mild confidence cap (the parse was not clean), which is
+    # exactly what makes the fold visible to the evidence weight.
+    from interview_coach.evaluator import NOISE_CONFIDENCE_CEILING
+
     payload = json.loads(_eval_json(_good_dimensions(), weighted=4.0, confidence=0.9))
     for field in ("weighted_score", "confidence", "follow_up_recommended", "follow_up_rationale"):
         payload["dimensions"][field] = payload.pop(field)
     client, fake = make_client([json.dumps(payload)])
     ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
     assert ev.weighted_score == pytest.approx(4.0)
-    assert ev.confidence == pytest.approx(0.9)
+    assert ev.confidence == pytest.approx(NOISE_CONFIDENCE_CEILING)  # 0.9 capped by the noise guard
     assert set(ev.dimensions) == set(_good_dimensions())
     assert fake.call_count == 1
 
@@ -696,3 +711,263 @@ def test_live_weak_scores_below_strong():
     weak = evaluate(client, QUESTION.question, WEAK_ANSWER, QUESTION.rubric)
     assert set(strong.dimensions) == ACTIVE
     assert weak.weighted_score < strong.weighted_score
+
+
+# --- free-tier hardening: judge retry budget + sanitizer noise telemetry -------------------------
+
+
+def test_judge_retry_budget_absorbs_two_bad_replies(make_client):
+    # The 24/29 red day was pure structural flakiness with max_retries=1. The judge call now
+    # carries JUDGE_MAX_RETRIES=2: two invalid replies and a clean third one must still land.
+    replies = ["not json", "still not json", _eval_json(_good_dimensions())]
+    client, fake = make_client(replies)
+
+    evaluation = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+
+    assert evaluation.weighted_score == 4.0
+    assert fake.call_count == JUDGE_MAX_RETRIES + 1
+    assert telemetry.snapshot()["structured_output.invalid_reply"] == 2
+
+
+def test_sanitizer_counts_flattened_judgment_and_derived_echo():
+    data = {
+        "dimensions": {
+            **_good_dimensions(),
+            # gpt-5.4-mini's flatten mode: top-level judgment fields arrive inside "dimensions".
+            "weighted_score": 4.0,
+            "confidence": 0.9,
+        },
+        "follow_up_recommended": False,
+        "follow_up_rationale": "resolved",
+        "evidence_degraded": True,  # model echoing a derived field must be stripped AND counted
+    }
+
+    evaluation = Evaluation.model_validate(data)
+
+    assert evaluation.weighted_score == 4.0
+    assert evaluation.evidence_degraded is False
+    snap = telemetry.snapshot()
+    assert snap["sanitizer.judgment_flattened_in_dimensions"] == 2
+    assert snap["sanitizer.derived_field_echoed"] == 1
+
+
+def test_sanitizer_counts_stray_delivery_fixes_dropped():
+    data = {
+        "dimensions": _good_dimensions(),  # english_delivery NOT active
+        "weighted_score": 4.0,
+        "confidence": 0.9,
+        "follow_up_recommended": False,
+        "follow_up_rationale": "resolved",
+        "delivery_fixes": ["said 'model is overfit' — say 'the model overfits'"],
+    }
+
+    evaluation = Evaluation.model_validate(data)
+
+    assert evaluation.delivery_fixes == ()
+    assert telemetry.snapshot()["sanitizer.stray_delivery_fixes_dropped"] == 1
+
+
+def test_sanitizer_counts_misplaced_delivery_fixes_and_keeps_them_when_active():
+    data = {
+        "dimensions": {
+            **_good_dimensions(),
+            "english_delivery": {"score": 5, "evidence": "no evidence"},
+            "delivery_fixes": ["a — b"],  # nested where a dimension key belongs
+        },
+        "weighted_score": 4.0,
+        "confidence": 0.9,
+        "follow_up_recommended": False,
+        "follow_up_rationale": "resolved",
+    }
+
+    evaluation = Evaluation.model_validate(data)
+
+    assert evaluation.delivery_fixes == ("a — b",)
+    assert telemetry.snapshot()["sanitizer.delivery_fixes_misplaced"] == 1
+
+
+def test_sanitizer_counts_non_list_delivery_fixes():
+    data = {
+        "dimensions": {
+            **_good_dimensions(),
+            "english_delivery": {"score": 5, "evidence": "no evidence"},
+        },
+        "weighted_score": 4.0,
+        "confidence": 0.9,
+        "follow_up_recommended": False,
+        "follow_up_rationale": "resolved",
+        "delivery_fixes": {"oops": "a dict, not a list"},
+    }
+
+    evaluation = Evaluation.model_validate(data)
+
+    assert evaluation.delivery_fixes == ()
+    assert telemetry.snapshot()["sanitizer.delivery_fixes_not_list"] == 1
+
+
+# --- trust guards (graded deterministic confidence caps) + panel budget --------------------------
+
+
+def test_clean_judgment_carries_a_quiet_trust_trace(make_client):
+    client, _ = make_client([_eval_json(_good_dimensions(), confidence=0.95)])
+
+    ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+
+    assert ev.confidence == pytest.approx(0.95)  # nothing to cap
+    assert ev.trust is not None
+    assert ev.trust.pre_guard_confidence == pytest.approx(0.95)
+    assert ev.trust.unverifiable_fraction == 0.0
+    assert ev.trust.noise_events == ()
+
+
+def test_structural_noise_caps_confidence_mildly(make_client):
+    from interview_coach.evaluator import NOISE_CONFIDENCE_CEILING
+
+    # One garbage reply burns a structured-output retry before the clean one lands: the kept
+    # judgment must not read as full-confidence, but the cap stays far above the 0.5 trigger —
+    # noise alone never buys a panel (the #53 cost posture).
+    client, fake = make_client(["not json", _eval_json(_good_dimensions(), confidence=0.95)])
+
+    ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+
+    assert fake.call_count == 2
+    assert ev.confidence == pytest.approx(NOISE_CONFIDENCE_CEILING)
+    assert ev.trust is not None
+    assert "structured_output.invalid_reply" in ev.trust.noise_events
+    assert ev.panel is None  # 0.85 > 0.5: no escalation
+
+
+def test_flatten_fold_counts_as_noise_and_caps(make_client):
+    from interview_coach.evaluator import NOISE_CONFIDENCE_CEILING
+
+    flattened = json.loads(_eval_json(_good_dimensions(), confidence=0.95))
+    flattened["dimensions"]["weighted_score"] = flattened.pop("weighted_score")
+    client, fake = make_client([json.dumps(flattened)])
+
+    ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+
+    assert fake.call_count == 1  # folded, not retried
+    assert ev.confidence == pytest.approx(NOISE_CONFIDENCE_CEILING)
+    assert ev.trust is not None
+    assert "sanitizer.judgment_flattened_in_dimensions" in ev.trust.noise_events
+
+
+def test_panel_budget_exhausted_keeps_guarded_first_pass(make_client):
+    from interview_coach.evaluator import PanelBudget
+
+    # Self-reported low confidence would normally convene the committee; a spent budget must keep
+    # the guarded first pass and pay ZERO extra calls.
+    client, fake = make_client([_eval_json(_good_dimensions(), confidence=0.2)])
+
+    ev = evaluate(
+        client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric,
+        panel_budget=PanelBudget(remaining=0),
+    )
+
+    assert fake.call_count == 1
+    assert ev.panel is None
+    assert ev.confidence == pytest.approx(0.2)
+    assert telemetry.snapshot()["evaluator.panel_budget_exhausted"] == 1
+    # The rationing is recorded on the judgment itself — a suppressed escalation must never read
+    # as a confident pass in transcripts and reports.
+    assert ev.trust is not None and ev.trust.panel_suppressed is True
+
+
+def test_panel_budget_allows_one_escalation_then_stops(make_client):
+    from interview_coach.evaluator import PanelBudget
+
+    low = _eval_json(_good_dimensions(), confidence=0.2)
+    opinion = json.dumps(
+        {"recommended_score": 4.0, "argument": "Committee voice.", "key_evidence": "learning curves"}
+    )
+    verdict = _eval_json(_good_dimensions(), confidence=0.9)
+    client, fake = make_client([low, opinion, opinion, verdict])
+    budget = PanelBudget(remaining=1)
+
+    ev = evaluate(
+        client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric, panel_budget=budget
+    )
+
+    assert ev.panel is not None
+    assert fake.call_count == 4  # first pass + skeptic + advocate + verdict
+    assert budget.remaining == 0
+    assert ev.trust is not None  # the verdict carries its own trust trace
+
+
+def test_panel_budget_per_question_reads_env(monkeypatch):
+    from interview_coach.evaluator import PanelBudget
+
+    monkeypatch.delenv("PANEL_MAX_ESCALATIONS_PER_QUESTION", raising=False)
+    assert PanelBudget.per_question().remaining == 1
+    monkeypatch.setenv("PANEL_MAX_ESCALATIONS_PER_QUESTION", "3")
+    assert PanelBudget.per_question().remaining == 3
+    monkeypatch.setenv("PANEL_MAX_ESCALATIONS_PER_QUESTION", "junk")
+    assert PanelBudget.per_question().remaining == 1
+
+
+# --- strict decoding grammar built from the rubric ------------------------------------------------
+
+
+def test_evaluation_json_schema_locks_active_dimensions():
+    from interview_coach.evaluator import evaluation_json_schema
+
+    schema = evaluation_json_schema(QUESTION.rubric)
+
+    dims = schema["properties"]["dimensions"]
+    assert set(dims["properties"]) == ACTIVE  # exactly the active dims — weight-0 keys cannot exist
+    assert set(dims["required"]) == ACTIVE
+    assert dims["additionalProperties"] is False  # the flatten mode is grammatically impossible
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["weighted_score"] == {"type": "number", "minimum": 1, "maximum": 5}
+    # Delivery inactive -> the grammar must FORBID delivery_fixes entirely: strict mode requires
+    # every listed property, so listing it here forced invented fixes on 15/29 live cases.
+    assert "delivery_fixes" not in schema["properties"]
+
+
+def test_evaluation_json_schema_carries_delivery_fixes_only_when_active():
+    from interview_coach.evaluator import evaluation_json_schema
+
+    schema = evaluation_json_schema(_DELIVERY_RUBRIC)
+
+    assert "delivery_fixes" in schema["properties"]
+    assert "delivery_fixes" in schema["required"]
+    assert "english_delivery" in schema["properties"]["dimensions"]["properties"]
+
+
+def test_judge_call_carries_the_rubric_grammar(fake_openai_factory):
+    from interview_coach.llm import OpenAIClient
+
+    fake = fake_openai_factory([_eval_json(_good_dimensions())])
+    client = OpenAIClient(
+        __import__("interview_coach.config", fromlist=["ProviderSettings"]).ProviderSettings(
+            name="openai", api_key="test", base_url="http://openai.test", model="gpt-5.4-mini"
+        ),
+        client=fake,
+    )
+
+    evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+
+    sent = fake.chat.completions.calls[0]["response_format"]
+    assert sent["type"] == "json_schema"
+    assert set(sent["json_schema"]["schema"]["properties"]["dimensions"]["properties"]) == ACTIVE
+
+
+def test_panel_verdict_inherits_first_pass_noise(make_client):
+    from interview_coach.evaluator import NOISE_CONFIDENCE_CEILING
+
+    # The shaky exchange: first parse burns a retry, lands at low confidence, panel convenes, and
+    # the verdict parses cleanly. The kept verdict must still carry (and be capped by) the FIRST
+    # pass's noise — otherwise every escalated case reads as a clean parse in the shadow data.
+    low = _eval_json(_good_dimensions(), confidence=0.2)
+    opinion = json.dumps(
+        {"recommended_score": 4.0, "argument": "Committee voice.", "key_evidence": "learning curves"}
+    )
+    clean_verdict = _eval_json(_good_dimensions(), confidence=0.9)
+    client, fake = make_client(["not json", low, opinion, opinion, clean_verdict])
+
+    ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+
+    assert ev.panel is not None
+    assert ev.trust is not None
+    assert "structured_output.invalid_reply" in ev.trust.noise_events
+    assert ev.confidence == pytest.approx(NOISE_CONFIDENCE_CEILING)

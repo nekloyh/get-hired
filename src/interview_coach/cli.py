@@ -23,13 +23,13 @@ import argparse
 import logging
 import sys
 import time
-from datetime import UTC, datetime
 from pathlib import Path
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+from . import telemetry
 from .bank import BankError, load_pack
-from .bench import bench_passed, load_bench_data, render_bench_report, run_bench
+from .bench import bench_passed, bias_warnings, load_bench_data, render_bench_report, run_bench
 from .concepts import SEED_CONCEPTS, ChromaConceptStore, InMemoryConceptStore, build_concept_store
 from .config import load_settings
 from .diagnostic import SKILLS, CandidateProfile, diagnose_or_degrade
@@ -66,6 +66,7 @@ from .supervisor import (
     skill_states_from_state,
 )
 from .ui import render_skill_state_rows
+from .usage import daily_token_budget, remaining_today, usage_for_day, utc_date
 
 ANSWERS = {"strong": STRONG_ANSWER, "weak": WEAK_ANSWER}
 
@@ -564,34 +565,108 @@ def _cmd_eval_harness(client: LLMClient | None, args: argparse.Namespace) -> int
 
 
 def _utc_date() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%d")
+    # Delegates to the ledger's day key so the report date can never desynchronize from the
+    # daily-budget bucketing.
+    return utc_date()
+
+
+# A 29-case bench run measures ~100–200k tokens including retries; starting one with less than
+# this in the day's budget risks dying mid-run on insufficient_quota with a half-written report.
+BENCH_MIN_BUDGET_TOKENS = 200_000
+
+
+def _usage_delta(
+    before: dict[str, dict[str, int]], after: dict[str, dict[str, int]]
+) -> dict[str, dict[str, int]]:
+    """Per-provider token deltas across one run — ALL providers, so failover spend counts too.
+
+    Clamped at zero per stat: a run crossing UTC midnight diffs two different day buckets, and a
+    negative "run cost" would be nonsense in the report.
+    """
+    stats = ("prompt", "completion", "total", "calls")
+    delta: dict[str, dict[str, int]] = {}
+    for prov in before.keys() | after.keys():
+        b, a = before.get(prov, {}), after.get(prov, {})
+        row = {key: max(0, a.get(key, 0) - b.get(key, 0)) for key in stats}
+        if any(row.values()):
+            delta[prov] = row
+    return delta
 
 
 def _cmd_bench(client: LLMClient | None, args: argparse.Namespace) -> int:
     if client is None:
         raise RuntimeError("bench requires an LLM client")
+    provider = str(getattr(client, "primary_provider", "unknown"))
+    budget = daily_token_budget()
+    usage_before = usage_for_day()
+    left = max(0, budget - usage_before.get(provider, {}).get("total", 0))
+    print(f"Daily budget check ({provider}): ~{left:,} of {budget:,} tokens left by our count.")
+    if left < BENCH_MIN_BUDGET_TOKENS:
+        print(
+            f"WARNING: under {BENCH_MIN_BUDGET_TOKENS:,} tokens left — a full bench run may die "
+            "mid-run on insufficient_quota. Consider waiting for the daily reset (00:00 UTC).",
+            file=sys.stderr,
+        )
+    telemetry_before = telemetry.snapshot()
     data = load_bench_data(args.cases or None)
     results = run_bench(client, data.cases)
-    provider = getattr(client, "primary_provider", "unknown")
+    telemetry_after = telemetry.snapshot()
+    usage_after = usage_for_day()
+    run_usage = _usage_delta(usage_before, usage_after)
     settings = load_settings()
     report = render_bench_report(
         results,
         anchors=data.anchors,
-        provider=str(provider),
+        provider=provider,
         model=settings.primary_config.model or "unknown",
         date=_utc_date(),
+        telemetry_delta=telemetry.delta(telemetry_before, telemetry_after),
+        token_usage=run_usage,
     )
     out = Path(args.out) if args.out else Path("docs/audits") / f"calibration-bench-{_utc_date()}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(report, encoding="utf-8")
     within = sum(1 for r in results if r.within_band)
-    print(f"Bench: {within}/{len(results)} cases within band. Report written to {out}.")
+    spent = sum(stats["total"] for stats in run_usage.values())
+    left_after = max(0, budget - usage_after.get(provider, {}).get("total", 0))
+    print(
+        f"Bench: {within}/{len(results)} cases within band. Report written to {out}. "
+        f"Run cost ~{spent:,} tokens; ~{left_after:,} left today."
+    )
+    for warning in bias_warnings(results):
+        # Drift warning, not a gate: the run stays green, but a systematically drifting dimension
+        # deserves a re-anchor pass before it starts costing in-band cases.
+        print(f"BIAS TRIPWIRE: {warning}", file=sys.stderr)
     return 0 if bench_passed(results) else 1
+
+
+def _cmd_usage(client: LLMClient | None, args: argparse.Namespace) -> int:
+    """Today's client-side token ledger — the daily free-tier budget is invisible to the API."""
+    totals = usage_for_day()
+    if not totals:
+        print("No recorded usage today (ledger: logs/usage-ledger.jsonl).")
+    for provider, stats in sorted(totals.items()):
+        print(
+            f"{provider}: {stats['total']:,} tokens across {stats['calls']} call(s) "
+            f"({stats['prompt']:,} prompt + {stats['completion']:,} completion)"
+        )
+    budget = daily_token_budget()
+    settings = load_settings()
+    primary = settings.primary_provider
+    print(f"Primary ({primary}): ~{remaining_today(primary):,} of {budget:,} daily tokens left by our count.")
+    return 0
 
 
 def _cmd_forge(client: LLMClient | None, args: argparse.Namespace) -> int:
     if client is None:
         raise RuntimeError("forge requires an LLM client")
+    # Same preflight as the bench: gate 3 spends ~4+ calls per surviving draft, and a forge run
+    # started blind into a nearly-dead quota dies mid-queue with a half-written review file.
+    provider = getattr(client, "primary_provider", "unknown")
+    print(
+        f"Daily budget check ({provider}): ~{remaining_today(str(provider)):,} of "
+        f"{daily_token_budget():,} tokens left by our count."
+    )
     # Gate 2 must dedup across everything the merged install would serve: the built-in bank plus,
     # when the drafts target a pack, that pack's questions. The pack's concept notes then also
     # become valid Writer grounding / expected_concepts targets.
@@ -919,6 +994,9 @@ def main(argv: list[str] | None = None) -> int:
 
     harness_parser = sub.add_parser("eval-harness", help="Slice 0012: run Evaluator golden-answer checks")
     harness_parser.set_defaults(func=_cmd_eval_harness, requires_llm=True)
+
+    usage_parser = sub.add_parser("usage", help="Show today's token spend per provider (client-side daily ledger)")
+    usage_parser.set_defaults(func=_cmd_usage, requires_llm=False)
 
     bench_parser = sub.add_parser("bench", help="Issue 0022: bilingual Judge calibration bench")
     bench_parser.add_argument("--cases", default="", help="Path to a cases YAML (default: data/bench/cases.yaml).")

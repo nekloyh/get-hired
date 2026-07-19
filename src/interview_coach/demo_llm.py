@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, TypeVar
 
 from pydantic import BaseModel
@@ -42,6 +42,7 @@ class DemoLLMClient(LLMClient):
         validators: Sequence[Validator] = (),
         max_retries: int = 1,
         disable_thinking: bool = False,
+        json_schema: Mapping[str, Any] | None = None,  # accepted for interface parity; demo ignores it
     ) -> T:
         payload = self._payload_for(response_model, messages)
         parsed = response_model.model_validate(payload)

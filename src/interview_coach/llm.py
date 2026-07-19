@@ -9,16 +9,60 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, TypeVar
 
+import openai
 from openai import OpenAI
 from pydantic import BaseModel, ValidationError
 
+from . import telemetry
 from .config import ProviderName, ProviderSettings, Settings
+from .usage import record_usage
 
 logger = logging.getLogger(__name__)
+
+# Transport-retry policy (free-tier hardening): 429s and transient 5xx/connection failures get a
+# bounded, explicit backoff HERE and nowhere else — the SDK's own hidden retries are disabled in
+# ``_openai()`` so retry ownership is single (no multiplicative retry stacking). The exception is
+# ``insufficient_quota``: when the daily allowance is spent, waiting cannot help, so it fails fast
+# and loud instead of burning the timeout budget.
+_TRANSPORT_ATTEMPTS = 4  # 1 call + up to 3 backed-off retries
+_BACKOFF_SECONDS = (2.0, 5.0, 10.0)
+_MAX_RETRY_AFTER_SECONDS = 30.0  # cap on a provider-suggested Retry-After
+
+_sleep = time.sleep  # module-level so tests can stub the wait out
+
+
+def _quota_exhausted(err: Exception) -> bool:
+    """A 429 backoff cannot fix: the provider says the day's token allowance is spent."""
+    return "insufficient_quota" in f"{getattr(err, 'code', '')} {err}"
+
+
+def _retryable_transport_error(err: Exception) -> bool:
+    if isinstance(err, openai.RateLimitError):
+        return not _quota_exhausted(err)
+    if isinstance(err, openai.APIConnectionError):  # includes APITimeoutError
+        return True
+    if isinstance(err, openai.APIStatusError):
+        # 408/409 are transient (request timeout / conflict) — the SDK's own default retry policy
+        # covered them before max_retries=0 moved retry ownership here, so they stay retryable.
+        return err.status_code >= 500 or err.status_code in (408, 409)
+    return False
+
+
+def _retry_wait(err: Exception, attempt: int) -> float:
+    """Provider's Retry-After when it sent one (capped), else the fixed backoff schedule."""
+    headers = getattr(getattr(err, "response", None), "headers", None)
+    raw = headers.get("retry-after") if headers is not None else None
+    if raw is not None:
+        try:
+            return min(max(float(raw), 0.0), _MAX_RETRY_AFTER_SECONDS)
+        except ValueError:
+            pass
+    return _BACKOFF_SECONDS[min(attempt, len(_BACKOFF_SECONDS) - 1)]
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -27,7 +71,8 @@ T = TypeVar("T", bound=BaseModel)
 # ``{"role": ..., "content": ...}`` messages remain valid (str is Any), so the other single-shot
 # agents are unaffected.
 Message = dict[str, Any]
-ResponseFormat = dict[str, str]
+# json_object mode is flat strings; json_schema mode nests the full grammar — hence Any values.
+ResponseFormat = dict[str, Any]
 Validator = Callable[[Any], None]
 ToolSpec = dict[str, Any]
 # Executes one tool call: receives the tool name and parsed JSON arguments, returns the result
@@ -64,6 +109,16 @@ class LLMClient(ABC):
     ) -> str:
         """Return raw assistant content for ``messages``."""
 
+    @property
+    def supports_json_schema(self) -> bool:
+        """Whether this client can enforce strict ``response_format: json_schema`` grammars.
+
+        Constrained decoding kills structural noise at the source — a model literally cannot
+        flatten the judgment into ``dimensions`` or score a weight-0 dimension when the grammar
+        forbids the keys. Off by default; only clients whose support is live-verified opt in.
+        """
+        return False
+
     def chat_json(
         self,
         messages: Sequence[Message],
@@ -72,13 +127,30 @@ class LLMClient(ABC):
         validators: Sequence[Validator] = (),
         max_retries: int = 1,
         disable_thinking: bool = False,
+        json_schema: Mapping[str, Any] | None = None,
     ) -> T:
         """Get a schema-valid ``response_model`` from the model.
 
         Parses the reply, validates it against the pydantic schema, then runs any extra
         ``validators``. On any schema/domain validation failure it feeds the error back and retries
         up to ``max_retries`` times before raising :class:`StructuredOutputError`.
+
+        ``json_schema`` (a bare JSON Schema dict) upgrades the request to strict constrained
+        decoding on clients that support it (probed live on gpt-5.4-mini 2026-07-11); everywhere
+        else it is ignored and the parse-and-repair loop stays the only guard. The pydantic +
+        validator pipeline still runs either way — the grammar is an upstream filter, not a
+        replacement for validation.
         """
+        response_format: dict[str, Any] = {"type": "json_object"}
+        if json_schema is not None and self.supports_json_schema:
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": response_model.__name__.lower(),
+                    "strict": True,
+                    "schema": dict(json_schema),
+                },
+            }
         convo = list(messages)
         last_error: Exception | None = None
         for attempt in range(max_retries + 1):
@@ -86,7 +158,7 @@ class LLMClient(ABC):
             try:
                 raw = self.chat(
                     convo,
-                    response_format={"type": "json_object"},
+                    response_format=response_format,
                     disable_thinking=disable_thinking,
                 )
                 parsed = response_model.model_validate_json(_extract_json(raw))
@@ -95,6 +167,7 @@ class LLMClient(ABC):
                 return parsed
             except (ValidationError, ValueError) as err:
                 last_error = err
+                telemetry.incr("structured_output.invalid_reply")
                 logger.warning("structured-output attempt %d failed: %s", attempt + 1, err)
                 if attempt < max_retries:
                     convo = [
@@ -182,6 +255,9 @@ class _OpenAICompatibleClient(LLMClient):
                 api_key=self._settings.api_key,
                 base_url=self._settings.base_url,
                 timeout=self._settings.timeout_seconds,
+                # Retries are owned by _create()'s explicit backoff; the SDK's hidden default
+                # (max_retries=2) would stack multiplicatively under it.
+                max_retries=0,
             )
         return self._client
 
@@ -208,7 +284,47 @@ class _OpenAICompatibleClient(LLMClient):
                 kwargs["tool_choice"] = tool_choice
         if extra_body := self._thinking_extra_body(disable_thinking):
             kwargs["extra_body"] = extra_body
-        return self._openai().chat.completions.create(**kwargs).choices[0].message
+        for attempt in range(_TRANSPORT_ATTEMPTS):
+            try:
+                completion = self._openai().chat.completions.create(**kwargs)
+            except Exception as err:
+                if isinstance(err, openai.RateLimitError) and _quota_exhausted(err):
+                    logger.error(
+                        "%s daily quota exhausted (insufficient_quota) — backoff cannot help; "
+                        "check today's spend in %s",
+                        self.provider_name,
+                        "logs/usage-ledger.jsonl",
+                    )
+                    raise
+                if attempt + 1 >= _TRANSPORT_ATTEMPTS or not _retryable_transport_error(err):
+                    raise
+                wait = _retry_wait(err, attempt)
+                telemetry.incr(f"transport.backoff.{self.provider_name}")
+                logger.warning(
+                    "%s transport error (attempt %d/%d): %s — backing off %.1fs",
+                    self.provider_name,
+                    attempt + 1,
+                    _TRANSPORT_ATTEMPTS,
+                    err,
+                    wait,
+                )
+                _sleep(wait)
+            else:
+                self._record_usage(completion)
+                return completion.choices[0].message
+        raise AssertionError("unreachable: transport retry loop always returns or raises")
+
+    def _record_usage(self, completion: Any) -> None:
+        """Append this call's token usage to the daily ledger (fakes without ``usage`` are skipped)."""
+        used = getattr(completion, "usage", None)
+        if used is None:
+            return
+        record_usage(
+            self.provider_name,
+            self._settings.model,
+            prompt_tokens=getattr(used, "prompt_tokens", 0) or 0,
+            completion_tokens=getattr(used, "completion_tokens", 0) or 0,
+        )
 
     def chat(
         self,
@@ -350,6 +466,12 @@ class OpenAIClient(_OpenAICompatibleClient):
     provider_name: ProviderName = "openai"
     _supports_tools: bool = True
 
+    @property
+    def supports_json_schema(self) -> bool:
+        # Live-probed on gpt-5.4-mini (2026-07-11): strict grammars accepted, including nested
+        # objects, arrays, and minimum/maximum bounds. Groq/MiMo stay opted out until verified.
+        return True
+
 
 class LLMRouter(LLMClient):
     """Select the primary provider and fail over to the configured fallback on primary errors."""
@@ -375,6 +497,10 @@ class LLMRouter(LLMClient):
     def fallback_provider(self) -> ProviderName:
         return self._fallback_provider
 
+    @property
+    def supports_json_schema(self) -> bool:
+        return self._clients[self._primary_provider].supports_json_schema
+
     def chat(
         self,
         messages: Sequence[Message],
@@ -399,6 +525,15 @@ class LLMRouter(LLMClient):
                     err,
                 )
                 raise
+            if (
+                response_format is not None
+                and response_format.get("type") == "json_schema"
+                and not fallback.supports_json_schema
+            ):
+                # A strict grammar the fallback cannot enforce must not turn an outage into a 400:
+                # downgrade to plain JSON mode and let parse-and-repair carry the schema burden.
+                response_format = {"type": "json_object"}
+            telemetry.incr(f"router.failover.{self._primary_provider}")
             logger.warning(
                 "primary LLM provider %s failed; falling back to %s: %s",
                 self._primary_provider,

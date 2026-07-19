@@ -191,6 +191,31 @@ def dimension_bias(results: Sequence[BenchResult]) -> dict[str, dict[str, float]
     }
 
 
+# Below this many labelled cases a per-dimension bias estimate is noise, not signal: on a 1–5
+# scale with n=3–4 a single case swings the mean by ±0.25–0.33 (mlops_awareness went +0.00 → +0.50
+# between two same-day green runs on n=4). The report still shows the number but marks it unstable,
+# and the tripwire ignores it.
+BIAS_MIN_SAMPLES = 8
+
+# |bias| beyond this on a sufficiently-sampled dimension means the judge and the human labels
+# disagree systematically — the signal that triggered the July-11 re-anchor worklist. A warning,
+# not a gate: bands still gate correctness; this catches drift while everything is still green.
+BIAS_TRIPWIRE = 0.5
+
+
+def bias_warnings(results: Sequence[BenchResult]) -> list[str]:
+    """Tripwire lines for dimensions whose bias is both statistically grounded and drifting."""
+    warnings = []
+    for dim, stats in sorted(dimension_bias(results).items()):
+        if stats["n"] >= BIAS_MIN_SAMPLES and abs(stats["bias"]) > BIAS_TRIPWIRE:
+            warnings.append(
+                f"{dim}: bias {stats['bias']:+.2f} over n={int(stats['n'])} exceeds ±{BIAS_TRIPWIRE:.1f} "
+                "— re-anchor the judge guide for this dimension (see the 2026-07-11 re-anchor audit "
+                "for the worklist pattern)"
+            )
+    return warnings
+
+
 def weak_strong_separation(results: Sequence[BenchResult]) -> dict[str, float | None]:
     """Mean weighted_score of weak-labelled vs strong-labelled cases, and the gap between them."""
     weak = [r.score for r in results if r.case.is_weak and r.score is not None]
@@ -249,6 +274,52 @@ def mixed_mode_rows(results: Sequence[BenchResult]) -> list[dict[str, Any]]:
     return rows
 
 
+def trust_guard_rows(results: Sequence[BenchResult]) -> list[dict[str, Any]]:
+    """Per case where a deterministic trust signal moved (or would move) the judgment.
+
+    The rows surface what the saturated self-report cannot: blanked citations, holistic-vs-linear
+    divergence, and parse noise, next to the confidence actually kept after the graded caps.
+    """
+    rows = []
+    for result in results:
+        trust = result.evaluation.trust if result.evaluation is not None else None
+        if trust is None:
+            continue
+        signal = (
+            trust.unverifiable_fraction > 0
+            or trust.noise_events
+            or trust.divergence > 0.5
+            or result.confidence != trust.pre_guard_confidence
+        )
+        if not signal:
+            continue
+        rows.append(
+            {
+                "case_id": result.case.case_id,
+                "pre_guard": trust.pre_guard_confidence,
+                "final": result.confidence,
+                "unverifiable_fraction": trust.unverifiable_fraction,
+                "divergence": trust.divergence,
+                "noise_events": ", ".join(trust.noise_events) or "—",
+            }
+        )
+    return rows
+
+
+# The escalation thresholds the shadow analysis prices out. 0.5 is the live trigger; the higher
+# rungs answer "what would raising it buy / cost?" without paying for a single real escalation.
+SHADOW_TRIGGER_THRESHOLDS = (0.5, 0.6, 0.7)
+
+
+def shadow_trigger_counts(results: Sequence[BenchResult]) -> dict[float, int]:
+    """How many judgments would escalate at each candidate threshold, using guarded confidence."""
+    confidences = [r.confidence for r in results if r.confidence is not None]
+    return {
+        threshold: sum(1 for c in confidences if c < threshold)
+        for threshold in SHADOW_TRIGGER_THRESHOLDS
+    }
+
+
 def confidence_calibration(results: Sequence[BenchResult]) -> list[dict[str, Any]]:
     """Bucket cases by stated confidence; compare each bucket's mean confidence to its hit rate.
 
@@ -273,7 +344,9 @@ def confidence_calibration(results: Sequence[BenchResult]) -> list[dict[str, Any
 
 
 def render_bench_report(results: Sequence[BenchResult], *, anchors: Mapping[str, Mapping[str, str]] | None = None,
-                        provider: str = "unknown", model: str = "unknown", date: str = "unknown") -> str:
+                        provider: str = "unknown", model: str = "unknown", date: str = "unknown",
+                        telemetry_delta: Mapping[str, int] | None = None,
+                        token_usage: Mapping[str, Mapping[str, int]] | None = None) -> str:
     """Render the full Markdown calibration report written into docs/audits/."""
     total = len(results)
     passed = sum(1 for r in results if r.within_band)
@@ -294,7 +367,9 @@ def render_bench_report(results: Sequence[BenchResult], *, anchors: Mapping[str,
         conf = "ERR" if r.confidence is None else f"{r.confidence:.2f}"
         mark = "✅" if r.within_band else "❌"
         escalation = "—"
-        if r.evaluation is not None and r.evaluation.self_critique is not None:
+        if r.evaluation is not None and r.evaluation.panel is not None:
+            escalation = "panel: " + ", ".join(r.evaluation.panel.triggers)
+        elif r.evaluation is not None and r.evaluation.self_critique is not None:
             escalation = ", ".join(r.evaluation.self_critique.triggers)
         lines.append(
             f"| {r.case.case_id} | {r.case.skill} | {r.case.language} | {r.case.expected_range} "
@@ -304,9 +379,14 @@ def render_bench_report(results: Sequence[BenchResult], *, anchors: Mapping[str,
             lines.append(f"| | | | | | | | `{r.error}` |")
 
     lines += ["", "## Per-dimension bias (judge − human label)", "",
-              "| dimension | bias | n |", "| --- | ---: | ---: |"]
+              "| dimension | bias | n | stability |", "| --- | ---: | ---: | --- |"]
     for dim, stats in sorted(dimension_bias(results).items()):
-        lines.append(f"| {dim} | {stats['bias']:+.2f} | {int(stats['n'])} |")
+        stability = "ok" if stats["n"] >= BIAS_MIN_SAMPLES else f"⚠ n<{BIAS_MIN_SAMPLES} — unstable estimate"
+        lines.append(f"| {dim} | {stats['bias']:+.2f} | {int(stats['n'])} | {stability} |")
+    if tripwires := bias_warnings(results):
+        lines.append("")
+        for warning in tripwires:
+            lines.append(f"- **BIAS TRIPWIRE** — {warning}")
 
     sep = weak_strong_separation(results)
     lines += ["", "## Weak/strong separation", ""]
@@ -344,6 +424,50 @@ def render_bench_report(results: Sequence[BenchResult], *, anchors: Mapping[str,
         lines.append(
             f"| {row['bucket']} | {row['n']} | {row['mean_confidence']:.2f} | {row['hit_rate']:.0%} |"
         )
+
+    guard_rows = trust_guard_rows(results)
+    lines += ["", "## Trust guards (deterministic confidence caps)", ""]
+    if guard_rows:
+        lines += ["| case | self-reported | kept | unverifiable | divergence | noise |",
+                  "| --- | ---: | ---: | ---: | ---: | --- |"]
+        for row in guard_rows:
+            lines.append(
+                f"| {row['case_id']} | {row['pre_guard']:.2f} | {row['final']:.2f} "
+                f"| {row['unverifiable_fraction']:.0%} | {row['divergence']:.2f} | {row['noise_events']} |"
+            )
+    else:
+        lines.append("- no case tripped a deterministic trust signal this run")
+    shadow = shadow_trigger_counts(results)
+    if shadow:
+        lines.append("")
+        lines.append(
+            "- shadow escalations by trigger threshold (0.5 is live): "
+            + "; ".join(f"<{threshold:.1f} → {count}" for threshold, count in sorted(shadow.items()))
+        )
+
+    if telemetry_delta is not None:
+        # Structural-noise telemetry (free-tier hardening): which sanitizer folds / retries /
+        # backoffs THIS run triggered. A new noise mode from the live model shows up here as a
+        # moving counter while the run is still green — before it ever costs an in-band case.
+        lines += ["", "## Noise & transport telemetry (this run)", ""]
+        if telemetry_delta:
+            lines += ["| event | count |", "| --- | ---: |"]
+            for key, count in sorted(telemetry_delta.items()):
+                lines.append(f"| {key} | {count} |")
+        else:
+            lines.append("- clean run: no sanitizer folds, retries, or transport backoffs")
+
+    if token_usage is not None:
+        lines += ["", "## Token usage (this run)", "",
+                  "| provider | calls | prompt | completion | total |",
+                  "| --- | ---: | ---: | ---: | ---: |"]
+        for prov, stats in sorted(token_usage.items()):
+            lines.append(
+                f"| {prov} | {stats.get('calls', 0)} | {stats.get('prompt', 0)} "
+                f"| {stats.get('completion', 0)} | {stats.get('total', 0)} |"
+            )
+        if not token_usage:
+            lines.append("| (none recorded) | 0 | 0 | 0 | 0 |")
 
     if anchors:
         lines += ["", "## BARS anchors used for labelling", ""]

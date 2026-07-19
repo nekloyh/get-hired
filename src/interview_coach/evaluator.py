@@ -15,17 +15,28 @@ signal.
 from __future__ import annotations
 
 import logging
+import os
 import unicodedata
-from typing import Literal
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from . import telemetry
 from .llm import LLMClient, Message, StructuredOutputError, Validator
 from .rubric import TECHNICAL_DIMENSIONS, Rubric
 
 logger = logging.getLogger(__name__)
 
 NO_EVIDENCE = "no evidence"
+
+# Structured-output retry budget for the JUDGE call specifically (free-tier hardening). The default
+# max_retries=1 proved too thin against gpt-5.4-mini's structural noise — one bad day went 24/29 red
+# on flakiness alone. A retry only costs a call when validation actually failed, so the extra
+# attempt is almost always free; the sanitizer telemetry (telemetry.py) is what makes NEW noise
+# modes visible before they exhaust even this budget. Panel voices keep the default: their schema
+# is three flat fields and each escalation already costs 3 extra calls.
+JUDGE_MAX_RETRIES = 2
 
 
 class EvidenceViolation(ValueError):
@@ -122,6 +133,32 @@ class PanelTrace(BaseModel):
     disagreement: float = Field(ge=0, le=4)
 
 
+class TrustTrace(BaseModel):
+    """The deterministic signals behind this judgment's guarded confidence (derived, never model-authored).
+
+    gpt-5.4-mini self-reports confidence in [0.90, 0.99] on every bench case (mean 0.95, re-anchor
+    audit 2026-07-11), so the stated number carries almost no signal. What DOES vary per judgment is
+    observable: how many citations failed the verbatim check, how far the holistic score sits from
+    its own linear arithmetic, and whether the parse needed structural-noise folds or retries. This
+    trace records those signals next to the confidence they capped, so the bench can answer "what
+    WOULD a different escalation trigger have fired on?" without paying for a single panel call —
+    the shadow data that decides whether the 0.5 threshold is worth moving on a future judge.
+    """
+
+    pre_guard_confidence: float = Field(ge=0, le=1, description="The model's raw self-reported confidence.")
+    unverifiable_fraction: float = Field(ge=0, le=1)
+    divergence: float = Field(ge=0, description="|holistic − linear| weighted score gap.")
+    noise_events: tuple[str, ...] = ()
+    panel_suppressed: bool = Field(
+        default=False,
+        description=(
+            "True when escalation triggers fired but the caller's PanelBudget was spent — the "
+            "committee was wanted but rationed. Without this a suppressed escalation is "
+            "indistinguishable from a confident pass in every transcript and report."
+        ),
+    )
+
+
 class Evaluation(BaseModel):
     """The Evaluator's typed judgment of a single answer."""
 
@@ -153,6 +190,7 @@ class Evaluation(BaseModel):
     )
     self_critique: SelfCritiqueTrace | None = None
     panel: PanelTrace | None = None
+    trust: TrustTrace | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -176,8 +214,9 @@ class Evaluation(BaseModel):
         if not isinstance(data, dict):
             return data
         data = {**data}
-        for derived in ("evidence_degraded", "self_critique", "panel"):
-            data.pop(derived, None)
+        for derived in ("evidence_degraded", "self_critique", "panel", "trust"):
+            if data.pop(derived, None) is not None:
+                telemetry.incr("sanitizer.derived_field_echoed")
         dimensions = data.get("dimensions")
         if isinstance(dimensions, dict):
             dimensions = {**dimensions}
@@ -190,15 +229,22 @@ class Evaluation(BaseModel):
                 if top_level in dimensions:
                     stray = dimensions.pop(top_level)
                     data.setdefault(top_level, stray)
+                    telemetry.incr("sanitizer.judgment_flattened_in_dimensions")
             misplaced = dimensions.pop("delivery_fixes", None)
             if isinstance(misplaced, list) and not data.get("delivery_fixes"):
                 data["delivery_fixes"] = misplaced
+                telemetry.incr("sanitizer.delivery_fixes_misplaced")
             if "english_delivery" not in dimensions:
                 # No delivery score, no delivery advice — dropping stray fixes deterministically
                 # keeps the pure-VN "no phantom scores" guarantee without burning an LLM retry.
+                if data.get("delivery_fixes"):
+                    telemetry.incr("sanitizer.stray_delivery_fixes_dropped")
                 data["delivery_fixes"] = []
-        if not isinstance(data.get("delivery_fixes"), (list, tuple)):
-            data["delivery_fixes"] = []
+        fixes = data.get("delivery_fixes")
+        if fixes is not None and not isinstance(fixes, (list, tuple)):
+            telemetry.incr("sanitizer.delivery_fixes_not_list")
+            fixes = None
+        data["delivery_fixes"] = [] if fixes is None else fixes
         return data
 
 
@@ -285,6 +331,7 @@ def _sanitize_unverifiable_evidence(evaluation: Evaluation, answer: str) -> Eval
     }
     if not changed:
         return evaluation
+    telemetry.incr("evaluator.unverifiable_citations", len(changed))
     entirely_degraded = len(changed) == len(evaluation.dimensions)
     logger.warning(
         "evidence degrade: blanked %d/%d unverifiable quote(s) to keep the score: %s%s",
@@ -301,24 +348,110 @@ def _sanitize_unverifiable_evidence(evaluation: Evaluation, answer: str) -> Eval
     )
 
 
-def apply_evidence_degrade_haircut(evaluation: Evaluation) -> Evaluation:
-    """Cap ``confidence`` low when the judgment's citations were *entirely* unverifiable.
+def unverifiable_fraction(evaluation: Evaluation) -> float:
+    """Share of this judgment's citations that were blanked as unverifiable, in [0, 1]."""
+    if not evaluation.dimensions:
+        return 0.0
+    blanked = sum(1 for ds in evaluation.dimensions.values() if ds.evidence == UNVERIFIABLE_EVIDENCE)
+    return blanked / len(evaluation.dimensions)
 
-    Mirrors :func:`apply_cross_check`: it only ever lowers confidence (via ``min``) and is a no-op when
-    the evaluation is not degraded or is already below the ceiling. Applied to the judgment actually
-    kept, so a self-critique pass that restored verifiable evidence is not needlessly penalised.
+
+def apply_evidence_degrade_haircut(evaluation: Evaluation) -> Evaluation:
+    """Cap ``confidence`` in proportion to how much of the audit trail was unverifiable.
+
+    Generalises the issue-0033 haircut from binary to graded: with self-reported confidence
+    saturated at ~0.95 on every case (re-anchor audit 2026-07-11), a judgment with HALF its
+    citations blanked used to read exactly as trustworthy as a spotless one — the evidence weight
+    the Beta update consumes (skill.py) never saw the difference. The cap slides linearly from 1.0
+    (clean trail) down to :data:`EVIDENCE_DEGRADE_CONFIDENCE_CEILING` when EVERY citation was
+    blanked, so the fully-fabricated extreme behaves exactly as before. Mirrors
+    :func:`apply_cross_check`: min() only ever lowers, re-applying is a no-op, and it is applied to
+    the judgment actually kept.
     """
-    if not evaluation.evidence_degraded:
+    fraction = unverifiable_fraction(evaluation)
+    if fraction == 0.0:
         return evaluation
-    capped = min(evaluation.confidence, EVIDENCE_DEGRADE_CONFIDENCE_CEILING)
+    ceiling = 1.0 - (1.0 - EVIDENCE_DEGRADE_CONFIDENCE_CEILING) * fraction
+    capped = min(evaluation.confidence, ceiling)
     if capped == evaluation.confidence:
         return evaluation
     logger.info(
-        "evidence degrade: every citation unverifiable; capping confidence %.2f -> %.2f",
+        "evidence degrade: %.0f%% of citations unverifiable; capping confidence %.2f -> %.2f",
+        fraction * 100,
         evaluation.confidence,
         capped,
     )
     return evaluation.model_copy(update={"confidence": capped})
+
+
+# A parse that needed structural-noise folds or burned a structured-output retry is a judgment the
+# model did not deliver cleanly. Saturated self-report (~0.95 uniform) cannot see that, so a mild
+# deterministic cap records it — enough to move the evidence weight, deliberately far above the
+# 0.5 escalation threshold so noise alone never buys a panel (the #53 cost posture: on this judge
+# the committee does not move verdicts, so structural noise must not spend 3 extra calls).
+NOISE_CONFIDENCE_CEILING = 0.85
+
+# The telemetry keys that count as structural noise for the haircut. ``derived_field_echoed`` is
+# excluded on purpose: the panel-verdict prompt replays first-pass JSON and actively invites that
+# echo, so it is the one fold the system provokes rather than the model volunteering.
+NOISE_EVENT_KEYS = frozenset(
+    {
+        "sanitizer.judgment_flattened_in_dimensions",
+        "sanitizer.delivery_fixes_misplaced",
+        "sanitizer.stray_delivery_fixes_dropped",
+        "sanitizer.delivery_fixes_not_list",
+        "structured_output.invalid_reply",
+    }
+)
+
+
+def apply_noise_haircut(evaluation: Evaluation, noise_events: tuple[str, ...]) -> Evaluation:
+    """Cap ``confidence`` mildly when THIS judgment's parse needed folds or retries."""
+    if not noise_events:
+        return evaluation
+    capped = min(evaluation.confidence, NOISE_CONFIDENCE_CEILING)
+    if capped == evaluation.confidence:
+        return evaluation
+    logger.info(
+        "structural noise during parse (%s); capping confidence %.2f -> %.2f",
+        ", ".join(noise_events),
+        evaluation.confidence,
+        capped,
+    )
+    return evaluation.model_copy(update={"confidence": capped})
+
+
+def _noise_events(before: dict[str, int], after: dict[str, int]) -> tuple[str, ...]:
+    """Which noise counters moved between two telemetry snapshots (one judge call's attribution)."""
+    return tuple(sorted(NOISE_EVENT_KEYS & telemetry.delta(before, after).keys()))
+
+
+@dataclass
+class PanelBudget:
+    """A caller-owned cap on committee escalations — the panel's cost rail.
+
+    Each escalation costs 3 extra LLM calls; on a judge whose confidence is not saturated the
+    triggers can fire on every shaky turn of the same question. The micro-loop passes one budget
+    per question so a collapsing exchange pays the committee once, not once per turn. ``None``
+    passed to :func:`evaluate` means unlimited (the bench measures real trigger behavior).
+    """
+
+    remaining: int
+
+    @classmethod
+    def per_question(cls) -> PanelBudget:
+        raw = os.environ.get("PANEL_MAX_ESCALATIONS_PER_QUESTION", "")
+        try:
+            return cls(remaining=int(raw)) if raw else cls(remaining=1)
+        except ValueError:
+            logger.warning("PANEL_MAX_ESCALATIONS_PER_QUESTION=%r is not an integer; using default 1", raw)
+            return cls(remaining=1)
+
+    def try_consume(self) -> bool:
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
 
 
 _SYSTEM_PROMPT_CORE = (
@@ -448,6 +581,65 @@ _PANEL_SCHEMA_HINT = (
     '"key_evidence": "<the candidate\'s words you lean on>"}'
 )
 
+# Strict grammar for a panel voice (static — the shape never depends on the rubric).
+_PANEL_OPINION_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "recommended_score": {"type": "number", "minimum": 1, "maximum": 5},
+        "argument": {"type": "string"},
+        "key_evidence": {"type": "string"},
+    },
+    "required": ["recommended_score", "argument", "key_evidence"],
+    "additionalProperties": False,
+}
+
+
+def evaluation_json_schema(rubric: Rubric) -> dict:
+    """Strict decoding grammar for one judgment, built from the ACTIVE rubric dimensions.
+
+    This is the structural-noise fix at the source (probed live on gpt-5.4-mini 2026-07-11): with
+    ``additionalProperties: false`` on ``dimensions`` and the active dimensions as its only keys,
+    the model *cannot* flatten the judgment inside dimensions (~28% of live traffic per the
+    trust-guards audit), score a weight-0 dimension, nest ``delivery_fixes`` where a dimension
+    belongs, or emit fixes at all on a case that never scored delivery. Providers without
+    strict-grammar support ignore this and keep relying on the sanitizer + retry loop — which also
+    stays on here, as the safety net behind the grammar.
+    """
+    dimension = {
+        "type": "object",
+        "properties": {
+            "score": {"type": "integer", "minimum": 1, "maximum": 5},
+            "evidence": {"type": "string"},
+        },
+        "required": ["score", "evidence"],
+        "additionalProperties": False,
+    }
+    active = sorted(rubric.active)
+    properties: dict[str, Any] = {
+        "dimensions": {
+            "type": "object",
+            "properties": {name: dimension for name in active},
+            "required": active,
+            "additionalProperties": False,
+        },
+        "weighted_score": {"type": "number", "minimum": 1, "maximum": 5},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "follow_up_recommended": {"type": "boolean"},
+        "follow_up_rationale": {"type": "string"},
+    }
+    if "english_delivery" in rubric.active:
+        # Only a delivery-scored case may carry fixes. Strict mode makes every property required,
+        # so listing delivery_fixes unconditionally FORCED the model to invent fixes on cases that
+        # never scored delivery (15/29 stray-drop folds on the 2026-07-11 json-schema bench run) —
+        # the grammar must mirror the rubric exactly, like the prompt's schema hints already do.
+        properties["delivery_fixes"] = {"type": "array", "items": {"type": "string"}}
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+        "additionalProperties": False,
+    }
+
 
 def _panel_opinion(
     client: LLMClient,
@@ -474,6 +666,7 @@ def _panel_opinion(
         ],
         PanelOpinion,
         max_retries=1,
+        json_schema=_PANEL_OPINION_JSON_SCHEMA,
     )
 
 
@@ -603,7 +796,8 @@ def _evaluate_once(client: LLMClient, messages: list[Message], answer: str, rubr
             messages,
             Evaluation,
             validators=_make_validators(rubric, answer),
-            max_retries=1,
+            max_retries=JUDGE_MAX_RETRIES,
+            json_schema=evaluation_json_schema(rubric),
         )
     except StructuredOutputError as err:
         if not isinstance(err.__cause__, EvidenceViolation):
@@ -618,11 +812,13 @@ def _evaluate_once(client: LLMClient, messages: list[Message], answer: str, rubr
         # stay enforced — and sanitize any unverifiable citation. If schema/dimensions themselves are
         # still broken, this re-raises, which is correct: that is genuinely unusable output.
         logger.warning("evaluation evidence check exhausted its retry; degrading to sanitize-and-keep")
+        telemetry.incr("evaluator.evidence_degrade_pass")
         degraded = client.chat_json(
             messages,
             Evaluation,
             validators=_make_validators(rubric, answer, include_evidence=False),
-            max_retries=1,
+            max_retries=JUDGE_MAX_RETRIES,
+            json_schema=evaluation_json_schema(rubric),
         )
         return _sanitize_unverifiable_evidence(degraded, answer)
 
@@ -636,6 +832,34 @@ def _self_critique_triggers(evaluation: Evaluation, rubric: Rubric) -> tuple[str
     return tuple(triggers)
 
 
+def _finalize(
+    evaluation: Evaluation,
+    rubric: Rubric,
+    *,
+    pre_guard_confidence: float,
+    noise_events: tuple[str, ...],
+    panel_suppressed: bool = False,
+) -> Evaluation:
+    """Apply the graded trust guards and attach the TrustTrace — one pipeline for BOTH paths.
+
+    The trace's fraction/divergence are read from the guarded evaluation, which is safe because the
+    guards only ever touch ``confidence``; if a future guard adjusts scores or evidence, compute
+    these signals before guarding and thread them through instead.
+    """
+    guarded = apply_noise_haircut(apply_evidence_degrade_haircut(evaluation), noise_events)
+    return guarded.model_copy(
+        update={
+            "trust": TrustTrace(
+                pre_guard_confidence=pre_guard_confidence,
+                unverifiable_fraction=unverifiable_fraction(guarded),
+                divergence=weighted_score_divergence(guarded, rubric),
+                noise_events=noise_events,
+                panel_suppressed=panel_suppressed,
+            )
+        }
+    )
+
+
 def evaluate(
     client: LLMClient,
     question: str,
@@ -643,6 +867,7 @@ def evaluate(
     rubric: Rubric,
     *,
     language_mode: str = "en",
+    panel_budget: PanelBudget | None = None,
 ) -> Evaluation:
     """Run the Evaluator on one question + answer and return a typed, validated judgment.
 
@@ -652,33 +877,59 @@ def evaluate(
     0006's lone re-read): a Skeptic and an Advocate each argue the exchange, then the Evaluator
     re-evaluates having read both and that verdict is kept — the panel advises, the Evaluator
     decides (ADR 0001). The trigger condition is the entire cost gate: a confident first pass pays
-    zero extra calls. ``language_mode`` (issue 0024) adds Session-mode context for vn/mixed
-    Sessions; whether ``english_delivery`` is scored is the caller's decision, made
-    deterministically via the rubric (see ``language.rubric_with_delivery``).
+    zero extra calls, and ``panel_budget`` (caller-owned) can additionally cap how many escalations
+    are paid for. ``language_mode`` (issue 0024) adds Session-mode context for vn/mixed Sessions;
+    whether ``english_delivery`` is scored is the caller's decision, made deterministically via the
+    rubric (see ``language.rubric_with_delivery``).
+
+    The kept judgment carries a :class:`TrustTrace` and its confidence passes the graded trust
+    guards (evidence-degrade + structural-noise caps) — with the judge's self-report saturated at
+    ~0.95, those deterministic caps are what differentiate the evidence weight the Beta update sees
+    on non-escalated judgments (an escalated verdict weighs by committee agreement instead, per
+    issue 0027). The guards run AFTER the trigger decision on purpose: they inform the belief
+    update, not the cost gate (#53's deliberate non-change — on this judge the committee does not
+    move verdicts, so the trigger surface stays as-is until the shadow data argues otherwise).
     """
-    first = apply_cross_check(
-        _evaluate_once(
-            client, _build_messages(question, answer, rubric, language_mode), answer, rubric
-        ),
-        rubric,
+    noise_before = telemetry.snapshot()
+    raw = _evaluate_once(
+        client, _build_messages(question, answer, rubric, language_mode), answer, rubric
     )
+    noise = _noise_events(noise_before, telemetry.snapshot())
+    first = apply_cross_check(raw, rubric)
     triggers = _self_critique_triggers(first, rubric)
+    panel_suppressed = False
+    if triggers and panel_budget is not None and not panel_budget.try_consume():
+        telemetry.incr("evaluator.panel_budget_exhausted")
+        logger.warning(
+            "panel triggers (%s) but the escalation budget is spent; keeping the guarded first pass",
+            ", ".join(triggers),
+        )
+        triggers = ()
+        panel_suppressed = True
     if not triggers:
-        return apply_evidence_degrade_haircut(first)
+        return _finalize(
+            first,
+            rubric,
+            pre_guard_confidence=raw.confidence,
+            noise_events=noise,
+            panel_suppressed=panel_suppressed,
+        )
 
     skeptic = _panel_opinion(client, question, answer, rubric, first, role="skeptic")
     advocate = _panel_opinion(client, question, answer, rubric, first, role="advocate")
-    verdict = apply_cross_check(
-        _evaluate_once(
-            client,
-            _build_panel_verdict_messages(
-                question, answer, rubric, first, triggers, skeptic, advocate, language_mode
-            ),
-            answer,
-            rubric,
+    verdict_noise_before = telemetry.snapshot()
+    raw_verdict = _evaluate_once(
+        client,
+        _build_panel_verdict_messages(
+            question, answer, rubric, first, triggers, skeptic, advocate, language_mode
         ),
+        answer,
         rubric,
     )
+    # The kept verdict inherits the FIRST pass's noise too: the exchange whose opening parse needed
+    # folds or retries is exactly the shaky case the shadow data must not record as clean.
+    verdict_noise = tuple(sorted({*noise, *_noise_events(verdict_noise_before, telemetry.snapshot())}))
+    verdict = apply_cross_check(raw_verdict, rubric)
     disagreement = abs(skeptic.recommended_score - advocate.recommended_score)
     logger.info(
         "panel verdict (%s): first %.2f (conf %.2f) -> verdict %.2f (conf %.2f); "
@@ -692,7 +943,9 @@ def evaluate(
         advocate.recommended_score,
         disagreement,
     )
-    verdict = apply_evidence_degrade_haircut(verdict)
+    verdict = _finalize(
+        verdict, rubric, pre_guard_confidence=raw_verdict.confidence, noise_events=verdict_noise
+    )
     return verdict.model_copy(
         update={
             "panel": PanelTrace(
@@ -702,6 +955,6 @@ def evaluate(
                 initial_score=first.weighted_score,
                 initial_confidence=first.confidence,
                 disagreement=disagreement,
-            )
+            ),
         }
     )
