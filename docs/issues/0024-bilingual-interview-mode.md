@@ -68,3 +68,7 @@ calibration bench measures, which is why this sequences after 0022.
 - Live gate (ADR 0009): `docs/audits/calibration-bench-2026-07-11-bilingual-mode.md` — all four
   mixed cases in band; the broken-English case scored technical 4.00 with english_delivery 2/2
   (judge matches the human label) and 3 phrase fixes; EN/VN paired deltas mean |Δ| 0.22.
+
+## Continued by (2026-07-19 remediation)
+
+- Toneless-Vietnamese misclassification in answer_is_english (diacritic-ratio detector): R-23 (GH #78).

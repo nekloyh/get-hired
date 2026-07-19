@@ -65,3 +65,7 @@ within an answer or two, and Role criticality still never moves the prior mean.
 ## Status
 
 **Closed.** Acceptance criteria are implemented and covered.
+
+## Continued by (2026-07-19 remediation)
+
+- Atomic writes + lock: R-10 (GH #65). The ledger's first presentation surface is slice 0035 / R-28 (GH #83), governed by the ADR 0006 addendum boundary.

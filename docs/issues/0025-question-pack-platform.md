@@ -77,3 +77,7 @@ as issue 0013, whose breadth tail effectively becomes pack authoring under this 
 ## Status
 
 **Closed.** Acceptance criteria are implemented and covered.
+
+## Continued by (2026-07-19 remediation)
+
+- The contract's unimplemented half — skills/criticality/correlations as pack data — is ADR 0014 (Proposed, gated E6). New company packs via the Forge: R-33 (GH #88).

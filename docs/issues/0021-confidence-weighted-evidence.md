@@ -56,3 +56,7 @@ None — can start immediately.
 ## Status
 
 **Closed.** Acceptance criteria are implemented and covered.
+
+## Continued by (2026-07-19 remediation)
+
+- On the saturated judge the weight range collapsed to [1.93, 2.0] — the mechanism only bites through its deterministic caps. Replacement input: ADR 0011 derived confidence (Proposed); trigger rework: R-16 (GH #71).

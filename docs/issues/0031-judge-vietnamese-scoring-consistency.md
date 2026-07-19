@@ -88,3 +88,7 @@ None.
 (PR #41) fixed the VN consistency on all but one borderline case; that last case was a small-model
 capability limit (reproduced on `gpt-4o-mini` and Groq `llama-3.3-70b`), and the stronger
 `gpt-5.4-mini` judge scores it correctly — bench is now 20/20 green.
+
+## Continued by (2026-07-19 remediation)
+
+- Provider-side drift materialized on main 2026-07-19: dl_overfitting_weak_vi 3.30/3.30/3.20 vs band top 3.2 (GH #92). Backup-judge program: R-17 (GH #72).

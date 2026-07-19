@@ -75,3 +75,8 @@ or provider.
 ## Status
 
 **Closed.** Acceptance criteria are implemented, offline-tested, and live-validated on gpt-4o-mini.
+
+## Continued by (2026-07-19 remediation)
+
+- Repeatability + label provenance are now ADR 0009 addendum (b) — k=3 flake data in GH #92 and docs/audits/calibration-bench-2026-07-19.md.
+- Label freeze + live-query replay: R-15 (GH #70). Backup-judge program: R-17 (GH #72).

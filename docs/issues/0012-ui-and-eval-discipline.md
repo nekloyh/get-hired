@@ -52,3 +52,7 @@ The demo surface and the evaluation harness. A thin UI (Streamlit and/or a Typer
 ## Status
 
 **Closed.** Acceptance criteria are implemented and covered.
+
+## Continued by (2026-07-19 remediation)
+
+- Web-surface gaps found by the 2026-07-19 panel are tracked as R-06 (GH #61, random session ids), R-07 (GH #62, auth + WS Origin), R-08 (GH #63, exports on disk), R-12 (GH #67, single-worker guard + logging).
