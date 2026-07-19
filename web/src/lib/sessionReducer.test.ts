@@ -22,6 +22,7 @@ const form: SetupForm = {
     vietnamese_nlp: 3,
   },
   maxQuestions: 2,
+  languageMode: 'en',
 }
 
 describe('setup validation', () => {
