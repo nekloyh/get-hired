@@ -75,6 +75,8 @@ all `vi` notes carry English tags as their embedder-visible surface.
 **Recommendation (non-blocking, for when the Chroma path is stood up):** re-run this review on the
 real store; if Vietnamese-query relevance matters beyond metadata routing, swap to a multilingual
 embedder (e.g. a multilingual BGE variant) — measured against this same 50-lookup sample.
+*(Done 2026-07-11: see `concept-retrieval-review-chroma-2026-07-11.md` — 46/50 on the real store,
+and the Vietnamese weakness is confirmed and quantified.)*
 
 ## Accuracy review of the notes themselves
 
