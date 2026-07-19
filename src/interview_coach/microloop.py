@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 # earlier because the Evaluator stops recommending follow-ups.
 DEFAULT_MAX_TURNS = 4
 
+
 class CandidateIntent(RuntimeError):
     """Base class for Candidate-driven control signals (ADR 0005).
 
@@ -191,6 +192,7 @@ def run_micro_loop(
     max_turns: int = DEFAULT_MAX_TURNS,
     concept_store: ConceptStore | None = None,
     language_mode: str = DEFAULT_LANGUAGE_MODE,
+    interviewer_client: LLMClient | None = None,
 ) -> MicroLoopResult:
     """Resolve one question end-to-end, returning the exchange and the updated Skill state.
 
@@ -205,8 +207,12 @@ def run_micro_loop(
     if state is None:
         state = SkillState.neutral(seed.skill)
 
+    # ADR 0010: the Evaluator (``client``) and the Interviewer may run on different role clients.
+    # A single client stays valid — every existing caller and test passes one and gets both roles.
+    interviewer = interviewer_client if interviewer_client is not None else client
+
     turns: list[Turn] = []
-    question = render_seed_question(client, seed.question, language_mode)
+    question = render_seed_question(interviewer, seed.question, language_mode)
     is_follow_up = False
     grounding_concept_id: str | None = None
     grounding_concept_title: str | None = None
@@ -217,9 +223,7 @@ def run_micro_loop(
     while True:
         answer = candidate.answer(question)
         rubric = rubric_with_delivery(seed.rubric, language_mode, answer)
-        evaluation = evaluate(
-            client, question, answer, rubric, language_mode=language_mode, panel_budget=panel_budget
-        )
+        evaluation = evaluate(client, question, answer, rubric, language_mode=language_mode, panel_budget=panel_budget)
         turn = Turn(
             question=question,
             answer=answer,
@@ -253,7 +257,7 @@ def run_micro_loop(
 
         try:
             follow_up = generate_follow_up(
-                client,
+                interviewer,
                 original_question=seed.question,
                 answer=answer,
                 evaluation=evaluation,

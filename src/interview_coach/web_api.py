@@ -23,7 +23,7 @@ from .demo_llm import DemoLLMClient
 from .diagnostic import CandidateProfile, diagnose_or_degrade
 from .exporter import render_session_markdown
 from .ledger import load_priors, save_posteriors
-from .llm import LLMClient, build_client
+from .llm import LLMClient, build_client, build_role_clients
 from .microloop import CandidateInputUnavailable, CandidateIntent
 from .resources import build_resource_store
 from .supervisor import (
@@ -317,11 +317,14 @@ def _run_session_thread(
 ) -> None:
     try:
         client = _client_for_mode(runtime.mode, api_state.settings)
+        # ADR 0010: demo mode's client is not a router, so the bundle collapses to single-client
+        # semantics; live mode pins the judge and applies any ROLE_* overrides.
+        roles = build_role_clients(api_state.settings, client)
         concept_store = build_concept_store("memory", seed=True)
         resource_store = build_resource_store("memory", seed=True)
         with SqliteSaver.from_conn_string(api_state.checkpoint_db) as checkpointer:
             graph = build_session_graph(
-                client,
+                roles,
                 checkpointer=checkpointer,
                 concept_store=concept_store,
                 resource_store=resource_store,
@@ -339,7 +342,7 @@ def _run_session_thread(
                 carried = load_priors(api_state.ledger_db, payload.candidate_id, now=time.time())
                 diagnostic = diagnose_or_degrade(
                     profile,
-                    client,
+                    roles.diagnostic,
                     ledger_priors=carried.seed_means if carried else None,
                 )
                 initial_state = initial_session_state(

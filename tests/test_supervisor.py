@@ -117,7 +117,17 @@ def _diagnostic():
 
 
 def _fake_micro_loop(score: float):
-    def _run(client, seed, candidate, state=None, *, max_turns=4, concept_store=None, language_mode="en"):
+    def _run(
+        client,
+        seed,
+        candidate,
+        state=None,
+        *,
+        max_turns=4,
+        concept_store=None,
+        language_mode="en",
+        interviewer_client=None,
+    ):
         before = state or SkillState.neutral(seed.skill)
         ev = Evaluation(
             dimensions={"correctness": DimensionScore(score=round(score), evidence="no evidence")},
@@ -148,7 +158,17 @@ def _failing_then_resolving_micro_loop(score: float, *, fail_times: int = 1):
     base = _fake_micro_loop(score)
     calls = {"n": 0}
 
-    def _run(client, seed, candidate, state=None, *, max_turns=4, concept_store=None, language_mode="en"):
+    def _run(
+        client,
+        seed,
+        candidate,
+        state=None,
+        *,
+        max_turns=4,
+        concept_store=None,
+        language_mode="en",
+        interviewer_client=None,
+    ):
         calls["n"] += 1
         if calls["n"] <= fail_times:
             raise RuntimeError("evaluator blew up on this question")
@@ -163,9 +183,7 @@ def test_question_failure_is_isolated_and_session_continues(make_client, monkeyp
     # left untouched, the Supervisor advances, and questions resolved afterwards are preserved.
     from interview_coach import supervisor
 
-    monkeypatch.setattr(
-        supervisor, "run_micro_loop", _failing_then_resolving_micro_loop(5.0, fail_times=1)
-    )
+    monkeypatch.setattr(supervisor, "run_micro_loop", _failing_then_resolving_micro_loop(5.0, fail_times=1))
     client, fake = make_client(
         [
             _decision("advance_plan", "The first question could not be scored; move to the next planned Skill."),
@@ -202,7 +220,17 @@ def test_language_mode_threads_from_state_into_the_micro_loop(make_client, monke
     seen: list[str] = []
     base = _fake_micro_loop(4.0)
 
-    def _capture(client, seed, candidate, state=None, *, max_turns=4, concept_store=None, language_mode="en"):
+    def _capture(
+        client,
+        seed,
+        candidate,
+        state=None,
+        *,
+        max_turns=4,
+        concept_store=None,
+        language_mode="en",
+        interviewer_client=None,
+    ):
         seen.append(language_mode)
         return base(client, seed, candidate, state, max_turns=max_turns, concept_store=concept_store)
 

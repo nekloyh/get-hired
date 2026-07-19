@@ -12,6 +12,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, TypeVar
 
 import openai
@@ -19,7 +20,7 @@ from openai import OpenAI
 from pydantic import BaseModel, ValidationError
 
 from . import telemetry
-from .config import ProviderName, ProviderSettings, Settings
+from .config import ProviderName, ProviderSettings, RoleName, Settings
 from .usage import record_usage
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,7 @@ def _retry_wait(err: Exception, attempt: int) -> float:
         except ValueError:
             pass
     return _BACKOFF_SECONDS[min(attempt, len(_BACKOFF_SECONDS) - 1)]
+
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -216,9 +218,7 @@ class LLMClient(ABC):
         Raises :class:`ToolCallingUnsupported` when the provider cannot do native tool-calling, so
         the caller can fall back to a non-tool path.
         """
-        raise ToolCallingUnsupported(
-            f"{type(self).__name__} does not support native tool-calling"
-        )
+        raise ToolCallingUnsupported(f"{type(self).__name__} does not support native tool-calling")
 
 
 def _extract_json(content: str) -> str:
@@ -242,10 +242,24 @@ class _OpenAICompatibleClient(LLMClient):
     provider_name: ProviderName
     # Opt-in flag: only clients whose native function-calling is verified set this True.
     _supports_tools: bool = False
+    # Class-level default for strict json_schema decoding; per-instance config wins (the provider
+    # entry binds one model, so the ProviderSettings override is effectively per-model).
+    _default_supports_json_schema: bool = False
 
     def __init__(self, settings: ProviderSettings, client: Any | None = None) -> None:
         self._settings = settings
         self._client = client
+
+    @property
+    def supports_json_schema(self) -> bool:
+        if self._settings.supports_json_schema is not None:
+            return self._settings.supports_json_schema
+        return self._default_supports_json_schema
+
+    @property
+    def model_name(self) -> str:
+        """The concrete model this client calls — report labels must name the real judge."""
+        return self._settings.model
 
     def _openai(self) -> Any:
         if not self._settings.configured:
@@ -370,9 +384,7 @@ class _OpenAICompatibleClient(LLMClient):
         if not tool_calls:
             # Forced a tool call but the provider answered with prose — treat as unsupported so the
             # caller can fail loudly or intentionally route to a non-native fake path.
-            raise ToolCallingUnsupported(
-                f"{self.provider_name} returned no tool_calls for a forced tool request"
-            )
+            raise ToolCallingUnsupported(f"{self.provider_name} returned no tool_calls for a forced tool request")
 
         convo.append(self._assistant_tool_message(first, tool_calls))
         for call in tool_calls:
@@ -465,12 +477,10 @@ class OpenAIClient(_OpenAICompatibleClient):
 
     provider_name: ProviderName = "openai"
     _supports_tools: bool = True
-
-    @property
-    def supports_json_schema(self) -> bool:
-        # Live-probed on gpt-5.4-mini (2026-07-11): strict grammars accepted, including nested
-        # objects, arrays, and minimum/maximum bounds. Groq/MiMo stay opted out until verified.
-        return True
+    # Live-probed on gpt-5.4-mini (2026-07-11): strict grammars accepted, including nested
+    # objects, arrays, and minimum/maximum bounds. Groq/MiMo stay opted out until verified;
+    # a per-model env override (<PROVIDER>_SUPPORTS_JSON_SCHEMA) can flip any of them.
+    _default_supports_json_schema: bool = True
 
 
 class LLMRouter(LLMClient):
@@ -500,6 +510,10 @@ class LLMRouter(LLMClient):
     @property
     def supports_json_schema(self) -> bool:
         return self._clients[self._primary_provider].supports_json_schema
+
+    @property
+    def model_name(self) -> str:
+        return getattr(self._clients[self._primary_provider], "model_name", "")
 
     def chat(
         self,
@@ -576,20 +590,91 @@ class LLMRouter(LLMClient):
             return fallback.chat_with_tools(messages, **kwargs)
 
 
+_CLIENT_CLASSES: dict[ProviderName, type[_OpenAICompatibleClient]] = {
+    "mimo": MimoClient,
+    "groq": GroqClient,
+    "openai": OpenAIClient,
+}
+
+
 def build_client(settings: Settings) -> LLMClient:
     """Return the routed LLM client selected by ``PRIMARY_PROVIDER``."""
     clients: dict[ProviderName, LLMClient] = {}
-    mimo = settings.provider_config("mimo")
-    if mimo.configured:
-        clients["mimo"] = MimoClient(mimo)
-    groq = settings.provider_config("groq")
-    if groq.configured:
-        clients["groq"] = GroqClient(groq)
-    openai_cfg = settings.provider_config("openai")
-    if openai_cfg.configured:
-        clients["openai"] = OpenAIClient(openai_cfg)
+    for provider, client_cls in _CLIENT_CLASSES.items():
+        config = settings.provider_config(provider)
+        if config.configured:
+            clients[provider] = client_cls(config)
     return LLMRouter(
         settings.primary_provider,
         clients,
         fallback_provider=settings.fallback_provider,
     )
+
+
+@dataclass(frozen=True)
+class RoleClients:
+    """The per-role client bundle (ADR 0010).
+
+    ``judge`` is always a *pinned* provider client, never the failover router: per ADR 0009's
+    gate-as-code addendum, a judge-role failure must surface (retry-same-model happens at the
+    transport layer; the per-question net records a visible ``failed``) rather than silently hand
+    scoring to a model that never passed the bench. The other roles default to the shared router —
+    the exact pre-0010 object — so an unconfigured role behaves byte-identically to before.
+    """
+
+    judge: LLMClient
+    interviewer: LLMClient
+    supervisor: LLMClient
+    diagnostic: LLMClient
+    planner: LLMClient
+
+    @classmethod
+    def single(cls, client: LLMClient) -> RoleClients:
+        """Every role served by one client — the semantics of fakes, demo mode, and direct calls."""
+        return cls(
+            judge=client,
+            interviewer=client,
+            supervisor=client,
+            diagnostic=client,
+            planner=client,
+        )
+
+
+def ensure_role_clients(client: RoleClients | LLMClient | None) -> RoleClients | None:
+    """Normalize a call-site input: a bundle passes through, a bare client serves every role."""
+    if client is None or isinstance(client, RoleClients):
+        return client
+    return RoleClients.single(client)
+
+
+def _pinned_role_client(settings: Settings, role: RoleName) -> LLMClient:
+    """A single-provider client for ``role`` — no failover wrapper, overrides applied."""
+    config = settings.role_config(role)
+    if not config.configured:
+        raise LLMConfigurationError(
+            f"role {role!r} resolves to provider {config.name!r} which is not configured; "
+            "set its API key, base URL, and model"
+        )
+    return _CLIENT_CLASSES[config.name](config)
+
+
+def build_role_clients(settings: Settings, default_client: LLMClient | None = None) -> RoleClients:
+    """Build the ADR 0010 role bundle.
+
+    ``default_client`` is the already-built session client (router, demo, or a test fake). A
+    non-router default carries no provider identity to pin or route, so it serves every role
+    unchanged — which keeps demo mode and every existing fake-based test on single-client
+    semantics. With a real router: the judge is pinned to its resolved provider client (ADR
+    0009a), and only roles with ROLE_* env overrides get their own pinned client — everything
+    else shares the router object itself.
+    """
+    default = default_client if default_client is not None else build_client(settings)
+    if not isinstance(default, LLMRouter) or not hasattr(settings, "role_config"):
+        # No router = nothing to pin or route (fakes, demo mode). No ``role_config`` = a partial
+        # settings double (several CLI tests fake Settings with a SimpleNamespace) — role routing
+        # only applies to the real Settings contract.
+        return RoleClients.single(default)
+    non_judge: dict[str, LLMClient] = {}
+    for role in ("interviewer", "supervisor", "diagnostic", "planner"):
+        non_judge[role] = _pinned_role_client(settings, role) if settings.role_overridden(role) else default
+    return RoleClients(judge=_pinned_role_client(settings, "judge"), **non_judge)
