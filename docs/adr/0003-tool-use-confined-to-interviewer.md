@@ -27,3 +27,29 @@ Decision: distinguish it explicitly and **recover** without weakening the loud-f
 `ToolCallingUnsupported` (the model returning *no* tool call for a forced request) is untouched and still fails loudly: a real "this provider can't do native tool-calling" problem must not be hidden behind a degrade. This addendum only rescues the transient-glitch case the loud-failure rule never meant to cover.
 
 The same resilience principle applies to the end-of-Session Study Planner (`study_plan` node): it is optional end-matter produced *after* a fully-resolved interview, so a planner failure degrades to "no plan" (`study_plan=None` plus a `study_plan_error` marker) and the Session still completes, rather than discarding a finished interview at the final node.
+
+## Addendum (2026-07-19): the MiMo rationale is historical; the surviving principle is per-need grants with an eval gate
+
+The "Why" above is written around MiMo's `reasoning_content` 400 trap. MiMo's endpoint died
+2026-06-03 (issue 0015 audit); the current providers (Groq, OpenAI) carry no such quirk and the
+router code needs no special handling for them. The original constraint is **gone** — this ADR must
+not be read as "a provider quirk forbids tools elsewhere," because no such quirk exists anymore.
+
+The decision **stands on its surviving merits**, restated so the rationale matches reality:
+
+- **Tools are granted per proven need, and every grant carries an eval gate.** The Interviewer
+  holds its grant because Follow-up generation demonstrably uses `lookup_concept`. Any future
+  grant must name the need and the gate that would catch a regression: a judge-side grant is a
+  judge change and must pass `coach bench` (ADR 0009); a Supervisor-side grant must hold up on the
+  replay bench (issue 0029). "More agentic" is not a need.
+- **Grounding-by-injection is compliant today, by this ADR's own text.** The original decision
+  says non-Interviewer agents run single-shot with context "injected directly into the prompt".
+  Injecting a question's `expected_concepts` note into the Evaluator's prompt is exactly that — a
+  grounded judge needs **no** tool grant and no amendment here. (Whether injection becomes the
+  standard judge input is experiment E3's question, gated by the bench under ADR 0009.)
+- The addenda above (native tool-calling, typed failure taxonomy, degrade paths) are
+  provider-agnostic and remain binding.
+
+*Source: ADR red-team review 2026-07-19 — verdict AMEND (rationale rewrite, not repeal); panel
+report Phần 1 (judge grounding evidence: the BARS anchor surgery in `rubric.py` that an ungrounded
+judge required).*
