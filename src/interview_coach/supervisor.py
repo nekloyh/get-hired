@@ -24,7 +24,14 @@ from typing_extensions import TypedDict
 from .concepts import ConceptStore
 from .diagnostic import SKILLS, DiagnosticResult
 from .language import DEFAULT_LANGUAGE_MODE, validate_language_mode
-from .llm import LLMClient, Message, StructuredOutputError, Validator
+from .llm import (
+    LLMClient,
+    Message,
+    RoleClients,
+    StructuredOutputError,
+    Validator,
+    ensure_role_clients,
+)
 from .microloop import (
     DEFAULT_MAX_TURNS,
     Candidate,
@@ -135,10 +142,7 @@ def initial_session_state(
     state: SessionState = {
         "session_id": session_id,
         "topic_plan": topic_plan,
-        "skill_states": {
-            skill: _dump_skill_state(prior.state)
-            for skill, prior in diagnostic.priors.items()
-        },
+        "skill_states": {skill: _dump_skill_state(prior.state) for skill, prior in diagnostic.priors.items()},
         "skill_metadata": {
             skill: {
                 "role_criticality": prior.role_criticality.value,
@@ -183,7 +187,7 @@ def resumable_session_state(graph: Any, session_id: str) -> SessionState | None:
 
 
 def build_session_graph(
-    client: LLMClient,
+    client: LLMClient | RoleClients,
     *,
     checkpointer: SqliteSaver | None = None,
     concept_store: ConceptStore | None = None,
@@ -195,11 +199,17 @@ def build_session_graph(
 ):
     """Compile the StateGraph that runs one persisted multi-question Session.
 
+    ``client`` is either one client for every agent (the pre-ADR-0010 form, still what tests and
+    demo mode pass) or a :class:`RoleClients` bundle routing judge/interviewer/supervisor/planner
+    to their configured role clients.
+
     ``question_bank`` overrides the built-in reference bank with a loaded pack (ADR 0008 / 0025); it
     drives both question selection and the Supervisor's seed-availability rails.
     """
     if max_turns_per_question is not None and max_turns_per_question < 1:
         raise ValueError("max_turns_per_question must be >= 1")
+    roles = ensure_role_clients(client)
+    assert roles is not None  # a graph without any client cannot run
     bank = question_bank if question_bank is not None else QUESTION_BANK
 
     def question_node(state: SessionState) -> dict[str, Any]:
@@ -230,13 +240,14 @@ def build_session_graph(
                 else (DEFAULT_MAX_TURNS if candidate_factory is not None else len(seed.answers))
             )
             result = run_micro_loop(
-                client,
+                roles.judge,
                 seed,
                 candidate,
                 before,
                 max_turns=max_turns,
                 concept_store=concept_store,
                 language_mode=state.get("language_mode", DEFAULT_LANGUAGE_MODE),
+                interviewer_client=roles.interviewer,
             )
         except CandidateIntent:
             # ADR 0005 / issue 0018: the Candidate asked to stop (EOF/Ctrl-D, a web cancel/disconnect,
@@ -253,8 +264,7 @@ def build_session_graph(
             # resolved. The interviewer already retries transient tool noise at its own layer; this is
             # the Session-level backstop for everything else.
             logger.warning(
-                "question on skill %r failed (%s: %s); recording it as a failed question and "
-                "continuing the Session",
+                "question on skill %r failed (%s: %s); recording it as a failed question and continuing the Session",
                 skill,
                 type(err).__name__,
                 err,
@@ -280,7 +290,7 @@ def build_session_graph(
         }
 
     def supervisor_node(state: SessionState) -> dict[str, Any]:
-        decision = decide_next_move(client, state, now=now, question_bank=bank)
+        decision = decide_next_move(roles.supervisor, state, now=now, question_bank=bank)
         return _apply_supervisor_decision(state, decision, now=now)
 
     def study_plan_node(state: SessionState) -> dict[str, Any]:
@@ -290,7 +300,7 @@ def build_session_graph(
         # (a malformed plan that survives its retry, an empty catalog, a provider blip) must never
         # discard the completed Session — degrade to no plan and let the graph reach END.
         try:
-            plan = plan_study(client, state, resource_store=resource_store)
+            plan = plan_study(roles.planner, state, resource_store=resource_store)
         except Exception as err:  # noqa: BLE001 — last optional node; any failure here must not crash the run
             logger.warning("study planner failed; completing the Session without a Study Plan: %s", err)
             return {"study_plan": None, "study_plan_error": f"{type(err).__name__}: {err}"}
@@ -364,8 +374,7 @@ def decide_next_move(
             state, reason_prefix="Deterministic fallback after a provider transport error"
         )
         logger.warning(
-            "Supervisor LLM decision failed with a provider/transport error (%s: %s); using "
-            "deterministic fallback %s",
+            "Supervisor LLM decision failed with a provider/transport error (%s: %s); using deterministic fallback %s",
             type(err).__name__,
             err,
             fallback.action.value,
@@ -544,9 +553,7 @@ def _make_supervisor_validators(state: SessionState, bank: QuestionBank | None =
     return [validate]
 
 
-def _extra_probe_required(
-    state: SessionState, attempts: Mapping[str, int], bank: QuestionBank | None = None
-) -> bool:
+def _extra_probe_required(state: SessionState, attempts: Mapping[str, int], bank: QuestionBank | None = None) -> bool:
     """Whether advancing would discard unresolved, below-bar evidence while another seed remains."""
     if not state.get("transcript"):
         return False
@@ -658,9 +665,7 @@ def _dump_skill_state(state: SkillState) -> dict[str, float | str]:
     return {"skill": state.skill, "alpha": state.alpha, "beta": state.beta}
 
 
-def _dump_failed_question(
-    skill: str, prior: SkillState, *, plan_index: int, error: BaseException
-) -> dict[str, Any]:
+def _dump_failed_question(skill: str, prior: SkillState, *, plan_index: int, error: BaseException) -> dict[str, Any]:
     """Transcript entry for a question that crashed (slice 0014).
 
     It carries the same keys as a resolved entry so every transcript consumer keeps working, but with

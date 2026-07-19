@@ -47,7 +47,7 @@ from .fixtures import QUESTION, STRONG_ANSWER, WEAK_ANSWER
 from .forge import MAX_DRAFTS, ForgeError, render_forge_report, run_forge, write_forge_outputs
 from .language import DEFAULT_LANGUAGE_MODE, LANGUAGE_MODES
 from .ledger import load_priors, save_posteriors
-from .llm import LLMClient, build_client
+from .llm import LLMClient, RoleClients, build_client, build_role_clients, ensure_role_clients
 from .microloop import (
     DEFAULT_MAX_TURNS,
     CandidateIntent,
@@ -76,6 +76,21 @@ from .ui import render_skill_state_rows
 from .usage import daily_token_budget, remaining_today, usage_for_day, utc_date
 
 ANSWERS = {"strong": STRONG_ANSWER, "weak": WEAK_ANSWER}
+
+# What every subcommand receives (ADR 0010): the per-role bundle from main(), a bare client when a
+# test drives a command directly, or None on the offline path. ``ensure_role_clients`` normalizes.
+type ClientArg = RoleClients | LLMClient | None
+
+
+def _provider_label(client: LLMClient) -> str:
+    """Provider name for budget checks / report headers — router or pinned role client alike."""
+    return str(getattr(client, "primary_provider", None) or getattr(client, "provider_name", "unknown"))
+
+
+def _model_label(client: LLMClient) -> str:
+    """The model actually behind ``client`` — report labels must name the real judge (ADR 0009a)."""
+    return getattr(client, "model_name", "") or "unknown"
+
 
 # The A/B audit (docs/audits/concept-retrieval-embedder-ab-2026-07-11.md) recommends the
 # multilingual embedder for vn-mode practice; the default stays BGE because vectors are not
@@ -128,13 +143,14 @@ def _print_skill_update(before: SkillState, after: SkillState) -> None:
     )
 
 
-def _cmd_evaluate(client: LLMClient | None, args: argparse.Namespace) -> int:
-    if client is None:
+def _cmd_evaluate(client: ClientArg, args: argparse.Namespace) -> int:
+    roles = ensure_role_clients(client)
+    if roles is None:
         raise RuntimeError("evaluate requires an LLM client")
     print(f"QUESTION (skill: {QUESTION.skill}):\n{QUESTION.question}")
     labels = list(ANSWERS) if args.answer == "both" else [args.answer]
     for label in labels:
-        ev = evaluate(client, QUESTION.question, ANSWERS[label], QUESTION.rubric)
+        ev = evaluate(roles.judge, QUESTION.question, ANSWERS[label], QUESTION.rubric)
         _print_evaluation(label, ANSWERS[label], ev)
         # Each answer starts from a neutral prior, so strong vs. weak visibly move mastery in
         # opposite directions while both shrink variance (confidence rises).
@@ -179,8 +195,9 @@ def _print_micro_loop(result: MicroLoopResult) -> None:
     )
 
 
-def _cmd_interview(client: LLMClient | None, args: argparse.Namespace) -> int:
-    if client is None:
+def _cmd_interview(client: ClientArg, args: argparse.Namespace) -> int:
+    roles = ensure_role_clients(client)
+    if roles is None:
         raise RuntimeError("interview requires an LLM client")
     concept_store = build_concept_store(
         args.concept_store,
@@ -192,12 +209,13 @@ def _cmd_interview(client: LLMClient | None, args: argparse.Namespace) -> int:
         print(f"\n========== SEED QUESTION {n}/{len(SEED_QUESTIONS)} (skill: {seed.skill}) ==========")
         print(seed.question)
         result = run_micro_loop(
-            client,
+            roles.judge,
             seed,
             ScriptedCandidate(seed.answers),
             max_turns=args.max_turns,
             concept_store=concept_store,
             language_mode=args.language,
+            interviewer_client=roles.interviewer,
         )
         _print_micro_loop(result)
     return 0
@@ -214,13 +232,14 @@ def _parse_claim(raw: str) -> tuple[str, float]:
     return skill.strip(), score
 
 
-def _cmd_diagnose(client: LLMClient | None, args: argparse.Namespace) -> int:
+def _cmd_diagnose(client: ClientArg, args: argparse.Namespace) -> int:
     profile = CandidateProfile(
         target_role=args.target_role,
         target_companies=tuple(args.company),
         claimed_skills=dict(args.claim),
     )
-    result = diagnose_or_degrade(profile, client)
+    roles = ensure_role_clients(client)
+    result = diagnose_or_degrade(profile, roles.diagnostic if roles is not None else None)
     print(f"=== TOPIC PLAN (source: {result.topic_plan_source.value}) ===")
     for i, entry in enumerate(result.topic_plan, start=1):
         print(f"{i}. {entry.skill}  difficulty={entry.target_difficulty}  {entry.rationale}")
@@ -363,11 +382,12 @@ def _print_resume_recap(state: dict) -> None:
         )
 
 
-def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
-    if client is None:
+def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
+    roles = ensure_role_clients(client)
+    if roles is None:
         raise RuntimeError("session requires an LLM client")
     if args.diagram:
-        path = export_architecture_diagram(args.diagram, client)
+        path = export_architecture_diagram(args.diagram, roles)
         print(f"Exported architecture diagram to {path}")
         return 0
 
@@ -394,7 +414,7 @@ def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
     with SqliteSaver.from_conn_string(args.checkpoint_db) as checkpointer:
         candidate_factory = None if args.scripted else lambda seed: InteractiveCandidate()
         graph = build_session_graph(
-            client,
+            roles,
             checkpointer=checkpointer,
             concept_store=concept_store,
             resource_store=resource_store,
@@ -442,7 +462,7 @@ def _cmd_session(client: LLMClient | None, args: argparse.Namespace) -> int:
                 carried = load_priors(args.ledger_db, args.candidate, now=time.time())
                 diagnostic = diagnose_or_degrade(
                     profile,
-                    client,
+                    roles.diagnostic,
                     ledger_priors=carried.seed_means if carried else None,
                 )
                 state = initial_session_state(
@@ -511,8 +531,9 @@ def _print_postmortem(result: PostmortemResult) -> None:
         print(f"\n=== REGENERATED STUDY PLAN ===\n(planner unavailable: {error})")
 
 
-def _cmd_postmortem(client: LLMClient | None, args: argparse.Namespace) -> int:
-    if client is None:
+def _cmd_postmortem(client: ClientArg, args: argparse.Namespace) -> int:
+    roles = ensure_role_clients(client)
+    if roles is None:
         raise RuntimeError("postmortem requires an LLM client")
     resource_store = build_resource_store(
         args.resource_store,
@@ -522,7 +543,7 @@ def _cmd_postmortem(client: LLMClient | None, args: argparse.Namespace) -> int:
     candidate = ScriptedCandidate(args.scripted_recollection) if args.scripted_recollection else InteractiveCandidate()
     try:
         result = run_postmortem(
-            client,
+            roles.diagnostic,
             candidate,
             candidate_id=args.candidate,
             ledger_db=args.ledger_db,
@@ -547,7 +568,7 @@ def _cmd_postmortem(client: LLMClient | None, args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_pack_lint(client: LLMClient | None, args: argparse.Namespace) -> int:
+def _cmd_pack_lint(client: ClientArg, args: argparse.Namespace) -> int:
     try:
         pack = load_pack(args.pack_dir)
     except BankError as err:
@@ -562,15 +583,16 @@ def _cmd_pack_lint(client: LLMClient | None, args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_pack(client: LLMClient | None, args: argparse.Namespace) -> int:
+def _cmd_pack(client: ClientArg, args: argparse.Namespace) -> int:
     print("usage: coach pack lint <dir>", file=sys.stderr)
     return 2
 
 
-def _cmd_eval_harness(client: LLMClient | None, args: argparse.Namespace) -> int:
-    if client is None:
+def _cmd_eval_harness(client: ClientArg, args: argparse.Namespace) -> int:
+    roles = ensure_role_clients(client)
+    if roles is None:
         raise RuntimeError("eval-harness requires an LLM client")
-    results = run_golden_answer_harness(client)
+    results = run_golden_answer_harness(roles.judge)
     print(render_golden_answer_report(results))
     return 0 if harness_passed(results) else 1
 
@@ -602,10 +624,14 @@ def _usage_delta(before: dict[str, dict[str, int]], after: dict[str, dict[str, i
     return delta
 
 
-def _cmd_bench(client: LLMClient | None, args: argparse.Namespace) -> int:
-    if client is None:
+def _cmd_bench(client: ClientArg, args: argparse.Namespace) -> int:
+    roles = ensure_role_clients(client)
+    if roles is None:
         raise RuntimeError("bench requires an LLM client")
-    provider = str(getattr(client, "primary_provider", "unknown"))
+    # The bench measures the JUDGE role (ADR 0009c): with a role override in play, the pinned judge
+    # client — not the session router — is what runs, and the report is labeled with its identity.
+    judge = roles.judge
+    provider = _provider_label(judge)
     budget = daily_token_budget()
     usage_before = usage_for_day()
     left = max(0, budget - usage_before.get(provider, {}).get("total", 0))
@@ -618,16 +644,15 @@ def _cmd_bench(client: LLMClient | None, args: argparse.Namespace) -> int:
         )
     telemetry_before = telemetry.snapshot()
     data = load_bench_data(args.cases or None)
-    results = run_bench(client, data.cases)
+    results = run_bench(judge, data.cases)
     telemetry_after = telemetry.snapshot()
     usage_after = usage_for_day()
     run_usage = _usage_delta(usage_before, usage_after)
-    settings = load_settings()
     report = render_bench_report(
         results,
         anchors=data.anchors,
         provider=provider,
-        model=settings.primary_config.model or "unknown",
+        model=_model_label(judge),
         date=_utc_date(),
         telemetry_delta=telemetry.delta(telemetry_before, telemetry_after),
         token_usage=run_usage,
@@ -649,7 +674,7 @@ def _cmd_bench(client: LLMClient | None, args: argparse.Namespace) -> int:
     return 0 if bench_passed(results) else 1
 
 
-def _cmd_usage(client: LLMClient | None, args: argparse.Namespace) -> int:
+def _cmd_usage(client: ClientArg, args: argparse.Namespace) -> int:
     """Today's client-side token ledger — the daily free-tier budget is invisible to the API."""
     totals = usage_for_day()
     if not totals:
@@ -666,14 +691,18 @@ def _cmd_usage(client: LLMClient | None, args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_forge(client: LLMClient | None, args: argparse.Namespace) -> int:
-    if client is None:
+def _cmd_forge(client: ClientArg, args: argparse.Namespace) -> int:
+    roles = ensure_role_clients(client)
+    if roles is None:
         raise RuntimeError("forge requires an LLM client")
+    # The Forge's admission gate IS the live Evaluator, so the whole run rides the judge role
+    # client (a forge admission scored by a non-bench-validated model would be meaningless).
+    judge = roles.judge
     # Same preflight as the bench: gate 3 spends ~4+ calls per surviving draft, and a forge run
     # started blind into a nearly-dead quota dies mid-queue with a half-written review file.
-    provider = getattr(client, "primary_provider", "unknown")
+    provider = _provider_label(judge)
     print(
-        f"Daily budget check ({provider}): ~{remaining_today(str(provider)):,} of "
+        f"Daily budget check ({provider}): ~{remaining_today(provider):,} of "
         f"{daily_token_budget():,} tokens left by our count."
     )
     # Gate 2 must dedup across everything the merged install would serve: the built-in bank plus,
@@ -686,15 +715,13 @@ def _cmd_forge(client: LLMClient | None, args: argparse.Namespace) -> int:
         corpus.extend(q.question for questions in pack.questions.values() for q in questions)
         concepts.extend(pack.concepts)
     try:
-        run = run_forge(client, args.skill, args.n, concepts=concepts, existing_prompts=corpus)
+        run = run_forge(judge, args.skill, args.n, concepts=concepts, existing_prompts=corpus)
     except ForgeError as err:
         # Pipeline failure (the Writer produced nothing usable) — distinct from an honest
         # zero-admissions run, which still exits 0 with a full report (0 admitted is information).
         print(f"Forge FAILED: {err}", file=sys.stderr)
         return 1
-    provider = getattr(client, "primary_provider", "unknown")
-    settings = load_settings()
-    model = settings.primary_config.model or "unknown"
+    model = _model_label(judge)
     date = _utc_date()
     queue_path = Path(args.out) if args.out else Path(args.queue_dir) / f"review-queue-{date}.yaml"
     queue, report = write_forge_outputs(run, queue_path=queue_path, provider=str(provider), model=model, date=date)
@@ -720,7 +747,7 @@ def _forge_batch_size(raw: str) -> int:
     return n
 
 
-def _cmd_ingest_concepts(client: LLMClient | None, args: argparse.Namespace) -> int:
+def _cmd_ingest_concepts(client: ClientArg, args: argparse.Namespace) -> int:
     store = ChromaConceptStore.create(persist_dir=args.persist_dir, embedding_model=args.concept_embedder)
     count = store.ingest(SEED_CONCEPTS)
     print(
@@ -729,14 +756,14 @@ def _cmd_ingest_concepts(client: LLMClient | None, args: argparse.Namespace) -> 
     return 0
 
 
-def _cmd_ingest_resources(client: LLMClient | None, args: argparse.Namespace) -> int:
+def _cmd_ingest_resources(client: ClientArg, args: argparse.Namespace) -> int:
     store = ChromaResourceStore.create(persist_dir=args.persist_dir)
     count = store.ingest(SEED_RESOURCES)
     print(f"Ingested {count} learning resources into Chroma collection at {args.persist_dir!r}.")
     return 0
 
 
-def _cmd_api(client: LLMClient | None, args: argparse.Namespace) -> int:
+def _cmd_api(client: ClientArg, args: argparse.Namespace) -> int:
     import uvicorn
 
     uvicorn.run(
@@ -1126,4 +1153,7 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(None, args)
 
     client = build_client(settings)
-    return args.func(client, args)
+    # ADR 0010: commands receive the per-role bundle. With no ROLE_* overrides this is the same
+    # router object for every role except the judge, which is pinned to its provider client
+    # (ADR 0009a — judge failover must never swap the model mid-run).
+    return args.func(build_role_clients(settings, client), args)
