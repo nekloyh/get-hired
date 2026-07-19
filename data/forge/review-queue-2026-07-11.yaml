@@ -1,4 +1,7 @@
 # Question Forge review queue (issue 0028) — HUMAN MERGE ONLY.
+# STATUS: MERGED 2026-07-19 — all 3 drafts admitted into src/interview_coach/data/questions.yaml
+# (mlops section) after the delegated human review (R-33, GH #88). answers[1] (the weak admission
+# answers) stay HERE as bench-label material per ADR 0009 addendum (b); do not merge them twice.
 # Generated 2026-07-11 by `coach forge --skill mlops --n 3` (judge provider: openai, model: gpt-5.4-mini).
 # Gates passed: contract, novelty, admission (strong band 3.5-5.0, weak band 1.0-3.0).
 # answers[0] is the admitted strong answer; answers[1] is the admission-test WEAK answer,
