@@ -47,8 +47,20 @@ The within-a-question cycle: Interviewer asks → Candidate answers → Evaluato
 The between-questions cycle owned by the **Supervisor**: decide the next move once a question is fully resolved.
 
 **Skill**:
-A canonical competency the system assesses (e.g. ml_fundamentals, mlops, system_design, vietnamese_nlp). The taxonomy is fixed.
+A canonical competency the system assesses (e.g. ml_fundamentals, mlops, system_design, vietnamese_nlp). The taxonomy is fixed today; making it pack data is ADR 0014 (Proposed).
 _Avoid_: topic, area, dimension (a Skill is not a rubric dimension)
+
+**Derived confidence**:
+Uncertainty computed from *measured* signals — spread between independent judge votes, committee disagreement — rather than the judge's self-reported `confidence` field (which is saturated on the current judge and carries no discriminating signal). Proposed control signal for Self-critique/Panel escalation and evidence weighting; ADR 0011, experiment-gated, not yet in code.
+_Avoid_: self-reported confidence (the signal it replaces), certainty, trust score
+
+**Budget exhaustion**:
+The daily token budget running out mid-Session — *anticipated scarcity*. Neither Candidate intent nor an infrastructure surprise (ADR 0005 addendum): the Session suspends cleanly with a visible reason and resumes when the budget resets. Never recorded as `failed` questions, never a silent stall.
+_Avoid_: quota error (that names the provider symptom, not the category), timeout
+
+**Coaching memory**:
+Session history shown to the Candidate on presentation & planning surfaces — the dashboard, exports, Study-Plan narrative ("last time you struggled with backpressure"). Allowed by the ADR 0006 boundary; it must never enter the prompts of probing & judging agents (Evaluator, Interviewer, Supervisor), which is enforced by prompt-construction tests. Scoring memory remains decayed Beta priors only.
+_Avoid_: transcript RAG (the rejected mechanism), long-term memory (too broad — conflates the two sides of the boundary)
 
 ## Relationships
 

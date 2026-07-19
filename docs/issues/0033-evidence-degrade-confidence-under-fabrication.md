@@ -58,3 +58,7 @@ None. Not urgent — the current behavior is safe, just not maximally skeptical.
 ## Status
 
 **Closed.**
+
+## Continued by (2026-07-19 remediation)
+
+- Follow-on found in the red-team pass: the haircut is applied AFTER self-critique trigger computation, so evidence degradation never triggers self-critique today — folded into the R-16 trigger set (GH #71).

@@ -1,7 +1,7 @@
 # Adaptive Interview Coach
 
 A multi-agent system that runs an adaptive mock technical interview. Built primarily to **learn
-agentic patterns** — see `AGENTS.md` for the authoritative design and `CONTEXT.md` for the domain
+agentic patterns** — see `CLAUDE.md` for the authoritative design and `CONTEXT.md` for the domain
 glossary.
 
 ## Status

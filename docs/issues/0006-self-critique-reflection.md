@@ -27,3 +27,7 @@ The evaluator-optimizer reflection step (see `ADR 0001`): **Self-critique** live
 ## Status
 
 **Closed.** Acceptance criteria are implemented and covered.
+
+## Continued by (2026-07-19 remediation)
+
+- The low-confidence trigger is measurably dormant on gpt-5.4-mini (saturation ≥0.90) → deterministic trigger set is R-16 (GH #71); the replacement signal is ADR 0011 (Proposed, gated E4/E5).

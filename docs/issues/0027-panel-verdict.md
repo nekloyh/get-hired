@@ -55,3 +55,7 @@ evidence-weight signal), and natural escalations are 0/10 because gpt-5.4-mini's
 saturated ≥0.90 — the trigger threshold belongs to the bench re-anchor worklist. Full narrative:
 `docs/audits/calibration-bench-2026-07-11-panel-verdict.md` (baseline:
 `calibration-bench-2026-07-11-panel-baseline.md`).
+
+## Continued by (2026-07-19 remediation)
+
+- Natural escalations are 0/10 (saturation) → deterministic triggers R-16 (GH #71); the committee-disagreement signal this slice discovered becomes the core of ADR 0011 derived confidence (Proposed).
