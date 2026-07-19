@@ -1,7 +1,7 @@
 ---
 banner: |
   ⚠️ **Superseded by issue drafts** — This document is archived for reference.
-  For current roadmap and implementation details, see `/docs/issues/` and `/AGENTS.md`.
+  For current roadmap and implementation details, see `/docs/issues/` and `/CLAUDE.md`.
 ---
 
 # Adaptive AI/ML Interview Coach Agent — 2-Day MVP Build Blueprint
