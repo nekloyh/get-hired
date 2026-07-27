@@ -94,8 +94,7 @@ def _append_topic_plan(lines: list[str], session_state: Mapping[str, Any]) -> No
     lines.append("| ---: | --- | ---: | --- |")
     for i, item in enumerate(session_state.get("topic_plan", []), start=1):
         lines.append(
-            f"| {i} | `{_md(item.get('skill'))}` | {item.get('target_difficulty')} | "
-            f"{_md(item.get('rationale'))} |"
+            f"| {i} | `{_md(item.get('skill'))}` | {item.get('target_difficulty')} | {_md(item.get('rationale'))} |"
         )
     lines.append("")
 
@@ -136,14 +135,18 @@ def _append_transcript(lines: list[str], session_state: Mapping[str, Any]) -> No
             _append_evaluation(lines, turn.get("evaluation", {}))
             trace = turn.get("trace", {})
             if trace.get("evaluator_self_critique_triggers"):
-                lines.append(
-                    f"Self-critique triggers: `{_md(', '.join(trace['evaluator_self_critique_triggers']))}`"
-                )
+                lines.append(f"Self-critique triggers: `{_md(', '.join(trace['evaluator_self_critique_triggers']))}`")
             if trace.get("concept_lookup_query"):
                 lines.append(
                     f"Concept lookup: `{_md(trace.get('concept_lookup_query'))}` -> "
                     f"`{_md(trace.get('concept_hit_id') or 'none')}`"
                 )
+            if calls := trace.get("llm_calls"):
+                # The per-provider split is the point, not the total: a turn whose calls landed on a
+                # provider the role was not pinned to is a silent failover (ADR 0009 addendum a),
+                # and the export is where that becomes reviewable after the session is over.
+                split = ", ".join(f"{name} {n}" for name, n in trace.get("llm_calls_by_provider") or ())
+                lines.append(f"LLM calls: **{calls}**" + (f" ({_md(split)})" if split else ""))
             lines.append("")
 
 
@@ -247,9 +250,7 @@ def _append_study_plan(lines: list[str], plan: Any) -> None:
         resources = ", ".join(
             f"[{_md(resource.get('title'))}]({resource.get('url')})" for resource in item.get("resources", [])
         )
-        lines.append(
-            f"| {item.get('day')} | {_md(item.get('focus'))} | {resources} | {_md(item.get('outcome'))} |"
-        )
+        lines.append(f"| {item.get('day')} | {_md(item.get('focus'))} | {resources} | {_md(item.get('outcome'))} |")
     lines.append("")
     lines.append("### Milestones")
     lines.append("")

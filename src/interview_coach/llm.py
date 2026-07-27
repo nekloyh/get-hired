@@ -164,6 +164,42 @@ class _Breaker:
     opened_at: float | None = None
 
 
+# --- per-call trace (R-26) ----------------------------------------------------------------------
+
+# Greppable prefix for the one-line-per-call trace. One line per PROVIDER CALL — retries and
+# failures included — because the thing being diagnosed is precisely the call that misbehaved.
+CALL_LOG_PREFIX = "llm-call"
+
+# Counter keys, deliberately layered onto the existing telemetry module rather than a parallel
+# accounting system (the issue's "extend, don't duplicate"): the bench and forge already snapshot
+# and diff these counters, so per-call accounting comes along for free in those reports.
+LLM_CALL_KEY = "llm.calls"
+LLM_CALL_PROVIDER_PREFIX = "llm.calls."
+
+# How much of a rejected reply to log when structured output finally fails. Enough to see whether
+# the model produced prose, a code fence, a truncated object, or a refusal — which are four very
+# different bugs that all surface identically as "could not obtain schema-valid output".
+RAW_OUTPUT_LOG_CHARS = 500
+
+
+def call_counts(before: Mapping[str, int], after: Mapping[str, int]) -> tuple[int, tuple[tuple[str, int], ...]]:
+    """Provider calls made between two telemetry snapshots: total, and the per-provider split.
+
+    The per-provider split is what makes a silent failover legible after the fact: a judge phase
+    that recorded calls against a provider the role was never pinned to is the ADR 0009 failure
+    mode, and without this it leaves no trace at all in the export.
+    """
+    moved = telemetry.delta(before, after)
+    per_provider = tuple(
+        sorted(
+            (key[len(LLM_CALL_PROVIDER_PREFIX) :], count)
+            for key, count in moved.items()
+            if key.startswith(LLM_CALL_PROVIDER_PREFIX)
+        )
+    )
+    return moved.get(LLM_CALL_KEY, 0), per_provider
+
+
 class LLMClient(ABC):
     """The abstract interface every agent depends on."""
 
@@ -250,6 +286,17 @@ class LLMClient(ABC):
                             ),
                         },
                     ]
+        # Without the raw reply, prose, a code fence, a truncated object, and a refusal are four
+        # very different bugs that all surface identically as "could not obtain schema-valid
+        # output". Logged rather than folded into the message so the exception text (which callers
+        # and the degrade paths match on) stays stable, and so a full reply cannot blow up a
+        # user-facing error.
+        logger.error(
+            "structured output failed after %d attempt(s); last raw reply (first %d chars): %s",
+            max_retries + 1,
+            RAW_OUTPUT_LOG_CHARS,
+            raw[:RAW_OUTPUT_LOG_CHARS] if raw else "<no reply — the call itself failed>",
+        )
         raise StructuredOutputError(
             f"could not obtain schema-valid output after {max_retries + 1} attempt(s)"
         ) from last_error
@@ -365,10 +412,16 @@ class _OpenAICompatibleClient(LLMClient):
         if extra_body := self._thinking_extra_body(disable_thinking):
             kwargs["extra_body"] = extra_body
         for attempt in range(_TRANSPORT_ATTEMPTS):
+            started = _now()
             try:
                 completion = self._openai().chat.completions.create(**kwargs)
             except Exception as err:
-                if isinstance(err, openai.RateLimitError) and _quota_exhausted(err):
+                quota_dead = isinstance(err, openai.RateLimitError) and _quota_exhausted(err)
+                will_retry = not quota_dead and attempt + 1 < _TRANSPORT_ATTEMPTS and _retryable_transport_error(err)
+                # Traced before the raise, so a call that died still leaves its line — the failing
+                # call is the whole point of the trace.
+                self._trace_call(started, outcome=f"{'retry' if will_retry else 'error'}:{type(err).__name__}")
+                if quota_dead:
                     logger.error(
                         "%s daily quota exhausted (insufficient_quota) — backoff cannot help; "
                         "check today's spend in %s",
@@ -376,7 +429,7 @@ class _OpenAICompatibleClient(LLMClient):
                         "logs/usage-ledger.jsonl",
                     )
                     raise
-                if attempt + 1 >= _TRANSPORT_ATTEMPTS or not _retryable_transport_error(err):
+                if not will_retry:
                     raise
                 wait = _retry_wait(err, attempt)
                 telemetry.incr(f"transport.backoff.{self.provider_name}")
@@ -391,8 +444,30 @@ class _OpenAICompatibleClient(LLMClient):
                 _sleep(wait)
             else:
                 self._record_usage(completion)
+                self._trace_call(started, outcome="ok", completion=completion)
                 return completion.choices[0].message
         raise AssertionError("unreachable: transport retry loop always returns or raises")
+
+    def _trace_call(self, started: float, *, outcome: str, completion: Any = None) -> None:
+        """Count this provider call and emit its one-line trace (R-26).
+
+        Instrumented HERE, at the concrete client, rather than in the router: the pinned role
+        clients — the judge above all (ADR 0009 addendum a) — never pass through the router, so
+        router-level accounting would miss exactly the calls the ADR cares most about.
+        """
+        used = getattr(completion, "usage", None)
+        telemetry.incr(LLM_CALL_KEY)
+        telemetry.incr(f"{LLM_CALL_PROVIDER_PREFIX}{self.provider_name}")
+        logger.info(
+            "%s provider=%s model=%s ms=%.0f prompt=%d completion=%d outcome=%s",
+            CALL_LOG_PREFIX,
+            self.provider_name,
+            self._settings.model,
+            (_now() - started) * 1000.0,
+            getattr(used, "prompt_tokens", 0) or 0,
+            getattr(used, "completion_tokens", 0) or 0,
+            outcome,
+        )
 
     def _record_usage(self, completion: Any) -> None:
         """Append this call's token usage to the daily ledger (fakes without ``usage`` are skipped)."""

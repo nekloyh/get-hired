@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import httpx
 import openai as openai_sdk
 import pytest
@@ -11,6 +13,8 @@ from interview_coach.config import ProviderName, ProviderSettings, Settings
 from interview_coach.llm import (
     BREAKER_COOLDOWN_SECONDS,
     BREAKER_FAILURE_THRESHOLD,
+    CALL_LOG_PREFIX,
+    RAW_OUTPUT_LOG_CHARS,
     EmptyCompletionError,
     GroqClient,
     LLMClient,
@@ -20,6 +24,7 @@ from interview_coach.llm import (
     StructuredOutputError,
     ToolCallingUnsupported,
     build_client,
+    call_counts,
 )
 from interview_coach.usage import usage_for_day
 
@@ -218,6 +223,110 @@ def test_router_falls_back_on_primary_error():
     assert out == Foo(x=3, label="fallback")
     assert primary.calls == 1
     assert fallback.calls == 1
+
+
+# --- R-26: per-call trace + call accounting -----------------------------------------------------
+
+
+def test_every_call_is_counted_per_provider(make_client):
+    telemetry.reset()
+    client, _ = make_client(['{"x": 1, "label": "a"}'])
+    before = telemetry.snapshot()
+    client.chat([{"role": "user", "content": "go"}])
+    client.chat([{"role": "user", "content": "go"}])
+
+    total, per_provider = call_counts(before, telemetry.snapshot())
+    assert total == 2
+    assert per_provider == (("mimo", 2),)
+
+
+def test_retries_and_failures_are_counted_as_the_calls_they_are(make_client):
+    # A structured-output retry is a second real provider call. Counting only "logical" calls would
+    # under-report exactly the case the issue is about (<=8 judge calls per answer).
+    telemetry.reset()
+    client, fake = make_client(["not json at all", '{"x": 1, "label": "fixed"}'])
+    before = telemetry.snapshot()
+    client.chat_json([{"role": "user", "content": "go"}], Foo)
+
+    total, _ = call_counts(before, telemetry.snapshot())
+    assert fake.call_count == 2
+    assert total == 2
+
+
+def test_call_counts_ignores_unrelated_telemetry_movement():
+    before = {"llm.calls": 1, "llm.calls.mimo": 1, "sanitizer.whatever": 5}
+    after = {"llm.calls": 4, "llm.calls.mimo": 1, "llm.calls.groq": 2, "sanitizer.whatever": 9}
+
+    total, per_provider = call_counts(before, after)
+
+    assert total == 3
+    assert per_provider == (("groq", 2),)  # mimo did not move, so it is not in this turn's split
+
+
+def test_per_call_line_carries_provider_model_latency_tokens_and_outcome(make_client, caplog):
+    client, _ = make_client(
+        [{"content": '{"x": 1, "label": "a"}', "usage": {"prompt_tokens": 11, "completion_tokens": 7}}]
+    )
+    with caplog.at_level(logging.INFO, logger="interview_coach.llm"):
+        client.chat([{"role": "user", "content": "go"}])
+
+    line = next(m for m in caplog.messages if m.startswith(CALL_LOG_PREFIX))
+    assert "provider=mimo" in line
+    assert "model=test-model" in line
+    assert "prompt=11" in line
+    assert "completion=7" in line
+    assert "outcome=ok" in line
+    assert "ms=" in line
+
+
+def test_a_failed_call_still_emits_its_trace_line(make_client, caplog):
+    # The failing call is the one worth tracing; a trace that only records successes is useless for
+    # diagnosing an outage.
+    client, _ = make_client(
+        [openai_sdk.AuthenticationError("nope", response=httpx.Response(401, request=_http_request()), body=None)]
+    )
+    with caplog.at_level(logging.INFO, logger="interview_coach.llm"), pytest.raises(openai_sdk.AuthenticationError):
+        client.chat([{"role": "user", "content": "go"}])
+
+    line = next(m for m in caplog.messages if m.startswith(CALL_LOG_PREFIX))
+    assert "outcome=error:AuthenticationError" in line
+
+
+def test_a_backed_off_retry_is_traced_as_a_retry(make_client, caplog, monkeypatch):
+    monkeypatch.setattr(llm_module, "_sleep", lambda _s: None)
+    client, _ = make_client(
+        [
+            openai_sdk.APIStatusError("boom", response=httpx.Response(503, request=_http_request()), body=None),
+            '{"x": 1, "label": "recovered"}',
+        ]
+    )
+    with caplog.at_level(logging.INFO, logger="interview_coach.llm"):
+        client.chat([{"role": "user", "content": "go"}])
+
+    outcomes = [m.split("outcome=")[1] for m in caplog.messages if m.startswith(CALL_LOG_PREFIX)]
+    assert outcomes == ["retry:APIStatusError", "ok"]
+
+
+def test_structured_output_failure_logs_the_raw_reply(make_client, caplog):
+    # Prose, a code fence, a truncated object and a refusal all surface identically as
+    # "could not obtain schema-valid output"; the raw reply is what tells them apart.
+    junk = "I'm sorry, I cannot comply with that request. " * 40
+    client, _ = make_client([junk])
+    with caplog.at_level(logging.ERROR, logger="interview_coach.llm"), pytest.raises(StructuredOutputError):
+        client.chat_json([{"role": "user", "content": "go"}], Foo, max_retries=0)
+
+    logged = next(m for m in caplog.messages if "last raw reply" in m)
+    assert "I'm sorry, I cannot comply" in logged
+    assert len(logged) < len(junk)  # truncated, not the whole reply
+
+
+def test_raw_reply_is_capped_at_the_documented_length(make_client, caplog):
+    client, _ = make_client(["x" * 5_000])
+    with caplog.at_level(logging.ERROR, logger="interview_coach.llm"), pytest.raises(StructuredOutputError):
+        client.chat_json([{"role": "user", "content": "go"}], Foo, max_retries=0)
+
+    logged = next(m for m in caplog.messages if "last raw reply" in m)
+    assert logged.count("x") == RAW_OUTPUT_LOG_CHARS
 
 
 # --- R-09: typed failover + per-provider circuit breaker ----------------------------------------

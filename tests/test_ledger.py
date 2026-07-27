@@ -224,3 +224,35 @@ def test_export_shows_since_last_session_delta_only_for_a_returning_candidate():
     report = render_session_markdown(returning)
     assert "Since Previous Session" in report
     assert "0.400" in report and "0.750" in report and "+0.350" in report
+
+
+def test_export_shows_llm_calls_per_turn_with_the_provider_split():
+    # R-26 DoD: the export is where a finished session's cost and routing become reviewable. The
+    # provider split is the part that matters — a judge turn whose calls landed on a provider the
+    # role was never pinned to is the ADR 0009 silent failover, invisible everywhere else.
+    from interview_coach.exporter import render_session_markdown
+
+    state = {
+        "session_id": "s1",
+        "status": "complete",
+        "transcript": [
+            {
+                "skill": "mlops",
+                "stop_reason": "resolved",
+                "turns": [
+                    {
+                        "question": "q1",
+                        "answer": "a1",
+                        "is_follow_up": False,
+                        "evaluation": {"dimensions": {}, "weighted_score": 4.0, "confidence": 0.9},
+                        "trace": {"llm_calls": 5, "llm_calls_by_provider": [["openai", 4], ["groq", 1]]},
+                    }
+                ],
+            }
+        ],
+    }
+
+    report = render_session_markdown(state)
+
+    assert "LLM calls: **5**" in report
+    assert "openai 4" in report and "groq 1" in report
