@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from interview_coach.concepts import (
@@ -10,6 +12,7 @@ from interview_coach.concepts import (
     InMemoryConceptStore,
     build_concept_store,
     lookup_concept,
+    resolve_concept_store_kind,
     seed_concept_store,
 )
 from interview_coach.diagnostic import SKILLS
@@ -200,3 +203,57 @@ def test_resource_store_refuses_prefixed_embedder():
 
     with pytest.raises(RuntimeError, match="prefixes"):
         ChromaResourceStore.create(embedding_model=E5_SMALL_MULTILINGUAL)
+
+
+# --- R-13: the measured path is the default path -------------------------------------------------
+
+
+def test_auto_resolves_to_chroma_when_the_extras_are_importable(monkeypatch):
+    monkeypatch.setattr("interview_coach.concepts.rag_extras_available", lambda: True)
+
+    assert resolve_concept_store_kind("auto") == "chroma"
+
+
+def test_auto_falls_back_to_memory_without_the_extras(monkeypatch):
+    monkeypatch.setattr("interview_coach.concepts.rag_extras_available", lambda: False)
+
+    assert resolve_concept_store_kind("auto") == "memory"
+
+
+def test_an_explicit_kind_is_never_overridden(monkeypatch):
+    # An operator who asked for the keyword ranker gets it even on a machine with the extras.
+    monkeypatch.setattr("interview_coach.concepts.rag_extras_available", lambda: True)
+
+    assert resolve_concept_store_kind("memory") == "memory"
+
+
+def test_the_degraded_fallback_warns_loudly(monkeypatch, caplog):
+    # Silent degradation is the actual defect: every published retrieval number describes Chroma,
+    # so falling back to the keyword ranker has to be visible in the log and (via /api/health) the UI.
+    monkeypatch.setattr("interview_coach.concepts.rag_extras_available", lambda: False)
+
+    with caplog.at_level(logging.WARNING, logger="interview_coach.concepts"):
+        store = build_concept_store("auto", seed=False)
+
+    assert isinstance(store, InMemoryConceptStore)
+    assert "DEGRADED" in caplog.text
+    assert "--extra rag" in caplog.text
+
+
+def test_choosing_chroma_does_not_warn(monkeypatch, caplog):
+    built = {}
+    monkeypatch.setattr("interview_coach.concepts.rag_extras_available", lambda: True)
+    monkeypatch.setattr(
+        "interview_coach.concepts.ChromaConceptStore.create",
+        classmethod(lambda cls, **kwargs: built.setdefault("store", InMemoryConceptStore())),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="interview_coach.concepts"):
+        build_concept_store("auto", seed=False)
+
+    assert "DEGRADED" not in caplog.text
+
+
+def test_an_unknown_kind_still_fails_loudly():
+    with pytest.raises(ValueError, match="unknown concept store kind"):
+        build_concept_store("elasticsearch")

@@ -20,6 +20,7 @@ def _test_client(tmp_path):
         mimo_model="",
         groq_api_key="",
         groq_model="",
+        concept_store="memory",
     )
     app = create_app(
         settings=settings,
@@ -247,6 +248,7 @@ def _gated_client(tmp_path, *, token: str = _TOKEN, origins: str = ""):
         groq_model="",
         auth_token=token,
         allowed_origins=origins,
+        concept_store="memory",
     )
     app = create_app(
         settings=settings,
@@ -606,6 +608,7 @@ def _ui_client(tmp_path, *, static_dir):
         mimo_model="",
         groq_api_key="",
         groq_model="",
+        concept_store="memory",
     )
     app = create_app(
         settings=settings,
@@ -778,3 +781,11 @@ def test_a_ttl_of_zero_disables_the_sweep(tmp_path):
     )
 
     assert app.state.web_api.settings.checkpoint_ttl_seconds == 0
+
+
+def test_health_reports_the_retrieval_path(tmp_path):
+    # R-13: the UI banners a degraded path rather than letting it be invisible.
+    degraded = _test_client(tmp_path).get("/api/health").json()
+
+    assert degraded["concept_store"] == "memory"
+    assert degraded["retrieval_degraded"] is True

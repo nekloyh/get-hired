@@ -25,7 +25,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from pydantic import BaseModel, Field, ValidationError
 from starlette.status import WS_1008_POLICY_VIOLATION
 
-from .concepts import build_concept_store
+from .concepts import build_concept_store, resolve_concept_store_kind
 from .config import Settings, load_settings
 from .demo_llm import DemoLLMClient
 from .diagnostic import CandidateProfile, diagnose_or_degrade
@@ -376,6 +376,10 @@ def create_app(
             # Lets the UI ask for the shared secret at runtime instead of being built with it baked
             # in. Advertising *that* a gate exists discloses nothing an unauthorized 401 would not.
             "auth_required": bool(api_state.settings.auth_token),
+            # R-13: the UI banners a degraded retrieval path rather than letting it be invisible —
+            # every published retrieval number describes Chroma, not the keyword ranker.
+            "concept_store": resolve_concept_store_kind(api_state.settings.concept_store),
+            "retrieval_degraded": resolve_concept_store_kind(api_state.settings.concept_store) == "memory",
         }
 
     @app.websocket("/api/sessions/{session_id}")
@@ -591,7 +595,14 @@ def _run_session_thread(
         # ADR 0010: demo mode's client is not a router, so the bundle collapses to single-client
         # semantics; live mode pins the judge and applies any ROLE_* overrides.
         roles = build_role_clients(api_state.settings, client)
-        concept_store = build_concept_store("memory", seed=True)
+        # R-13: the measured path is the default path. Demo mode stays in-memory on purpose — it
+        # runs on a fake model for UX review, and building a Chroma index (first run: downloading an
+        # embedding model) to serve fake questions would be a slow answer to a question nobody asked.
+        concept_store = build_concept_store(
+            "memory" if runtime.mode == "demo" else api_state.settings.concept_store,
+            persist_dir=api_state.settings.concept_persist_dir or None,
+            seed=True,
+        )
         resource_store = build_resource_store("memory", seed=True)
         with SqliteSaver.from_conn_string(api_state.checkpoint_db) as checkpointer:
             graph = build_session_graph(

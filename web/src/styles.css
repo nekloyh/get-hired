@@ -1966,3 +1966,24 @@ details[open] summary::before {
     transition-duration: 0.001ms !important;
   }
 }
+
+/* R-13: retrieval running on the keyword ranker instead of Chroma. A warning, not an error — the
+   Session still works, it just is not the path every published retrieval number describes. */
+.degrade-banner {
+  background: linear-gradient(145deg, #ffffff, #fff6e6);
+  border: 1px solid rgba(226, 165, 61, 0.4);
+  border-radius: var(--r-lg);
+  color: #8a5a12;
+  font-size: 13px;
+  font-weight: 700;
+  margin: 0 auto 12px;
+  max-width: 1180px;
+  padding: 12px 18px;
+}
+
+.degrade-banner code {
+  background: rgba(226, 165, 61, 0.16);
+  border-radius: 6px;
+  font-size: 12px;
+  padding: 1px 6px;
+}

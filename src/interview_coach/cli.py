@@ -46,7 +46,6 @@ from .concepts import (
     SEED_CONCEPTS,
     ChromaConceptStore,
     ConceptStore,
-    InMemoryConceptStore,
     build_concept_store,
 )
 from .config import load_settings
@@ -416,7 +415,14 @@ def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
         # the Interviewer's lookups, instead of the built-in reference bank.
         pack = load_pack(args.pack)
         question_bank = pack.questions
-        concept_store: ConceptStore = InMemoryConceptStore(pack.concepts)
+        # R-13: a pack Session used to be pinned to the keyword ranker regardless of what was
+        # installed, so every pack interview ran on the un-measured retrieval path — and Vietnamese
+        # pack notes carry almost no signal in it. Seed the resolved store with the PACK's notes
+        # (never the built-in seeds: running "entirely from the pack" is the point of 0025).
+        concept_store: ConceptStore = build_concept_store(
+            args.concept_store, persist_dir=args.concept_persist_dir, seed=False
+        )
+        concept_store.ingest(pack.concepts)
         print(f"Running from pack {pack.metadata.get('name')!r} ({args.pack}).")
     else:
         concept_store = build_concept_store(
@@ -835,9 +841,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     iv_parser.add_argument(
         "--concept-store",
-        choices=["memory", "chroma"],
-        default="memory",
-        help="Concept store used by lookup_concept during Follow-up generation.",
+        choices=["auto", "memory", "chroma"],
+        default="auto",
+        help=(
+            "Concept store used by lookup_concept during Follow-up generation. 'auto' (default) "
+            "uses Chroma wherever the rag extras are installed and warns loudly when falling back "
+            "to the keyword ranker, so the measured retrieval path is also the default one."
+        ),
     )
     iv_parser.add_argument(
         "--concept-persist-dir",
@@ -953,9 +963,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     session_parser.add_argument(
         "--concept-store",
-        choices=["memory", "chroma"],
-        default="memory",
-        help="Concept store used by lookup_concept during Follow-up generation.",
+        choices=["auto", "memory", "chroma"],
+        default="auto",
+        help=(
+            "Concept store used by lookup_concept during Follow-up generation. 'auto' (default) "
+            "uses Chroma wherever the rag extras are installed and warns loudly when falling back "
+            "to the keyword ranker, so the measured retrieval path is also the default one."
+        ),
     )
     session_parser.add_argument(
         "--concept-persist-dir",

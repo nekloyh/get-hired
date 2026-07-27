@@ -7,6 +7,7 @@ Interviewer can exercise the tool loop without downloading an embedding model.
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import re
 from collections.abc import Iterable, Mapping, Sequence
@@ -187,14 +188,18 @@ class ChromaConceptStore:
             "metadata": {"hnsw:space": "cosine", "embedder": embedding_model},
         }
         revision = embedder_revision(embedding_model)
-        model_kwargs = {"revision": revision} if revision else {}
         encoder = None
         if prefixes is not None:
-            encoder = SentenceTransformer(embedding_model, **model_kwargs)
+            encoder = SentenceTransformer(embedding_model, revision=revision)
         else:
-            collection_kwargs["embedding_function"] = embedding_functions.SentenceTransformerEmbeddingFunction(
-                model_name=embedding_model, **model_kwargs
+            # Typed as Any: chromadb's `EmbeddingFunction` protocol does not admit its own concrete
+            # SentenceTransformer implementation, and that mismatch is not ours to fix. Kept local
+            # so it cannot spread — and stated as a type, not a `# type: ignore` that would go
+            # unused (and therefore error) in the CI environment, which has no chromadb installed.
+            embedding_fn: Any = embedding_functions.SentenceTransformerEmbeddingFunction(
+                model_name=embedding_model, revision=revision
             )
+            collection_kwargs["embedding_function"] = embedding_fn
         collection = client.get_or_create_collection(**collection_kwargs)
         stamped = (getattr(collection, "metadata", None) or {}).get("embedder")
         if stamped is not None and stamped != embedding_model:
@@ -277,6 +282,26 @@ def seed_concept_store(store: ConceptStore | None = None) -> ConceptStore:
     return target
 
 
+def rag_extras_available() -> bool:
+    """Whether the optional Chroma + sentence-transformers extras can be imported.
+
+    ``find_spec`` rather than a real import: this is called on the hot path of every Session start,
+    and importing sentence-transformers costs seconds and loads torch.
+    """
+    return all(importlib.util.find_spec(name) is not None for name in ("chromadb", "sentence_transformers"))
+
+
+def resolve_concept_store_kind(kind: str) -> str:
+    """What ``kind`` actually resolves to, without building anything.
+
+    Lets the API report the retrieval path it is on (and the UI warn about a degraded one) without
+    paying for a store it may not use.
+    """
+    if kind != "auto":
+        return kind
+    return "chroma" if rag_extras_available() else "memory"
+
+
 def build_concept_store(
     kind: str = "memory",
     *,
@@ -284,7 +309,28 @@ def build_concept_store(
     seed: bool = True,
     embedding_model: str = BGE_SMALL_EN,
 ) -> ConceptStore:
-    """Build the concept store used by the Interviewer."""
+    """Build the concept store used by the Interviewer.
+
+    ``kind="auto"`` (R-13) is the deployment default: use Chroma wherever the extras are installed,
+    fall back to the in-memory store with a **visible** warning otherwise. The point is that the
+    measured path and the default path stop being different — every published retrieval number
+    describes Chroma, while the web API and pack sessions were hardcoded to the in-memory
+    ASCII-Jaccard ranker, in which Vietnamese queries carry approximately zero signal.
+
+    Upgrade triggers recorded from the 2026-07-11 retrieval audit, as comments rather than code:
+    the toy store scores 47/50 against the embedders' 46-47/50 *at the current shelf size*, because
+    the Skill filter does most of the work. Past roughly 20-25 notes per Skill that stops holding,
+    and the audit's next step is k=3 retrieval plus an LLM pick. Revisit when taxonomy-as-data
+    (ADR 0014) grows the shelf.
+    """
+    if kind == "auto":
+        kind = resolve_concept_store_kind(kind)
+        if kind == "memory":
+            logger.warning(
+                "concept retrieval DEGRADED: chromadb/sentence-transformers are not installed, so "
+                "the Interviewer is using the in-memory keyword ranker. Vietnamese queries carry "
+                "almost no signal in it. Install the extras with `uv sync --extra rag`."
+            )
     if kind == "memory":
         store: ConceptStore = InMemoryConceptStore()
     elif kind == "chroma":

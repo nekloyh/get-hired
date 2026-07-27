@@ -13,7 +13,7 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 from .concepts import BGE_SMALL_EN, embedder_revision
 
@@ -164,8 +164,9 @@ class ChromaResourceStore:
             ) from err
 
         revision = embedder_revision(embedding_model)
-        embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=embedding_model, **({"revision": revision} if revision else {})
+        # See concepts.py: chromadb's protocol does not admit its own concrete implementation.
+        embedding_fn: Any = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name=embedding_model, revision=revision
         )
         client = chromadb.PersistentClient(path=str(persist_dir)) if persist_dir else chromadb.Client()
         # Stamp the embedder into the collection metadata, exactly as the concept store does: the

@@ -41,6 +41,10 @@ export type Health = {
   // R-07: whether the backend is gated. Drives whether the UI asks for an access token — which it
   // must do at runtime, because a build-time token would ship inside the bundle.
   auth_required?: boolean
+  // R-13: which retrieval path the backend is actually on. Every published retrieval number
+  // describes Chroma, so running on the keyword ranker is worth saying out loud.
+  concept_store?: string
+  retrieval_degraded?: boolean
 }
 
 export type SkillState = {
