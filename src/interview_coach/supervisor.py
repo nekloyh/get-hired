@@ -425,7 +425,7 @@ def _apply_supervisor_decision(
             status = SessionStatus.COMPLETE.value
             stop_reason = "topic_plan_complete"
     elif decision.action is SupervisorAction.EXTRA_QUESTION:
-        next_skill = state.get("transcript", [{}])[-1].get("skill", next_skill)
+        next_skill = _last_probed_skill(state) or next_skill
     elif decision.action is SupervisorAction.SKIP_AHEAD:
         next_index = decision.target_plan_index if decision.target_plan_index is not None else current_index + 2
         next_skill = plan[next_index]["skill"] if next_index < len(plan) else None
@@ -464,7 +464,7 @@ def _deterministic_supervisor_fallback(
     # string from the schema-invalid fallback while sharing the same deterministic decision logic.
     attempts = _attempts_by_skill(state)
     if _extra_probe_required(state, attempts):
-        last_skill = state.get("transcript", [{}])[-1].get("skill")
+        last_skill = _last_probed_skill(state)
         return SupervisorDecision(
             action=SupervisorAction.EXTRA_QUESTION,
             reasoning=(
@@ -516,7 +516,7 @@ def _make_supervisor_validators(state: SessionState, bank: QuestionBank | None =
     plan = state.get("topic_plan", [])
     plan_len = len(plan)
     attempts = _attempts_by_skill(state)
-    last_skill = state.get("transcript", [{}])[-1].get("skill") if state.get("transcript") else None
+    last_skill = _last_probed_skill(state)
     extra_probe_required = _extra_probe_required(state, attempts, bank)
     expected_advance_skill = _advance_plan_target_skill(state)
 
@@ -604,6 +604,19 @@ def _expected_next_skill(
         index = decision.target_plan_index
         return plan[index]["skill"] if index is not None and index < len(plan) else None
     return None
+
+
+def _last_probed_skill(state: SessionState) -> str | None:
+    """The Skill of the most recent transcript item, or ``None`` when nothing has been probed yet.
+
+    Replaces four copies of ``state.get("transcript", [{}])[-1].get("skill")``. That default was
+    dead weight that happened to produce ``None`` via an empty dict — and it hid the
+    empty-transcript case behind an index that would start raising ``IndexError`` the moment anyone
+    "simplified" the default to ``[]``. The empty case is real (the Supervisor's prompt builder runs
+    before the first question resolves), so it is now stated rather than stumbled into.
+    """
+    transcript = state.get("transcript") or ()
+    return transcript[-1].get("skill") if transcript else None
 
 
 def _attempts_by_skill(state: SessionState) -> dict[str, int]:
@@ -760,7 +773,7 @@ def _next_action_semantics(state: SessionState) -> str:
         ),
     ]
     if _extra_probe_required(state, attempts):
-        last_skill = state.get("transcript", [{}])[-1].get("skill")
+        last_skill = _last_probed_skill(state)
         lines.append(
             f"- The last {last_skill} question stopped by safety_cap below its evidence bar and another seed remains; "
             "prefer extra_question unless a stronger deviation is justified."

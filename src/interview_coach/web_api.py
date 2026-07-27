@@ -10,6 +10,7 @@ import secrets
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Literal
@@ -484,10 +485,24 @@ def create_app(
         except OSError:
             raise HTTPException(status_code=404, detail="No completed Session found for this Session id.") from None
 
+    _sweep_checkpoints_at_startup(api_state)
     # Registered last, deliberately: a mount at "/" matches everything, so every API route above has
     # to be in the table already or the UI would swallow them.
     _mount_static_ui(app, static_dir if static_dir is not None else resolved.static_dir)
     return app
+
+
+def _sweep_checkpoints_at_startup(api_state: WebApiState) -> None:
+    """Reap stale checkpoint threads once, at app construction — the DB had no reaper at all."""
+    ttl = api_state.settings.checkpoint_ttl_seconds
+    if ttl <= 0:
+        return
+    try:
+        with SqliteSaver.from_conn_string(api_state.checkpoint_db) as checkpointer:
+            prune_checkpoints(checkpointer, max_age_seconds=ttl, now=time.time())
+    except Exception:
+        # A cleanup must never be the reason the server fails to start.
+        logger.warning("checkpoint sweep failed at startup", exc_info=True)
 
 
 def _mount_static_ui(app: FastAPI, static_dir: str | Path) -> None:
@@ -641,6 +656,57 @@ def _run_session_thread(
     except Exception as err:  # noqa: BLE001 - API boundary converts graph/provider failures to events
         logger.exception("Session %s failed", runtime.session_id)
         runtime.emit({"type": "session_error", "error": f"{type(err).__name__}: {err}"})
+
+
+def prune_checkpoints(checkpointer: Any, *, max_age_seconds: float, now: float) -> list[str]:
+    """Drop checkpoint threads whose newest checkpoint is older than ``max_age_seconds``.
+
+    The checkpoint DB had no reaper of any kind: every Session ever started stayed in it for the life
+    of the deployment, on a single-file SQLite that also serves live resume.
+
+    A **TTL sweep, not delete-on-completion.** Dropping a thread the moment its Session completes
+    looks tidier and is the first option the issue offers, but it breaks a path that works today:
+    reconnecting to a finished Session currently replays its final checkpoint and re-emits the
+    report (measured, not assumed). With the thread gone, that resume finds nothing and fails. The
+    TTL keeps recently-finished Sessions resumable and still bounds growth, which was the actual
+    complaint.
+
+    Best-effort by design: a cleanup that cannot read one thread's timestamp must not stop the
+    server from starting, so unparseable rows are left alone rather than guessed at.
+    """
+    newest: dict[str, float] = {}
+    try:
+        for entry in checkpointer.list(None):
+            thread_id = entry.config.get("configurable", {}).get("thread_id")
+            stamp = _checkpoint_timestamp(entry.checkpoint.get("ts"))
+            if thread_id is None or stamp is None:
+                continue
+            newest[thread_id] = max(newest.get(thread_id, stamp), stamp)
+    except Exception:
+        logger.warning("could not enumerate checkpoint threads; skipping the sweep", exc_info=True)
+        return []
+    pruned = []
+    for thread_id, stamp in sorted(newest.items()):
+        if now - stamp <= max_age_seconds:
+            continue
+        try:
+            checkpointer.delete_thread(thread_id)
+        except Exception:
+            logger.warning("could not prune checkpoint thread %s", thread_id, exc_info=True)
+            continue
+        pruned.append(thread_id)
+    if pruned:
+        logger.info("pruned %d checkpoint thread(s) older than %.0fs", len(pruned), max_age_seconds)
+    return pruned
+
+
+def _checkpoint_timestamp(raw: Any) -> float | None:
+    if not isinstance(raw, str):
+        return None
+    try:
+        return datetime.fromisoformat(raw).timestamp()
+    except ValueError:
+        return None
 
 
 def _persist_export(api_state: WebApiState, session_id: str, final_state: dict[str, Any]) -> None:

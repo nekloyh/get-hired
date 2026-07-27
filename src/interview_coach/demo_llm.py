@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, TypeVar
 
 from pydantic import BaseModel
@@ -51,62 +51,96 @@ class DemoLLMClient(LLMClient):
         return parsed
 
     def _payload_for(self, response_model: type[BaseModel], messages: Sequence[Message]) -> dict[str, Any]:
-        name = response_model.__name__
+        # Dispatch on the class OBJECT, not its ``__name__``: a rename anywhere in the codebase used
+        # to silently stop matching here and fall through to ``{}``, which then failed as a confusing
+        # schema-validation error about missing fields rather than "demo mode does not know this
+        # model". An unknown model is now a loud error at the dispatch site that names the fix.
+        builders = self._payload_builders()
+        builder = builders.get(response_model)
+        if builder is None:
+            raise ValueError(
+                f"demo mode has no payload for {response_model.__name__!r}. Add one to "
+                "DemoLLMClient._payload_builders — falling through to an empty payload would surface "
+                "as a schema error about missing fields, several layers away from the real cause."
+            )
         text = "\n\n".join(str(message.get("content", "")) for message in messages)
-        if name == "DiagnosticPlanResponse":
-            return {
-                "topic_plan": [
-                    {
-                        "skill": skill,
-                        "target_difficulty": 3 if skill != "mlops" else 4,
-                        "rationale": f"Demo Topic Plan probes {skill} with role-aware priority.",
-                    }
-                    for skill in SKILLS
-                ]
-            }
-        if name == "Evaluation":
-            return self._evaluation_payload(text)
-        if name == "SupervisorDecision":
-            return {
-                "action": "advance_plan",
-                "reasoning": "Demo Supervisor follows the Topic Plan unless a hard cap completes the Session.",
-                "target_skill": None,
-                "target_plan_index": None,
-            }
-        if name == "StudyPlanDraft":
-            return self._study_plan_payload(text)
-        if name == "ConceptToolRequest":
-            return {
-                "query": "core mechanism and failure mode",
-                "skill": self._target_skill(text),
-                "language": "vi" if self._target_skill(text) == "vietnamese_nlp" else None,
-                "reason": "Demo lookup grounds the Follow-up in the active Skill.",
-            }
-        if name == "FollowUp":
-            return {
-                "question": "Using the retrieved mechanism, what concrete failure mode would you watch for?",
-                "targets": "mechanism and failure-mode depth from the retrieved concept note",
-            }
-        if name == "RenderedSeedQuestion":
-            # Issue 0024: a vn/mixed demo Session must actually ask in Vietnamese — falling through
-            # to {} would silently degrade every demo question to English. The framing carries
-            # enough Vietnamese-specific characters to clear the deterministic rendering validator.
-            original = self._section(text, "QUESTION (English original)", "SESSION LANGUAGE MODE")
-            return {
-                "question": (
-                    "Bạn hãy trình bày và giải thích thật rõ ràng (giữ nguyên thuật ngữ tiếng Anh): "
-                    f"{original or 'câu hỏi phỏng vấn ở trên'}"
-                )
-            }
-        if name == "PanelOpinion":
-            # Issue 0027: demo confidence never dips below the escalation bar, but a payload case
-            # keeps demo mode schema-complete if a panel is ever reached.
-            return {
-                "recommended_score": 3.0,
-                "argument": "Demo panel voice: the answer shows real mechanism but leaves the trade-off implicit.",
-                "key_evidence": "the opening sentences of the answer",
-            }
-        return {}
+        return builder(text)
+
+    def _payload_builders(self) -> dict[type[BaseModel], Callable[[str], dict[str, Any]]]:
+        # Imported here rather than at module scope: these are the agents' response models, and
+        # demo_llm is imported by the web API at startup — a module-level import would drag the whole
+        # agent graph into every process that only wanted a fake client.
+        from .diagnostic import DiagnosticPlanResponse
+        from .evaluator import Evaluation, PanelOpinion
+        from .interviewer import ConceptToolRequest, FollowUp, RenderedSeedQuestion
+        from .study_planner import StudyPlanDraft
+        from .supervisor import SupervisorDecision
+
+        return {
+            DiagnosticPlanResponse: self._diagnostic_payload,
+            Evaluation: self._evaluation_payload,
+            SupervisorDecision: self._supervisor_payload,
+            StudyPlanDraft: self._study_plan_payload,
+            ConceptToolRequest: self._concept_tool_payload,
+            FollowUp: self._follow_up_payload,
+            RenderedSeedQuestion: self._rendered_seed_payload,
+            PanelOpinion: self._panel_opinion_payload,
+        }
+
+    def _diagnostic_payload(self, text: str) -> dict[str, Any]:
+        return {
+            "topic_plan": [
+                {
+                    "skill": skill,
+                    "target_difficulty": 3 if skill != "mlops" else 4,
+                    "rationale": f"Demo Topic Plan probes {skill} with role-aware priority.",
+                }
+                for skill in SKILLS
+            ]
+        }
+
+    def _supervisor_payload(self, text: str) -> dict[str, Any]:
+        return {
+            "action": "advance_plan",
+            "reasoning": "Demo Supervisor follows the Topic Plan unless a hard cap completes the Session.",
+            "target_skill": None,
+            "target_plan_index": None,
+        }
+
+    def _concept_tool_payload(self, text: str) -> dict[str, Any]:
+        return {
+            "query": "core mechanism and failure mode",
+            "skill": self._target_skill(text),
+            "language": "vi" if self._target_skill(text) == "vietnamese_nlp" else None,
+            "reason": "Demo lookup grounds the Follow-up in the active Skill.",
+        }
+
+    def _follow_up_payload(self, text: str) -> dict[str, Any]:
+        return {
+            "question": "Using the retrieved mechanism, what concrete failure mode would you watch for?",
+            "targets": "mechanism and failure-mode depth from the retrieved concept note",
+        }
+
+    def _rendered_seed_payload(self, text: str) -> dict[str, Any]:
+        # Issue 0024: a vn/mixed demo Session must actually ask in Vietnamese — falling through
+        # to {} would silently degrade every demo question to English. The framing carries
+        # enough Vietnamese-specific characters to clear the deterministic rendering validator.
+        original = self._section(text, "QUESTION (English original)", "SESSION LANGUAGE MODE")
+        return {
+            "question": (
+                "Bạn hãy trình bày và giải thích thật rõ ràng (giữ nguyên thuật ngữ tiếng Anh): "
+                f"{original or 'câu hỏi phỏng vấn ở trên'}"
+            )
+        }
+
+    def _panel_opinion_payload(self, text: str) -> dict[str, Any]:
+        # Issue 0027: demo confidence never dips below the escalation bar, but a payload case
+        # keeps demo mode schema-complete if a panel is ever reached.
+        return {
+            "recommended_score": 3.0,
+            "argument": "Demo panel voice: the answer shows real mechanism but leaves the trade-off implicit.",
+            "key_evidence": "the opening sentences of the answer",
+        }
 
     def _evaluation_payload(self, prompt: str) -> dict[str, Any]:
         answer = self._section(prompt, "CANDIDATE ANSWER", "RUBRIC")

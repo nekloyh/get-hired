@@ -120,6 +120,10 @@ class Settings(BaseSettings):
     # serves the UI). Set in the image so one container answers both the UI and the API on one
     # origin — which is also what lets the bundle default to same-origin instead of baking a host.
     static_dir: str = Field("", validation_alias="COACH_STATIC_DIR")
+    # How long a finished Session's checkpoint thread is kept before the startup sweep drops it
+    # (R-27). Long enough that reconnecting to a just-finished Session still replays its report;
+    # short enough that the SQLite file does not grow for the life of the deployment. 0 disables.
+    checkpoint_ttl_seconds: float = Field(7 * 24 * 3600, validation_alias="COACH_CHECKPOINT_TTL_SECONDS")
 
     # ADR 0010: per-role overrides. Empty/None = inherit the primary provider / provider model /
     # global temperature — the pre-0010 behavior, byte-identical.

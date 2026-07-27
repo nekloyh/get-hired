@@ -32,6 +32,21 @@ _EMBEDDING_PREFIXES: dict[str, tuple[str, str]] = {
     E5_SMALL_MULTILINGUAL: ("query: ", "passage: "),
 }
 
+# model id -> pinned Hugging Face commit. A bare model id resolves to whatever `main` points at
+# *today*: the upstream can re-upload weights and every vector already on disk silently stops being
+# comparable to the ones queried against it — a retrieval-quality regression with no error and no
+# diff to blame. The persisted collection outlives the process, so the weights that built it have to
+# be nailed down too. Resolved from the HF API on 2026-07-27.
+EMBEDDER_REVISIONS: dict[str, str] = {
+    BGE_SMALL_EN: "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a",
+    E5_SMALL_MULTILINGUAL: "614241f622f53c4eeff9890bdc4f31cfecc418b3",
+}
+
+
+def embedder_revision(embedding_model: str) -> str | None:
+    """The pinned commit for ``embedding_model``, or ``None`` for an unpinned custom id."""
+    return EMBEDDER_REVISIONS.get(embedding_model)
+
 
 @dataclass(frozen=True)
 class ConceptNote:
@@ -171,12 +186,14 @@ class ChromaConceptStore:
             "name": collection_name,
             "metadata": {"hnsw:space": "cosine", "embedder": embedding_model},
         }
+        revision = embedder_revision(embedding_model)
+        model_kwargs = {"revision": revision} if revision else {}
         encoder = None
         if prefixes is not None:
-            encoder = SentenceTransformer(embedding_model)
+            encoder = SentenceTransformer(embedding_model, **model_kwargs)
         else:
             collection_kwargs["embedding_function"] = embedding_functions.SentenceTransformerEmbeddingFunction(
-                model_name=embedding_model
+                model_name=embedding_model, **model_kwargs
             )
         collection = client.get_or_create_collection(**collection_kwargs)
         stamped = (getattr(collection, "metadata", None) or {}).get("embedder")

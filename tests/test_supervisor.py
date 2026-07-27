@@ -17,6 +17,7 @@ from interview_coach.supervisor import (
     SupervisorDecision,
     _apply_supervisor_decision,
     _deterministic_supervisor_fallback,
+    _last_probed_skill,
     _make_supervisor_validators,
     build_session_graph,
     decide_next_move,
@@ -1003,3 +1004,31 @@ def test_the_phrase_list_classifier_is_gone():
     import interview_coach.supervisor as supervisor
 
     assert not hasattr(supervisor, "_reasoning_claims_same_skill_probe")
+
+
+def test_the_last_probed_skill_is_none_on_an_empty_transcript():
+    # R-27: the old idiom was `state.get("transcript", [{}])[-1].get("skill")` — a default that
+    # happened to yield None via an empty dict, and would have started raising IndexError the moment
+    # anyone "simplified" it to []. The empty case is real: the Supervisor's prompt builder runs
+    # before the first question resolves.
+    state = _plan_state(["ml_fundamentals", "deep_learning"])
+    state["transcript"] = []
+
+    assert _last_probed_skill(state) is None
+    assert _last_probed_skill({}) is None
+
+
+def test_the_last_probed_skill_is_the_most_recent_item():
+    state = _plan_state(["ml_fundamentals", "deep_learning"])
+    state["transcript"] = [_transcript_item("ml_fundamentals"), _transcript_item("mlops")]
+
+    assert _last_probed_skill(state) == "mlops"
+
+
+def test_extra_question_on_an_empty_transcript_keeps_the_planned_skill():
+    # The path the dead default silently covered: no transcript yet, so there is no "same Skill" to
+    # probe and the plan's own next_skill must survive rather than becoming None.
+    state = _plan_state(["ml_fundamentals", "deep_learning"])
+    state["transcript"] = []
+
+    assert _apply(state, "extra_question")["next_skill"] == "ml_fundamentals"
