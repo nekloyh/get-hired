@@ -18,7 +18,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .diagnostic import SKILLS, CandidateProfile, diagnose
 from .language import DEFAULT_LANGUAGE_MODE
@@ -27,6 +27,7 @@ from .seeds import SeedQuestion
 from .session_serde import transcript_items
 from .skill import SkillState
 from .supervisor import (
+    SessionState,
     SupervisorDecision,
     build_session_graph,
     decide_next_move,
@@ -191,4 +192,4 @@ def replay_decision(
     The counterfactual: "given exactly this state, what would model X decide?" — the seed of
     decision-level regression testing across model swaps.
     """
-    return decide_next_move(client, artifact.final_state, now=now)
+    return decide_next_move(client, cast("SessionState", artifact.final_state), now=now)

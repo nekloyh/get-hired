@@ -23,7 +23,9 @@ import argparse
 import logging
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 
@@ -43,6 +45,7 @@ from .concepts import (
     E5_SMALL_MULTILINGUAL,
     SEED_CONCEPTS,
     ChromaConceptStore,
+    ConceptStore,
     InMemoryConceptStore,
     build_concept_store,
 )
@@ -265,7 +268,7 @@ def _cmd_diagnose(client: ClientArg, args: argparse.Namespace) -> int:
     return 0
 
 
-def _print_session_summary(state: dict) -> None:
+def _print_session_summary(state: Mapping[str, Any]) -> None:
     print(f"=== SESSION {state['session_id']} ({state['status']}) ===")
     print(
         f"questions: {state['question_count']}   stop_reason: {state.get('stop_reason')}   "
@@ -338,7 +341,9 @@ def _print_live_question_update(state: dict, item: dict, question_number: int) -
         print(row)
 
 
-def _run_session_graph(graph, state: dict | None, config: dict, *, live: bool, already_seen: int = 0) -> dict:
+def _run_session_graph(
+    graph, state: Mapping[str, Any] | None, config: dict, *, live: bool, already_seen: int = 0
+) -> dict:
     if not live:
         return graph.invoke(state, config)
 
@@ -384,7 +389,7 @@ def _inflight_session_message(session_id: str) -> str:
     )
 
 
-def _print_resume_recap(state: dict) -> None:
+def _print_resume_recap(state: Mapping[str, Any]) -> None:
     """Compact recap of what a resumed Session already resolved, instead of replaying history."""
     transcript = state.get("transcript", [])
     print(f"=== RESUMING SESSION {state.get('session_id')} ===")
@@ -411,7 +416,7 @@ def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
         # the Interviewer's lookups, instead of the built-in reference bank.
         pack = load_pack(args.pack)
         question_bank = pack.questions
-        concept_store = InMemoryConceptStore(pack.concepts)
+        concept_store: ConceptStore = InMemoryConceptStore(pack.concepts)
         print(f"Running from pack {pack.metadata.get('name')!r} ({args.pack}).")
     else:
         concept_store = build_concept_store(

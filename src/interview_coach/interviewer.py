@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from typing import Any, cast
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -253,7 +254,7 @@ def _make_validators(
                 "(established English technical terms may stay in English)"
             )
 
-    validators = [reject_reask, require_grounding]
+    validators: list[Callable[[Any], None]] = [reject_reask, require_grounding]
     if language_mode == "vn":
         validators.append(require_vietnamese)
     return validators
@@ -416,7 +417,9 @@ def _native_follow_up_attempt(
         tool_executor=execute,
         response_model=FollowUp,
         final_instruction=_NATIVE_FINAL_INSTRUCTION,
-        validators=_make_validators(original_question, lambda: captured.get("lookup"), language_mode),
+        validators=_make_validators(
+            original_question, lambda: cast("ConceptLookup | None", captured.get("lookup")), language_mode
+        ),
         tool_choice={"type": "function", "function": {"name": "lookup_concept"}},
         max_retries=1,
         disable_thinking=True,

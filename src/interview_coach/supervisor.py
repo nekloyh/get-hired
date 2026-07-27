@@ -14,7 +14,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
@@ -200,7 +200,8 @@ def resumable_session_state(graph: Any, session_id: str) -> SessionState | None:
     an in-flight Session. ``graph`` must have been compiled with a checkpointer.
     """
     snapshot = graph.get_state(session_config(session_id))
-    return dict(snapshot.values) if snapshot.values else None
+    # LangGraph returns a plain dict; it is a SessionState by construction — we wrote it.
+    return cast("SessionState", dict(snapshot.values)) if snapshot.values else None
 
 
 def build_session_graph(
@@ -399,7 +400,7 @@ def decide_next_move(
         return fallback
 
 
-def export_architecture_diagram(path: str | Path, client: LLMClient) -> Path:
+def export_architecture_diagram(path: str | Path, client: LLMClient | RoleClients) -> Path:
     """Export the LangGraph architecture diagram using draw_mermaid_png()."""
     graph = build_session_graph(client)
     output = Path(path)

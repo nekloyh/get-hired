@@ -150,7 +150,7 @@ class BenchData:
 
 def _default_cases_path() -> Path:
     # data/bench/cases.yaml lives at the repo root (a content pack), not inside the package.
-    return resources.files("interview_coach").joinpath("..", "..", "data", "bench", "cases.yaml").resolve()
+    return resources.files("interview_coach").joinpath("..", "..", "data", "bench", "cases.yaml").resolve()  # type: ignore[attr-defined]  # always a real file, never a zip member
 
 
 def load_bench_data(path: str | Path | None = None) -> BenchData:
@@ -443,15 +443,15 @@ def confidence_calibration(results: Sequence[BenchResult]) -> list[dict[str, Any
     buckets = [(0.0, 0.5), (0.5, 0.7), (0.7, 0.9), (0.9, 1.01)]
     rows = []
     for lo, hi in buckets:
-        in_bucket = [r for r in results if r.confidence is not None and lo <= r.confidence < hi]
+        in_bucket = [(r, r.confidence) for r in results if r.confidence is not None and lo <= r.confidence < hi]
         if not in_bucket:
             continue
-        hits = sum(1 for r in in_bucket if r.within_band)
+        hits = sum(1 for r, _ in in_bucket if r.within_band)
         rows.append(
             {
                 "bucket": f"[{lo:.1f},{hi if hi <= 1.0 else 1.0:.1f}]",
                 "n": len(in_bucket),
-                "mean_confidence": sum(r.confidence for r in in_bucket) / len(in_bucket),
+                "mean_confidence": sum(confidence for _, confidence in in_bucket) / len(in_bucket),
                 "hit_rate": hits / len(in_bucket),
             }
         )
@@ -632,10 +632,10 @@ def render_bench_report(
             "| provider | calls | prompt | completion | total |",
             "| --- | ---: | ---: | ---: | ---: |",
         ]
-        for prov, stats in sorted(token_usage.items()):
+        for prov, usage in sorted(token_usage.items()):
             lines.append(
-                f"| {prov} | {stats.get('calls', 0)} | {stats.get('prompt', 0)} "
-                f"| {stats.get('completion', 0)} | {stats.get('total', 0)} |"
+                f"| {prov} | {usage.get('calls', 0)} | {usage.get('prompt', 0)} "
+                f"| {usage.get('completion', 0)} | {usage.get('total', 0)} |"
             )
         if not token_usage:
             lines.append("| (none recorded) | 0 | 0 | 0 | 0 |")

@@ -207,7 +207,7 @@ class Settings(BaseSettings):
             )
         if role == "judge":
             self._require_bench_validated_judge(provider, provider_raw)
-        config = self.provider_config(provider)  # type: ignore[arg-type]
+        config = self.provider_config(provider)
         return config.model_copy(
             update={
                 "model": model or config.model,

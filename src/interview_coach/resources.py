@@ -13,7 +13,7 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 from .concepts import BGE_SMALL_EN, embedder_revision
 
@@ -229,7 +229,7 @@ class ChromaResourceStore:
                 url=str(metadata["url"]),
                 summary=str(result["documents"][0][i]),
                 resource_type=str(metadata.get("resource_type", "article")),
-                effort_minutes=int(metadata.get("effort_minutes", 45)),
+                effort_minutes=int(cast("int", metadata.get("effort_minutes", 45))),
                 tags=tuple(str(metadata.get("tags", "")).split(",")) if metadata.get("tags") else (),
             )
             matches.append(ResourceMatch(resource=resource, score=None if distance is None else 1.0 - float(distance)))
