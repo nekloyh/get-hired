@@ -37,7 +37,7 @@ export async function fetchExportMarkdown(sessionId: string): Promise<string> {
 /** Turn an export failure into something the Candidate can act on rather than a bare status code. */
 export function exportFailureMessage(status: number): string {
   if (status === 401) return 'Export refused: the access token is missing or wrong. Re-enter it in Setup.'
-  if (status === 404) return 'Export is no longer on the server — it only keeps completed Sessions in memory.'
+  if (status === 404) return 'The server has no completed Session under this id.'
   return `Export failed (HTTP ${status}).`
 }
 
