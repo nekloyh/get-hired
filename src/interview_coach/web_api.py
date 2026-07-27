@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 from langgraph.checkpoint.sqlite import SqliteSaver
 from pydantic import BaseModel, Field, ValidationError
 from starlette.status import WS_1008_POLICY_VIOLATION
@@ -319,15 +320,19 @@ def configure_session_logging() -> None:
 def create_app(
     *,
     settings: Settings | None = None,
-    checkpoint_db: str | Path = ".session-checkpoints.sqlite",
-    ledger_db: str | Path = ".skill-ledger.json",
-    exports_dir: str | Path = DEFAULT_EXPORTS_DIR,
+    checkpoint_db: str | Path | None = None,
+    ledger_db: str | Path | None = None,
+    exports_dir: str | Path | None = None,
+    static_dir: str | Path | None = None,
 ) -> FastAPI:
+    # Explicit arguments win (tests pin every path under tmp_path); otherwise the environment
+    # decides, so a container can put all three on one mounted volume without a code change.
+    resolved = settings or load_settings()
     api_state = WebApiState(
-        settings=settings or load_settings(),
-        checkpoint_db=str(checkpoint_db),
-        ledger_db=str(ledger_db),
-        exports_dir=str(exports_dir),
+        settings=resolved,
+        checkpoint_db=str(checkpoint_db if checkpoint_db is not None else resolved.checkpoint_db),
+        ledger_db=str(ledger_db if ledger_db is not None else resolved.ledger_db),
+        exports_dir=str(exports_dir if exports_dir is not None else resolved.exports_dir),
     )
     _validate_auth_settings(api_state.settings)
     app = FastAPI(title="Adaptive Interview Coach API")
@@ -479,7 +484,31 @@ def create_app(
         except OSError:
             raise HTTPException(status_code=404, detail="No completed Session found for this Session id.") from None
 
+    # Registered last, deliberately: a mount at "/" matches everything, so every API route above has
+    # to be in the table already or the UI would swallow them.
+    _mount_static_ui(app, static_dir if static_dir is not None else resolved.static_dir)
     return app
+
+
+def _mount_static_ui(app: FastAPI, static_dir: str | Path) -> None:
+    """Serve the built React bundle from this app when one is present.
+
+    Optional, because the dev setup has Vite serving the UI on its own port. In a container it is
+    what collapses UI and API onto **one origin**: same-origin means the bundle needs no baked-in
+    API host, the WebSocket inherits the page's scheme (so `wss://` follows `https://` for free),
+    and there is no cross-origin handshake for CORS or the Origin allowlist to adjudicate.
+    """
+    if not str(static_dir).strip():
+        return
+    directory = Path(static_dir)
+    if not (directory / "index.html").is_file():
+        logger.warning(
+            "COACH_STATIC_DIR=%s has no index.html; serving the API only. Did `npm run build` run?",
+            directory,
+        )
+        return
+    app.mount("/", StaticFiles(directory=directory, html=True), name="ui")
+    logger.info("serving the built UI from %s", directory)
 
 
 configure_session_logging()

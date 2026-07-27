@@ -590,3 +590,111 @@ def test_a_failed_disk_write_does_not_fail_the_session(tmp_path, monkeypatch):
     _complete_a_demo_session(client, "unwritable")
 
     assert client.get("/api/sessions/unwritable/export.md").status_code == 200
+
+
+# --- R-11: one origin serves the UI and the API --------------------------------------------------
+
+
+def _ui_client(tmp_path, *, static_dir):
+    settings = Settings(
+        _env_file=None,
+        primary_provider="mimo",
+        mimo_api_key="",
+        mimo_base_url="",
+        mimo_model="",
+        groq_api_key="",
+        groq_model="",
+    )
+    app = create_app(
+        settings=settings,
+        checkpoint_db=tmp_path / "checkpoints.sqlite",
+        ledger_db=tmp_path / "ledger.json",
+        exports_dir=tmp_path / "exports",
+        static_dir=static_dir,
+    )
+    return TestClient(app)
+
+
+def _built_ui(tmp_path):
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text("<!doctype html><title>Interview Coach</title>", encoding="utf-8")
+    (dist / "assets" / "index-abc123.js").write_text("console.log('ui')", encoding="utf-8")
+    return dist
+
+
+def test_the_built_ui_is_served_from_the_same_origin_as_the_api(tmp_path):
+    client = _ui_client(tmp_path, static_dir=_built_ui(tmp_path))
+
+    assert "Interview Coach" in client.get("/").text
+    assert client.get("/assets/index-abc123.js").status_code == 200
+
+
+def test_mounting_the_ui_does_not_shadow_the_api(tmp_path):
+    # A mount at "/" matches everything, so registration order is load-bearing: get this wrong and
+    # the UI swallows /api/health and every Session socket.
+    client = _ui_client(tmp_path, static_dir=_built_ui(tmp_path))
+
+    assert client.get("/api/health").json()["status"] == "ok"
+    with client.websocket_connect("/api/sessions/ui-mounted") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+        assert ws.receive_json()["type"] == "session_started"
+
+
+def test_no_static_dir_leaves_the_api_alone(tmp_path):
+    # The dev setup has Vite serving the UI; the API must not start 404-ing as a file server.
+    client = _ui_client(tmp_path, static_dir="")
+
+    assert client.get("/api/health").status_code == 200
+    assert client.get("/").status_code == 404
+
+
+def test_a_static_dir_without_a_build_degrades_to_api_only(tmp_path):
+    # Pointing at a directory that was never built is a misconfiguration, not a reason to refuse to
+    # serve the API — mounting it would fail every request instead.
+    empty = tmp_path / "not-built"
+    empty.mkdir()
+
+    client = _ui_client(tmp_path, static_dir=empty)
+
+    assert client.get("/api/health").status_code == 200
+
+
+def test_state_paths_come_from_the_environment_when_not_passed(tmp_path):
+    # R-11: a container points all three at one mounted volume without a code change.
+    settings = Settings(
+        _env_file=None,
+        primary_provider="mimo",
+        mimo_api_key="",
+        mimo_base_url="",
+        mimo_model="",
+        groq_api_key="",
+        groq_model="",
+        checkpoint_db=str(tmp_path / "state" / "checkpoints.sqlite"),
+        ledger_db=str(tmp_path / "state" / "ledger.json"),
+        exports_dir=str(tmp_path / "state" / "exports"),
+    )
+    app = create_app(settings=settings)
+
+    state = app.state.web_api
+    assert state.checkpoint_db == str(tmp_path / "state" / "checkpoints.sqlite")
+    assert state.ledger_db == str(tmp_path / "state" / "ledger.json")
+    assert state.exports_dir == str(tmp_path / "state" / "exports")
+
+
+def test_default_state_paths_are_unchanged(tmp_path):
+    # Zero-change rollout for a local checkout: the historical CWD-relative names still apply.
+    settings = Settings(
+        _env_file=None,
+        primary_provider="mimo",
+        mimo_api_key="",
+        mimo_base_url="",
+        mimo_model="",
+        groq_api_key="",
+        groq_model="",
+    )
+    state = create_app(settings=settings).state.web_api
+
+    assert state.checkpoint_db == ".session-checkpoints.sqlite"
+    assert state.ledger_db == ".skill-ledger.json"
+    assert state.exports_dir == "data/exports"

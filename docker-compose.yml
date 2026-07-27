@@ -1,0 +1,41 @@
+# Single-VPS deployment (R-11): the app plus an nginx that terminates TLS and proxies `wss://`.
+#
+# `docker compose up -d` after copying `.env.example` to `.env` and setting COACH_AUTH_TOKEN /
+# COACH_ALLOWED_ORIGINS. See docs/deploy.md for the runbook, including certificates.
+
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Overrides whatever .env says: these are container paths, and .env is written for a local
+      # checkout where the same keys mean host paths.
+      COACH_CHECKPOINT_DB: /app/state/session-checkpoints.sqlite
+      COACH_LEDGER_DB: /app/state/skill-ledger.json
+      COACH_EXPORTS_DIR: /app/state/exports
+      COACH_STATIC_DIR: /app/web/dist
+    volumes:
+      # Everything that must survive a restart or a redeploy. Losing this volume loses in-flight
+      # Sessions (checkpoints), every report not yet downloaded (R-08), and cross-session Skill
+      # priors (the ledger) — the interviews themselves, not just a cache.
+      - coach-state:/app/state
+    expose:
+      - "8000"
+    # No published port by default: the app is reachable only through nginx, so TLS cannot be
+    # bypassed by hitting the backend directly. Add `ports: ["127.0.0.1:8000:8000"]` to debug.
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./deploy/nginx/certs:/etc/nginx/certs:ro
+
+volumes:
+  coach-state:

@@ -72,6 +72,11 @@ Markdown export button.
 
 ### Exposing it beyond localhost
 
+For an actual deployment — Docker image, compose stack with TLS and `wss://`, and the single-VPS
+runbook — see **[`docs/deploy.md`](docs/deploy.md)**. `docker compose up -d --build` is the whole
+thing once `.env` is filled in. The rest of this section is the configuration that matters wherever
+you run it.
+
 The API ships **open** — no auth — because that is the right default for `localhost`, and the wrong
 one anywhere else (`coach api` warns about this on startup). Before putting it on a network:
 
