@@ -207,6 +207,13 @@ export function App() {
           {providerLabel}
         </span>
       </header>
+      {health?.retrieval_degraded ? (
+        <div className="degrade-banner" role="status">
+          Concept retrieval is running on the in-memory keyword ranker — Vietnamese lookups carry
+          almost no signal in it. Install the optional RAG extras (<code>uv sync --extra rag</code>)
+          for the measured retrieval path.
+        </div>
+      ) : null}
       <main className="app-shell">
       {phase === 1 && (
         <section className="setup-stage">

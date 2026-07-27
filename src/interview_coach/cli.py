@@ -46,8 +46,9 @@ from .concepts import (
     SEED_CONCEPTS,
     ChromaConceptStore,
     ConceptStore,
-    InMemoryConceptStore,
     build_concept_store,
+    embedder_for_language,
+    embedder_persist_dir,
 )
 from .config import load_settings
 from .diagnostic import SKILLS, CandidateProfile, diagnose_or_degrade
@@ -108,10 +109,11 @@ def _model_label(client: LLMClient) -> str:
 # portable across embedders — an existing --persist-dir collection must be re-ingested when
 # switching. Only meaningful with --concept-store=chroma.
 _CONCEPT_EMBEDDER_HELP = (
-    f"SentenceTransformer model for the Chroma concept store (default: {BGE_SMALL_EN}). "
-    f"For Vietnamese-heavy practice use {E5_SMALL_MULTILINGUAL} (its query:/passage: prefixes are "
-    "applied automatically). Re-ingest any persisted collection after switching — embeddings from "
-    "different models do not mix."
+    "SentenceTransformer model for the Chroma concept store. Unset, it follows the Session's "
+    f"language (R-14): vn/mixed use {E5_SMALL_MULTILINGUAL}, en uses {BGE_SMALL_EN}. BGE is "
+    "English-only and collapses Vietnamese text onto a hub, so a vn Session retrieving with it "
+    "ranks near-randomly. The persist dir is namespaced per embedder — vectors from different "
+    "models do not mix."
 )
 
 
@@ -416,14 +418,23 @@ def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
         # the Interviewer's lookups, instead of the built-in reference bank.
         pack = load_pack(args.pack)
         question_bank = pack.questions
-        concept_store: ConceptStore = InMemoryConceptStore(pack.concepts)
+        # R-13: a pack Session used to be pinned to the keyword ranker regardless of what was
+        # installed, so every pack interview ran on the un-measured retrieval path — and Vietnamese
+        # pack notes carry almost no signal in it. Seed the resolved store with the PACK's notes
+        # (never the built-in seeds: running "entirely from the pack" is the point of 0025).
+        concept_store: ConceptStore = build_concept_store(
+            args.concept_store, persist_dir=args.concept_persist_dir, seed=False
+        )
+        concept_store.ingest(pack.concepts)
         print(f"Running from pack {pack.metadata.get('name')!r} ({args.pack}).")
     else:
+        # R-14: unless the operator names one, the embedder follows the Session's language.
+        embedder = args.concept_embedder or embedder_for_language(args.language or DEFAULT_LANGUAGE_MODE)
         concept_store = build_concept_store(
             args.concept_store,
-            persist_dir=args.concept_persist_dir,
+            persist_dir=embedder_persist_dir(args.concept_persist_dir, embedder),
             seed=not args.no_seed_concepts,
-            embedding_model=args.concept_embedder,
+            embedding_model=embedder,
         )
     resource_store = build_resource_store(
         args.resource_store,
@@ -835,9 +846,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     iv_parser.add_argument(
         "--concept-store",
-        choices=["memory", "chroma"],
-        default="memory",
-        help="Concept store used by lookup_concept during Follow-up generation.",
+        choices=["auto", "memory", "chroma"],
+        default="auto",
+        help=(
+            "Concept store used by lookup_concept during Follow-up generation. 'auto' (default) "
+            "uses Chroma wherever the rag extras are installed and warns loudly when falling back "
+            "to the keyword ranker, so the measured retrieval path is also the default one."
+        ),
     )
     iv_parser.add_argument(
         "--concept-persist-dir",
@@ -857,7 +872,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     iv_parser.add_argument(
         "--concept-embedder",
-        default=BGE_SMALL_EN,
+        default=None,
         help=_CONCEPT_EMBEDDER_HELP,
     )
     iv_parser.set_defaults(func=_cmd_interview, requires_llm=True)
@@ -953,9 +968,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     session_parser.add_argument(
         "--concept-store",
-        choices=["memory", "chroma"],
-        default="memory",
-        help="Concept store used by lookup_concept during Follow-up generation.",
+        choices=["auto", "memory", "chroma"],
+        default="auto",
+        help=(
+            "Concept store used by lookup_concept during Follow-up generation. 'auto' (default) "
+            "uses Chroma wherever the rag extras are installed and warns loudly when falling back "
+            "to the keyword ranker, so the measured retrieval path is also the default one."
+        ),
     )
     session_parser.add_argument(
         "--concept-persist-dir",
@@ -969,7 +988,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     session_parser.add_argument(
         "--concept-embedder",
-        default=BGE_SMALL_EN,
+        default=None,
         help=_CONCEPT_EMBEDDER_HELP,
     )
     session_parser.add_argument(
@@ -1137,7 +1156,7 @@ def main(argv: list[str] | None = None) -> int:
     ingest_parser.add_argument("--persist-dir", default=".chroma", help="Chroma persistence directory.")
     ingest_parser.add_argument(
         "--concept-embedder",
-        default=BGE_SMALL_EN,
+        default=None,
         help=_CONCEPT_EMBEDDER_HELP,
     )
     ingest_parser.set_defaults(func=_cmd_ingest_concepts, requires_llm=False)

@@ -120,6 +120,10 @@ class Settings(BaseSettings):
     # serves the UI). Set in the image so one container answers both the UI and the API on one
     # origin — which is also what lets the bundle default to same-origin instead of baking a host.
     static_dir: str = Field("", validation_alias="COACH_STATIC_DIR")
+    # Concept retrieval (R-13). "auto" = Chroma wherever the rag extras are installed, in-memory
+    # with a visible degrade warning otherwise, so the measured path IS the default path.
+    concept_store: str = Field("auto", validation_alias="COACH_CONCEPT_STORE")
+    concept_persist_dir: str = Field(".chroma", validation_alias="COACH_CONCEPT_PERSIST_DIR")
     # How long a finished Session's checkpoint thread is kept before the startup sweep drops it
     # (R-27). Long enough that reconnecting to a just-finished Session still replays its report;
     # short enough that the SQLite file does not grow for the life of the deployment. 0 disables.

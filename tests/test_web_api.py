@@ -8,10 +8,10 @@ from starlette.status import WS_1008_POLICY_VIOLATION
 from starlette.websockets import WebSocketDisconnect
 
 from interview_coach.config import Settings
-from interview_coach.web_api import create_app, export_path
+from interview_coach.web_api import ResumeSessionPayload, create_app, export_path
 
 
-def _test_client(tmp_path):
+def _app(tmp_path):
     settings = Settings(
         _env_file=None,
         primary_provider="mimo",
@@ -20,6 +20,7 @@ def _test_client(tmp_path):
         mimo_model="",
         groq_api_key="",
         groq_model="",
+        concept_store="memory",
     )
     app = create_app(
         settings=settings,
@@ -27,7 +28,11 @@ def _test_client(tmp_path):
         ledger_db=tmp_path / "ledger.json",
         exports_dir=tmp_path / "exports",
     )
-    return TestClient(app)
+    return app
+
+
+def _test_client(tmp_path):
+    return TestClient(_app(tmp_path))
 
 
 def test_health_reports_provider_config_and_demo_availability(tmp_path):
@@ -247,6 +252,7 @@ def _gated_client(tmp_path, *, token: str = _TOKEN, origins: str = ""):
         groq_model="",
         auth_token=token,
         allowed_origins=origins,
+        concept_store="memory",
     )
     app = create_app(
         settings=settings,
@@ -606,6 +612,7 @@ def _ui_client(tmp_path, *, static_dir):
         mimo_model="",
         groq_api_key="",
         groq_model="",
+        concept_store="memory",
     )
     app = create_app(
         settings=settings,
@@ -778,3 +785,74 @@ def test_a_ttl_of_zero_disables_the_sweep(tmp_path):
     )
 
     assert app.state.web_api.settings.checkpoint_ttl_seconds == 0
+
+
+def test_health_reports_the_retrieval_path(tmp_path):
+    # R-13: the UI banners a degraded path rather than letting it be invisible.
+    degraded = _test_client(tmp_path).get("/api/health").json()
+
+    assert degraded["concept_store"] == "memory"
+    assert degraded["retrieval_degraded"] is True
+
+
+def test_a_resumed_session_keeps_its_language_for_retrieval(tmp_path):
+    # R-14's real hazard: the resume payload carries no language_mode, so without reading it back
+    # out of the checkpoint a resumed Vietnamese Session would silently rebuild its retrieval on the
+    # English embedder and rank near-randomly for the rest of the interview.
+    from interview_coach.web_api import _session_language_mode
+
+    # Run the Session to completion before reading: while a question is pending the graph is blocked
+    # INSIDE the node, so no checkpoint for that step has been written yet and reading here would be
+    # a race (it passed locally and failed in CI).
+    app = _app(tmp_path)
+    client = TestClient(app)
+    with client.websocket_connect("/api/sessions/vn-session") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1, "language_mode": "vn"})
+        _receive_until(ws, "question")
+        ws.send_json({"type": "candidate_answer", "answer": "Câu trả lời demo về drift."})
+        _receive_until(ws, "session_completed", limit=40)
+
+    resumed = _session_language_mode(
+        app.state.web_api, "vn-session", ResumeSessionPayload(type="resume_session"), True
+    )
+
+    assert resumed == "vn"
+
+
+def test_an_unknown_session_falls_back_to_the_default_language(tmp_path):
+    from interview_coach.web_api import _session_language_mode
+
+    api_state = _app(tmp_path).state.web_api
+
+    assert _session_language_mode(api_state, "never-existed", ResumeSessionPayload(type="resume_session"), True) == "en"
+
+
+def test_the_startup_sweep_actually_runs(tmp_path):
+    # Regression guard: `prune_checkpoints` was defined BELOW the module-level `app = create_app()`,
+    # so the startup sweep raised NameError straight into its own best-effort `except` and silently
+    # never ran. A reaper that never reaps is worse than none — it looks like the problem is solved.
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    db = tmp_path / "checkpoints.sqlite"
+    with SqliteSaver.from_conn_string(str(db)) as checkpointer:
+        _put_checkpoint(checkpointer, "ancient", "2020-01-01T00:00:00+00:00")
+
+    settings = Settings(
+        _env_file=None,
+        primary_provider="mimo",
+        mimo_api_key="",
+        mimo_base_url="",
+        mimo_model="",
+        groq_api_key="",
+        groq_model="",
+        concept_store="memory",
+    )
+    create_app(
+        settings=settings,
+        checkpoint_db=db,
+        ledger_db=tmp_path / "ledger.json",
+        exports_dir=tmp_path / "exports",
+    )
+
+    with SqliteSaver.from_conn_string(str(db)) as checkpointer:
+        assert _threads(checkpointer) == set()
