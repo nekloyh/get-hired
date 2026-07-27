@@ -22,6 +22,13 @@ anchors:
     "2": >-
       Mentions a fix in isolation ("add more data", "use dropout") without connecting it to a
       diagnosis, trade-off, or downstream effect.
+    "3": >-
+      The fix is tied to ONE link of the chain — either why it is needed or what it affects — but
+      the interaction is asserted rather than traced (e.g. "remove the rate limiter so the queue
+      drains faster", with nothing about what that does to the failing service). Monitoring or
+      alerting added alongside a fix is not reasoning about that fix's effect on the system and does
+      not by itself lift a 2 to a 3. An asserted chain is a 3 however fluently or confidently it is
+      phrased, in any language.
     "4": >-
       Reasons about the interaction: names a diagnosis, the trade-off it drives, and the consequence
       of the chosen fix on other parts of the system (e.g. "regularise, but that raises bias, so I
@@ -42,6 +49,23 @@ anchors:
     "2": >-
       Names the relevant concepts but no mechanism — keyword-level recall ("use regularization,
       cross-validation") without saying how or why they work.
+      The 1/2 boundary: a 2 must introduce at least one idea the question did not already supply.
+      Answering "why is word segmentation important?" with "you need to split the words so the model
+      understands" echoes the question's own vocabulary and names nothing — a 1, and a 1 in
+      Vietnamese too, where the judge's draws on that exact answer spanned 2.00–3.00 while its
+      English twin sat at 2.00 on every draw (GH #96).
+    "3": >-
+      States a mechanism but stops there: nothing about what it costs, when it fails, or what it
+      trades away (e.g. "dropout randomly zeroes activations during training so the network cannot
+      rely on any one unit" — how it works, with no price named). A mechanism with no cost attached
+      is a 3 however fluently or confidently it is phrased, in any language.
+      The 2/3 boundary is HOW, not WHAT: an answer must say how the technique produces the effect in
+      question. "Dropout turns off some neurons so it is better" names the operation and asserts the
+      benefit with no causal step between them — that is a 2, and it is a 2 in Vietnamese too, where
+      the same sentence reads more authoritatively (GH #92/#96, the measured failure mode).
+      This test decides 2 vs 3 and nothing above it: an answer that names a mechanism AND a
+      trade-off is a 4 even when compressed. Stating it unscoped measurably dragged strong answers
+      from 4 to 3 (depth bias +0.03 → −0.11, three strong cases straddling the 3.8 floor).
     "4": >-
       States the mechanism and one real trade-off or failure mode, even briefly (e.g. "L2 shrinks
       weights which lowers variance but raises bias"). Edge-case coverage is a 5, not a bar for 4.

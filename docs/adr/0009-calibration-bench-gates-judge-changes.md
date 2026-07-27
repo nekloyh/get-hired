@@ -174,6 +174,40 @@ the whole split. **`depth` and `system_thinking` remain to be anchored at 3**, t
 both are weighted in every case, so re-anchoring them moves the whole set and must land with its own
 k=3 evidence rather than riding along with the run that discovered it.
 
+## Addendum (2026-07-27b): a scale fix must name the boundary it decides — GH #96
+
+`depth` and `system_thinking` were anchored at 3. `panel_sd_retry_storm`'s |Δ| closed from 2.00 to
+**1.00**, weak/strong separation and every other bias held, and no band was touched. Evidence:
+`docs/audits/calibration-bench-2026-07-27-anchor96.md`.
+
+Two findings generalise beyond that case, and both cost a red gate to learn.
+
+### (e) An unscoped anchor is a bar change, not a scale fix
+
+The first working wording added the middle band *and* an operational test for it ("a mechanism says
+HOW the technique produces the effect, not merely what it does"). The test was correct, and the
+judge applied it **everywhere**, not only at the 2/3 boundary it was written for: `depth` bias went
++0.03 → −0.11 and strong answers that had been stable at 4.00/4.00/4.00 began drawing 3.5–3.7, until
+one fell below its 3.8 floor.
+
+Rule: **every anchor clause states which boundary it decides and that it does not raise the bar
+above it.** A clause phrased as a general principle will be applied as one. This is the mirror image
+of the missing-anchor bug — a hole lets the judge invent a threshold, an unscoped rule moves every
+threshold — and both surface as band-edge instability rather than as an obviously wrong score.
+
+### (f) One green invocation is not a measurement, and the gate must be re-run per wording
+
+The unscoped wording returned **35/35, 35/35, 34/35**. Had the first invocation been taken as the
+gate, a change that reds one run in three would have merged with a green artifact attached to it.
+Addendum (d) made the *gate* median-of-k; this makes the *evidence* multi-invocation: a judge change
+merges on repeated invocations agreeing, and each new wording restarts that count — a green run of
+wording A says nothing about wording B. Where the daily token budget cannot cover the repeats, the
+change waits; it does not merge on the runs that were affordable.
+
+*Source: GH #96, 2026-07-27 — three measured wordings, per-dimension EN/VN diagnosis on both
+regressed pairs, and the strong-case regression that the single-invocation reading would have
+missed.*
+
 *Source: GH #92 resolution, 2026-07-27 — per-dimension EN/VN diagnosis, judge-guide re-anchor, and
 admission of the six 2026-07-11 pending cases. Evidence:
 `docs/audits/calibration-bench-2026-07-27.md`.*
