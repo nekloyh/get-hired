@@ -801,10 +801,16 @@ def test_a_resumed_session_keeps_its_language_for_retrieval(tmp_path):
     # English embedder and rank near-randomly for the rest of the interview.
     from interview_coach.web_api import _session_language_mode
 
+    # Run the Session to completion before reading: while a question is pending the graph is blocked
+    # INSIDE the node, so no checkpoint for that step has been written yet and reading here would be
+    # a race (it passed locally and failed in CI).
     app = _app(tmp_path)
-    with TestClient(app).websocket_connect("/api/sessions/vn-session") as ws:
+    client = TestClient(app)
+    with client.websocket_connect("/api/sessions/vn-session") as ws:
         ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1, "language_mode": "vn"})
         _receive_until(ws, "question")
+        ws.send_json({"type": "candidate_answer", "answer": "Câu trả lời demo về drift."})
+        _receive_until(ws, "session_completed", limit=40)
 
     resumed = _session_language_mode(
         app.state.web_api, "vn-session", ResumeSessionPayload(type="resume_session"), True
