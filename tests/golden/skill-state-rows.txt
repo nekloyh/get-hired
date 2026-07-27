@@ -1,0 +1,5 @@
+deep_learning      [########------------] mastery=  40% confidence=  45% criticality=core
+ml_fundamentals    [########------------] mastery=  38% confidence=  40% criticality=must_have
+mlops              [########------------] mastery=  38% confidence=  40% criticality=must_have
+system_design      [##########----------] mastery=  50% confidence=  15% criticality=core
+vietnamese_nlp     [##########----------] mastery=  50% confidence=  30% criticality=peripheral

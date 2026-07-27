@@ -1,0 +1,39 @@
+SESSION:
+- question_count: 3 / 3
+- current_plan_index: 1
+- next_skill: None
+
+TOPIC PLAN:
+0. ml_fundamentals difficulty=3 rationale=must_have for the target role; start near difficulty 3 from the Candidate's weak prior (mastery 0.50, evidence bar 4.0)
+1. mlops difficulty=3 rationale=must_have for the target role; start near difficulty 3 from the Candidate's weak prior (mastery 0.50, evidence bar 4.0)
+2. deep_learning difficulty=3 rationale=core for the target role; start near difficulty 3 from the Candidate's weak prior (mastery 0.50, evidence bar 3.0)
+3. system_design difficulty=3 rationale=core for the target role; start near difficulty 3 from the Candidate's weak prior (mastery 0.50, evidence bar 3.0)
+4. vietnamese_nlp difficulty=3 rationale=peripheral for the target role; start near difficulty 3 from the Candidate's weak prior (mastery 0.50, evidence bar 2.0)
+
+SKILL STATES:
+- deep_learning: mastery=0.500, confidence=0.150, criticality=core, evidence_bar=3.0
+- ml_fundamentals: mastery=0.620, confidence=0.417, criticality=must_have, evidence_bar=4.0
+- mlops: mastery=0.385, confidence=0.395, criticality=must_have, evidence_bar=4.0
+- system_design: mastery=0.500, confidence=0.150, criticality=core, evidence_bar=3.0
+- vietnamese_nlp: mastery=0.500, confidence=0.300, criticality=peripheral, evidence_bar=2.0
+
+RESOLVED QUESTION EVIDENCE:
+- Q1 skill=ml_fundamentals score=4.00 confidence=0.90 stop=resolved
+- Q2 skill=mlops score=2.00 confidence=0.80 stop=safety_cap
+- Q3 skill=mlops score=0.00 confidence=0.00 stop=failed
+
+SEED AVAILABILITY (a Skill with 0 left cannot be probed again):
+- ml_fundamentals: probed 1/9 seeds (8 left)
+- deep_learning: probed 0/9 seeds (9 left)
+- mlops: probed 2/12 seeds (10 left)
+- system_design: probed 0/9 seeds (9 left)
+- vietnamese_nlp: probed 0/6 seeds (6 left)
+
+NEXT ACTION SEMANTICS:
+- advance_plan moves from Topic Plan index 1 (None) to index 2 (deep_learning).
+- extra_question asks a separate new seed question for the same Skill as the last resolved question.
+- safety_cap means the Micro-loop stopped while the Evaluator still wanted a Follow-up; treat it as unresolved evidence, not normal resolution.
+
+Choose the next Macro-loop move. Prefer advance_plan unless the evidence justifies a deviation. A consistently strong Candidate may end early; weak or uncertain evidence may justify extra_question or switch_skill — but only toward a Skill that still has seeds left.
+Return JSON shaped like:
+{"action": "advance_plan|extra_question|skip_ahead|switch_skill|end_early", "reasoning": "<why this macro decision follows from the evidence>", "target_skill": "<canonical Skill or null>", "target_plan_index": <integer or null>, "will_probe_skill": "<canonical Skill the next question targets, or null>"}

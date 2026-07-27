@@ -1,0 +1,35 @@
+=== SESSION alice-traj (complete) ===
+questions: 3   stop_reason: max_questions   language_mode: en
+
+=== SKILL STATES ===
+deep_learning      [########------------] mastery=  40% confidence=  45% criticality=core
+ml_fundamentals    [########------------] mastery=  38% confidence=  40% criticality=must_have
+mlops              [########------------] mastery=  38% confidence=  40% criticality=must_have
+system_design      [##########----------] mastery=  50% confidence=  15% criticality=core
+vietnamese_nlp     [##########----------] mastery=  50% confidence=  30% criticality=peripheral
+
+--- QUESTION 1 (ml_fundamentals) ---
+score=2.00/5   confidence=0.82   stop=resolved
+  1. QUESTION: You have a 1-to-100 imbalanced dataset. Walk me through training and evaluating a classifier on it without fooling yourself.
+     turn_stop_reason: resolved
+
+--- QUESTION 2 (mlops) ---
+score=2.00/5   confidence=0.82   stop=resolved
+  1. QUESTION: How would you monitor a production model for data drift and decide when retraining is actually justified?
+     turn_stop_reason: resolved
+
+--- QUESTION 3 (deep_learning) ---
+score=2.00/5   confidence=0.82   stop=resolved
+  1. QUESTION: When would you choose SGD with momentum over Adam, and what does AdamW change?
+     turn_stop_reason: resolved
+
+=== SUPERVISOR DECISIONS ===
+- after Q1: advance_plan (deviation=False) — Demo Supervisor follows the Topic Plan unless a hard cap completes the Session.
+- after Q2: advance_plan (deviation=False) — Demo Supervisor follows the Topic Plan unless a hard cap completes the Session.
+- after Q3: end_early (deviation=True) — Hard cap reached: max_questions bound the Session before any LLM deviation choice.
+
+=== STUDY PLAN ===
+readiness_estimate=58% — Demo estimate: usable baseline with several targeted gaps to practice.
+1. ml_fundamentals (mastery=38%, criticality=must_have): ml_fundamentals_cross_validation, ml_fundamentals_ridge_regularization
+2. mlops (mastery=38%, criticality=must_have): mlops_google_rules, mlops_google_cloud_architecture
+3. deep_learning (mastery=40%, criticality=core): deep_learning_resnet_d2l, deep_learning_pytorch_transfer_learning
