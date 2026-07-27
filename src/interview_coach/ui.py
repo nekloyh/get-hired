@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from .skill import SkillState
+from .session_serde import sorted_skill_states
 
 
 def render_skill_state_bar(mastery: float, *, width: int = 20) -> str:
@@ -21,8 +21,7 @@ def render_skill_state_rows(session_state: Mapping[str, Any], *, width: int = 20
     """Render sorted final/live Skill states from a Session state mapping."""
     rows: list[str] = []
     metadata = session_state.get("skill_metadata", {})
-    for skill, raw in sorted(session_state.get("skill_states", {}).items()):
-        state = SkillState(skill=str(raw["skill"]), alpha=float(raw["alpha"]), beta=float(raw["beta"]))
+    for skill, state in sorted_skill_states(session_state):
         criticality = metadata.get(skill, {}).get("role_criticality", "unknown")
         rows.append(
             f"{skill:<18} {render_skill_state_bar(state.mastery, width=width)} "

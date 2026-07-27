@@ -193,3 +193,36 @@ def test_contested_verdict_moves_posterior_less_than_consensus_at_identical_scor
     consensus = apply_evaluation(before, _panel_evaluation(5.0, disagreement=0.0))
     contested = apply_evaluation(before, _panel_evaluation(5.0, disagreement=3.0))
     assert consensus.mastery > contested.mastery > before.mastery
+
+
+# --- R-20: the single rehydration point ----------------------------------------------------------
+
+
+def test_from_dict_coerces_json_round_tripped_values():
+    # Old checkpoints carry ints and, historically, stringly numbers.
+    state = SkillState.from_dict({"skill": "mlops", "alpha": 1, "beta": "2"})
+
+    assert state == SkillState(skill="mlops", alpha=1.0, beta=2.0)
+
+
+@pytest.mark.parametrize("missing", ["skill", "alpha", "beta"])
+def test_from_dict_raises_rather_than_inventing_a_neutral_prior(missing):
+    # Silently falling back to Beta(1,1) would put a plausible-looking 50% mastery in a report,
+    # which is worse than a KeyError precisely because nobody would question it.
+    raw = {"skill": "mlops", "alpha": 2.0, "beta": 3.0}
+    del raw[missing]
+
+    with pytest.raises(KeyError):
+        SkillState.from_dict(raw)
+
+
+def test_from_dict_keeps_the_positivity_check():
+    with pytest.raises(ValueError, match="must both be > 0"):
+        SkillState.from_dict({"skill": "mlops", "alpha": 0, "beta": 1})
+
+
+def test_to_dict_round_trips_and_keeps_writer_key_order():
+    state = SkillState(skill="mlops", alpha=2.5, beta=1.5)
+
+    assert list(state.to_dict()) == ["skill", "alpha", "beta"]
+    assert SkillState.from_dict(state.to_dict()) == state

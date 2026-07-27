@@ -383,10 +383,7 @@ def _synthesized_session_state(
         }
     return {
         "session_id": f"postmortem-{candidate_id}",
-        "skill_states": {
-            skill: {"skill": state.skill, "alpha": state.alpha, "beta": state.beta}
-            for skill, state in states.items()
-        },
+        "skill_states": {skill: state.to_dict() for skill, state in states.items()},
         "skill_metadata": metadata,
         "transcript": [],
     }

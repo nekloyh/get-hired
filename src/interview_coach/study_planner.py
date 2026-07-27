@@ -24,6 +24,7 @@ from .resources import (
     search_resources,
     seed_resource_store,
 )
+from .session_serde import skill_states_from_mapping, transcript_items
 from .skill import SkillState
 
 DEFAULT_STUDY_TOPICS = 3
@@ -202,8 +203,9 @@ def rank_study_targets(session_state: Mapping[str, Any]) -> list[StudyTarget]:
     """Rank Skills by final weakness, Role criticality, and residual uncertainty."""
     targets: list[StudyTarget] = []
     metadata = session_state.get("skill_metadata", {})
-    for skill, raw in session_state.get("skill_states", {}).items():
-        state = SkillState(skill=str(raw["skill"]), alpha=float(raw["alpha"]), beta=float(raw["beta"]))
+    # Deliberately UNSORTED: this loop's order feeds StudyTarget construction, and
+    # `sorted_skill_states` would reorder it. `skill_states_from_mapping` preserves insertion order.
+    for skill, state in skill_states_from_mapping(session_state).items():
         criticality = str(metadata.get(skill, {}).get("role_criticality", "peripheral"))
         weakness = 1.0 - state.mastery
         uncertainty = 1.0 - state.confidence
@@ -423,11 +425,11 @@ def _gap_query(
 ) -> str:
     weak_dimensions: list[str] = []
     rationales: list[str] = []
-    for item in session_state.get("transcript", []):
-        if item.get("skill") != skill:
+    for item in transcript_items(session_state):
+        if item.skill != skill:
             continue
-        for turn in item.get("turns", []):
-            evaluation = turn.get("evaluation", {})
+        for turn in item.turns:
+            evaluation = turn.evaluation
             rationales.append(str(evaluation.get("follow_up_rationale", "")))
             dimensions = evaluation.get("dimensions", {})
             for dim, score in sorted(
@@ -449,13 +451,13 @@ def _gap_query(
 
 def _transcript_evidence(session_state: Mapping[str, Any]) -> str:
     rows = []
-    for i, item in enumerate(session_state.get("transcript", []), start=1):
+    for i, item in enumerate(transcript_items(session_state), start=1):
         rows.append(
-            f"- Q{i} skill={item.get('skill')} score={float(item.get('resolved_weighted_score', 0)):.2f}/5 "
-            f"confidence={float(item.get('resolved_confidence', 0)):.2f} stop={item.get('stop_reason')}"
+            f"- Q{i} skill={item.skill} score={item.resolved_weighted_score:.2f}/5 "
+            f"confidence={item.resolved_confidence:.2f} stop={item.stop_reason}"
         )
-        for turn_n, turn in enumerate(item.get("turns", []), start=1):
-            evaluation = turn.get("evaluation", {})
+        for turn_n, turn in enumerate(item.turns, start=1):
+            evaluation = turn.evaluation
             weak = []
             for dim, score in evaluation.get("dimensions", {}).items():
                 if dim == "english_delivery":  # delivery, not knowledge (ADR 0007)

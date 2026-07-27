@@ -24,6 +24,7 @@ from .diagnostic import SKILLS, CandidateProfile, diagnose
 from .language import DEFAULT_LANGUAGE_MODE
 from .llm import LLMClient, Message
 from .seeds import SeedQuestion
+from .session_serde import transcript_items
 from .skill import SkillState
 from .supervisor import (
     SupervisorDecision,
@@ -125,21 +126,21 @@ def posterior_masteries(final_state: Mapping[str, Any]) -> dict[str, float]:
     """Per-Skill posterior mastery from a finished Session's state."""
     out: dict[str, float] = {}
     for skill, raw in final_state.get("skill_states", {}).items():
-        out[skill] = SkillState(skill=str(raw["skill"]), alpha=float(raw["alpha"]), beta=float(raw["beta"])).mastery
+        out[skill] = SkillState.from_dict(raw).mastery
     return out
 
 
 def probed_ordering(final_state: Mapping[str, Any]) -> list[str]:
     """Skills that were actually probed, ranked by posterior mastery (strongest first)."""
-    probed = {item["skill"] for item in final_state.get("transcript", []) if item.get("turns")}
+    probed = {item.skill for item in transcript_items(final_state) if item.turns}
     masteries = posterior_masteries(final_state)
     return sorted(probed, key=lambda s: masteries.get(s, 0.5), reverse=True)
 
 
 def attempts_by_skill(final_state: Mapping[str, Any]) -> dict[str, int]:
     counts: dict[str, int] = {}
-    for item in final_state.get("transcript", []):
-        counts[item["skill"]] = counts.get(item["skill"], 0) + 1
+    for item in transcript_items(final_state):
+        counts[item.skill] = counts.get(item.skill, 0) + 1
     return counts
 
 

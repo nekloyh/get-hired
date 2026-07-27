@@ -36,14 +36,19 @@ from .microloop import (
     DEFAULT_MAX_TURNS,
     Candidate,
     CandidateIntent,
-    MicroLoopResult,
     ScriptedCandidate,
     StopReason,
     run_micro_loop,
 )
 from .resources import ResourceStore
 from .seeds import QUESTION_BANK, QuestionBank, SeedQuestion, rotation_offset, seed_count, select_seed_question
-from .skill import SkillState, evidence_weight_for
+from .session_serde import (
+    TranscriptItem,
+    skill_states_from_mapping,
+    sorted_skill_states,
+    transcript_items,
+)
+from .skill import SkillState
 from .study_planner import plan_study
 
 logger = logging.getLogger(__name__)
@@ -154,7 +159,7 @@ def initial_session_state(
     state: SessionState = {
         "session_id": session_id,
         "topic_plan": topic_plan,
-        "skill_states": {skill: _dump_skill_state(prior.state) for skill, prior in diagnostic.priors.items()},
+        "skill_states": {skill: prior.state.to_dict() for skill, prior in diagnostic.priors.items()},
         "skill_metadata": {
             skill: {
                 "role_criticality": prior.role_criticality.value,
@@ -228,7 +233,7 @@ def build_session_graph(
         if state.get("status") == SessionStatus.COMPLETE.value:
             return {}
         skill = _next_skill(state)
-        attempts_for_skill = sum(1 for item in state.get("transcript", []) if item["skill"] == skill)
+        attempts_for_skill = sum(1 for item in transcript_items(state) if item.skill == skill)
         before = _load_skill_state(state, skill)
         try:
             # Seed selection lives inside the isolation net (slice 0014): a selection failure — most
@@ -283,17 +288,17 @@ def build_session_graph(
             )
             transcript = [
                 *state.get("transcript", []),
-                _dump_failed_question(skill, before, plan_index=state.get("current_plan_index", 0), error=err),
+                TranscriptItem.failed(skill, before, plan_index=state.get("current_plan_index", 0), error=err),
             ]
             return {
                 "question_count": state.get("question_count", 0) + 1,
                 "transcript": transcript,
             }
         skill_states = dict(state["skill_states"])
-        skill_states[skill] = _dump_skill_state(result.skill_state)
+        skill_states[skill] = result.skill_state.to_dict()
         transcript = [
             *state.get("transcript", []),
-            _dump_micro_loop(result, plan_index=state.get("current_plan_index", 0)),
+            TranscriptItem.from_micro_loop(result, plan_index=state.get("current_plan_index", 0)),
         ]
         return {
             "skill_states": skill_states,
@@ -564,16 +569,16 @@ def _make_supervisor_validators(state: SessionState, bank: QuestionBank | None =
 
 def _extra_probe_required(state: SessionState, attempts: Mapping[str, int], bank: QuestionBank | None = None) -> bool:
     """Whether advancing would discard unresolved, below-bar evidence while another seed remains."""
-    if not state.get("transcript"):
+    items = transcript_items(state)
+    if not items:
         return False
-    last = state["transcript"][-1]
-    if last.get("stop_reason") != StopReason.SAFETY_CAP.value:
+    last = items[-1]
+    if last.stop_reason != StopReason.SAFETY_CAP.value:
         return False
-    skill = last.get("skill")
-    if not _has_unused_seed(skill, attempts, bank):
+    if not _has_unused_seed(last.skill, attempts, bank):
         return False
-    evidence_bar = float(state.get("skill_metadata", {}).get(skill, {}).get("evidence_bar", 0))
-    return float(last.get("resolved_weighted_score", 0)) < evidence_bar
+    evidence_bar = float(state.get("skill_metadata", {}).get(last.skill, {}).get("evidence_bar", 0))
+    return last.resolved_weighted_score < evidence_bar
 
 
 def _advance_plan_target_skill(state: SessionState) -> str | None:
@@ -615,15 +620,15 @@ def _last_probed_skill(state: SessionState) -> str | None:
     "simplified" the default to ``[]``. The empty case is real (the Supervisor's prompt builder runs
     before the first question resolves), so it is now stated rather than stumbled into.
     """
-    transcript = state.get("transcript") or ()
-    return transcript[-1].get("skill") if transcript else None
+    items = transcript_items(state)
+    return items[-1].skill if items else None
 
 
 def _attempts_by_skill(state: SessionState) -> dict[str, int]:
     """Count how many seed questions have already been asked per Skill (from the transcript)."""
     counts: dict[str, int] = {}
-    for item in state.get("transcript", []):
-        counts[item["skill"]] = counts.get(item["skill"], 0) + 1
+    for item in transcript_items(state):
+        counts[item.skill] = counts.get(item.skill, 0) + 1
     return counts
 
 
@@ -657,77 +662,20 @@ def _load_skill_state(state: SessionState, skill: str) -> SkillState:
     raw = state["skill_states"].get(skill)
     if raw is None:
         return SkillState.neutral(skill)
-    return SkillState(skill=str(raw["skill"]), alpha=float(raw["alpha"]), beta=float(raw["beta"]))
+    return SkillState.from_dict(raw)
 
 
 def skill_states_from_state(state: Mapping[str, Any]) -> dict[str, SkillState]:
     """Rehydrate every persisted Skill posterior — used to write the cross-session ledger (0023)."""
-    return {
-        skill: SkillState(skill=str(raw["skill"]), alpha=float(raw["alpha"]), beta=float(raw["beta"]))
-        for skill, raw in state.get("skill_states", {}).items()
-    }
+    return skill_states_from_mapping(state)
 
 
-def _dump_skill_state(state: SkillState) -> dict[str, float | str]:
-    return {"skill": state.skill, "alpha": state.alpha, "beta": state.beta}
 
-
-def _dump_failed_question(skill: str, prior: SkillState, *, plan_index: int, error: BaseException) -> dict[str, Any]:
-    """Transcript entry for a question that crashed (slice 0014).
-
-    It carries the same keys as a resolved entry so every transcript consumer keeps working, but with
-    zero-evidence sentinels, no turns, the Skill's *unchanged* prior belief (a crash is not evidence of
-    low mastery), and a visible ``error`` so the failure is recorded rather than swallowed (ADR 0003).
-    """
-    return {
-        "skill": skill,
-        "plan_index": plan_index,
-        "stop_reason": StopReason.FAILED.value,
-        "resolved_weighted_score": 0.0,
-        "resolved_confidence": 0.0,
-        "evidence_weight": 0.0,  # a crash is not evidence (issue 0014/0021): prior kept, zero weight
-        "skill_state": _dump_skill_state(prior),
-        "turns": [],
-        "error": f"{type(error).__name__}: {error}",
-    }
-
-
-def _dump_micro_loop(result: MicroLoopResult, *, plan_index: int) -> dict[str, Any]:
-    def dump_trace(turn) -> dict[str, Any]:
-        trace = asdict(turn.trace)
-        if turn.trace.stop_reason is not None:
-            trace["stop_reason"] = turn.trace.stop_reason.value
-        return trace
-
-    return {
-        "skill": result.skill,
-        "plan_index": plan_index,
-        "stop_reason": result.stop_reason.value,
-        "resolved_weighted_score": result.resolved_evaluation.weighted_score,
-        "resolved_confidence": result.resolved_evaluation.confidence,
-        # The evidence weight actually folded into the belief (issues 0021/0027), so the scaling is
-        # auditable in the export. Same function apply_evaluation uses — single source of truth.
-        "evidence_weight": evidence_weight_for(result.resolved_evaluation),
-        "skill_state": _dump_skill_state(result.skill_state),
-        "turns": [
-            {
-                "question": turn.question,
-                "answer": turn.answer,
-                "is_follow_up": turn.is_follow_up,
-                "grounding_concept_id": turn.grounding_concept_id,
-                "grounding_concept_title": turn.grounding_concept_title,
-                "evaluation": turn.evaluation.model_dump(mode="json"),
-                "trace": dump_trace(turn),
-            }
-            for turn in result.turns
-        ],
-    }
 
 
 def _skill_state_summary(state: SessionState) -> str:
     lines = []
-    for skill, raw in sorted(state.get("skill_states", {}).items()):
-        s = SkillState(skill=str(raw["skill"]), alpha=float(raw["alpha"]), beta=float(raw["beta"]))
+    for skill, s in sorted_skill_states(state):
         meta = state.get("skill_metadata", {}).get(skill, {})
         lines.append(
             f"- {skill}: mastery={s.mastery:.3f}, confidence={s.confidence:.3f}, "
@@ -738,10 +686,10 @@ def _skill_state_summary(state: SessionState) -> str:
 
 def _evidence_summary(state: SessionState) -> str:
     rows = []
-    for i, item in enumerate(state.get("transcript", []), start=1):
+    for i, item in enumerate(transcript_items(state), start=1):
         rows.append(
-            f"- Q{i} skill={item['skill']} score={item['resolved_weighted_score']:.2f} "
-            f"confidence={item['resolved_confidence']:.2f} stop={item['stop_reason']}"
+            f"- Q{i} skill={item.skill} score={item.resolved_weighted_score:.2f} "
+            f"confidence={item.resolved_confidence:.2f} stop={item.stop_reason}"
         )
     return "\n".join(rows) or "- none"
 

@@ -1,0 +1,666 @@
+{
+  "final_state": {
+    "candidate_id": "",
+    "current_plan_index": 2,
+    "language_mode": "en",
+    "max_elapsed_seconds": 1800,
+    "max_questions": 3,
+    "next_skill": null,
+    "question_count": 3,
+    "session_id": "alice-traj",
+    "skill_metadata": {
+      "deep_learning": {
+        "evidence_bar": 3.0,
+        "role_criticality": "core"
+      },
+      "ml_fundamentals": {
+        "evidence_bar": 4.0,
+        "role_criticality": "must_have"
+      },
+      "mlops": {
+        "evidence_bar": 4.0,
+        "role_criticality": "must_have"
+      },
+      "system_design": {
+        "evidence_bar": 3.0,
+        "role_criticality": "core"
+      },
+      "vietnamese_nlp": {
+        "evidence_bar": 2.0,
+        "role_criticality": "peripheral"
+      }
+    },
+    "skill_states": {
+      "deep_learning": {
+        "alpha": 1.6972058823529412,
+        "beta": 2.562205882352941,
+        "skill": "deep_learning"
+      },
+      "ml_fundamentals": {
+        "alpha": 1.4325,
+        "beta": 2.2975,
+        "skill": "ml_fundamentals"
+      },
+      "mlops": {
+        "alpha": 1.4325,
+        "beta": 2.2975,
+        "skill": "mlops"
+      },
+      "system_design": {
+        "alpha": 1.2647058823529411,
+        "beta": 1.2647058823529411,
+        "skill": "system_design"
+      },
+      "vietnamese_nlp": {
+        "alpha": 1.6428571428571432,
+        "beta": 1.6428571428571432,
+        "skill": "vietnamese_nlp"
+      }
+    },
+    "started_at": 1.0,
+    "status": "complete",
+    "stop_reason": "max_questions",
+    "study_plan": {
+      "milestones": [
+        {
+          "description": "Answer the top-priority Skill without notes.",
+          "evidence": "A recorded three-minute answer covers mechanism and trade-offs.",
+          "week": 1
+        },
+        {
+          "description": "Run a mixed mock interview under time pressure.",
+          "evidence": "Every planned Skill has one complete answer and one Follow-up response.",
+          "week": 2
+        }
+      ],
+      "prioritized_topics": [
+        {
+          "confidence": 0.3998599745073612,
+          "mastery": 0.3840482573726542,
+          "priority": 1,
+          "rationale": "Demo Study Planner prioritizes the weakest or most role-critical Skill state.",
+          "resources": [
+            {
+              "effort_minutes": 60,
+              "id": "ml_fundamentals_cross_validation",
+              "resource_type": "documentation",
+              "skill": "ml_fundamentals",
+              "summary": "A practical reference for validation splits, cross-validation iterators, leakage traps, and when grouped or time-aware evaluation is required.",
+              "title": "scikit-learn: Cross-validation",
+              "url": "https://scikit-learn.org/stable/modules/cross_validation.html"
+            },
+            {
+              "effort_minutes": 35,
+              "id": "ml_fundamentals_ridge_regularization",
+              "resource_type": "documentation",
+              "skill": "ml_fundamentals",
+              "summary": "A focused reference for L2-regularized linear models, useful for connecting penalties, coefficient shrinkage, variance control, and model selection.",
+              "title": "scikit-learn: Ridge regression and L2 regularization",
+              "url": "https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.Ridge.html"
+            }
+          ],
+          "role_criticality": "must_have",
+          "skill": "ml_fundamentals",
+          "target_mastery": "Give a concise answer with mechanism, trade-off, and deployment implication.",
+          "title": "Sharpen ml fundamentals"
+        },
+        {
+          "confidence": 0.3998599745073612,
+          "mastery": 0.3840482573726542,
+          "priority": 2,
+          "rationale": "Demo Study Planner prioritizes the weakest or most role-critical Skill state.",
+          "resources": [
+            {
+              "effort_minutes": 90,
+              "id": "mlops_google_rules",
+              "resource_type": "guide",
+              "skill": "mlops",
+              "summary": "A production-minded guide to launching, monitoring, iterating, and debugging ML systems as they move from heuristics to learned models.",
+              "title": "Google: Rules of Machine Learning",
+              "url": "https://developers.google.com/machine-learning/guides/rules-of-ml"
+            },
+            {
+              "effort_minutes": 60,
+              "id": "mlops_google_cloud_architecture",
+              "resource_type": "documentation",
+              "skill": "mlops",
+              "summary": "A catalog of MLOps architecture guides covering custom training, pipelines, model serving, and operational concerns across the ML lifecycle.",
+              "title": "Google Cloud: ML applications and operations architecture guides",
+              "url": "https://docs.cloud.google.com/architecture/ai-ml/ml-application-operations-architecture-guides"
+            }
+          ],
+          "role_criticality": "must_have",
+          "skill": "mlops",
+          "target_mastery": "Give a concise answer with mechanism, trade-off, and deployment implication.",
+          "title": "Sharpen mlops"
+        },
+        {
+          "confidence": 0.45311832327549706,
+          "mastery": 0.3984601574368181,
+          "priority": 3,
+          "rationale": "Demo Study Planner prioritizes the weakest or most role-critical Skill state.",
+          "resources": [
+            {
+              "effort_minutes": 75,
+              "id": "deep_learning_resnet_d2l",
+              "resource_type": "book_chapter",
+              "skill": "deep_learning",
+              "summary": "A hands-on chapter on residual connections, ResNet blocks, and why skip paths make very deep networks easier to optimize.",
+              "title": "Dive into Deep Learning: Residual Networks",
+              "url": "https://d2l.ai/chapter_convolutional-modern/resnet.html"
+            },
+            {
+              "effort_minutes": 90,
+              "id": "deep_learning_pytorch_transfer_learning",
+              "resource_type": "tutorial",
+              "skill": "deep_learning",
+              "summary": "A practical PyTorch tutorial for fine-tuning and feature-extraction workflows, useful for discussing representation reuse and training loops concretely.",
+              "title": "PyTorch Tutorial: Transfer Learning for Computer Vision",
+              "url": "https://docs.pytorch.org/tutorials/beginner/transfer_learning_tutorial.html"
+            }
+          ],
+          "role_criticality": "core",
+          "skill": "deep_learning",
+          "target_mastery": "Give a concise answer with mechanism, trade-off, and deployment implication.",
+          "title": "Sharpen deep learning"
+        }
+      ],
+      "readiness_estimate": 0.58,
+      "readiness_rationale": "Demo estimate: usable baseline with several targeted gaps to practice.",
+      "schedule": [
+        {
+          "day": 1,
+          "focus": "Practice ml fundamentals",
+          "outcome": "Write one answer with a concrete trade-off and failure mode.",
+          "resources": [
+            {
+              "effort_minutes": 60,
+              "id": "ml_fundamentals_cross_validation",
+              "resource_type": "documentation",
+              "skill": "ml_fundamentals",
+              "summary": "A practical reference for validation splits, cross-validation iterators, leakage traps, and when grouped or time-aware evaluation is required.",
+              "title": "scikit-learn: Cross-validation",
+              "url": "https://scikit-learn.org/stable/modules/cross_validation.html"
+            }
+          ]
+        },
+        {
+          "day": 2,
+          "focus": "Practice mlops",
+          "outcome": "Write one answer with a concrete trade-off and failure mode.",
+          "resources": [
+            {
+              "effort_minutes": 35,
+              "id": "ml_fundamentals_ridge_regularization",
+              "resource_type": "documentation",
+              "skill": "ml_fundamentals",
+              "summary": "A focused reference for L2-regularized linear models, useful for connecting penalties, coefficient shrinkage, variance control, and model selection.",
+              "title": "scikit-learn: Ridge regression and L2 regularization",
+              "url": "https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.Ridge.html"
+            }
+          ]
+        },
+        {
+          "day": 3,
+          "focus": "Practice deep learning",
+          "outcome": "Write one answer with a concrete trade-off and failure mode.",
+          "resources": [
+            {
+              "effort_minutes": 90,
+              "id": "mlops_google_rules",
+              "resource_type": "guide",
+              "skill": "mlops",
+              "summary": "A production-minded guide to launching, monitoring, iterating, and debugging ML systems as they move from heuristics to learned models.",
+              "title": "Google: Rules of Machine Learning",
+              "url": "https://developers.google.com/machine-learning/guides/rules-of-ml"
+            }
+          ]
+        },
+        {
+          "day": 4,
+          "focus": "Practice ml fundamentals",
+          "outcome": "Write one answer with a concrete trade-off and failure mode.",
+          "resources": [
+            {
+              "effort_minutes": 60,
+              "id": "mlops_google_cloud_architecture",
+              "resource_type": "documentation",
+              "skill": "mlops",
+              "summary": "A catalog of MLOps architecture guides covering custom training, pipelines, model serving, and operational concerns across the ML lifecycle.",
+              "title": "Google Cloud: ML applications and operations architecture guides",
+              "url": "https://docs.cloud.google.com/architecture/ai-ml/ml-application-operations-architecture-guides"
+            }
+          ]
+        },
+        {
+          "day": 5,
+          "focus": "Practice mlops",
+          "outcome": "Write one answer with a concrete trade-off and failure mode.",
+          "resources": [
+            {
+              "effort_minutes": 75,
+              "id": "deep_learning_resnet_d2l",
+              "resource_type": "book_chapter",
+              "skill": "deep_learning",
+              "summary": "A hands-on chapter on residual connections, ResNet blocks, and why skip paths make very deep networks easier to optimize.",
+              "title": "Dive into Deep Learning: Residual Networks",
+              "url": "https://d2l.ai/chapter_convolutional-modern/resnet.html"
+            }
+          ]
+        },
+        {
+          "day": 6,
+          "focus": "Practice deep learning",
+          "outcome": "Write one answer with a concrete trade-off and failure mode.",
+          "resources": [
+            {
+              "effort_minutes": 90,
+              "id": "deep_learning_pytorch_transfer_learning",
+              "resource_type": "tutorial",
+              "skill": "deep_learning",
+              "summary": "A practical PyTorch tutorial for fine-tuning and feature-extraction workflows, useful for discussing representation reuse and training loops concretely.",
+              "title": "PyTorch Tutorial: Transfer Learning for Computer Vision",
+              "url": "https://docs.pytorch.org/tutorials/beginner/transfer_learning_tutorial.html"
+            }
+          ]
+        },
+        {
+          "day": 7,
+          "focus": "Review and mock interview synthesis",
+          "outcome": "Record one timed answer and compare it against the rubric.",
+          "resources": []
+        },
+        {
+          "day": 8,
+          "focus": "Practice mlops",
+          "outcome": "Write one answer with a concrete trade-off and failure mode.",
+          "resources": [
+            {
+              "effort_minutes": 35,
+              "id": "ml_fundamentals_ridge_regularization",
+              "resource_type": "documentation",
+              "skill": "ml_fundamentals",
+              "summary": "A focused reference for L2-regularized linear models, useful for connecting penalties, coefficient shrinkage, variance control, and model selection.",
+              "title": "scikit-learn: Ridge regression and L2 regularization",
+              "url": "https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.Ridge.html"
+            }
+          ]
+        },
+        {
+          "day": 9,
+          "focus": "Practice deep learning",
+          "outcome": "Write one answer with a concrete trade-off and failure mode.",
+          "resources": [
+            {
+              "effort_minutes": 90,
+              "id": "mlops_google_rules",
+              "resource_type": "guide",
+              "skill": "mlops",
+              "summary": "A production-minded guide to launching, monitoring, iterating, and debugging ML systems as they move from heuristics to learned models.",
+              "title": "Google: Rules of Machine Learning",
+              "url": "https://developers.google.com/machine-learning/guides/rules-of-ml"
+            }
+          ]
+        },
+        {
+          "day": 10,
+          "focus": "Practice ml fundamentals",
+          "outcome": "Write one answer with a concrete trade-off and failure mode.",
+          "resources": [
+            {
+              "effort_minutes": 60,
+              "id": "mlops_google_cloud_architecture",
+              "resource_type": "documentation",
+              "skill": "mlops",
+              "summary": "A catalog of MLOps architecture guides covering custom training, pipelines, model serving, and operational concerns across the ML lifecycle.",
+              "title": "Google Cloud: ML applications and operations architecture guides",
+              "url": "https://docs.cloud.google.com/architecture/ai-ml/ml-application-operations-architecture-guides"
+            }
+          ]
+        },
+        {
+          "day": 11,
+          "focus": "Practice mlops",
+          "outcome": "Write one answer with a concrete trade-off and failure mode.",
+          "resources": [
+            {
+              "effort_minutes": 75,
+              "id": "deep_learning_resnet_d2l",
+              "resource_type": "book_chapter",
+              "skill": "deep_learning",
+              "summary": "A hands-on chapter on residual connections, ResNet blocks, and why skip paths make very deep networks easier to optimize.",
+              "title": "Dive into Deep Learning: Residual Networks",
+              "url": "https://d2l.ai/chapter_convolutional-modern/resnet.html"
+            }
+          ]
+        },
+        {
+          "day": 12,
+          "focus": "Practice deep learning",
+          "outcome": "Write one answer with a concrete trade-off and failure mode.",
+          "resources": [
+            {
+              "effort_minutes": 90,
+              "id": "deep_learning_pytorch_transfer_learning",
+              "resource_type": "tutorial",
+              "skill": "deep_learning",
+              "summary": "A practical PyTorch tutorial for fine-tuning and feature-extraction workflows, useful for discussing representation reuse and training loops concretely.",
+              "title": "PyTorch Tutorial: Transfer Learning for Computer Vision",
+              "url": "https://docs.pytorch.org/tutorials/beginner/transfer_learning_tutorial.html"
+            }
+          ]
+        },
+        {
+          "day": 13,
+          "focus": "Practice ml fundamentals",
+          "outcome": "Write one answer with a concrete trade-off and failure mode.",
+          "resources": [
+            {
+              "effort_minutes": 60,
+              "id": "ml_fundamentals_cross_validation",
+              "resource_type": "documentation",
+              "skill": "ml_fundamentals",
+              "summary": "A practical reference for validation splits, cross-validation iterators, leakage traps, and when grouped or time-aware evaluation is required.",
+              "title": "scikit-learn: Cross-validation",
+              "url": "https://scikit-learn.org/stable/modules/cross_validation.html"
+            }
+          ]
+        },
+        {
+          "day": 14,
+          "focus": "Review and mock interview synthesis",
+          "outcome": "Record one timed answer and compare it against the rubric.",
+          "resources": []
+        }
+      ],
+      "session_id": "alice-traj"
+    },
+    "study_plan_error": null,
+    "supervisor_decisions": [
+      {
+        "action": "advance_plan",
+        "after_question": 1,
+        "deviation": false,
+        "from_plan_index": 0,
+        "llm_reasoning": "Demo Supervisor follows the Topic Plan unless a hard cap completes the Session.",
+        "reasoning": "Demo Supervisor follows the Topic Plan unless a hard cap completes the Session.",
+        "target_plan_index": null,
+        "target_skill": null,
+        "to_plan_index": 1,
+        "will_probe_skill": null
+      },
+      {
+        "action": "advance_plan",
+        "after_question": 2,
+        "deviation": false,
+        "from_plan_index": 1,
+        "llm_reasoning": "Demo Supervisor follows the Topic Plan unless a hard cap completes the Session.",
+        "reasoning": "Demo Supervisor follows the Topic Plan unless a hard cap completes the Session.",
+        "target_plan_index": null,
+        "target_skill": null,
+        "to_plan_index": 2,
+        "will_probe_skill": null
+      },
+      {
+        "action": "end_early",
+        "after_question": 3,
+        "deviation": true,
+        "from_plan_index": 2,
+        "llm_reasoning": "Hard cap reached: max_questions bound the Session before any LLM deviation choice.",
+        "reasoning": "Hard cap reached: max_questions bound the Session before any LLM deviation choice.",
+        "target_plan_index": null,
+        "target_skill": null,
+        "to_plan_index": 2,
+        "will_probe_skill": null
+      }
+    ],
+    "topic_plan": [
+      {
+        "rationale": "must_have for the target role; start near difficulty 3 from the Candidate's weak prior (mastery 0.50, evidence bar 4.0)",
+        "skill": "ml_fundamentals",
+        "target_difficulty": 3
+      },
+      {
+        "rationale": "must_have for the target role; start near difficulty 3 from the Candidate's weak prior (mastery 0.50, evidence bar 4.0)",
+        "skill": "mlops",
+        "target_difficulty": 3
+      },
+      {
+        "rationale": "core for the target role; start near difficulty 3 from the Candidate's weak prior (mastery 0.50, evidence bar 3.0)",
+        "skill": "deep_learning",
+        "target_difficulty": 3
+      },
+      {
+        "rationale": "core for the target role; start near difficulty 3 from the Candidate's weak prior (mastery 0.50, evidence bar 3.0)",
+        "skill": "system_design",
+        "target_difficulty": 3
+      },
+      {
+        "rationale": "peripheral for the target role; start near difficulty 3 from the Candidate's weak prior (mastery 0.50, evidence bar 2.0)",
+        "skill": "vietnamese_nlp",
+        "target_difficulty": 3
+      }
+    ],
+    "transcript": [
+      {
+        "evidence_weight": 1.73,
+        "plan_index": 0,
+        "resolved_confidence": 0.82,
+        "resolved_weighted_score": 2.0,
+        "skill": "ml_fundamentals",
+        "skill_state": {
+          "alpha": 1.4325,
+          "beta": 2.2975,
+          "skill": "ml_fundamentals"
+        },
+        "stop_reason": "resolved",
+        "turns": [
+          {
+            "answer": "A strong answer.",
+            "evaluation": {
+              "confidence": 0.82,
+              "delivery_fixes": [],
+              "dimensions": {
+                "communication": {
+                  "evidence": "A strong answer.",
+                  "score": 2
+                },
+                "correctness": {
+                  "evidence": "A strong answer.",
+                  "score": 2
+                },
+                "depth": {
+                  "evidence": "A strong answer.",
+                  "score": 2
+                },
+                "system_thinking": {
+                  "evidence": "A strong answer.",
+                  "score": 2
+                }
+              },
+              "evidence_degraded": false,
+              "follow_up_rationale": "Demo Evaluator keeps the loop short so the web workflow can be reviewed.",
+              "follow_up_recommended": false,
+              "panel": null,
+              "self_critique": null,
+              "trust": {
+                "divergence": 0.0,
+                "noise_events": [],
+                "panel_suppressed": false,
+                "pre_guard_confidence": 0.82,
+                "unverifiable_fraction": 0.0
+              },
+              "weighted_score": 2.0
+            },
+            "grounding_concept_id": null,
+            "grounding_concept_title": null,
+            "is_follow_up": false,
+            "question": "You have a 1-to-100 imbalanced dataset. Walk me through training and evaluating a classifier on it without fooling yourself.",
+            "trace": {
+              "concept_hit_id": null,
+              "concept_hit_score": null,
+              "concept_hit_title": null,
+              "concept_lookup_language": null,
+              "concept_lookup_query": null,
+              "concept_lookup_skill": null,
+              "evaluator_self_critique_triggers": [],
+              "llm_calls": 0,
+              "llm_calls_by_provider": [],
+              "stop_reason": "resolved"
+            }
+          }
+        ]
+      },
+      {
+        "evidence_weight": 1.73,
+        "plan_index": 1,
+        "resolved_confidence": 0.82,
+        "resolved_weighted_score": 2.0,
+        "skill": "mlops",
+        "skill_state": {
+          "alpha": 1.4325,
+          "beta": 2.2975,
+          "skill": "mlops"
+        },
+        "stop_reason": "resolved",
+        "turns": [
+          {
+            "answer": "A weak answer.",
+            "evaluation": {
+              "confidence": 0.82,
+              "delivery_fixes": [],
+              "dimensions": {
+                "communication": {
+                  "evidence": "A weak answer.",
+                  "score": 2
+                },
+                "correctness": {
+                  "evidence": "A weak answer.",
+                  "score": 2
+                },
+                "depth": {
+                  "evidence": "A weak answer.",
+                  "score": 2
+                },
+                "mlops_awareness": {
+                  "evidence": "A weak answer.",
+                  "score": 2
+                },
+                "system_thinking": {
+                  "evidence": "A weak answer.",
+                  "score": 2
+                }
+              },
+              "evidence_degraded": false,
+              "follow_up_rationale": "Demo Evaluator keeps the loop short so the web workflow can be reviewed.",
+              "follow_up_recommended": false,
+              "panel": null,
+              "self_critique": null,
+              "trust": {
+                "divergence": 0.0,
+                "noise_events": [],
+                "panel_suppressed": false,
+                "pre_guard_confidence": 0.82,
+                "unverifiable_fraction": 0.0
+              },
+              "weighted_score": 2.0
+            },
+            "grounding_concept_id": null,
+            "grounding_concept_title": null,
+            "is_follow_up": false,
+            "question": "How would you monitor a production model for data drift and decide when retraining is actually justified?",
+            "trace": {
+              "concept_hit_id": null,
+              "concept_hit_score": null,
+              "concept_hit_title": null,
+              "concept_lookup_language": null,
+              "concept_lookup_query": null,
+              "concept_lookup_skill": null,
+              "evaluator_self_critique_triggers": [],
+              "llm_calls": 0,
+              "llm_calls_by_provider": [],
+              "stop_reason": "resolved"
+            }
+          }
+        ]
+      },
+      {
+        "evidence_weight": 1.73,
+        "plan_index": 2,
+        "resolved_confidence": 0.82,
+        "resolved_weighted_score": 2.0,
+        "skill": "deep_learning",
+        "skill_state": {
+          "alpha": 1.6972058823529412,
+          "beta": 2.562205882352941,
+          "skill": "deep_learning"
+        },
+        "stop_reason": "resolved",
+        "turns": [
+          {
+            "answer": "A strong answer.",
+            "evaluation": {
+              "confidence": 0.82,
+              "delivery_fixes": [],
+              "dimensions": {
+                "communication": {
+                  "evidence": "A strong answer.",
+                  "score": 2
+                },
+                "correctness": {
+                  "evidence": "A strong answer.",
+                  "score": 2
+                },
+                "depth": {
+                  "evidence": "A strong answer.",
+                  "score": 2
+                },
+                "system_thinking": {
+                  "evidence": "A strong answer.",
+                  "score": 2
+                }
+              },
+              "evidence_degraded": false,
+              "follow_up_rationale": "Demo Evaluator keeps the loop short so the web workflow can be reviewed.",
+              "follow_up_recommended": false,
+              "panel": null,
+              "self_critique": null,
+              "trust": {
+                "divergence": 0.0,
+                "noise_events": [],
+                "panel_suppressed": false,
+                "pre_guard_confidence": 0.82,
+                "unverifiable_fraction": 0.0
+              },
+              "weighted_score": 2.0
+            },
+            "grounding_concept_id": null,
+            "grounding_concept_title": null,
+            "is_follow_up": false,
+            "question": "When would you choose SGD with momentum over Adam, and what does AdamW change?",
+            "trace": {
+              "concept_hit_id": null,
+              "concept_hit_score": null,
+              "concept_hit_title": null,
+              "concept_lookup_language": null,
+              "concept_lookup_query": null,
+              "concept_lookup_skill": null,
+              "evaluator_self_critique_triggers": [],
+              "llm_calls": 0,
+              "llm_calls_by_provider": [],
+              "stop_reason": "resolved"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "ground_truth": {
+    "deep_learning": 0.8,
+    "ml_fundamentals": 0.9,
+    "mlops": 0.15,
+    "system_design": 0.5
+  },
+  "persona": "alice",
+  "version": 1
+}

@@ -282,7 +282,7 @@ def _print_session_summary(state: dict) -> None:
             raw = skill_states.get(skill)
             if raw is None:
                 continue
-            after = float(raw["alpha"]) / (float(raw["alpha"]) + float(raw["beta"]))
+            after = SkillState.from_dict(raw).mastery
             before = float(prior[skill])
             print(f"  {skill}: {before:.2f} -> {after:.2f} ({after - before:+.2f})")
     for i, item in enumerate(state.get("transcript", []), start=1):

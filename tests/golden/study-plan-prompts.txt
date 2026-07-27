@@ -1,0 +1,24 @@
+- Q1 skill=ml_fundamentals score=4.00/5 confidence=0.90 stop=resolved
+  - turn 1 weak_dimensions: system_thinking=3
+  - turn 1 follow_up_rationale: The answer is strong and covers key aspects of the bias-variance tradeoff and learning curves.
+- Q2 skill=mlops score=2.00/5 confidence=0.80 stop=safety_cap
+  - turn 1 weak_dimensions: communication=3, depth=3, mlops_awareness=3, system_thinking=2
+  - turn 1 follow_up_rationale: The candidate's uncertainty about specific thresholds and metrics for retraining suggests that further probing could clarify their understanding of practical implementations.
+  - turn 2 weak_dimensions: communication=3, correctness=3, depth=2, mlops_awareness=2, system_thinking=2
+  - turn 2 follow_up_rationale: The candidate's understanding of metrics and their application to business risk is unclear, which could benefit from further exploration.
+  - turn 3 weak_dimensions: communication=3, depth=3, mlops_awareness=2, system_thinking=2
+  - turn 3 follow_up_rationale: The candidate's uncertainty about implementation suggests there may be deeper knowledge or specific strategies they could elaborate on.
+  - turn 4 weak_dimensions: communication=3, correctness=3, depth=2, mlops_awareness=3, system_thinking=2
+  - turn 4 follow_up_rationale: The candidate's understanding of feature drift and retraining is vague, suggesting a follow-up could clarify their knowledge and approach.
+- Q3 skill=mlops score=0.00/5 confidence=0.00 stop=failed
+
+--- deep_learning gap_query ---
+deep_learning interview gap mastery 0.50 confidence 0.15 role criticality must_have weak dimensions 
+--- ml_fundamentals gap_query ---
+ml_fundamentals interview gap mastery 0.62 confidence 0.42 role criticality must_have weak dimensions system_thinking The answer is strong and covers key aspects of the bias-variance tradeoff and learning curves.
+--- mlops gap_query ---
+mlops interview gap mastery 0.39 confidence 0.40 role criticality must_have weak dimensions system_thinking communication depth mlops_awareness The candidate's uncertainty about specific thresholds and metrics for retraining suggests that further probing could clarify their understanding of practical implementations. The candidate's understanding of metrics and their application to business risk is unclear, which could benefit from further exploration.
+--- system_design gap_query ---
+system_design interview gap mastery 0.50 confidence 0.15 role criticality must_have weak dimensions 
+--- vietnamese_nlp gap_query ---
+vietnamese_nlp interview gap mastery 0.50 confidence 0.30 role criticality must_have weak dimensions 

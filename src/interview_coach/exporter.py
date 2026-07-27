@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from .session_serde import decision_records, sorted_skill_states, transcript_items
 from .skill import SkillState
 
 
@@ -54,8 +55,7 @@ def _append_skill_states(lines: list[str], session_state: Mapping[str, Any]) -> 
     lines.append("| Skill | Mastery | Confidence | Beta | Role criticality |")
     lines.append("| --- | ---: | ---: | --- | --- |")
     metadata = session_state.get("skill_metadata", {})
-    for skill, raw in sorted(session_state.get("skill_states", {}).items()):
-        state = SkillState(skill=str(raw["skill"]), alpha=float(raw["alpha"]), beta=float(raw["beta"]))
+    for skill, state in sorted_skill_states(session_state):
         meta = metadata.get(skill, {})
         lines.append(
             f"| `{_md(skill)}` | {state.mastery:.3f} | {state.confidence:.3f} | "
@@ -80,7 +80,7 @@ def _append_ledger_deltas(lines: list[str], session_state: Mapping[str, Any]) ->
         if raw is None:
             continue
         before = float(prior[skill])
-        after = SkillState(skill=str(raw["skill"]), alpha=float(raw["alpha"]), beta=float(raw["beta"])).mastery
+        after = SkillState.from_dict(raw).mastery
         lines.append(f"| `{_md(skill)}` | {before:.3f} | {after:.3f} | {after - before:+.3f} |")
     lines.append("")
 
@@ -102,50 +102,49 @@ def _append_topic_plan(lines: list[str], session_state: Mapping[str, Any]) -> No
 def _append_transcript(lines: list[str], session_state: Mapping[str, Any]) -> None:
     lines.append("## Transcript")
     lines.append("")
-    for i, item in enumerate(session_state.get("transcript", []), start=1):
-        lines.append(f"### Question {i}: `{_md(item.get('skill'))}`")
+    for i, item in enumerate(transcript_items(session_state), start=1):
+        lines.append(f"### Question {i}: `{_md(item.skill)}`")
         lines.append("")
-        if item.get("stop_reason") == "failed":
+        if item.stop_reason == "failed":
             lines.append(
-                f"**Question failed and was skipped** — `{_md(item.get('error', 'unknown error'))}`; "
-                f"stop: `{_md(_display_stop_reason(item.get('stop_reason')))}`."
+                f"**Question failed and was skipped** — `{_md(item.error or 'unknown error')}`; "
+                f"stop: `{_md(_display_stop_reason(item.stop_reason))}`."
             )
         else:
-            score_label = "Kept score" if item.get("stop_reason") == "safety_cap" else "Resolved score"
+            score_label = "Kept score" if item.stop_reason == "safety_cap" else "Resolved score"
             lines.append(
-                f"{score_label}: **{float(item.get('resolved_weighted_score', 0)):.2f}/5**; "
-                f"confidence: **{float(item.get('resolved_confidence', 0)):.2f}**; "
-                f"evidence weight: **{float(item.get('evidence_weight', 0)):.2f}**; "
-                f"stop: `{_md(_display_stop_reason(item.get('stop_reason')))}`."
+                f"{score_label}: **{item.resolved_weighted_score:.2f}/5**; "
+                f"confidence: **{item.resolved_confidence:.2f}**; "
+                f"evidence weight: **{item.evidence_weight:.2f}**; "
+                f"stop: `{_md(_display_stop_reason(item.stop_reason))}`."
             )
         lines.append("")
-        for turn_n, turn in enumerate(item.get("turns", []), start=1):
-            kind = "Follow-up" if turn.get("is_follow_up") else "Question"
+        for turn_n, turn in enumerate(item.turns, start=1):
+            kind = "Follow-up" if turn.is_follow_up else "Question"
             lines.append(f"#### Turn {turn_n}: {kind}")
             lines.append("")
-            lines.append(f"**Interviewer:** {_md(turn.get('question'))}")
+            lines.append(f"**Interviewer:** {_md(turn.question)}")
             lines.append("")
-            lines.append(f"**Candidate:** {_md(turn.get('answer'))}")
-            if turn.get("grounding_concept_id"):
+            lines.append(f"**Candidate:** {_md(turn.answer)}")
+            if turn.grounding_concept_id:
                 lines.append("")
                 lines.append(
-                    f"Grounded by: `{_md(turn.get('grounding_concept_id'))}` "
-                    f"({_md(turn.get('grounding_concept_title'))})"
+                    f"Grounded by: `{_md(turn.grounding_concept_id)}` ({_md(turn.grounding_concept_title)})"
                 )
-            _append_evaluation(lines, turn.get("evaluation", {}))
-            trace = turn.get("trace", {})
-            if trace.get("evaluator_self_critique_triggers"):
-                lines.append(f"Self-critique triggers: `{_md(', '.join(trace['evaluator_self_critique_triggers']))}`")
-            if trace.get("concept_lookup_query"):
+            _append_evaluation(lines, turn.evaluation)
+            trace = turn.trace
+            if trace.evaluator_self_critique_triggers:
+                lines.append(f"Self-critique triggers: `{_md(', '.join(trace.evaluator_self_critique_triggers))}`")
+            if trace.concept_lookup_query:
                 lines.append(
-                    f"Concept lookup: `{_md(trace.get('concept_lookup_query'))}` -> "
-                    f"`{_md(trace.get('concept_hit_id') or 'none')}`"
+                    f"Concept lookup: `{_md(trace.concept_lookup_query)}` -> "
+                    f"`{_md(trace.concept_hit_id or 'none')}`"
                 )
-            if calls := trace.get("llm_calls"):
+            if calls := trace.llm_calls:
                 # The per-provider split is the point, not the total: a turn whose calls landed on a
                 # provider the role was not pinned to is a silent failover (ADR 0009 addendum a),
                 # and the export is where that becomes reviewable after the session is over.
-                split = ", ".join(f"{name} {n}" for name, n in trace.get("llm_calls_by_provider") or ())
+                split = ", ".join(f"{name} {n}" for name, n in trace.llm_calls_by_provider or ())
                 lines.append(f"LLM calls: **{calls}**" + (f" ({_md(split)})" if split else ""))
             lines.append("")
 
@@ -208,10 +207,10 @@ def _append_supervisor_decisions(lines: list[str], session_state: Mapping[str, A
         return
     lines.append("## Supervisor Decisions")
     lines.append("")
-    for decision in session_state["supervisor_decisions"]:
+    for decision in decision_records(session_state):
         lines.append(
-            f"- After Q{decision.get('after_question')}: `{_md(decision.get('action'))}` "
-            f"(deviation=`{decision.get('deviation')}`) - {_md(decision.get('llm_reasoning'))}"
+            f"- After Q{decision.after_question}: `{_md(decision.action)}` "
+            f"(deviation=`{decision.deviation}`) - {_md(decision.llm_reasoning)}"
         )
     lines.append("")
 
