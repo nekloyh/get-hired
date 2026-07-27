@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import pytest
 
 from interview_coach.concepts import (
+    BGE_SMALL_EN,
     CONCEPT_COLLECTION,
+    E5_SMALL_MULTILINGUAL,
     SEED_CONCEPTS,
     ChromaConceptStore,
     ConceptNote,
     InMemoryConceptStore,
     build_concept_store,
+    embedder_for_language,
+    embedder_persist_dir,
     lookup_concept,
     resolve_concept_store_kind,
     seed_concept_store,
@@ -257,3 +262,34 @@ def test_choosing_chroma_does_not_warn(monkeypatch, caplog):
 def test_an_unknown_kind_still_fails_loudly():
     with pytest.raises(ValueError, match="unknown concept store kind"):
         build_concept_store("elasticsearch")
+
+
+# --- R-14: the embedder follows the Session's language -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("language_mode", "expected"),
+    [("vn", E5_SMALL_MULTILINGUAL), ("mixed", E5_SMALL_MULTILINGUAL), ("en", BGE_SMALL_EN)],
+)
+def test_language_mode_drives_the_embedder(language_mode, expected):
+    # Mechanism, not the A/B margin: BGE is English-only and collapses Vietnamese onto a hub, so a
+    # vn Session retrieving with it ranks near-randomly regardless of what 50 queries scored.
+    assert embedder_for_language(language_mode) == expected
+
+
+def test_an_unknown_language_mode_keeps_the_english_default():
+    assert embedder_for_language("fr") == BGE_SMALL_EN
+
+
+def test_each_embedder_gets_its_own_persist_dir():
+    # Both candidates are 384-dim, so a shared directory lets Chroma serve queries from one model
+    # against an index built by the other — confidently scored garbage rather than an error.
+    vn_dir = embedder_persist_dir(".chroma", E5_SMALL_MULTILINGUAL)
+    en_dir = embedder_persist_dir(".chroma", BGE_SMALL_EN)
+
+    assert vn_dir != en_dir
+    assert "/" not in Path(vn_dir).name  # the model id's slash must not create a nested dir
+
+
+def test_an_in_memory_store_needs_no_persist_dir():
+    assert embedder_persist_dir(None, E5_SMALL_MULTILINGUAL) is None

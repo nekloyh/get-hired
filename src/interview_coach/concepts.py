@@ -291,6 +291,35 @@ def rag_extras_available() -> bool:
     return all(importlib.util.find_spec(name) is not None for name in ("chromadb", "sentence_transformers"))
 
 
+def embedder_for_language(language_mode: str) -> str:
+    """The concept embedder a Session in ``language_mode`` should retrieve with (R-14).
+
+    vn/mixed get ``multilingual-e5-small``; en keeps BGE unchanged.
+
+    The justification is **mechanism, not the measurement**, and the audit says so plainly: the
+    2026-07-11 A/B was a 1-hit margin at p=1.0, which establishes nothing on its own. What does
+    establish it is that BGE is English-only and collapses Vietnamese text onto a hub — near-identical
+    similarity for unrelated notes — while e5 is actually trained on Vietnamese. A retrieval ranker
+    that cannot separate Vietnamese notes is broken for a vn Session regardless of what a 50-query
+    sample happened to score.
+    """
+    return E5_SMALL_MULTILINGUAL if language_mode in ("vn", "mixed") else BGE_SMALL_EN
+
+
+def embedder_persist_dir(persist_dir: str | Path | None, embedding_model: str) -> str | None:
+    """Namespace the persist dir per embedder.
+
+    Vectors do not mix across models: bge-small and e5-small are both 384-dim, so a shared directory
+    would let Chroma serve queries from one model against an index built by the other. The identity
+    stamp in ``ChromaConceptStore.create`` already turns that into a loud error — this keeps the two
+    Sessions from colliding in the first place, so a vn Session does not have to fail before the
+    operator learns to re-ingest.
+    """
+    if persist_dir is None:
+        return None
+    return str(Path(persist_dir) / embedding_model.replace("/", "__"))
+
+
 def resolve_concept_store_kind(kind: str) -> str:
     """What ``kind`` actually resolves to, without building anything.
 

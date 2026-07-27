@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
@@ -25,11 +25,17 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from pydantic import BaseModel, Field, ValidationError
 from starlette.status import WS_1008_POLICY_VIOLATION
 
-from .concepts import build_concept_store, resolve_concept_store_kind
+from .concepts import (
+    build_concept_store,
+    embedder_for_language,
+    embedder_persist_dir,
+    resolve_concept_store_kind,
+)
 from .config import Settings, load_settings
 from .demo_llm import DemoLLMClient
 from .diagnostic import CandidateProfile, diagnose_or_degrade
 from .exporter import export_session_markdown, render_session_markdown
+from .language import DEFAULT_LANGUAGE_MODE
 from .ledger import load_priors, save_posteriors
 from .llm import LLMClient, build_client, build_role_clients
 from .microloop import CandidateInputUnavailable, CandidateIntent
@@ -319,6 +325,57 @@ def configure_session_logging() -> None:
         log.addHandler(handler)
 
 
+def prune_checkpoints(checkpointer: Any, *, max_age_seconds: float, now: float) -> list[str]:
+    """Drop checkpoint threads whose newest checkpoint is older than ``max_age_seconds``.
+
+    The checkpoint DB had no reaper of any kind: every Session ever started stayed in it for the life
+    of the deployment, on a single-file SQLite that also serves live resume.
+
+    A **TTL sweep, not delete-on-completion.** Dropping a thread the moment its Session completes
+    looks tidier and is the first option the issue offers, but it breaks a path that works today:
+    reconnecting to a finished Session currently replays its final checkpoint and re-emits the
+    report (measured, not assumed). With the thread gone, that resume finds nothing and fails. The
+    TTL keeps recently-finished Sessions resumable and still bounds growth, which was the actual
+    complaint.
+
+    Best-effort by design: a cleanup that cannot read one thread's timestamp must not stop the
+    server from starting, so unparseable rows are left alone rather than guessed at.
+    """
+    newest: dict[str, float] = {}
+    try:
+        for entry in checkpointer.list(None):
+            thread_id = entry.config.get("configurable", {}).get("thread_id")
+            stamp = _checkpoint_timestamp(entry.checkpoint.get("ts"))
+            if thread_id is None or stamp is None:
+                continue
+            newest[thread_id] = max(newest.get(thread_id, stamp), stamp)
+    except Exception:
+        logger.warning("could not enumerate checkpoint threads; skipping the sweep", exc_info=True)
+        return []
+    pruned = []
+    for thread_id, stamp in sorted(newest.items()):
+        if now - stamp <= max_age_seconds:
+            continue
+        try:
+            checkpointer.delete_thread(thread_id)
+        except Exception:
+            logger.warning("could not prune checkpoint thread %s", thread_id, exc_info=True)
+            continue
+        pruned.append(thread_id)
+    if pruned:
+        logger.info("pruned %d checkpoint thread(s) older than %.0fs", len(pruned), max_age_seconds)
+    return pruned
+
+
+def _checkpoint_timestamp(raw: Any) -> float | None:
+    if not isinstance(raw, str):
+        return None
+    try:
+        return datetime.fromisoformat(raw).timestamp()
+    except ValueError:
+        return None
+
+
 def create_app(
     *,
     settings: Settings | None = None,
@@ -598,10 +655,15 @@ def _run_session_thread(
         # R-13: the measured path is the default path. Demo mode stays in-memory on purpose — it
         # runs on a fake model for UX review, and building a Chroma index (first run: downloading an
         # embedding model) to serve fake questions would be a slow answer to a question nobody asked.
+        # R-14: the embedder follows the Session's language. BGE is English-only and collapses
+        # Vietnamese onto a hub, so a vn/mixed Session retrieving with it ranks near-randomly.
+        language_mode = _session_language_mode(api_state, runtime.session_id, payload, resume)
+        embedder = embedder_for_language(language_mode)
         concept_store = build_concept_store(
             "memory" if runtime.mode == "demo" else api_state.settings.concept_store,
-            persist_dir=api_state.settings.concept_persist_dir or None,
+            persist_dir=embedder_persist_dir(api_state.settings.concept_persist_dir or None, embedder),
             seed=True,
+            embedding_model=embedder,
         )
         resource_store = build_resource_store("memory", seed=True)
         with SqliteSaver.from_conn_string(api_state.checkpoint_db) as checkpointer:
@@ -670,55 +732,32 @@ def _run_session_thread(
         runtime.emit({"type": "session_error", "error": f"{type(err).__name__}: {err}"})
 
 
-def prune_checkpoints(checkpointer: Any, *, max_age_seconds: float, now: float) -> list[str]:
-    """Drop checkpoint threads whose newest checkpoint is older than ``max_age_seconds``.
 
-    The checkpoint DB had no reaper of any kind: every Session ever started stayed in it for the life
-    of the deployment, on a single-file SQLite that also serves live resume.
+def _session_language_mode(
+    api_state: WebApiState,
+    session_id: str,
+    payload: StartSessionPayload | ResumeSessionPayload,
+    resume: bool,
+) -> str:
+    """The Session's language mode, known BEFORE the graph is built (R-14).
 
-    A **TTL sweep, not delete-on-completion.** Dropping a thread the moment its Session completes
-    looks tidier and is the first option the issue offers, but it breaks a path that works today:
-    reconnecting to a finished Session currently replays its final checkpoint and re-emits the
-    report (measured, not assumed). With the thread gone, that resume finds nothing and fails. The
-    TTL keeps recently-finished Sessions resumable and still bounds growth, which was the actual
-    complaint.
-
-    Best-effort by design: a cleanup that cannot read one thread's timestamp must not stop the
-    server from starting, so unparseable rows are left alone rather than guessed at.
+    A fresh Session carries it on the start payload. A *resumed* one does not — the payload has only
+    a mode — so it has to come out of the checkpoint, or resuming a Vietnamese Session would silently
+    rebuild its retrieval on the English embedder and rank near-randomly for the rest of the
+    interview. Falls back to the default on any read failure: a missing checkpoint is the
+    "unknown session" path, which the graph reports far better than a crash in here would.
     """
-    newest: dict[str, float] = {}
+    if not resume:
+        return getattr(payload, "language_mode", DEFAULT_LANGUAGE_MODE)
     try:
-        for entry in checkpointer.list(None):
-            thread_id = entry.config.get("configurable", {}).get("thread_id")
-            stamp = _checkpoint_timestamp(entry.checkpoint.get("ts"))
-            if thread_id is None or stamp is None:
-                continue
-            newest[thread_id] = max(newest.get(thread_id, stamp), stamp)
+        with SqliteSaver.from_conn_string(api_state.checkpoint_db) as checkpointer:
+            checkpoint = checkpointer.get(cast("Any", session_config(session_id)))
+        raw: Mapping[str, Any] = cast("Mapping[str, Any]", checkpoint or {})
+        values: Mapping[str, Any] = raw.get("channel_values") or {}
+        return str(values.get("language_mode") or DEFAULT_LANGUAGE_MODE)
     except Exception:
-        logger.warning("could not enumerate checkpoint threads; skipping the sweep", exc_info=True)
-        return []
-    pruned = []
-    for thread_id, stamp in sorted(newest.items()):
-        if now - stamp <= max_age_seconds:
-            continue
-        try:
-            checkpointer.delete_thread(thread_id)
-        except Exception:
-            logger.warning("could not prune checkpoint thread %s", thread_id, exc_info=True)
-            continue
-        pruned.append(thread_id)
-    if pruned:
-        logger.info("pruned %d checkpoint thread(s) older than %.0fs", len(pruned), max_age_seconds)
-    return pruned
-
-
-def _checkpoint_timestamp(raw: Any) -> float | None:
-    if not isinstance(raw, str):
-        return None
-    try:
-        return datetime.fromisoformat(raw).timestamp()
-    except ValueError:
-        return None
+        logger.warning("could not read language_mode for resumed Session %s", session_id, exc_info=True)
+        return DEFAULT_LANGUAGE_MODE
 
 
 def _persist_export(api_state: WebApiState, session_id: str, final_state: dict[str, Any]) -> None:
