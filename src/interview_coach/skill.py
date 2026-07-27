@@ -13,7 +13,9 @@ Diagnostic, slice 0009).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from typing import Any
 
 from .evaluator import Evaluation
 
@@ -102,6 +104,25 @@ class SkillState:
     def neutral(cls, skill: str) -> SkillState:
         """A fresh Skill carrying the weak, uninformative prior (no evidence yet)."""
         return cls(skill=skill)
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> SkillState:
+        """Rehydrate a persisted Beta belief — the single rehydration point (R-20).
+
+        This expression used to be copy-pasted at eight sites across five modules, which is how a
+        serialization detail ends up being re-decided independently in five places.
+
+        Subscripts deliberately: a malformed entry must raise rather than quietly become the neutral
+        prior, because a 50%-mastery row looks entirely plausible in a report and would be believed.
+        The ``str()``/``float()`` coercions absorb JSON-round-tripped ints and stringly values from
+        older checkpoints, and ``__post_init__``'s ``alpha``/``beta`` > 0 check stays the one
+        validation point it already is.
+        """
+        return cls(skill=str(raw["skill"]), alpha=float(raw["alpha"]), beta=float(raw["beta"]))
+
+    def to_dict(self) -> dict[str, float | str]:
+        """The persisted form. Key order matches every existing writer, byte for byte."""
+        return {"skill": self.skill, "alpha": self.alpha, "beta": self.beta}
 
     @property
     def mastery(self) -> float:

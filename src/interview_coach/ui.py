@@ -22,7 +22,7 @@ def render_skill_state_rows(session_state: Mapping[str, Any], *, width: int = 20
     rows: list[str] = []
     metadata = session_state.get("skill_metadata", {})
     for skill, raw in sorted(session_state.get("skill_states", {}).items()):
-        state = SkillState(skill=str(raw["skill"]), alpha=float(raw["alpha"]), beta=float(raw["beta"]))
+        state = SkillState.from_dict(raw)
         criticality = metadata.get(skill, {}).get("role_criticality", "unknown")
         rows.append(
             f"{skill:<18} {render_skill_state_bar(state.mastery, width=width)} "

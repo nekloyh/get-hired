@@ -55,7 +55,7 @@ def _append_skill_states(lines: list[str], session_state: Mapping[str, Any]) -> 
     lines.append("| --- | ---: | ---: | --- | --- |")
     metadata = session_state.get("skill_metadata", {})
     for skill, raw in sorted(session_state.get("skill_states", {}).items()):
-        state = SkillState(skill=str(raw["skill"]), alpha=float(raw["alpha"]), beta=float(raw["beta"]))
+        state = SkillState.from_dict(raw)
         meta = metadata.get(skill, {})
         lines.append(
             f"| `{_md(skill)}` | {state.mastery:.3f} | {state.confidence:.3f} | "
@@ -80,7 +80,7 @@ def _append_ledger_deltas(lines: list[str], session_state: Mapping[str, Any]) ->
         if raw is None:
             continue
         before = float(prior[skill])
-        after = SkillState(skill=str(raw["skill"]), alpha=float(raw["alpha"]), beta=float(raw["beta"])).mastery
+        after = SkillState.from_dict(raw).mastery
         lines.append(f"| `{_md(skill)}` | {before:.3f} | {after:.3f} | {after - before:+.3f} |")
     lines.append("")
 

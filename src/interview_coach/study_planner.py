@@ -203,7 +203,7 @@ def rank_study_targets(session_state: Mapping[str, Any]) -> list[StudyTarget]:
     targets: list[StudyTarget] = []
     metadata = session_state.get("skill_metadata", {})
     for skill, raw in session_state.get("skill_states", {}).items():
-        state = SkillState(skill=str(raw["skill"]), alpha=float(raw["alpha"]), beta=float(raw["beta"]))
+        state = SkillState.from_dict(raw)
         criticality = str(metadata.get(skill, {}).get("role_criticality", "peripheral"))
         weakness = 1.0 - state.mastery
         uncertainty = 1.0 - state.confidence

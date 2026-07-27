@@ -125,7 +125,7 @@ def posterior_masteries(final_state: Mapping[str, Any]) -> dict[str, float]:
     """Per-Skill posterior mastery from a finished Session's state."""
     out: dict[str, float] = {}
     for skill, raw in final_state.get("skill_states", {}).items():
-        out[skill] = SkillState(skill=str(raw["skill"]), alpha=float(raw["alpha"]), beta=float(raw["beta"])).mastery
+        out[skill] = SkillState.from_dict(raw).mastery
     return out
 
 

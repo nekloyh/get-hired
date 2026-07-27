@@ -154,7 +154,7 @@ def initial_session_state(
     state: SessionState = {
         "session_id": session_id,
         "topic_plan": topic_plan,
-        "skill_states": {skill: _dump_skill_state(prior.state) for skill, prior in diagnostic.priors.items()},
+        "skill_states": {skill: prior.state.to_dict() for skill, prior in diagnostic.priors.items()},
         "skill_metadata": {
             skill: {
                 "role_criticality": prior.role_criticality.value,
@@ -290,7 +290,7 @@ def build_session_graph(
                 "transcript": transcript,
             }
         skill_states = dict(state["skill_states"])
-        skill_states[skill] = _dump_skill_state(result.skill_state)
+        skill_states[skill] = result.skill_state.to_dict()
         transcript = [
             *state.get("transcript", []),
             _dump_micro_loop(result, plan_index=state.get("current_plan_index", 0)),
@@ -657,19 +657,16 @@ def _load_skill_state(state: SessionState, skill: str) -> SkillState:
     raw = state["skill_states"].get(skill)
     if raw is None:
         return SkillState.neutral(skill)
-    return SkillState(skill=str(raw["skill"]), alpha=float(raw["alpha"]), beta=float(raw["beta"]))
+    return SkillState.from_dict(raw)
 
 
 def skill_states_from_state(state: Mapping[str, Any]) -> dict[str, SkillState]:
     """Rehydrate every persisted Skill posterior — used to write the cross-session ledger (0023)."""
     return {
-        skill: SkillState(skill=str(raw["skill"]), alpha=float(raw["alpha"]), beta=float(raw["beta"]))
+        skill: SkillState.from_dict(raw)
         for skill, raw in state.get("skill_states", {}).items()
     }
 
-
-def _dump_skill_state(state: SkillState) -> dict[str, float | str]:
-    return {"skill": state.skill, "alpha": state.alpha, "beta": state.beta}
 
 
 def _dump_failed_question(skill: str, prior: SkillState, *, plan_index: int, error: BaseException) -> dict[str, Any]:
@@ -686,7 +683,7 @@ def _dump_failed_question(skill: str, prior: SkillState, *, plan_index: int, err
         "resolved_weighted_score": 0.0,
         "resolved_confidence": 0.0,
         "evidence_weight": 0.0,  # a crash is not evidence (issue 0014/0021): prior kept, zero weight
-        "skill_state": _dump_skill_state(prior),
+        "skill_state": prior.to_dict(),
         "turns": [],
         "error": f"{type(error).__name__}: {error}",
     }
@@ -708,7 +705,7 @@ def _dump_micro_loop(result: MicroLoopResult, *, plan_index: int) -> dict[str, A
         # The evidence weight actually folded into the belief (issues 0021/0027), so the scaling is
         # auditable in the export. Same function apply_evaluation uses — single source of truth.
         "evidence_weight": evidence_weight_for(result.resolved_evaluation),
-        "skill_state": _dump_skill_state(result.skill_state),
+        "skill_state": result.skill_state.to_dict(),
         "turns": [
             {
                 "question": turn.question,
@@ -727,7 +724,7 @@ def _dump_micro_loop(result: MicroLoopResult, *, plan_index: int) -> dict[str, A
 def _skill_state_summary(state: SessionState) -> str:
     lines = []
     for skill, raw in sorted(state.get("skill_states", {}).items()):
-        s = SkillState(skill=str(raw["skill"]), alpha=float(raw["alpha"]), beta=float(raw["beta"]))
+        s = SkillState.from_dict(raw)
         meta = state.get("skill_metadata", {}).get(skill, {})
         lines.append(
             f"- {skill}: mastery={s.mastery:.3f}, confidence={s.confidence:.3f}, "
