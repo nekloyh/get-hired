@@ -9,6 +9,7 @@ import re
 import secrets
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from hashlib import sha256
@@ -722,7 +723,9 @@ def _persist_export(api_state: WebApiState, session_id: str, final_state: dict[s
         logger.exception("could not persist the Markdown export for Session %s", session_id)
 
 
-def _stream_graph(graph, initial_state: dict[str, Any] | None, config: dict[str, Any], runtime: RuntimeSession) -> dict:
+def _stream_graph(
+    graph, initial_state: Mapping[str, Any] | None, config: dict[str, Any], runtime: RuntimeSession
+) -> dict:
     final_state: dict[str, Any] | None = None
     for event in graph.stream(initial_state, config, stream_mode="values"):
         if runtime.cancelled.is_set():

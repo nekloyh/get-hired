@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from pydantic import BaseModel
 
@@ -181,7 +181,7 @@ class DemoLLMClient(LLMClient):
             for i, skill in enumerate(skills, start=1)
         ]
         schedule = []
-        flat_ids = [rid for topic in topics for rid in topic["resource_ids"]]
+        flat_ids = [rid for topic in topics for rid in cast("list[str]", topic["resource_ids"])]
         for day in range(1, 15):
             if day in {7, 14}:
                 schedule.append(
