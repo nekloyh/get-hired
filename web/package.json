@@ -12,6 +12,9 @@
     "test:e2e:reconnect": "VITE_API_URL=http://127.0.0.1:8010 playwright test e2e/reconnect-flow.spec.ts --project=chromium"
   },
   "dependencies": {
+    "@fontsource-variable/jetbrains-mono": "^5.2.8",
+    "@fontsource-variable/phudu": "^5.2.10",
+    "@fontsource/be-vietnam-pro": "^5.2.8",
     "lucide-react": "^0.561.0",
     "react": "^19.2.3",
     "react-dom": "^19.2.3"
