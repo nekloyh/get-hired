@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue
+import re
 import secrets
 import threading
 import time
 from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -24,7 +26,7 @@ from .concepts import build_concept_store
 from .config import Settings, load_settings
 from .demo_llm import DemoLLMClient
 from .diagnostic import CandidateProfile, diagnose_or_degrade
-from .exporter import render_session_markdown
+from .exporter import export_session_markdown, render_session_markdown
 from .ledger import load_priors, save_posteriors
 from .llm import LLMClient, build_client, build_role_clients
 from .microloop import CandidateInputUnavailable, CandidateIntent
@@ -94,6 +96,15 @@ LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 # How long a gated socket may stay open without authenticating. Without a deadline an unauthenticated
 # connection holds a slot indefinitely — free denial of service against a single-worker deployment.
 AUTH_FRAME_TIMEOUT_SECONDS = 10.0
+
+# Completed-Session Markdown outlives the process here (R-08). The in-memory dict alone meant a
+# restart ate every report that had not been downloaded yet, while the Session itself sat safely in
+# the checkpoint DB — the one artifact the Candidate actually keeps was the one thing not persisted.
+DEFAULT_EXPORTS_DIR = "data/exports"
+
+# A Session id that is safe to use as a filename verbatim. Anything else gets digested (see
+# ``export_path``) rather than rejected, so an unusual id still produces a report.
+SAFE_SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
 def allowed_origins(settings: Settings) -> tuple[str, ...]:
@@ -249,8 +260,23 @@ class WebApiState:
     settings: Settings
     checkpoint_db: str
     ledger_db: str = ".skill-ledger.json"
+    exports_dir: str = DEFAULT_EXPORTS_DIR
     completed_sessions: dict[str, dict[str, Any]] = field(default_factory=dict)
     runtimes: dict[str, RuntimeSession] = field(default_factory=dict)
+
+
+def export_path(exports_dir: str | Path, session_id: str) -> Path:
+    """Where a completed Session's Markdown lives on disk.
+
+    The Session id is client-supplied — it arrives as a URL path segment — so it is never
+    interpolated into a filename unchecked: ``../../.ssh/authorized_keys`` would otherwise be a
+    write primitive on completion and a read primitive on export. Ids that are already safe (the
+    UUIDs R-06 generates) keep their own name so the directory stays greppable by a human; anything
+    else is replaced by a digest, which cannot collide and cannot escape the directory.
+    """
+    base = Path(exports_dir)
+    safe = session_id if SAFE_SESSION_ID.fullmatch(session_id) else sha256(session_id.encode("utf-8")).hexdigest()
+    return base / f"{safe}.md"
 
 
 def _validate_auth_settings(settings: Settings) -> None:
@@ -295,11 +321,13 @@ def create_app(
     settings: Settings | None = None,
     checkpoint_db: str | Path = ".session-checkpoints.sqlite",
     ledger_db: str | Path = ".skill-ledger.json",
+    exports_dir: str | Path = DEFAULT_EXPORTS_DIR,
 ) -> FastAPI:
     api_state = WebApiState(
         settings=settings or load_settings(),
         checkpoint_db=str(checkpoint_db),
         ledger_db=str(ledger_db),
+        exports_dir=str(exports_dir),
     )
     _validate_auth_settings(api_state.settings)
     app = FastAPI(title="Adaptive Interview Coach API")
@@ -438,11 +466,18 @@ def create_app(
                     headers={"WWW-Authenticate": "Bearer"},
                 )
         state = api_state.completed_sessions.get(session_id)
-        if state is None:
-            raise HTTPException(status_code=404, detail="No completed Session found for this Session id.")
-        if state.get("status") != SessionStatus.COMPLETE.value:
-            raise HTTPException(status_code=409, detail="Session is not complete yet.")
-        return render_session_markdown(state)
+        if state is not None:
+            if state.get("status") != SessionStatus.COMPLETE.value:
+                # In memory but unfinished: a cancelled or errored run. Saying "not complete yet" is
+                # more useful than falling through to a 404 that implies it never existed.
+                raise HTTPException(status_code=409, detail="Session is not complete yet.")
+            return render_session_markdown(state)
+        # Not in this process's memory — which after any restart is every Session ever completed.
+        stored = export_path(api_state.exports_dir, session_id)
+        try:
+            return stored.read_text(encoding="utf-8")
+        except OSError:
+            raise HTTPException(status_code=404, detail="No completed Session found for this Session id.") from None
 
     return app
 
@@ -559,6 +594,7 @@ def _run_session_thread(
             # Persist posteriors for a returning Candidate (0023); candidate_id rides in the state so a
             # resumed Session saves too. save_posteriors no-ops on an empty id.
             if final_state.get("status") == SessionStatus.COMPLETE.value:
+                _persist_export(api_state, runtime.session_id, final_state)
                 save_posteriors(
                     api_state.ledger_db,
                     str(final_state.get("candidate_id", "")),
@@ -576,6 +612,19 @@ def _run_session_thread(
     except Exception as err:  # noqa: BLE001 - API boundary converts graph/provider failures to events
         logger.exception("Session %s failed", runtime.session_id)
         runtime.emit({"type": "session_error", "error": f"{type(err).__name__}: {err}"})
+
+
+def _persist_export(api_state: WebApiState, session_id: str, final_state: dict[str, Any]) -> None:
+    """Write the completed Session's Markdown to disk so a restart cannot eat the report.
+
+    Best-effort on purpose: the Candidate has just finished an interview, and a full disk or a
+    read-only mount must not turn a completed Session into an error event. The in-memory copy still
+    serves this process, and the failure is logged rather than raised.
+    """
+    try:
+        export_session_markdown(final_state, export_path(api_state.exports_dir, session_id))
+    except OSError:
+        logger.exception("could not persist the Markdown export for Session %s", session_id)
 
 
 def _stream_graph(graph, initial_state: dict[str, Any] | None, config: dict[str, Any], runtime: RuntimeSession) -> dict:

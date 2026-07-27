@@ -29,6 +29,8 @@ logs/
 sessions.db
 # LangGraph SQLite checkpoints + their WAL/SHM sidecars are per-machine runtime state
 .session-checkpoints.sqlite*
+# Completed-Session reports (R-08). Real interview transcripts — Candidate data, never repo content.
+data/exports/
 
 # Claude Code local state (agent worktrees, local settings)
 .claude/

@@ -6,7 +6,7 @@ from starlette.status import WS_1008_POLICY_VIOLATION
 from starlette.websockets import WebSocketDisconnect
 
 from interview_coach.config import Settings
-from interview_coach.web_api import create_app
+from interview_coach.web_api import create_app, export_path
 
 
 def _test_client(tmp_path):
@@ -23,6 +23,7 @@ def _test_client(tmp_path):
         settings=settings,
         checkpoint_db=tmp_path / "checkpoints.sqlite",
         ledger_db=tmp_path / "ledger.json",
+        exports_dir=tmp_path / "exports",
     )
     return TestClient(app)
 
@@ -249,6 +250,7 @@ def _gated_client(tmp_path, *, token: str = _TOKEN, origins: str = ""):
         settings=settings,
         checkpoint_db=tmp_path / "checkpoints.sqlite",
         ledger_db=tmp_path / "ledger.json",
+        exports_dir=tmp_path / "exports",
     )
     return TestClient(app)
 
@@ -488,3 +490,103 @@ def test_an_ungated_server_accepts_any_loopback_origin(tmp_path, origin):
     with client.websocket_connect("/api/sessions/open", headers={"Origin": origin}) as ws:
         ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
         assert ws.receive_json()["type"] == "session_started"
+
+
+# --- R-08: a completed report must survive a restart ---------------------------------------------
+
+
+def _complete_a_demo_session(client, session_id: str) -> None:
+    with client.websocket_connect(f"/api/sessions/{session_id}") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+        _receive_until(ws, "question")
+        while True:
+            ws.send_json({"type": "candidate_answer", "answer": "A reasonable answer about batching."})
+            event = _receive_until_any(ws, {"question", "session_completed"}, limit=60)
+            if event["type"] == "session_completed":
+                return
+
+
+def _receive_until_any(ws, event_types: set[str], *, limit: int = 40):
+    for _ in range(limit):
+        event = ws.receive_json()
+        if event["type"] in event_types:
+            return event
+    raise AssertionError(f"did not receive any of {event_types}")
+
+
+def test_a_completed_export_survives_losing_the_in_memory_state(tmp_path):
+    # The whole point of R-08: `completed_sessions` is per-process, so before this every report that
+    # had not been downloaded yet died with the server — while the Session itself sat safely in the
+    # checkpoint DB. A fresh app object is exactly what a restart looks like to the endpoint.
+    client = _test_client(tmp_path)
+    _complete_a_demo_session(client, "restart-me")
+
+    restarted = _test_client(tmp_path)
+    response = restarted.get("/api/sessions/restart-me/export.md")
+
+    assert response.status_code == 200
+    assert "# Interview Session: restart-me" in response.text
+    assert "## Study Plan" in response.text
+
+
+def test_the_export_lands_in_the_configured_directory(tmp_path):
+    client = _test_client(tmp_path)
+
+    _complete_a_demo_session(client, "on-disk")
+
+    assert (tmp_path / "exports" / "on-disk.md").read_text(encoding="utf-8").startswith("# Interview Session:")
+
+
+def test_an_unknown_session_is_still_a_404_after_the_disk_fallback(tmp_path):
+    assert _test_client(tmp_path).get("/api/sessions/never-existed/export.md").status_code == 404
+
+
+def test_a_restored_export_is_still_gated_by_the_token(tmp_path):
+    # The disk fallback must not become an unauthenticated way around R-07.
+    open_client = _test_client(tmp_path)
+    _complete_a_demo_session(open_client, "gated-restart")
+
+    gated = _gated_client(tmp_path)
+
+    assert gated.get("/api/sessions/gated-restart/export.md").status_code == 401
+    authorized = gated.get(
+        "/api/sessions/gated-restart/export.md", headers={"Authorization": f"Bearer {_TOKEN}"}
+    )
+    assert authorized.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "session_id",
+    ["../escaped", "../../etc/passwd", "nested/child", "..", ".", ""],
+    ids=["parent", "deep-traversal", "subdir", "dotdot", "dot", "empty"],
+)
+def test_a_hostile_session_id_cannot_escape_the_exports_directory(tmp_path, session_id):
+    # The id is a client-supplied URL path segment. Unchecked it is a write primitive on completion
+    # and a read primitive on export.
+    exports = tmp_path / "exports"
+
+    resolved = export_path(exports, session_id)
+
+    assert resolved.parent.resolve() == exports.resolve()
+    assert resolved.suffix == ".md"
+
+
+def test_a_safe_session_id_keeps_its_own_filename(tmp_path):
+    # R-06 ids are UUIDs; keeping them verbatim is what makes the directory greppable by a human.
+    assert export_path(tmp_path, "6f1c9a2e-3d4b-4a55-8f27-1b0d9c7e5a31").name == (
+        "6f1c9a2e-3d4b-4a55-8f27-1b0d9c7e5a31.md"
+    )
+
+
+def test_a_failed_disk_write_does_not_fail_the_session(tmp_path, monkeypatch):
+    # A full disk at the moment an interview ends must not turn a completed Session into an error
+    # event — the in-memory copy still serves this process.
+    def explode(*_args, **_kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr("interview_coach.web_api.export_session_markdown", explode)
+    client = _test_client(tmp_path)
+
+    _complete_a_demo_session(client, "unwritable")
+
+    assert client.get("/api/sessions/unwritable/export.md").status_code == 200
