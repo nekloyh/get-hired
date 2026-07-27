@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 from fastapi.testclient import TestClient
 from starlette.status import WS_1008_POLICY_VIOLATION
@@ -698,3 +700,81 @@ def test_default_state_paths_are_unchanged(tmp_path):
     assert state.checkpoint_db == ".session-checkpoints.sqlite"
     assert state.ledger_db == ".skill-ledger.json"
     assert state.exports_dir == "data/exports"
+
+
+# --- R-27: the checkpoint DB gets a reaper -------------------------------------------------------
+
+
+def _put_checkpoint(checkpointer, thread_id: str, ts: str) -> None:
+    checkpointer.put(
+        {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}},
+        {"v": 1, "id": f"c-{thread_id}", "ts": ts, "channel_values": {}, "channel_versions": {}, "versions_seen": {}},
+        {"source": "update", "step": 1},
+        {},
+    )
+
+
+def _threads(checkpointer) -> set[str]:
+    return {entry.config["configurable"]["thread_id"] for entry in checkpointer.list(None)}
+
+
+def test_the_sweep_drops_only_threads_past_the_ttl(tmp_path):
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    from interview_coach.web_api import prune_checkpoints
+
+    now = datetime(2026, 7, 27, tzinfo=UTC).timestamp()
+    with SqliteSaver.from_conn_string(str(tmp_path / "cp.sqlite")) as checkpointer:
+        _put_checkpoint(checkpointer, "ancient", "2020-01-01T00:00:00+00:00")
+        _put_checkpoint(checkpointer, "yesterday", "2026-07-26T00:00:00+00:00")
+
+        pruned = prune_checkpoints(checkpointer, max_age_seconds=7 * 24 * 3600, now=now)
+
+        assert pruned == ["ancient"]
+        assert _threads(checkpointer) == {"yesterday"}
+
+
+def test_a_just_finished_session_is_still_resumable(tmp_path):
+    # This is why the sweep is a TTL and not delete-on-completion: reconnecting to a finished Session
+    # replays its final checkpoint and re-emits the report. Dropping the thread the moment the
+    # Session completes would break that measured behaviour to save a few kilobytes.
+    client = _test_client(tmp_path)
+    _complete_a_demo_session(client, "finished")
+
+    with client.websocket_connect("/api/sessions/finished") as ws:
+        ws.send_json({"type": "resume_session", "mode": "demo"})
+        assert _receive_until(ws, "session_completed", limit=40)["state"]["status"] == "complete"
+
+
+def test_an_unreadable_timestamp_is_left_alone_rather_than_guessed(tmp_path):
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    from interview_coach.web_api import prune_checkpoints
+
+    with SqliteSaver.from_conn_string(str(tmp_path / "cp.sqlite")) as checkpointer:
+        _put_checkpoint(checkpointer, "undated", "not-a-timestamp")
+
+        assert prune_checkpoints(checkpointer, max_age_seconds=1, now=1e12) == []
+        assert _threads(checkpointer) == {"undated"}
+
+
+def test_a_ttl_of_zero_disables_the_sweep(tmp_path):
+    # The knob has to be able to turn the reaper off for a deployment that wants every checkpoint.
+    settings = Settings(
+        _env_file=None,
+        primary_provider="mimo",
+        mimo_api_key="",
+        mimo_base_url="",
+        mimo_model="",
+        groq_api_key="",
+        groq_model="",
+        checkpoint_ttl_seconds=0,
+    )
+    app = create_app(
+        settings=settings,
+        checkpoint_db=tmp_path / "cp.sqlite",
+        ledger_db=tmp_path / "ledger.json",
+        exports_dir=tmp_path / "exports",
+    )
+
+    assert app.state.web_api.settings.checkpoint_ttl_seconds == 0

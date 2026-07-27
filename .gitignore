@@ -24,6 +24,8 @@ node_modules/
 
 # Runtime artifacts (per the build plan)
 chroma_db/
+# `coach ... --concept-store chroma` defaults its persist dir here; it is a rebuildable index.
+.chroma
 logs/
 *.db
 sessions.db

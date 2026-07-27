@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from interview_coach.ui import render_skill_state_bar, render_skill_state_rows
 
 
@@ -25,3 +27,37 @@ def test_render_skill_state_rows_include_mastery_confidence_and_criticality():
     assert rows == [
         "mlops              [######--] mastery=  75% confidence=  55% criticality=must_have"
     ]
+
+
+# --- R-27: demo mode dispatches on class objects, not class names --------------------------------
+
+
+def test_demo_mode_rejects_a_model_it_has_no_payload_for():
+    # It used to fall through to `{}`, which then failed as a schema error about missing fields
+    # several layers away from the real cause — and a rename anywhere silently stopped matching.
+    from pydantic import BaseModel
+
+    from interview_coach.demo_llm import DemoLLMClient
+
+    class Unregistered(BaseModel):
+        value: int
+
+    with pytest.raises(ValueError, match="demo mode has no payload"):
+        DemoLLMClient().chat_json([{"role": "user", "content": "x"}], Unregistered)
+
+
+def test_demo_mode_covers_every_agent_response_model():
+    from interview_coach.demo_llm import DemoLLMClient
+
+    builders = DemoLLMClient()._payload_builders()
+
+    assert {model.__name__ for model in builders} == {
+        "DiagnosticPlanResponse",
+        "Evaluation",
+        "SupervisorDecision",
+        "StudyPlanDraft",
+        "ConceptToolRequest",
+        "FollowUp",
+        "RenderedSeedQuestion",
+        "PanelOpinion",
+    }

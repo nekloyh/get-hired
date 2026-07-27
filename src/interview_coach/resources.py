@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from .concepts import BGE_SMALL_EN
+from .concepts import BGE_SMALL_EN, embedder_revision
 
 logger = logging.getLogger(__name__)
 
@@ -114,11 +114,7 @@ class InMemoryResourceStore:
         if n_results < 1:
             raise ValueError("n_results must be >= 1")
         self.search_calls.append({"query": query, "skill": skill, "n_results": n_results})
-        candidates = [
-            resource
-            for resource in self._resources.values()
-            if skill is None or resource.skill == skill
-        ]
+        candidates = [resource for resource in self._resources.values() if skill is None or resource.skill == skill]
         if not candidates:
             raise LookupError(f"no resources match skill={skill!r}")
 
@@ -167,13 +163,27 @@ class ChromaResourceStore:
                 "Chroma resource retrieval requires optional packages: chromadb and sentence-transformers"
             ) from err
 
-        embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=embedding_model)
+        revision = embedder_revision(embedding_model)
+        embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name=embedding_model, **({"revision": revision} if revision else {})
+        )
         client = chromadb.PersistentClient(path=str(persist_dir)) if persist_dir else chromadb.Client()
+        # Stamp the embedder into the collection metadata, exactly as the concept store does: the
+        # candidate embedders are all 384-dim, so Chroma would happily accept queries from a
+        # different model against a persisted index and return confidently-scored garbage. The
+        # resource store persists too, so it needs the same guard — its absence here was the gap.
         collection = client.get_or_create_collection(
             name=collection_name,
             embedding_function=embedding_fn,
-            metadata={"hnsw:space": "cosine"},
+            metadata={"hnsw:space": "cosine", "embedder": embedding_model},
         )
+        stamped = (getattr(collection, "metadata", None) or {}).get("embedder")
+        if stamped is not None and stamped != embedding_model:
+            raise RuntimeError(
+                f"collection {collection_name!r} was built with embedder {stamped!r} but "
+                f"{embedding_model!r} was requested — embeddings do not mix across models. "
+                "Re-ingest into a fresh persist dir (or delete the old collection) to switch."
+            )
         return cls(collection)
 
     def ingest(self, resources: Iterable[LearningResource]) -> int:
