@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
+from starlette.status import WS_1008_POLICY_VIOLATION
+from starlette.websockets import WebSocketDisconnect
 
 from interview_coach.config import Settings
 from interview_coach.web_api import create_app
@@ -227,3 +230,163 @@ def _receive_until(ws, event_type: str, *, limit: int = 20):
         if event["type"] == event_type:
             return event
     raise AssertionError(f"did not receive event type {event_type!r}")
+
+
+# --- R-07: shared bearer token + WebSocket Origin check -----------------------------------------
+
+_TOKEN = "s3cret-shared-token"
+
+
+def _gated_client(tmp_path, *, token: str = _TOKEN, origins: str = ""):
+    settings = Settings(
+        _env_file=None,
+        primary_provider="mimo",
+        mimo_api_key="",
+        mimo_base_url="",
+        mimo_model="",
+        groq_api_key="",
+        groq_model="",
+        auth_token=token,
+        allowed_origins=origins,
+    )
+    app = create_app(
+        settings=settings,
+        checkpoint_db=tmp_path / "checkpoints.sqlite",
+        ledger_db=tmp_path / "ledger.json",
+    )
+    return TestClient(app)
+
+
+def test_export_requires_a_bearer_token_when_gated(tmp_path):
+    # The export is the full transcript — the most disclosure-sensitive thing this API serves.
+    client = _gated_client(tmp_path)
+
+    unauthenticated = client.get("/api/sessions/whatever/export.md")
+
+    assert unauthenticated.status_code == 401
+    assert unauthenticated.headers["www-authenticate"] == "Bearer"
+
+
+@pytest.mark.parametrize(
+    "header",
+    ["", "Bearer wrong-token", _TOKEN, f"Basic {_TOKEN}", "Bearer"],
+    ids=["missing", "wrong-token", "no-scheme", "wrong-scheme", "scheme-only"],
+)
+def test_export_rejects_every_malformed_authorization(tmp_path, header):
+    client = _gated_client(tmp_path)
+
+    response = client.get("/api/sessions/whatever/export.md", headers={"Authorization": header})
+
+    assert response.status_code == 401
+
+
+def test_good_token_reaches_the_handler(tmp_path):
+    # 404, not 401: the token was accepted and the request got as far as "no such session", which is
+    # what proves the gate opened rather than the route being unreachable.
+    client = _gated_client(tmp_path)
+
+    response = client.get(
+        "/api/sessions/whatever/export.md", headers={"Authorization": f"Bearer {_TOKEN}"}
+    )
+
+    assert response.status_code == 404
+
+
+def test_export_stays_open_when_no_token_is_configured(tmp_path):
+    # "unset = open, for local dev" is the documented contract; a 401 here would break every
+    # existing localhost workflow.
+    client = _test_client(tmp_path)
+
+    assert client.get("/api/sessions/whatever/export.md").status_code == 404
+
+
+def test_socket_closes_on_a_missing_auth_frame(tmp_path):
+    client = _gated_client(tmp_path)
+
+    with pytest.raises(WebSocketDisconnect) as caught:
+        with client.websocket_connect("/api/sessions/gated") as ws:
+            ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+            ws.receive_json()
+
+    assert caught.value.code == WS_1008_POLICY_VIOLATION
+
+
+def test_socket_closes_on_a_wrong_token(tmp_path):
+    client = _gated_client(tmp_path)
+
+    with pytest.raises(WebSocketDisconnect) as caught:
+        with client.websocket_connect("/api/sessions/gated") as ws:
+            ws.send_json({"type": "auth", "token": "not-the-token"})
+            ws.receive_json()
+
+    assert caught.value.code == WS_1008_POLICY_VIOLATION
+
+
+def test_a_good_auth_frame_lets_the_session_run(tmp_path):
+    client = _gated_client(tmp_path)
+
+    with client.websocket_connect("/api/sessions/gated") as ws:
+        ws.send_json({"type": "auth", "token": _TOKEN})
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+        started = ws.receive_json()
+        assert started["type"] == "session_started"
+        assert _receive_until(ws, "question")["question"]
+
+
+def test_socket_rejects_a_disallowed_origin_before_accepting(tmp_path):
+    # Rejected during the handshake, so the socket never becomes live — CORSMiddleware cannot do
+    # this because it never sees a WebSocket handshake at all.
+    client = _gated_client(tmp_path, origins="https://coach.example.com")
+
+    with pytest.raises(WebSocketDisconnect) as caught:
+        with client.websocket_connect(
+            "/api/sessions/gated", headers={"Origin": "https://evil.example.com"}
+        ) as ws:
+            ws.receive_json()
+
+    assert caught.value.code == WS_1008_POLICY_VIOLATION
+
+
+def test_socket_accepts_an_allowlisted_origin(tmp_path):
+    client = _gated_client(tmp_path, origins="https://coach.example.com")
+
+    with client.websocket_connect(
+        "/api/sessions/gated", headers={"Origin": "https://coach.example.com"}
+    ) as ws:
+        ws.send_json({"type": "auth", "token": _TOKEN})
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+        assert ws.receive_json()["type"] == "session_started"
+
+
+def test_a_browser_origin_cannot_bypass_the_allowlist_by_omitting_origin(tmp_path):
+    # A missing Origin passes the origin check (non-browser clients never send one), so the TOKEN
+    # has to be what actually stops the request. If both were skippable this would be a hole.
+    client = _gated_client(tmp_path, origins="https://coach.example.com")
+
+    with pytest.raises(WebSocketDisconnect) as caught:
+        with client.websocket_connect("/api/sessions/gated") as ws:
+            ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+            ws.receive_json()
+
+    assert caught.value.code == WS_1008_POLICY_VIOLATION
+
+
+def test_origin_is_not_gated_when_no_token_is_set(tmp_path):
+    # Ungated local dev must keep working from any dev-server port.
+    client = _test_client(tmp_path)
+
+    with client.websocket_connect(
+        "/api/sessions/open", headers={"Origin": "http://localhost:4321"}
+    ) as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+        assert ws.receive_json()["type"] == "session_started"
+
+
+def test_a_stray_auth_frame_is_a_no_op_on_an_open_server(tmp_path):
+    # A client that always sends its auth frame must work against gated and open servers alike.
+    client = _test_client(tmp_path)
+
+    with client.websocket_connect("/api/sessions/open") as ws:
+        ws.send_json({"type": "auth", "token": "ignored"})
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+        assert ws.receive_json()["type"] == "session_started"

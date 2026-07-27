@@ -1,5 +1,6 @@
 import { Building2, CircleGauge, Play, RotateCcw, SlidersHorizontal, UserRound } from 'lucide-react'
 import type { CSSProperties } from 'react'
+import { rotateSessionId } from '../lib/sessionId'
 import { SKILLS, type Health, type SetupForm, type Skill } from '../lib/types'
 
 type Props = {
@@ -44,8 +45,20 @@ export function SetupPanel({ form, health, errors, onChange, onStart, onResume }
           </select>
         </label>
         <label>
-          Session id
-          <input value={form.sessionId} onChange={(event) => onChange({ ...form, sessionId: event.target.value })} />
+          Session id <span className="hint">(private to this browser)</span>
+          {/* Read-only by design (R-06): a typeable id is how one visitor resumes and exports
+              another's interview. "New session" is the only way to change it. */}
+          <span className="field-row">
+            <input value={form.sessionId} readOnly aria-label="Session id" />
+            <button
+              type="button"
+              className="ghost-button"
+              onClick={() => onChange({ ...form, sessionId: rotateSessionId() })}
+              title="Abandon this Session id and start a fresh one"
+            >
+              New session
+            </button>
+          </span>
         </label>
         <label>
           Candidate id <span className="hint">(optional — remembers progress across sessions)</span>

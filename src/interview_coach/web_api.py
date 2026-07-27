@@ -5,17 +5,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue
+import secrets
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from langgraph.checkpoint.sqlite import SqliteSaver
 from pydantic import BaseModel, Field, ValidationError
+from starlette.status import WS_1008_POLICY_VIOLATION
 
 from .concepts import build_concept_store
 from .config import Settings, load_settings
@@ -67,7 +69,68 @@ class CancelSessionPayload(BaseModel):
     type: Literal["cancel_session"]
 
 
-ClientPayload = StartSessionPayload | ResumeSessionPayload | CandidateAnswerPayload | CancelSessionPayload
+class AuthPayload(BaseModel):
+    """The first frame a client sends when the server is gated (R-07).
+
+    A frame rather than a query parameter on purpose: query strings land in access logs, proxy
+    logs, and browser history, so `?token=` leaks the shared secret to every intermediary.
+    """
+
+    type: Literal["auth"]
+    token: str = ""
+
+
+ClientPayload = StartSessionPayload | ResumeSessionPayload | CandidateAnswerPayload | CancelSessionPayload | AuthPayload
+
+# Browser origins allowed to open a Session socket when no allowlist is configured — the Vite dev
+# server, matching what CORS already permitted before R-07.
+DEFAULT_ALLOWED_ORIGINS: tuple[str, ...] = ("http://localhost:5173", "http://127.0.0.1:5173")
+
+# How long a gated socket may stay open without authenticating. Without a deadline an unauthenticated
+# connection holds a slot indefinitely — free denial of service against a single-worker deployment.
+AUTH_FRAME_TIMEOUT_SECONDS = 10.0
+
+def allowed_origins(settings: Settings) -> tuple[str, ...]:
+    """Browser origins permitted to reach this API — one list for CORS and the WS handshake."""
+    configured = [origin.strip() for origin in settings.allowed_origins.split(",") if origin.strip()]
+    return tuple(configured) if configured else DEFAULT_ALLOWED_ORIGINS
+
+
+def origin_allowed(origin: str | None, settings: Settings) -> bool:
+    """Whether a WebSocket handshake carrying ``origin`` may proceed.
+
+    A *missing* Origin passes. That is not a hole: Origin is set by the browser and cannot be forged
+    or omitted by page JavaScript, so the cross-site hijack this guards against always carries one.
+    Absent Origin means a non-browser client (curl, the test client, a native app), which the shared
+    token — not this check — is what actually gates.
+    """
+    if not settings.auth_token:
+        # Ungated deployment: the documented "unset = open, for local dev" contract. Gating origins
+        # here would break a dev server on any other port while protecting nothing that the missing
+        # token does not already leave open.
+        return True
+    if origin is None:
+        return True
+    return origin in allowed_origins(settings)
+
+
+def token_matches(candidate: str, settings: Settings) -> bool:
+    """Constant-time comparison against the shared secret (never ``==`` on a credential)."""
+    return secrets.compare_digest(candidate, settings.auth_token)
+
+
+async def authenticate_socket(websocket: WebSocket, settings: Settings) -> bool:
+    """Consume and check the client's opening auth frame. True when the socket may proceed."""
+    if not settings.auth_token:
+        return True
+    try:
+        raw = await asyncio.wait_for(websocket.receive_json(), timeout=AUTH_FRAME_TIMEOUT_SECONDS)
+    except (TimeoutError, WebSocketDisconnect, ValueError):
+        return False
+    if not isinstance(raw, dict) or raw.get("type") != "auth":
+        return False
+    return token_matches(str(raw.get("token", "")), settings)
+
 
 # ADR 0005: cancellation is a control signal, never data. A distinct sentinel object put on the
 # answers queue wakes a blocked read immediately and is unambiguous — a genuine empty-string answer
@@ -160,9 +223,15 @@ def create_app(
     )
     app = FastAPI(title="Adaptive Interview Coach API")
     app.state.web_api = api_state
+    origins = allowed_origins(api_state.settings)
+    if not api_state.settings.auth_token:
+        logger.warning(
+            "COACH_AUTH_TOKEN is unset: every endpoint is OPEN and the WebSocket accepts any "
+            "Origin. Fine on localhost, unsafe anywhere reachable — set it before exposing this."
+        )
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+        allow_origins=list(origins),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -181,7 +250,18 @@ def create_app(
 
     @app.websocket("/api/sessions/{session_id}")
     async def session_socket(websocket: WebSocket, session_id: str) -> None:
+        # Origin is checked BEFORE accept(): a rejected cross-site handshake must never become a
+        # live socket, and CORSMiddleware cannot do this — it does not see WebSocket handshakes at
+        # all, which is why the pre-R-07 CORS config guarded nothing here.
+        if not origin_allowed(websocket.headers.get("origin"), api_state.settings):
+            logger.warning("rejected WebSocket handshake from disallowed origin %r", websocket.headers.get("origin"))
+            await websocket.close(code=WS_1008_POLICY_VIOLATION)
+            return
         await websocket.accept()
+        if not await authenticate_socket(websocket, api_state.settings):
+            logger.warning("rejected WebSocket connection: missing or invalid auth frame")
+            await websocket.close(code=WS_1008_POLICY_VIOLATION)
+            return
         # Defined behavior for two tabs on one session_id: reject the second so two graphs can't run
         # concurrently against one checkpoint thread. One live socket per Session id.
         if session_id in api_state.runtimes:
@@ -229,6 +309,11 @@ def create_app(
                         payload,
                         True,
                     )
+                elif isinstance(payload, AuthPayload):
+                    # Already authenticated (or the server is ungated) — a repeat auth frame is a
+                    # harmless no-op rather than an "unknown payload type" error, so a client that
+                    # always sends one works against gated and open servers alike.
+                    continue
                 elif isinstance(payload, CandidateAnswerPayload):
                     runtime.answers.put(payload.answer)
                 else:
@@ -248,7 +333,16 @@ def create_app(
                 api_state.runtimes.pop(session_id, None)
 
     @app.get("/api/sessions/{session_id}/export.md", response_class=PlainTextResponse)
-    def export_markdown(session_id: str) -> str:
+    def export_markdown(session_id: str, authorization: str = Header(default="")) -> str:
+        # The export is the whole transcript — the most disclosure-sensitive thing this API serves.
+        if api_state.settings.auth_token:
+            scheme, _, presented = authorization.partition(" ")
+            if scheme.lower() != "bearer" or not token_matches(presented.strip(), api_state.settings):
+                raise HTTPException(
+                    status_code=401,
+                    detail="Missing or invalid bearer token.",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
         state = api_state.completed_sessions.get(session_id)
         if state is None:
             raise HTTPException(status_code=404, detail="No completed Session found for this Session id.")
@@ -279,6 +373,8 @@ def _parse_payload(raw: dict[str, Any]) -> ClientPayload:
         model = CandidateAnswerPayload
     elif payload_type == "cancel_session":
         model = CancelSessionPayload
+    elif payload_type == "auth":
+        model = AuthPayload
     else:
         raise ValueError(f"unknown WebSocket payload type: {payload_type!r}")
     try:
