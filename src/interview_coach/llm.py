@@ -624,6 +624,25 @@ class OpenAIClient(_OpenAICompatibleClient):
     _default_supports_json_schema: bool = True
 
 
+class ZenMuxClient(_OpenAICompatibleClient):
+    """OpenAI-compatible client for ZenMux — an **availability** tier, never the judge.
+
+    ZenMux aggregates many upstream models behind one OpenAI-compatible endpoint, which is exactly
+    what makes it useful as a fallback and exactly why it must not score: the model actually serving
+    a request is the aggregator's decision, so "the judge" would not be a fixed model at all. ADR
+    0009's pinning requires a named model with a green bench artifact, and a router-of-routers
+    cannot satisfy that by construction. Enforced in `Settings._require_bench_validated_judge`.
+
+    Capabilities are opted out until measured, per ADR 0003's tools-per-proven-need rule: whether
+    the served model supports function-calling or strict `json_schema` grammars depends on which
+    upstream it lands on. `ZENMUX_SUPPORTS_JSON_SCHEMA=true` flips the grammar path once a specific
+    model is pinned and verified.
+    """
+
+    provider_name: ProviderName = "zenmux"
+    _supports_tools: bool = False
+
+
 class LLMRouter(LLMClient):
     """Select the primary provider and fail over to the configured fallback on primary *outages*.
 
@@ -854,6 +873,7 @@ _CLIENT_CLASSES: dict[ProviderName, type[_OpenAICompatibleClient]] = {
     "mimo": MimoClient,
     "groq": GroqClient,
     "openai": OpenAIClient,
+    "zenmux": ZenMuxClient,
 }
 
 
