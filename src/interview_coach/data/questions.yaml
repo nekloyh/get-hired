@@ -583,6 +583,262 @@ mlops:
     follow_up_seeds:
       - Ask how they would get unbiased labels when the model blocks the very outcomes it needs to learn from.
 
+  # --- Forge-admitted 2026-07-11 (issue 0028), human-reviewed and merged 2026-07-19 (R-33, GH #88).
+  # answers[0] are the admission-tested strong exemplars kept verbatim; answers[1] are
+  # hand-written Follow-up replies. The weak admission answers remain in
+  # data/forge/review-queue-2026-07-11.yaml as bench-label material (ADR 0009 addendum b).
+  - question: You own a fraud model that is deployed in real time. Two weeks after launch, the business
+      reports a small but steady drop in approval quality, but the offline validation metrics from the
+      last training run still look strong. How would you design a monitoring and retraining plan that
+      distinguishes data drift from label delay, and what signals would trigger a retrain versus a rollback?
+    rubric:
+      weights:
+        correctness: 0.3
+        depth: 0.3
+        communication: 0.1
+        system_thinking: 0.3
+        mlops_awareness: 0.3
+    answers:
+    - 'I’d separate the problem into three streams: model performance, feature/data drift, and label availability.
+
+
+      1) Monitoring design
+
+      - Online business KPI: approval quality, fraud loss rate, chargeback rate, false positive rate on
+      reviewed cases, and segment-level metrics by channel, geography, merchant type, device, etc. This
+      is the earliest signal that the deployed policy is hurting the business.
+
+      - Input drift: track feature distributions and missingness in real time against the training baseline
+      using PSI/KS/JS divergence, plus embedding drift if we have high-cardinality categorical features.
+      I’d monitor both marginal drift and key joint slices, because a feature can look stable marginally
+      while a segment shifts materially.
+
+      - Score drift and calibration: monitor the score distribution, acceptance rate at fixed threshold,
+      and calibration on delayed labels once they arrive. A stable AUC offline does not guarantee the
+      live score distribution or threshold behavior is stable.
+
+      - Label delay handling: build a label-lag dashboard that shows how many transactions have matured
+      enough to be labeled, the age distribution of labels, and performance on the subset with complete
+      labels. I’d use survival/lag-aware reporting so we don’t mistake “no labels yet” for “no degradation.”
+
+
+      2) Distinguishing drift from label delay
+
+      - If business KPIs worsen immediately, but feature distributions and score distributions are stable,
+      I’d suspect threshold miscalibration, policy interaction, or label delay rather than covariate drift.
+
+      - If feature drift appears first, and the degradation shows up later when labels mature, that points
+      to data drift causing true performance loss.
+
+      - To separate them quantitatively, I’d compare three cohorts: recent live traffic with no labels
+      yet, recent traffic with matured labels, and a stable historical holdout. If the unlabeled cohort
+      drifts but the matured-label cohort has not yet degraded, the issue is likely label lag. If both
+      drift and matured-label performance degrade, that is stronger evidence of real concept/covariate
+      shift.
+
+      - I’d also monitor prediction-to-label delay by segment, because fraud labels often arrive later
+      for some merchants or dispute types; uneven delay can create a false impression of segment-specific
+      drift.
+
+
+      3) Retrain vs rollback triggers
+
+      - Retrain trigger: sustained feature drift above threshold in important features, plus confirmed
+      degradation on matured labels or calibration error beyond tolerance. I’d require persistence over
+      multiple windows to avoid reacting to noise, and I’d retrain on a rolling window that matches the
+      current fraud regime, with time-based splits and recent data weighting if the fraud pattern is nonstationary.
+
+      - Rollback trigger: a sharp post-deploy drop in business KPI or a clear bug-like signature, such
+      as a sudden score distribution collapse, missing feature spike, schema mismatch, or a segment-wide
+      failure that started exactly at release. That suggests a serving or feature pipeline issue, so I’d
+      revert to the last known-good model while investigating.
+
+      - If the model is stable but the threshold is wrong because base rates changed, I’d prefer threshold
+      recalibration or policy adjustment before a full retrain.
+
+
+      4) Operational plan
+
+      - Set alert tiers: warning for drift, investigation for KPI degradation, and rollback for severe
+      or abrupt regressions.
+
+      - Keep a champion/challenger setup so a candidate retrain can be shadow-evaluated before promotion.
+
+      - After retraining, compare against the current model on the same delayed-label cohort and require
+      improvement in both business KPI and calibration, not just offline AUC.
+
+
+      In short: use real-time drift and score monitoring to detect input shift early, use lag-aware label
+      tracking to avoid false alarms from delayed fraud outcomes, retrain when drift is persistent and
+      confirmed by matured labels, and rollback when the change looks abrupt or operationally broken rather
+      than like gradual data shift.'
+    - 'First the signals that exist before any label matures: the live score distribution and acceptance
+      rate at the current threshold, feature-drift statistics on the top features by importance, and pipeline
+      health — missingness spikes and schema mismatches. Those catch most incidents in the first hour;
+      label-dependent metrics mature weeks later by construction, so they confirm a diagnosis rather than
+      detect the incident.'
+    difficulty: 4
+    expected_concepts:
+    - mlops_drift_monitoring
+    - mlops_feedback_loops
+    - mlops_model_rollout
+    follow_up_seeds:
+    - Ask what they would monitor in the first hour, before any fraud label has matured.
+    - Ask how delayed labels change the retrain-versus-rollback decision.
+    - Ask when they would roll back instead of retraining.
+  - question: A team wants to add CI/CD to an ML pipeline that trains a churn model daily, validates data
+      at each boundary, and publishes models to a registry. Describe the pipeline stages you would automate,
+      the checks you would place before training and before deployment, and how experiment tracking and
+      lineage should be used to make a failed release reproducible.
+    rubric:
+      weights:
+        correctness: 0.3
+        depth: 0.3
+        communication: 0.1
+        system_thinking: 0.3
+        mlops_awareness: 0.3
+    answers:
+    - 'I’d automate the pipeline as a set of gated stages: 1) source/data ingestion, 2) data validation
+      and feature generation, 3) training, 4) evaluation and model comparison, 5) packaging and registry
+      publish, and 6) deployment/rollback. Each stage should emit artifacts and metadata so the run is
+      fully traceable.
+
+
+      Before training, I’d validate the input data at the boundary: schema checks, type/range constraints,
+      missingness thresholds, categorical domain checks, duplicate/key integrity, and basic distribution
+      checks against the previous day or a reference window. I’d also validate feature availability to
+      prevent leakage, for example ensuring labels or post-event fields are not present in training features.
+      If the data fails, the pipeline should stop before training so we don’t waste compute or register
+      a model trained on bad inputs.
+
+
+      During training, I’d log the exact code version, container image, hyperparameters, random seed,
+      training dataset snapshot/version, and environment details to an experiment tracker. I’d also log
+      metrics like AUC, calibration, recall at a business threshold, and slice metrics for important cohorts.
+      That gives us a reproducible record of what was tried and why a model was selected.
+
+
+      Before deployment, I’d gate on both offline quality and release safety. Concretely: compare the
+      candidate to the current production model on a fixed holdout set, require minimum metric thresholds,
+      check for regressions on key slices, verify calibration and latency/size constraints, and run a
+      shadow or canary check if the serving path is involved. I’d also validate the model artifact itself:
+      schema of inputs/outputs, serialization compatibility, and that the registry entry points to the
+      exact immutable artifact that passed evaluation. If the candidate is worse than baseline or violates
+      a business constraint, it should stay in the registry as a versioned artifact but not be promoted.
+
+
+      For lineage, I’d record end-to-end provenance: raw data version, feature pipeline version, training
+      code commit, environment/container digest, parameters, metrics, and the parent-child links between
+      dataset -> features -> model -> deployment. That way, if a release fails in production, I can reproduce
+      it by checking out the same code, pulling the same data snapshot and feature definitions, and rerunning
+      the exact experiment from the tracker. The lineage graph also helps answer “what changed?” when
+      a daily retrain causes drift or a metric drop, because I can diff the new run against the last good
+      one and isolate whether the cause was data, features, code, or hyperparameters.'
+    - 'Ingestion to features: schema, types, ranges, key integrity, missingness against a reference window.
+      Features to training: leakage checks — no post-event fields, a label-availability audit — plus feature
+      coverage so training-time features exist at serving time. Training to registry: metric thresholds
+      against the current champion on a fixed holdout, slice regressions, calibration, artifact schema.
+      Registry to deploy: serialization compatibility, latency and size budgets, and a canary gate with
+      automatic rollback criteria.'
+    difficulty: 4
+    expected_concepts:
+    - mlops_ci_cd_models
+    - mlops_data_validation
+    - mlops_experiment_tracking
+    follow_up_seeds:
+    - Ask which checks run at each pipeline boundary and which of them block training.
+    - Ask what metadata the registry must store for a failed release to be reproducible.
+    - Ask how they would reproduce a bad model version from lineage alone.
+  - question: 'You are choosing how to evaluate and serve a recommendation model for a product with three
+      usage patterns: nightly batch scoring for email, low-latency real-time ranking in the app, and a
+      streaming feature pipeline for fresh events. How would you compare offline and online evaluation
+      for this system, and what rollout strategy would you use to safely move from an offline-approved
+      model to production across these serving modes?'
+    rubric:
+      weights:
+        correctness: 0.3
+        depth: 0.4
+        communication: 0.1
+        system_thinking: 0.3
+        mlops_awareness: 0.3
+    answers:
+    - 'I’d separate the problem into three evaluation/serving loops, because each mode has different latency,
+      freshness, and failure risks.
+
+
+      1) Offline evaluation: use it to screen candidates, not to declare victory.
+
+      - For the nightly batch email scorer, offline metrics like AUC, log loss, calibration, and top-k
+      lift on a time-based holdout are useful because the model is consumed in a delayed, non-interactive
+      way.
+
+      - For real-time ranking, offline ranking metrics such as NDCG@k, MAP, recall@k, and calibration
+      still matter, but they are only proxies. The key is to evaluate on a temporally correct split and
+      with the same feature availability you will have online, otherwise you get leakage from future events
+      or from features that won’t exist at request time.
+
+      - For the streaming feature pipeline, offline evaluation should also check feature freshness and
+      point-in-time correctness: whether the feature values at prediction time match what the online store
+      would have produced. A model can look great offline and fail online if the streaming pipeline introduces
+      delay, missing events, or different aggregation windows.
+
+
+      2) Online evaluation: use it to validate the real system behavior.
+
+      - In the app, online A/B testing is the gold standard because it captures user feedback loops, latency,
+      ranking position bias, and business metrics like CTR, conversion, retention, and revenue. Offline
+      ranking gains often do not translate because the model changes what users see, which changes the
+      data distribution.
+
+      - For email batch scoring, online evaluation is usually slower and more delayed: compare open/click/conversion
+      rates, unsubscribe rate, and downstream revenue by holdout cohort. Since delivery is nightly, you
+      can run a controlled experiment at the campaign or user level.
+
+      - For the streaming pipeline, online checks should include operational metrics: event lag, feature
+      staleness, missing-rate, and end-to-end prediction latency, because a model can be statistically
+      good but operationally unusable if the freshest features arrive too late.
+
+
+      3) Rollout strategy: progressive, mode-specific, and gated by both model quality and system health.
+
+      - First, validate offline with a time-split backtest and a shadow deployment that replays live traffic
+      without affecting users. This catches schema mismatches, feature drift, and latency issues before
+      exposure.
+
+      - Then do a canary or small-slice rollout per serving mode. For the app, start with a tiny percentage
+      of traffic and compare against control using guardrail metrics: latency p95/p99, error rate, CTR,
+      conversion, and complaint/uninstall rates. For email, start with a small user segment or a subset
+      of campaigns. For streaming features, deploy the feature pipeline first in parallel, compare online
+      feature values against the existing pipeline, and only then switch the model to consume it.
+
+      - Use a staged promotion: shadow -> canary -> A/B test -> full rollout. Keep automatic rollback
+      if guardrails regress, especially if the model improves offline but hurts latency, calibration,
+      or downstream business metrics.
+
+      - I would also version the model and features together, because a recommendation model is only as
+      good as the feature pipeline feeding it. If the streaming features change, I’d treat that as a coupled
+      release and require the same point-in-time validation and monitoring.
+
+
+      In short: offline evaluation tells me whether the model is promising under historical data; online
+      evaluation tells me whether the whole recommendation system works under real traffic. I’d use offline
+      metrics to narrow candidates, then roll out gradually with shadowing, canaries, and A/B tests, with
+      separate guardrails for batch email, real-time ranking, and streaming freshness.'
+    - 'Offline you get proxy ranking quality: NDCG@k, recall@k, calibration on a time-correct holdout.
+      Online the metric is the feedback loop itself — CTR, conversion, retention, revenue per session
+      — plus the operational set offline cannot see: p99 latency, feature staleness, event lag. The tell
+      is offline gains that do not reproduce online; that is usually position bias or a feature-freshness
+      gap, which is why the A/B with guardrails makes the promote decision, not the offline table.'
+    difficulty: 5
+    expected_concepts:
+    - mlops_online_evaluation
+    - mlops_serving_modes
+    - mlops_model_rollout
+    follow_up_seeds:
+    - Ask which metrics differ between offline and online evaluation and why the gap appears.
+    - Ask how they would stage the rollout across the three serving modes.
+    - Ask what rollback signals they would define per serving mode.
+
 system_design:
   - question: >-
       Design a high-level architecture for an online feature store used by a real-time ML ranking
