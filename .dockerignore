@@ -1,0 +1,41 @@
+# Build context hygiene: everything here either bloats the image, breaks the build, or must never
+# be baked in.
+
+# Secrets — a .env copied into the image is a credential shipped to whoever pulls it.
+.env
+.env.*
+!.env.example
+
+# Rebuilt inside the image
+web/node_modules/
+web/dist/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local runtime state — the container mounts a volume for this
+state/
+data/exports/
+logs/
+.chroma/
+chroma_db/
+*.sqlite
+*.sqlite-*
+.skill-ledger.json
+.session-checkpoints.sqlite*
+
+# Tooling caches and history
+.git/
+.github/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.claude/
+web/playwright-report/
+web/test-results/
+
+# Not needed at runtime
+tests/
+docs/
+web/e2e/

@@ -1,11 +1,16 @@
-import { spawn, type ChildProcess } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import path from 'node:path'
 import { expect, test } from '@playwright/test'
 
 // Issue 0016: kill `coach api` mid-question, restart it, reconnect from the browser, and confirm the
 // Session continues to completion. Runs its own backend on a dedicated port (not the shared dev-server
 // backend other e2e specs assume) since this spec needs to kill/respawn it mid-test.
-const API_PORT = 8010
+//
+// R-11 adds a second mode: set COACH_E2E_CONTAINER=<name> and the same spec restarts a *container*
+// instead of a local process, which is how the deploy artifact's "survives `docker restart`
+// mid-question" claim gets checked from a real browser rather than asserted.
+const CONTAINER = process.env.COACH_E2E_CONTAINER ?? ''
+const API_PORT = Number(process.env.COACH_E2E_PORT ?? 8010)
 const API_BASE = `http://127.0.0.1:${API_PORT}`
 const REPO_ROOT = path.resolve(process.cwd(), '..')
 
@@ -33,6 +38,15 @@ function killApi(proc: ChildProcess): void {
   } else {
     proc.kill('SIGKILL')
   }
+}
+
+/** Container mode: stop the backend the same way an operator's `docker restart` would. */
+function stopContainer(): void {
+  spawnSync('docker', ['stop', '-t', '0', CONTAINER], { stdio: 'ignore' })
+}
+
+function startContainer(): void {
+  spawnSync('docker', ['start', CONTAINER], { stdio: 'ignore' })
 }
 
 async function waitForHealth(timeoutMs: number): Promise<boolean> {
@@ -66,6 +80,8 @@ test.describe('web kill/restart/reconnect (issue 0016)', () => {
   test.afterEach(() => {
     if (apiProcess) killApi(apiProcess)
     apiProcess = null
+    // Container mode never owns the container's lifetime — leave it running for whoever started it.
+    if (CONTAINER) startContainer()
   })
 
   test('kill coach api mid-question, restart, reconnect, continue to completion', async ({ page }, testInfo) => {
@@ -78,9 +94,10 @@ test.describe('web kill/restart/reconnect (issue 0016)', () => {
       testInfo.project.name !== 'chromium' || process.env.VITE_API_URL !== API_BASE,
       'Run via `npm run test:e2e:reconnect`, not the default test:e2e suite.',
     )
-    apiProcess = spawnApi()
-    const up = await waitForHealth(20_000)
-    test.skip(!up, 'coach api did not come up on the dedicated e2e port for this test.')
+    if (CONTAINER) startContainer()
+    else apiProcess = spawnApi()
+    const up = await waitForHealth(30_000)
+    test.skip(!up, 'the backend did not come up on the dedicated e2e port for this test.')
 
     // The dev server must be started with VITE_API_URL=http://127.0.0.1:8010 (see package.json's
     // test:e2e:reconnect script) so the page's fixed API_BASE points at this test's own backend.
@@ -104,16 +121,21 @@ test.describe('web kill/restart/reconnect (issue 0016)', () => {
     // round trip can complete faster than this Node-side process kill, so waiting for that click to
     // resolve first would let the follow-up arrive before the connection actually drops.
     await expect(answerBox).toBeEnabled({ timeout: 30_000 })
-    killApi(apiProcess)
-    apiProcess = null
-    const down = await waitForDown(10_000)
+    if (CONTAINER) {
+      stopContainer()
+    } else {
+      killApi(apiProcess)
+      apiProcess = null
+    }
+    const down = await waitForDown(15_000)
     expect(down).toBe(true)
 
     await expect(page.getByRole('alert')).toBeVisible({ timeout: 20_000 })
     await expect(page.getByText(/Connection lost/)).toBeVisible()
 
-    apiProcess = spawnApi()
-    const backUp = await waitForHealth(20_000)
+    if (CONTAINER) startContainer()
+    else apiProcess = spawnApi()
+    const backUp = await waitForHealth(30_000)
     expect(backUp).toBe(true)
 
     await page.getByRole('button', { name: /Reconnect/ }).click()

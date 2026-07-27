@@ -87,6 +87,17 @@ class Settings(BaseSettings):
     # browser-origin policy that lives only in CORS does not actually guard the socket.
     allowed_origins: str = Field("", validation_alias="COACH_ALLOWED_ORIGINS")
 
+    # Where the server keeps state that must outlive the process (R-11). The defaults are the
+    # historical CWD-relative paths, so nothing changes for a local run; a container points all
+    # three at one mounted volume, which is what makes `docker restart` mid-question resumable.
+    checkpoint_db: str = Field(".session-checkpoints.sqlite", validation_alias="COACH_CHECKPOINT_DB")
+    ledger_db: str = Field(".skill-ledger.json", validation_alias="COACH_LEDGER_DB")
+    exports_dir: str = Field("data/exports", validation_alias="COACH_EXPORTS_DIR")
+    # Built React bundle to serve from this app. Empty = API only (the dev-server setup, where Vite
+    # serves the UI). Set in the image so one container answers both the UI and the API on one
+    # origin — which is also what lets the bundle default to same-origin instead of baking a host.
+    static_dir: str = Field("", validation_alias="COACH_STATIC_DIR")
+
     # ADR 0010: per-role overrides. Empty/None = inherit the primary provider / provider model /
     # global temperature — the pre-0010 behavior, byte-identical.
     role_judge_provider: str = Field("", validation_alias="ROLE_JUDGE_PROVIDER")

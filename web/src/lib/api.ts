@@ -1,7 +1,12 @@
 import { loadAuthToken } from './authToken'
 import type { Health } from './types'
 
-export const API_BASE = import.meta.env.VITE_API_URL ?? 'http://127.0.0.1:8000'
+// Dev runs the UI on Vite's port and the API on its own, so the default has to name the backend.
+// A production build is served BY the backend (or by nginx in front of it), so it defaults to
+// same-origin — which is what lets one image run behind any hostname, and makes `wss://` follow
+// `https://` without configuration. `VITE_API_URL` still overrides both (the reconnect e2e uses it).
+export const API_BASE =
+  import.meta.env.VITE_API_URL ?? (import.meta.env.DEV ? 'http://127.0.0.1:8000' : window.location.origin)
 
 // Read per call, never captured at module load: the token is entered at runtime (see authToken.ts),
 // so a value cached here would be the empty string from before the operator typed it in.
