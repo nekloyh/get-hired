@@ -92,6 +92,13 @@ class SupervisorDecision(BaseModel):
     reasoning: str = Field(min_length=1)
     target_skill: str | None = None
     target_plan_index: int | None = Field(default=None, ge=0)
+    # The Skill the very next question will target, stated as data (R-22). Every action already
+    # determines this deterministically, so it is a cross-check rather than new information: if the
+    # model's own answer disagrees with what its action actually does, the decision is incoherent and
+    # gets sent back. It replaces a ~25-substring classifier over free-form English prose, which
+    # decayed silently with any model or wording change and could not see Vietnamese at all.
+    # ``None`` always passes — a model that omits the field behaves exactly as before.
+    will_probe_skill: str | None = None
 
 
 SUPERVISOR_SYSTEM_PROMPT = (
@@ -105,13 +112,18 @@ SUPERVISOR_SYSTEM_PROMPT = (
     "- skip_ahead: skip over already-satisfied plan entries.\n"
     "- switch_skill: probe a different Skill because evidence suggests the current path is less useful.\n"
     "- end_early: finish when the Candidate is consistently strong enough or no useful probe remains.\n\n"
+    "Also state `will_probe_skill`: the canonical Skill the very NEXT question will target — the "
+    "next Topic Plan Skill for advance_plan, the same Skill for extra_question, your target for "
+    "switch_skill or skip_ahead, and null for end_early (nothing follows it). It must match what "
+    "your action actually does; say null if you are unsure.\n\n"
     "Return one JSON object only."
 )
 
 _SUPERVISOR_SCHEMA_HINT = (
     '{"action": "advance_plan|extra_question|skip_ahead|switch_skill|end_early", '
     '"reasoning": "<why this macro decision follows from the evidence>", '
-    '"target_skill": "<canonical Skill or null>", "target_plan_index": <integer or null>}'
+    '"target_skill": "<canonical Skill or null>", "target_plan_index": <integer or null>, '
+    '"will_probe_skill": "<canonical Skill the next question targets, or null>"}'
 )
 
 
@@ -501,7 +513,8 @@ def _build_supervisor_messages(state: SessionState, bank: QuestionBank | None = 
 
 def _make_supervisor_validators(state: SessionState, bank: QuestionBank | None = None) -> list[Validator]:
     skills = set(SKILLS)
-    plan_len = len(state.get("topic_plan", []))
+    plan = state.get("topic_plan", [])
+    plan_len = len(plan)
     attempts = _attempts_by_skill(state)
     last_skill = state.get("transcript", [{}])[-1].get("skill") if state.get("transcript") else None
     extra_probe_required = _extra_probe_required(state, attempts, bank)
@@ -522,18 +535,14 @@ def _make_supervisor_validators(state: SessionState, bank: QuestionBank | None =
                 "below that Skill's evidence_bar, and another seed remains. Choose extra_question for "
                 f"{last_skill!r}, or provide a different valid deviation."
             )
-        if (
-            decision.action is SupervisorAction.ADVANCE_PLAN
-            and expected_advance_skill is not None
-            and last_skill is not None
-            and expected_advance_skill != last_skill
-            and _reasoning_claims_same_skill_probe(decision.reasoning, last_skill)
-        ):
-            raise ValueError(
-                "advance_plan moves to the next Topic Plan Skill "
-                f"({expected_advance_skill!r}), but the reasoning claims it will ask another "
-                f"{last_skill!r} question. Use extra_question for the same Skill or correct the reasoning."
-            )
+        if decision.will_probe_skill is not None:
+            expected_next_skill = _expected_next_skill(decision, plan, last_skill, expected_advance_skill)
+            if decision.will_probe_skill != expected_next_skill:
+                raise ValueError(
+                    f"will_probe_skill is {decision.will_probe_skill!r}, but {decision.action.value} "
+                    f"actually probes {expected_next_skill!r} next. Choose the action that matches the "
+                    "Skill you intend to probe, or set will_probe_skill to null."
+                )
         # Seed gate: a deviation that probes a Skill with no unused seed would only re-ask an
         # identical question, so it is rejected — the model must advance, switch elsewhere, or end.
         if decision.action is SupervisorAction.EXTRA_QUESTION and not _has_unused_seed(last_skill, attempts, bank):
@@ -573,43 +582,28 @@ def _advance_plan_target_skill(state: SessionState) -> str | None:
     return plan[next_index]["skill"] if next_index < len(plan) else None
 
 
-def _reasoning_claims_same_skill_probe(reasoning: str, skill: str) -> bool:
-    text = reasoning.lower()
-    skill_terms = {skill.lower(), skill.replace("_", " ").lower()}
-    if not any(term in text for term in skill_terms):
-        return False
-    if any(
-        marker in text
-        for marker in (
-            "already probed",
-            "already been probed",
-            "has been probed",
-            "was probed",
-            "no more",
-            "not need more",
-            "does not need more",
-            "sufficient evidence",
-            "move on from",
-        )
-    ):
-        return False
-    future_probe_phrases = (
-        "ask another",
-        "ask one more",
-        "another question",
-        "one more question",
-        "more evidence",
-        "gather more evidence",
-        "collect more evidence",
-        "probe further",
-        "further probe",
-        "continue probing",
-        "probe again",
-        "re-probe",
-        "same skill",
-        "current skill",
-    )
-    return any(phrase in text for phrase in future_probe_phrases)
+def _expected_next_skill(
+    decision: SupervisorDecision,
+    plan: list[dict[str, Any]],
+    last_skill: str | None,
+    expected_advance_skill: str | None,
+) -> str | None:
+    """The Skill the next question will actually target, derived from the action itself.
+
+    This is the same arithmetic ``_apply_supervisor_decision`` performs, which is the point: the
+    model's ``will_probe_skill`` is checked against what its own action will really do, so the two
+    cannot drift apart silently. ``end_early`` probes nothing, so its expected value is ``None``.
+    """
+    if decision.action is SupervisorAction.ADVANCE_PLAN:
+        return expected_advance_skill
+    if decision.action is SupervisorAction.EXTRA_QUESTION:
+        return last_skill
+    if decision.action is SupervisorAction.SWITCH_SKILL:
+        return decision.target_skill
+    if decision.action is SupervisorAction.SKIP_AHEAD:
+        index = decision.target_plan_index
+        return plan[index]["skill"] if index is not None and index < len(plan) else None
+    return None
 
 
 def _attempts_by_skill(state: SessionState) -> dict[str, int]:

@@ -17,6 +17,7 @@ from interview_coach.supervisor import (
     SupervisorDecision,
     _apply_supervisor_decision,
     _deterministic_supervisor_fallback,
+    _make_supervisor_validators,
     build_session_graph,
     decide_next_move,
     export_architecture_diagram,
@@ -31,6 +32,7 @@ def _decision(
     *,
     target_skill: str | None = None,
     target_plan_index: int | None = None,
+    will_probe_skill: str | None = None,
 ) -> str:
     return json.dumps(
         {
@@ -38,6 +40,7 @@ def _decision(
             "reasoning": reasoning,
             "target_skill": target_skill,
             "target_plan_index": target_plan_index,
+            "will_probe_skill": will_probe_skill,
         }
     )
 
@@ -642,13 +645,16 @@ def test_safety_cap_below_evidence_bar_requires_extra_question_when_seed_remains
     assert fake.call_count == 2
 
 
-def test_advance_plan_rejects_reasoning_that_claims_same_skill_probe(make_client):
+def test_advance_plan_rejects_a_will_probe_skill_it_does_not_actually_probe(make_client):
+    # R-22: the incoherence is now caught as data — advance_plan moves to the NEXT plan Skill, so
+    # claiming it will probe the one just finished is a contradiction regardless of how the
+    # reasoning is worded, or what language it is worded in.
     state = initial_session_state("reasoning-session", _diagnostic(), max_questions=10, started_at=0)
     state["transcript"] = [_transcript_item("mlops", score=4.0)]
     state["question_count"] = 1
     client, fake = make_client(
         [
-            _decision("advance_plan", "Advance plan so we can ask another mlops question for more evidence."),
+            _decision("advance_plan", "Advance plan.", will_probe_skill="mlops"),
             _decision("advance_plan", "Move to the next planned Skill."),
         ]
     )
@@ -660,12 +666,14 @@ def test_advance_plan_rejects_reasoning_that_claims_same_skill_probe(make_client
     assert fake.call_count == 2
 
 
-def test_advance_plan_allows_reasoning_that_says_skill_was_already_probed(make_client):
+def test_prose_mentioning_the_finished_skill_is_no_longer_a_rejection(make_client):
+    # The old substring classifier had to carve out "already probed" style phrasings by hand to
+    # avoid rejecting them. With the check on a structured field, reasoning is just prose again.
     state = initial_session_state("already-probed-session", _diagnostic(), max_questions=10, started_at=0)
     state["transcript"] = [_transcript_item("mlops", score=4.0)]
     state["question_count"] = 1
     client, fake = make_client(
-        [_decision("advance_plan", "mlops was already probed, so move to the next planned Skill.")]
+        [_decision("advance_plan", "Ask another mlops question? No — mlops is done, move to the next Skill.")]
     )
 
     decision = decide_next_move(client, state, now=lambda: 1)
@@ -680,8 +688,8 @@ def test_supervisor_uses_deterministic_fallback_after_repeated_invalid_reasoning
     state["question_count"] = 1
     client, fake = make_client(
         [
-            _decision("advance_plan", "Advance plan so we can ask another mlops question for more evidence."),
-            _decision("advance_plan", "Still ask another mlops question for more evidence."),
+            _decision("advance_plan", "Advance plan.", will_probe_skill="mlops"),
+            _decision("advance_plan", "Advance plan again.", will_probe_skill="mlops"),
         ]
     )
 
@@ -898,3 +906,100 @@ def test_the_deterministic_fallback_advances_when_the_evidence_is_good_enough():
     state["skill_metadata"] = {"mlops": {"evidence_bar": 3.0}}
 
     assert _deterministic_supervisor_fallback(state).action is SupervisorAction.ADVANCE_PLAN
+
+
+# --- R-22: will_probe_skill is checked as data, not as prose --------------------------------------
+
+
+def _validate(state, *, reasoning: str = "test decision", **decision_kwargs):
+    """Run the Supervisor validators over one decision, as decide_next_move does."""
+    decision = SupervisorDecision(reasoning=reasoning, **decision_kwargs)
+    for validator in _make_supervisor_validators(state):
+        validator(decision)
+
+
+def test_every_action_accepts_the_skill_it_really_probes():
+    state = _plan_state(["ml_fundamentals", "deep_learning", "mlops"], current_index=0)
+    state["transcript"] = [_transcript_item("ml_fundamentals")]
+
+    _validate(state, action=SupervisorAction.ADVANCE_PLAN, will_probe_skill="deep_learning")
+    _validate(state, action=SupervisorAction.EXTRA_QUESTION, will_probe_skill="ml_fundamentals")
+    _validate(state, action=SupervisorAction.SWITCH_SKILL, target_skill="mlops", will_probe_skill="mlops")
+    _validate(state, action=SupervisorAction.SKIP_AHEAD, target_plan_index=2, will_probe_skill="mlops")
+    _validate(state, action=SupervisorAction.END_EARLY, will_probe_skill=None)
+
+
+@pytest.mark.parametrize(
+    ("action", "kwargs", "claimed"),
+    [
+        (SupervisorAction.ADVANCE_PLAN, {}, "ml_fundamentals"),
+        (SupervisorAction.EXTRA_QUESTION, {}, "deep_learning"),
+        (SupervisorAction.SWITCH_SKILL, {"target_skill": "mlops"}, "deep_learning"),
+        (SupervisorAction.SKIP_AHEAD, {"target_plan_index": 2}, "deep_learning"),
+        (SupervisorAction.END_EARLY, {}, "mlops"),
+    ],
+    ids=["advance_plan", "extra_question", "switch_skill", "skip_ahead", "end_early"],
+)
+def test_a_claim_that_contradicts_the_action_is_rejected(action, kwargs, claimed):
+    # end_early is included deliberately: it probes nothing, so naming any Skill is incoherent.
+    state = _plan_state(["ml_fundamentals", "deep_learning", "mlops"], current_index=0)
+    state["transcript"] = [_transcript_item("ml_fundamentals")]
+
+    with pytest.raises(ValueError, match="will_probe_skill"):
+        _validate(state, action=action, will_probe_skill=claimed, **kwargs)
+
+
+def test_null_always_passes_so_an_omitting_model_behaves_as_before():
+    # The field is a cross-check, not new information. A model that never fills it must not be
+    # worse off than before R-22 — otherwise this becomes a compatibility break dressed as a fix.
+    state = _plan_state(["ml_fundamentals", "deep_learning", "mlops"], current_index=0)
+    state["transcript"] = [_transcript_item("ml_fundamentals")]
+
+    for action, kwargs in [
+        (SupervisorAction.ADVANCE_PLAN, {}),
+        (SupervisorAction.EXTRA_QUESTION, {}),
+        (SupervisorAction.SWITCH_SKILL, {"target_skill": "mlops"}),
+        (SupervisorAction.SKIP_AHEAD, {"target_plan_index": 2}),
+        (SupervisorAction.END_EARLY, {}),
+    ]:
+        _validate(state, action=action, will_probe_skill=None, **kwargs)
+
+
+def test_vietnamese_reasoning_is_validated_exactly_like_english():
+    # The substring classifier was ~25 hard-coded ENGLISH phrases, so a Vietnamese-reasoning model
+    # slipped past it entirely — in a project whose whole point is Vietnamese candidates.
+    state = _plan_state(["ml_fundamentals", "deep_learning", "mlops"], current_index=0)
+    state["transcript"] = [_transcript_item("ml_fundamentals")]
+
+    with pytest.raises(ValueError, match="will_probe_skill"):
+        _validate(
+            state,
+            action=SupervisorAction.ADVANCE_PLAN,
+            reasoning="Hỏi thêm một câu ml_fundamentals nữa để lấy thêm bằng chứng.",
+            will_probe_skill="ml_fundamentals",
+        )
+
+
+def test_advance_plan_off_the_end_expects_no_next_skill():
+    state = _plan_state(["ml_fundamentals", "deep_learning"], current_index=1)
+    state["transcript"] = [_transcript_item("deep_learning")]
+
+    _validate(state, action=SupervisorAction.ADVANCE_PLAN, will_probe_skill=None)
+    with pytest.raises(ValueError, match="will_probe_skill"):
+        _validate(state, action=SupervisorAction.ADVANCE_PLAN, will_probe_skill="deep_learning")
+
+
+def test_the_deterministic_fallback_never_fills_the_field():
+    # AC: the deterministic path stays untouched. It constructs decisions in code, where the claim
+    # would be tautological, so it leaves the field null and skips the check entirely.
+    state = _plan_state(["mlops", "system_design"])
+    state["transcript"] = [_transcript_item("mlops", score=1.0, stop_reason="safety_cap")]
+    state["skill_metadata"] = {"mlops": {"evidence_bar": 3.0}}
+
+    assert _deterministic_supervisor_fallback(state).will_probe_skill is None
+
+
+def test_the_phrase_list_classifier_is_gone():
+    import interview_coach.supervisor as supervisor
+
+    assert not hasattr(supervisor, "_reasoning_claims_same_skill_probe")
