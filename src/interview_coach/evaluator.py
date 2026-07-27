@@ -47,6 +47,7 @@ class EvidenceViolation(ValueError):
     UNRELATED validator kept failing would silently un-enforce verbatim citations.
     """
 
+
 # Degrade marker (issue 0030 follow-up / calibration bench): when the model cites a paraphrase we
 # cannot verify against the answer even after a retry, we blank that one citation to this marker and
 # keep the score, rather than crash the whole judgment. The evidence is an audit trail — a valid
@@ -67,8 +68,16 @@ _EVIDENCE_RULE = (
 # substring test (case stays significant on purpose; see test_case_changed_evidence_*).
 _QUOTE_GLYPHS = str.maketrans(
     {
-        "‘": "'", "’": "'", "‚": "'", "‛": "'", "′": "'",
-        "“": '"', "”": '"', "„": '"', "‟": '"', "″": '"',
+        "‘": "'",
+        "’": "'",
+        "‚": "'",
+        "‛": "'",
+        "′": "'",
+        "“": '"',
+        "”": '"',
+        "„": '"',
+        "‟": '"',
+        "″": '"',
     }
 )
 
@@ -113,9 +122,7 @@ class PanelOpinion(BaseModel):
 
     recommended_score: float = Field(ge=1, le=5, description="This voice's holistic 1–5 read.")
     argument: str = Field(min_length=1, description="One-paragraph scorecard for the export packet.")
-    key_evidence: str = Field(
-        min_length=1, description="The candidate's actual words this voice leans on."
-    )
+    key_evidence: str = Field(min_length=1, description="The candidate's actual words this voice leans on.")
 
 
 class PanelTrace(BaseModel):
@@ -163,9 +170,7 @@ class Evaluation(BaseModel):
     """The Evaluator's typed judgment of a single answer."""
 
     dimensions: dict[str, DimensionScore]
-    weighted_score: float = Field(
-        ge=1, le=5, description="The Evaluator's holistic, weight-aware aggregate (1–5)."
-    )
+    weighted_score: float = Field(ge=1, le=5, description="The Evaluator's holistic, weight-aware aggregate (1–5).")
     confidence: float = Field(ge=0, le=1)
     follow_up_recommended: bool
     follow_up_rationale: str = Field(
@@ -468,6 +473,13 @@ _SYSTEM_PROMPT_CORE = (
     "the language itself never raise or lower a score. A weak answer scores just as low in Vietnamese "
     "as in English, and a strong one just as high — the same idea earns the same score in either "
     "language.\n"
+    "- APPLY THAT AS A TEST, not just an intention. Before you score, restate the answer's technical "
+    "claims to yourself as plain English propositions, stripped of all style, and score THAT "
+    "restatement. If your score would differ between the original wording and the plain restatement, "
+    "the difference you are reacting to is language, and the restatement is the one to score. "
+    "Idiomatic, natural, or confident phrasing in ANY language is not evidence of correctness or "
+    "depth; clumsy or broken phrasing is not evidence of error. Ask 'what did they actually claim, "
+    "and did they say why?' — never 'does this sound like someone who knows?'\n"
     f"- For every dimension, {_EVIDENCE_RULE}\n"
 )
 
@@ -481,7 +493,7 @@ _DELIVERY_SYSTEM_RULE = (
     "dimension ever moves for language quality. When you score english_delivery 3 or below, "
     "'delivery_fixes' must list at least three concrete phrase-level fixes, each quoting the "
     "candidate's actual wording and giving a better phrasing (e.g. \"overfit happen when model "
-    "memorize\" → \"overfitting happens when the model memorizes\"). Never say only 'improve your "
+    'memorize" → "overfitting happens when the model memorizes"). Never say only \'improve your '
     "English'.\n"
 )
 
@@ -508,6 +520,7 @@ def _system_prompt(rubric: Rubric) -> str:
         return SYSTEM_PROMPT
     return _SYSTEM_PROMPT_CORE + _SYSTEM_PROMPT_TAIL
 
+
 _SCHEMA_HINT = (
     '{"dimensions": {"<dimension>": {"score": <1-5>, "evidence": "<verbatim quote|no evidence>"}}, '
     '"weighted_score": <1-5>, "confidence": <0-1>, '
@@ -528,6 +541,7 @@ _DELIVERY_SCHEMA_HINT = (
 
 def _schema_hint(rubric: Rubric) -> str:
     return _DELIVERY_SCHEMA_HINT if "english_delivery" in rubric.active else _SCHEMA_HINT
+
 
 # Session-mode context for the judge (issue 0024 / ADR 0007). Only vn/mixed add a block — the en
 # default keeps the prompt byte-identical to the pre-0024 judge for every legacy bench case, so the
@@ -670,9 +684,7 @@ def _panel_opinion(
     )
 
 
-def _build_messages(
-    question: str, answer: str, rubric: Rubric, language_mode: str = "en"
-) -> list[Message]:
+def _build_messages(question: str, answer: str, rubric: Rubric, language_mode: str = "en") -> list[Message]:
     mode_block = _LANGUAGE_MODE_BLOCKS.get(language_mode)
     user = (
         f"QUESTION:\n{question}\n\n"
@@ -891,9 +903,7 @@ def evaluate(
     move verdicts, so the trigger surface stays as-is until the shadow data argues otherwise).
     """
     noise_before = telemetry.snapshot()
-    raw = _evaluate_once(
-        client, _build_messages(question, answer, rubric, language_mode), answer, rubric
-    )
+    raw = _evaluate_once(client, _build_messages(question, answer, rubric, language_mode), answer, rubric)
     noise = _noise_events(noise_before, telemetry.snapshot())
     first = apply_cross_check(raw, rubric)
     triggers = _self_critique_triggers(first, rubric)
@@ -920,9 +930,7 @@ def evaluate(
     verdict_noise_before = telemetry.snapshot()
     raw_verdict = _evaluate_once(
         client,
-        _build_panel_verdict_messages(
-            question, answer, rubric, first, triggers, skeptic, advocate, language_mode
-        ),
+        _build_panel_verdict_messages(question, answer, rubric, first, triggers, skeptic, advocate, language_mode),
         answer,
         rubric,
     )
@@ -943,9 +951,7 @@ def evaluate(
         advocate.recommended_score,
         disagreement,
     )
-    verdict = _finalize(
-        verdict, rubric, pre_guard_confidence=raw_verdict.confidence, noise_events=verdict_noise
-    )
+    verdict = _finalize(verdict, rubric, pre_guard_confidence=raw_verdict.confidence, noise_events=verdict_noise)
     return verdict.model_copy(
         update={
             "panel": PanelTrace(

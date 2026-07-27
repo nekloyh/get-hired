@@ -29,7 +29,15 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 
 from . import telemetry
 from .bank import BankError, load_pack
-from .bench import bench_passed, bias_warnings, load_bench_data, render_bench_report, run_bench
+from .bench import (
+    BENCH_DEFAULT_K,
+    bench_passed,
+    bias_warnings,
+    load_bench_data,
+    render_bench_report,
+    repeatability_warnings,
+    run_bench,
+)
 from .concepts import (
     BGE_SMALL_EN,
     E5_SMALL_MULTILINGUAL,
@@ -603,9 +611,10 @@ def _utc_date() -> str:
     return utc_date()
 
 
-# A 29-case bench run measures ~100–200k tokens including retries; starting one with less than
-# this in the day's budget risks dying mid-run on insufficient_quota with a half-written report.
-BENCH_MIN_BUDGET_TOKENS = 200_000
+# One full sweep of the case list measures ~50–70k tokens including retries; the gate runs k of
+# them, so the preflight scales with k. Starting a run with less than this in the day's budget risks
+# dying mid-run on insufficient_quota with a half-written report.
+BENCH_MIN_BUDGET_TOKENS_PER_PASS = 70_000
 
 
 def _usage_delta(before: dict[str, dict[str, int]], after: dict[str, dict[str, int]]) -> dict[str, dict[str, int]]:
@@ -632,19 +641,23 @@ def _cmd_bench(client: ClientArg, args: argparse.Namespace) -> int:
     # client — not the session router — is what runs, and the report is labeled with its identity.
     judge = roles.judge
     provider = _provider_label(judge)
+    k = max(1, int(args.k))
     budget = daily_token_budget()
     usage_before = usage_for_day()
     left = max(0, budget - usage_before.get(provider, {}).get("total", 0))
+    needed = BENCH_MIN_BUDGET_TOKENS_PER_PASS * k
     print(f"Daily budget check ({provider}): ~{left:,} of {budget:,} tokens left by our count.")
-    if left < BENCH_MIN_BUDGET_TOKENS:
+    if left < needed:
         print(
-            f"WARNING: under {BENCH_MIN_BUDGET_TOKENS:,} tokens left — a full bench run may die "
+            f"WARNING: under {needed:,} tokens left (k={k} sweeps) — a full bench run may die "
             "mid-run on insufficient_quota. Consider waiting for the daily reset (00:00 UTC).",
             file=sys.stderr,
         )
     telemetry_before = telemetry.snapshot()
     data = load_bench_data(args.cases or None)
-    results = run_bench(judge, data.cases)
+    if k > 1:
+        print(f"Running {k} sweeps of {len(data.cases)} cases (gate = median-of-k, ADR 0009d)...")
+    results = run_bench(judge, data.cases, k=k)
     telemetry_after = telemetry.snapshot()
     usage_after = usage_for_day()
     run_usage = _usage_delta(usage_before, usage_after)
@@ -671,6 +684,10 @@ def _cmd_bench(client: ClientArg, args: argparse.Namespace) -> int:
         # Drift warning, not a gate: the run stays green, but a systematically drifting dimension
         # deserves a re-anchor pass before it starts costing in-band cases.
         print(f"BIAS TRIPWIRE: {warning}", file=sys.stderr)
+    for warning in repeatability_warnings(results):
+        # Also not a gate (the median is the verdict) — this is the signal that a case is one
+        # provider nudge from flipping, which no single-run report can show (GH #92).
+        print(f"REPEATABILITY: {warning}", file=sys.stderr)
     return 0 if bench_passed(results) else 1
 
 
@@ -1046,6 +1063,16 @@ def main(argv: list[str] | None = None) -> int:
 
     bench_parser = sub.add_parser("bench", help="Issue 0022: bilingual Judge calibration bench")
     bench_parser.add_argument("--cases", default="", help="Path to a cases YAML (default: data/bench/cases.yaml).")
+    bench_parser.add_argument(
+        "--k",
+        type=int,
+        default=BENCH_DEFAULT_K,
+        help=(
+            f"Runs per case; the gate judges the MEDIAN (default: {BENCH_DEFAULT_K}). One draw of a "
+            "stochastic judge is not a measurement — see ADR 0009 addendum (d). Use --k 1 for a "
+            "cheap indicative run, never to gate a merge."
+        ),
+    )
     bench_parser.add_argument(
         "--out", default="", help="Report output path (default: docs/audits/calibration-bench-<date>.md)."
     )

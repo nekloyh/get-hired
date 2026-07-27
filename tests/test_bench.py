@@ -13,10 +13,12 @@ from interview_coach.bench import (
     language_deltas,
     load_bench_data,
     render_bench_report,
+    repeatability_rows,
+    repeatability_warnings,
     run_bench,
     weak_strong_separation,
 )
-from interview_coach.evaluator import DimensionScore, Evaluation
+from interview_coach.evaluator import JUDGE_MAX_RETRIES, DimensionScore, Evaluation
 from interview_coach.rubric import Rubric
 
 
@@ -103,10 +105,7 @@ def test_bench_dataset_mixed_mode_cases_are_wired_for_0024():
     # english_delivery has a BARS anchor now that it is labelled
     assert "english_delivery" in data.anchors
     # at least one case proves disentanglement: weak delivery label on a technically-strong band
-    assert any(
-        c.labels.get("english_delivery", 5) <= 2 and c.expected_min >= 3.0
-        for c in mixed
-    )
+    assert any(c.labels.get("english_delivery", 5) <= 2 and c.expected_min >= 3.0 for c in mixed)
 
 
 # --- pure metrics -------------------------------------------------------------------------------
@@ -206,6 +205,156 @@ def test_run_bench_marks_provider_error_as_out_of_band(make_client):
     assert results[0].error is not None
     assert not results[0].within_band
     assert not bench_passed(results)
+
+
+# --- median-of-k gate (GH #92, ADR 0009 addendum d) ---------------------------------------------
+
+
+def test_run_bench_defaults_to_one_run_per_case(make_client):
+    client, fake = make_client([_eval_json(4, {"correctness": 4})])
+    results = run_bench(client, (_case("solo"),))
+    assert fake.call_count == 1
+    assert results[0].scores == (4.0,)
+    assert results[0].spread is None
+
+
+def test_run_bench_gates_on_the_median_not_the_worst_or_best_run(make_client):
+    # The GH #92 signature exactly: band tops at 3.2, the judge draws 3.3/3.3/3.2. Two of three
+    # single runs would have redded the gate; the MEDIAN (3.3) is out of band, so the verdict is a
+    # stable red rather than a 1-in-3 coin flip.
+    case = _case("edge", lo=1.6, hi=3.2)
+    client, fake = make_client([_eval_json(s, {"correctness": 3}) for s in (3.3, 3.3, 3.2)])
+    results = run_bench(client, (case,), k=3)
+    assert fake.call_count == 3
+    assert results[0].scores == (3.3, 3.3, 3.2)
+    assert results[0].score == pytest.approx(3.3)
+    assert not results[0].within_band
+    assert not bench_passed(results)
+
+
+def test_median_ignores_a_single_outlier_run(make_client):
+    # The mirror case: two in-band draws and one wild one. The median holds the gate green rather
+    # than letting one bad draw red a judge that is actually behaving.
+    case = _case("noisy", lo=1.6, hi=3.2)
+    client, _ = make_client([_eval_json(s, {"correctness": 3}) for s in (2.0, 4.8, 2.1)])
+    results = run_bench(client, (case,), k=3)
+    assert results[0].score == pytest.approx(2.1)
+    assert results[0].within_band
+    assert bench_passed(results)
+
+
+def test_representative_evaluation_is_a_real_run_not_a_blend(make_client):
+    # Downstream metrics (bias, calibration, trust) read result.evaluation, so it must be ONE
+    # internally coherent judgment — the median run — never an average of several.
+    case = _case("rep", lo=1.0, hi=5.0)
+    client, _ = make_client(
+        [
+            _eval_json(2, {"correctness": 2}, confidence=0.10),
+            _eval_json(4, {"correctness": 4}, confidence=0.90),
+            _eval_json(3, {"correctness": 3}, confidence=0.50),
+        ]
+    )
+    results = run_bench(client, (case,), k=3)
+    assert results[0].score == pytest.approx(3.0)
+    assert results[0].confidence == pytest.approx(0.50)  # the median run's own confidence
+    assert results[0].evaluation.dimensions["correctness"].score == 3
+
+
+def test_straddling_the_band_edge_warns_without_gating(make_client):
+    # Some runs in, some out: the median is green, so the gate passes — but the case is one provider
+    # nudge from flipping and must say so. This is the signal whose absence hid GH #92 for 8 days.
+    case = _case("straddler", lo=1.0, hi=2.5)
+    client, _ = make_client([_eval_json(s, {"correctness": 2}) for s in (2.4, 2.5, 2.7)])
+    results = run_bench(client, (case,), k=3)
+    assert results[0].within_band
+    assert bench_passed(results)
+    assert results[0].straddles_band_edge
+    assert results[0].spread == pytest.approx(0.3)
+    assert "straddle" in " ".join(repeatability_warnings(results))
+
+
+def test_stable_case_produces_no_repeatability_noise(make_client):
+    client, _ = make_client([_eval_json(2, {"correctness": 2})] * 3)
+    results = run_bench(client, (_case("stable", lo=1.0, hi=2.6),), k=3)
+    assert not results[0].straddles_band_edge
+    assert results[0].spread == pytest.approx(0.0)
+    assert repeatability_rows(results) == []
+    assert repeatability_warnings(results) == []
+
+
+def test_one_errored_run_does_not_red_a_case_the_judge_agrees_on(make_client):
+    # With k draws instead of one, a single transport blip is k times more likely to hit. Dropping
+    # it (and reporting it) keeps the gate measuring the JUDGE, not the transport — but the run
+    # count it stands on is surfaced.
+    good = _eval_json(2, {"correctness": 2})
+    # Enough bad replies to exhaust the judge's real retry budget, so run 2 genuinely dies rather
+    # than self-correcting on a retry (which is what the transport layer is supposed to do).
+    dead_run = ['{"bad": 1}'] * (JUDGE_MAX_RETRIES + 1)
+    client, _ = make_client([good, *dead_run, good])
+    results = run_bench(client, (_case("blip", lo=1.0, hi=2.6),), k=3)
+    assert results[0].errored_runs == 1
+    assert len(results[0].scores) == 2
+    assert results[0].within_band
+    assert bench_passed(results)
+    assert "errored" in " ".join(repeatability_warnings(results))
+
+
+def test_a_case_surviving_on_one_run_is_still_reported(make_client):
+    # k-1 failures leave a single score and therefore NO spread. Reporting must key off the errors,
+    # not the spread, or the case whose median is weakest evidence is the one that goes unmentioned.
+    good = _eval_json(2, {"correctness": 2})
+    dead = ['{"bad": 1}'] * (JUDGE_MAX_RETRIES + 1)
+    client, _ = make_client([*dead, *dead, good])
+    results = run_bench(client, (_case("barely", lo=1.0, hi=2.6),), k=3)
+    assert results[0].errored_runs == 2
+    assert results[0].scores == (2.0,)
+    assert results[0].spread is None
+    assert [row["case_id"] for row in repeatability_rows(results)] == ["barely"]
+    assert "2 of 3 runs errored" in " ".join(repeatability_warnings(results))
+
+
+def test_every_run_erroring_is_still_an_error_result(make_client):
+    client, _ = make_client(['{"bad": 1}'] * 6)
+    results = run_bench(client, (_case("dead"),), k=3)
+    assert results[0].error is not None
+    assert results[0].scores == ()
+    assert not results[0].within_band
+    assert not bench_passed(results)
+
+
+def test_run_bench_rejects_a_nonsense_k(make_client):
+    client, _ = make_client([])
+    with pytest.raises(ValueError, match="k must be >= 1"):
+        run_bench(client, (_case("x"),), k=0)
+
+
+def test_report_shows_runs_and_the_repeatability_section(make_client):
+    case = _case("edge", lo=1.0, hi=2.5)
+    client, _ = make_client([_eval_json(s, {"correctness": 2}) for s in (2.4, 2.5, 2.7)])
+    report = render_bench_report(run_bench(client, (case,), k=3))
+    assert "median-of-k, k=3" in report
+    assert "## Repeatability (k=3)" in report
+    assert "2.40/2.50/2.70" in report
+    assert "**REPEATABILITY**" in report
+
+
+def test_report_labels_a_single_run_as_ungated(make_client):
+    client, _ = make_client([_eval_json(2, {"correctness": 2})])
+    report = render_bench_report(run_bench(client, (_case("solo"),)))
+    assert "single run (k=1)" in report
+    assert "## Repeatability" not in report
+
+
+def test_report_renders_every_anchor_band_not_just_two_and_four():
+    # The anchors section is the record of the scale the labels were set against, so a middle anchor
+    # must not be silently dropped from it (the 3 anchors added in GH #92 were invisible under the
+    # old hardcoded 2/4 rendering).
+    report = render_bench_report(
+        [_result(_case("a"), weighted=3)],
+        anchors={"correctness": {"2": "half-right", "3": "bare assertion", "4": "mechanism stated"}},
+    )
+    for band in ("2: half-right", "3: bare assertion", "4: mechanism stated"):
+        assert band in report
 
 
 def test_empty_bench_does_not_pass_the_gate_vacuously():
@@ -342,7 +491,10 @@ def test_trust_guard_rows_surface_only_signalled_cases():
 
     quiet = _result_with_trust(_case("quiet"), confidence=0.95, pre_guard=0.95)
     capped = _result_with_trust(
-        _case("capped"), confidence=0.7, pre_guard=0.95, fraction=0.5,
+        _case("capped"),
+        confidence=0.7,
+        pre_guard=0.95,
+        fraction=0.5,
         noise=("structured_output.invalid_reply",),
     )
     rows = trust_guard_rows([quiet, capped])
@@ -369,7 +521,11 @@ def test_shadow_trigger_counts_price_out_thresholds():
 
 def test_report_renders_trust_guard_section():
     capped = _result_with_trust(
-        _case("capped"), confidence=0.7, pre_guard=0.95, fraction=0.5, divergence=0.2,
+        _case("capped"),
+        confidence=0.7,
+        pre_guard=0.95,
+        fraction=0.5,
+        divergence=0.2,
         noise=("sanitizer.judgment_flattened_in_dimensions",),
     )
     report = render_bench_report([capped])
@@ -417,8 +573,13 @@ def test_bias_warnings_ignore_small_in_band_bias():
 def test_report_marks_unstable_bias_rows_and_renders_tripwires():
     from interview_coach.bench import BIAS_MIN_SAMPLES
 
-    thin = [_result(_case("thin", labels={"english_delivery": 2, "correctness": 2}),
-                    dims={"english_delivery": 2, "correctness": 4}, weighted=3.0)]
+    thin = [
+        _result(
+            _case("thin", labels={"english_delivery": 2, "correctness": 2}),
+            dims={"english_delivery": 2, "correctness": 4},
+            weighted=3.0,
+        )
+    ]
     grounded = [
         _result(_case(f"g{i}", labels={"correctness": 2}), dims={"correctness": 4}, weighted=3.0)
         for i in range(BIAS_MIN_SAMPLES)

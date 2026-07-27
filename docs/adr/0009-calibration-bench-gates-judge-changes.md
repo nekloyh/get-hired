@@ -73,3 +73,103 @@ changes touching both gate on both. "It passed a bench" without naming which one
 
 *Source: ADR red-team review 2026-07-19 — verdict REAFFIRM + 3 AMENDs; Wave-0 execution k=3 data
 (GH #92); remediation decisions B1 (judge pinning) and the R-15/R-17 label/backup-judge program.*
+
+## Addendum (2026-07-27): the gate is median-of-k — resolving (b)'s open choice
+
+Addendum (b) left one decision open: the judge runs the bench at `temperature=0` **or** the gate
+becomes median-of-k. **Resolved: median-of-k, k=3, at the production temperature (`0.2`).**
+
+### The decision, and why not temperature=0
+
+`temperature=0` was rejected on two counts. First, it measures a judge configuration that never
+ships — every real Session judges at `LLM_TEMPERATURE=0.2`, so a gate at 0 certifies a different
+sampler than the one the value chain runs on. Second, it does not actually buy determinism: hosted
+inference is not bitwise reproducible at temperature 0 (batching and expert-routing nondeterminism
+survive greedy decoding), so it would have traded away production fidelity for an *appearance* of
+repeatability, and the "three consecutive runs, same exit code" bar could still have failed.
+
+Median-of-k keeps the production sampler and is self-consistent with this addendum's own rule about
+bands: if a band must be derived from a score *distribution*, the gate should read that same
+distribution rather than one draw from it. The median is the cheapest robust statistic of it, and at
+odd k it is always an **observed** run — so the representative judgment every downstream metric
+reads (bias, confidence calibration, trust guards, delivery) stays one internally coherent
+judgment, never a blend.
+
+**Costs, accepted:** k× tokens per gate (~150k for k=3 over 35 cases, against a 2.5M daily budget),
+and the preflight scales with k. `--k 1` remains available for a cheap indicative run and is
+explicitly **not** a merge gate.
+
+**Errored runs are dropped, not fatal**, provided at least one run survived. With k draws instead of
+one, a single transport blip became k times more likely to red the gate on infrastructure rather
+than judge quality — the measurement-side reading of ADR 0005's "infrastructure noise must never
+corrupt skill evidence". The surviving run count is reported; an all-errors case is still an error.
+
+### The straddle tripwire
+
+A case whose k runs land partly inside and partly outside its band is reported as **straddling**.
+It does not gate — the median is the verdict — but it is the signal whose absence let GH #92 hide:
+on 2026-07-11 `dl_overfitting_weak_vi` passed 3/3 and looked healthy, and eight days later the same
+case was 1/3. A straddle says the band edge cuts through the judge's score distribution, i.e. the
+case is one provider nudge from flipping, *while its median still reads green*. Straddles are
+tracked and resolved, never tolerated as background noise.
+
+### Band re-derivation procedure
+
+1. Bands are derived from a **k≥3 distribution**, never a single observation, and are recorded with
+   the run data that produced them.
+2. **A band is never widened to turn a red run green.** That is the one-way ratchet this ADR exists
+   to prevent: each widening buys one green run and permanently lowers the bar.
+3. When a case's median sits outside its band, the order of investigation is **diagnose before
+   re-band**: identify the dimension driving it (per-dimension scores, and for a paired case the
+   EN/VN twin delta) and fix the *judge guide* if the judge is wrong. Re-deriving the band is the
+   remedy only when the human **label** is wrong — which must be argued from the answer and the BARS
+   anchors, not from the judge's output.
+4. Re-anchor cadence: the bench is re-run k=3 on any judge-touching change, and the bands are
+   re-examined whenever a bias tripwire fires (|bias| > 0.5 at n ≥ 8) or a case straddles.
+
+### Worked precedent: `dl_overfitting_weak` (GH #92)
+
+Rule 3 applied, and it found a real defect rather than a mis-set band. Per-dimension measurement
+(k=3 on both twins) showed the judge scoring the **same answer in two languages** two points apart:
+
+| dimension | EN | VN | human label |
+| --- | --- | --- | --- |
+| correctness | 2/2/2 | **4/4/4** | 3 |
+| communication | 3/3/3 | **4/4/4** | 3 |
+| depth · system_thinking | 2/2/2 · 2/2/2 | 2/2/2 · 2/2/2 | 2 · 2 |
+
+Root cause: `correctness` carried BARS anchors at 1, 2, 4, 5 and **none at 3**. "Names the right
+technique, justifies it with a bare *so it is better*" had no home on the scale, so the judge fell
+off whichever side the *phrasing* suggested — and idiomatic Vietnamese reads as more authoritative
+than clumsy English. `communication`, which already had a 3 anchor, split by only one point on the
+identical pair: the size of the split tracked the size of the hole in the scale.
+
+Remedy: add the missing 3 anchor to `correctness` (and to `communication`), and make the
+language-invariance rule **operational** — restate the answer's claims as plain English propositions
+and score that restatement, rather than merely instructing the judge to be unbiased. After the
+re-anchor the EN twin matched the human label on all four dimensions and the pair's holistic delta
+closed from +1.10 to 0.00.
+
+The generalisable lesson, which is why this is in the ADR and not just an audit: **a missing middle
+anchor is a language-fairness bug.** Any dimension with a gap in its BARS scale lets the judge
+resolve the gap on style, and style is exactly what the bilingual bench exists to keep out of the
+score. Every anchor gap is a latent EN/VN split.
+
+That generalisation was then confirmed on a second pair in the same run. `panel_sd_retry_storm` —
+the trap case whose confident prose recommends actions that would *worsen* an outage — carries a
+stable |Δ| of 2.00, and the per-dimension split lands exactly where the remaining holes are:
+
+| dimension | EN | VN | Δ | has a `3` anchor? |
+| --- | ---: | ---: | ---: | :---: |
+| communication · correctness | 4.00 · 1.00 | 4.00 · 2.00 | 0.00 · +1.00 | yes (added 2026-07-27) |
+| depth | 2.00 | 3.33 | **+1.33** | **no — 2 and 4 only** |
+| system_thinking | 1.33 | **3.67** | **+2.33** | **no — 2 and 4 only** |
+
+The dimensions whose hole was filled now agree across languages; the two that still have one carry
+the whole split. **`depth` and `system_thinking` remain to be anchored at 3**, tracked as GH #96:
+both are weighted in every case, so re-anchoring them moves the whole set and must land with its own
+k=3 evidence rather than riding along with the run that discovered it.
+
+*Source: GH #92 resolution, 2026-07-27 — per-dimension EN/VN diagnosis, judge-guide re-anchor, and
+admission of the six 2026-07-11 pending cases. Evidence:
+`docs/audits/calibration-bench-2026-07-27.md`.*
