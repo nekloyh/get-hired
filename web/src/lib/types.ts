@@ -38,6 +38,9 @@ export type Health = {
   fallback_provider: string
   fallback_configured: boolean
   demo_available: boolean
+  // R-07: whether the backend is gated. Drives whether the UI asks for an access token — which it
+  // must do at runtime, because a build-time token would ship inside the bundle.
+  auth_required?: boolean
 }
 
 export type SkillState = {

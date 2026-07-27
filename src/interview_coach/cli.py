@@ -789,18 +789,16 @@ def _cmd_ingest_resources(client: ClientArg, args: argparse.Namespace) -> int:
 def _cmd_api(client: ClientArg, args: argparse.Namespace) -> int:
     import uvicorn
 
-    # `log_config=None` is load-bearing, not tidying. Uvicorn otherwise installs its own dictConfig
-    # over ours, which silences every `interview_coach.*` INFO record — including R-26's per-call
-    # `llm-call provider=... model=... outcome=...` trace. A server that hides the trace is a server
-    # where a silent judge failover is still undiagnosable, which is the whole point of having it.
-    # Leaving uvicorn's config alone makes its own logs flow through the CLI's basicConfig instead.
-    logging.getLogger("interview_coach").setLevel(logging.INFO)
+    # Logging for the server lives in `web_api.configure_session_logging`, not here: with `--reload`
+    # uvicorn serves from a spawned subprocess that never runs this function, so anything configured
+    # at this point is simply absent from the process that handles requests — which is where R-26's
+    # per-call `llm-call provider=... model=... outcome=...` trace has to be visible for a silent
+    # judge failover to be diagnosable at all. Uvicorn keeps its own log config (banner, access log).
     uvicorn.run(
         "interview_coach.web_api:app",
         host=args.host,
         port=args.port,
         reload=args.reload,
-        log_config=None,
     )
     return 0
 

@@ -6,6 +6,7 @@ import { SetupPanel } from './components/SetupPanel'
 import { SkillBars } from './components/SkillBars'
 import { TopicPlan } from './components/TopicPlan'
 import { authFrame, fetchHealth, sessionWebSocketUrl } from './lib/api'
+import { loadAuthToken, saveAuthToken } from './lib/authToken'
 import { loadSessionId } from './lib/sessionId'
 import {
   addCandidateAnswer,
@@ -38,6 +39,8 @@ const defaultForm: SetupForm = {
 export function App() {
   const [health, setHealth] = useState<Health | null>(null)
   const [form, setForm] = useState(defaultForm)
+  // R-07: held for the life of the tab, never compiled into the bundle. See lib/authToken.ts.
+  const [authToken, setAuthToken] = useState(loadAuthToken)
   const [session, setSession] = useState(initialSession)
   const [draft, setDraft] = useState('')
   const [setupErrors, setSetupErrors] = useState<string[]>([])
@@ -240,9 +243,14 @@ export function App() {
             </div>
           </section>
           <SetupPanel
+            authToken={authToken}
             errors={errors}
             form={form}
             health={health}
+            onAuthTokenChange={(token) => {
+              setAuthToken(token)
+              saveAuthToken(token)
+            }}
             onChange={setForm}
             onResume={() => connect(true)}
             onStart={() => connect(false)}

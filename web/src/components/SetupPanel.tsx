@@ -7,12 +7,23 @@ type Props = {
   form: SetupForm
   health: Health | null
   errors: string[]
+  authToken: string
+  onAuthTokenChange: (token: string) => void
   onChange: (form: SetupForm) => void
   onStart: () => void
   onResume: () => void
 }
 
-export function SetupPanel({ form, health, errors, onChange, onStart, onResume }: Props) {
+export function SetupPanel({
+  form,
+  health,
+  errors,
+  authToken,
+  onAuthTokenChange,
+  onChange,
+  onStart,
+  onResume,
+}: Props) {
   const setClaim = (skill: Skill, value: number) => {
     onChange({ ...form, claimedSkills: { ...form.claimedSkills, [skill]: value } })
   }
@@ -60,6 +71,21 @@ export function SetupPanel({ form, health, errors, onChange, onStart, onResume }
             </button>
           </span>
         </label>
+        {health?.auth_required ? (
+          <label>
+            Access token <span className="hint">(this server is gated)</span>
+            {/* Typed in, never built in: a `VITE_*` token is inlined into the JS bundle, so anyone
+                who can fetch the app owns the shared secret it is supposed to gate. */}
+            <input
+              type="password"
+              value={authToken}
+              placeholder="COACH_AUTH_TOKEN"
+              autoComplete="off"
+              aria-label="Access token"
+              onChange={(event) => onAuthTokenChange(event.target.value)}
+            />
+          </label>
+        ) : null}
         <label>
           Candidate id <span className="hint">(optional — remembers progress across sessions)</span>
           <input

@@ -1,20 +1,32 @@
 import { CalendarDays, Download, ExternalLink, FileText, Trophy } from 'lucide-react'
+import { useState } from 'react'
 import { fetchExportMarkdown } from '../lib/api'
 import { pct } from '../lib/skillMetrics'
 import type { SessionState } from '../lib/types'
 
 export function ReportView({ state }: { state: SessionState | null }) {
+  const [exportError, setExportError] = useState<string | null>(null)
   if (!state || state.status !== 'complete') return null
   const plan = state.study_plan
 
   const downloadExport = async () => {
-    const markdown = await fetchExportMarkdown(state.session_id)
-    const url = URL.createObjectURL(new Blob([markdown], { type: 'text/markdown' }))
-    const link = document.createElement('a')
-    link.href = url
-    link.download = `interview-${state.session_id}.md`
-    link.click()
-    URL.revokeObjectURL(url)
+    // React does not await an event handler's promise, so an unhandled rejection here would be a
+    // console line and a button that visibly does nothing — the worst failure mode for the one
+    // control that gets the Candidate their transcript.
+    setExportError(null)
+    try {
+      const markdown = await fetchExportMarkdown(state.session_id)
+      const url = URL.createObjectURL(new Blob([markdown], { type: 'text/markdown' }))
+      const link = document.createElement('a')
+      link.href = url
+      link.download = `interview-${state.session_id}.md`
+      link.click()
+      // Deferred: revoking synchronously after click() races the browser's read of the blob. The
+      // spec does not promise the download has resolved the URL by then.
+      setTimeout(() => URL.revokeObjectURL(url), 0)
+    } catch (error) {
+      setExportError(error instanceof Error ? error.message : 'Export failed.')
+    }
   }
 
   return (
@@ -43,6 +55,12 @@ export function ReportView({ state }: { state: SessionState | null }) {
           </button>
         </div>
       </div>
+
+      {exportError ? (
+        <div className="error-box" role="alert">
+          <p>{exportError}</p>
+        </div>
+      ) : null}
 
       {plan ? (
         <>
