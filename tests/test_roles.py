@@ -22,6 +22,8 @@ from interview_coach.llm import (
     LLMRouter,
     OpenAIClient,
     RoleClients,
+    ZenMuxClient,
+    build_client,
     build_role_clients,
     ensure_role_clients,
 )
@@ -238,3 +240,105 @@ def test_micro_loop_single_client_still_serves_both_roles():
 
     assert single.calls == 1
     assert result.turns[0].evaluation.weighted_score == 4.0
+
+
+# --- ZenMux: an availability tier that can never hold the judge role -----------------------------
+
+
+def test_zenmux_is_a_known_provider_and_builds_a_client():
+    settings = _settings(zenmux_api_key="test", zenmux_model="auto")
+
+    client = build_client(settings)
+
+    assert isinstance(client, LLMRouter)
+    # Reachable as a routed provider — the availability tier this slot exists for.
+    assert isinstance(client._clients["zenmux"], ZenMuxClient)
+
+
+def test_zenmux_serves_availability_roles():
+    # The point of the slot: it can carry the Interviewer or the Supervisor when the primary is out.
+    settings = _settings(
+        zenmux_api_key="test",
+        zenmux_model="auto",
+        role_interviewer_provider="zenmux",
+    )
+
+    roles = build_role_clients(settings)
+
+    assert isinstance(roles.interviewer, ZenMuxClient)
+    assert isinstance(roles.judge, OpenAIClient)
+
+
+@pytest.mark.parametrize("provider", ["zenmux", "groq", "mimo"])
+def test_the_judge_role_refuses_a_provider_with_no_bench_artifact(provider):
+    # ADR 0009a: every score flows into the Beta state, the Supervisor's deviation calls and the
+    # Study Plan, so an unmeasured judge produces numbers indistinguishable from measured ones.
+    # Groq is the standing proof — 18/20 with a VN over-scoring delta of 2.00.
+    settings = _settings(
+        role_judge_provider=provider,
+        zenmux_api_key="test",
+        zenmux_model="auto",
+        mimo_api_key="test",
+        mimo_base_url="https://example.invalid/v1",
+        mimo_model="mimo-model",
+    )
+
+    with pytest.raises(ValueError, match="no green `coach bench` artifact"):
+        settings.role_config("judge")
+
+
+def test_an_unvalidated_primary_cannot_become_the_judge_by_default():
+    # The env-var path is not the only one: with no ROLE_JUDGE_PROVIDER the judge inherits the
+    # primary, which is how a Groq-only deployment would have started scoring on an unbenched model.
+    settings = Settings(_env_file=None, primary_provider="groq", groq_api_key="test", groq_model="llama")
+
+    with pytest.raises(ValueError, match="PRIMARY_PROVIDER"):
+        settings.role_config("judge")
+
+
+def test_the_bench_validated_provider_is_accepted():
+    assert _settings().role_config("judge").name == "openai"
+
+
+def test_an_unvalidated_judge_requires_an_explicit_opt_in():
+    # Refusing outright would strand a Groq-only user; the ADR's objection is to a *silent* swap, so
+    # the escape hatch exists but has to be typed into the deployment.
+    settings = _settings(role_judge_provider="zenmux", zenmux_api_key="test", zenmux_model="auto")
+
+    with pytest.raises(ValueError):
+        settings.role_config("judge")
+
+    opted_in = _settings(
+        role_judge_provider="zenmux",
+        zenmux_api_key="test",
+        zenmux_model="auto",
+        allow_unvalidated_judge=True,
+    )
+
+    assert opted_in.role_config("judge").name == "zenmux"
+
+
+@pytest.mark.parametrize(
+    ("primary", "expected"),
+    [("openai", "groq"), ("groq", "mimo"), ("mimo", "groq"), ("zenmux", "groq")],
+)
+def test_adding_zenmux_does_not_change_any_existing_fallback(primary, expected):
+    # Zero-change rollout: zenmux sits last in the preference order, and one of the first three is
+    # always different from the primary, so no existing configuration resolves anywhere new.
+    assert Settings(_env_file=None, primary_provider=primary).fallback_provider == expected
+
+
+def test_zenmux_claims_no_capability_it_has_not_been_measured_on():
+    # ADR 0003: capability per proven need. ZenMux picks the upstream model per request, so neither
+    # function-calling nor strict grammars can be assumed until a specific model is pinned.
+    settings = _settings(zenmux_api_key="test", zenmux_model="auto")
+    client = ZenMuxClient(settings.provider_config("zenmux"))
+
+    assert client.supports_tool_calls is False
+    assert client.supports_json_schema is False
+
+
+def test_a_pinned_zenmux_model_can_opt_into_grammars():
+    settings = _settings(zenmux_api_key="test", zenmux_model="openai/gpt-5.4-mini", zenmux_supports_json_schema=True)
+
+    assert ZenMuxClient(settings.provider_config("zenmux")).supports_json_schema is True
