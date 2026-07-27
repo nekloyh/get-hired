@@ -14,6 +14,9 @@ from interview_coach.skill import SkillState, apply_evaluation
 from interview_coach.supervisor import (
     SessionStatus,
     SupervisorAction,
+    SupervisorDecision,
+    _apply_supervisor_decision,
+    _deterministic_supervisor_fallback,
     build_session_graph,
     decide_next_move,
     export_architecture_diagram,
@@ -725,3 +728,173 @@ def test_live_session_runs_through_graph_and_logs_supervisor_reasoning():
     assert 1 <= len(final["transcript"]) <= 2
     assert final["supervisor_decisions"], "the Supervisor should log at least one decision"
     assert all(d["llm_reasoning"].strip() for d in final["supervisor_decisions"])
+
+
+# --- R-21: the skip_ahead / switch_skill apply-paths ---------------------------------------------
+#
+# Two of the five Supervisor actions had zero apply-path coverage. They are the two that move the
+# plan pointer by something other than +1, so a wrong `next_index` or `next_skill` does not crash —
+# it silently interviews the Candidate on the wrong Skill, or ends the Session early, and the only
+# evidence is a transcript nobody re-reads.
+
+
+def _plan_state(skills: list[str], *, current_index: int = 0, question_count: int = 1):
+    state = initial_session_state("apply-path-session", _diagnostic(), max_questions=40, started_at=0)
+    state["topic_plan"] = [{"skill": s, "target_difficulty": 3, "rationale": "test"} for s in skills]
+    state["current_plan_index"] = current_index
+    state["next_skill"] = skills[current_index] if current_index < len(skills) else None
+    state["question_count"] = question_count
+    return state
+
+
+def _apply(state, action: str, **kwargs):
+    return _apply_supervisor_decision(
+        state,
+        SupervisorDecision(action=SupervisorAction(action), reasoning="test decision", **kwargs),
+        now=lambda: 0.0,
+    )
+
+
+def test_skip_ahead_to_an_explicit_index_moves_the_pointer_and_the_skill():
+    state = _plan_state(["ml_fundamentals", "deep_learning", "mlops", "system_design"])
+
+    result = _apply(state, "skip_ahead", target_plan_index=2)
+
+    assert result["current_plan_index"] == 2
+    assert result["next_skill"] == "mlops"
+    assert result["status"] == SessionStatus.ACTIVE.value
+    assert result["stop_reason"] is None
+
+
+def test_skip_ahead_without_a_target_jumps_two_entries():
+    # The documented default: skipping "over already-satisfied plan entries" means current + 2, not
+    # current + 1 (which would just be advance_plan).
+    state = _plan_state(["ml_fundamentals", "deep_learning", "mlops", "system_design"])
+
+    result = _apply(state, "skip_ahead")
+
+    assert result["current_plan_index"] == 2
+    assert result["next_skill"] == "mlops"
+
+
+def test_skip_ahead_off_the_end_of_the_plan_completes_the_session():
+    # Walking off the end must COMPLETE rather than leave next_skill None on an ACTIVE Session — the
+    # conditional edge routes on status, so an active state with no skill would re-enter the
+    # supervisor node with nothing to ask.
+    state = _plan_state(["ml_fundamentals", "deep_learning"])
+
+    result = _apply(state, "skip_ahead", target_plan_index=5)
+
+    assert result["next_skill"] is None
+    assert result["status"] == SessionStatus.COMPLETE.value
+    assert result["stop_reason"] == "topic_plan_complete"
+
+
+def test_skip_ahead_landing_exactly_on_the_last_entry_still_runs_it():
+    # Off-by-one guard: index == len(plan) - 1 is the final question, not the end of the Session.
+    state = _plan_state(["ml_fundamentals", "deep_learning", "mlops"])
+
+    result = _apply(state, "skip_ahead", target_plan_index=2)
+
+    assert result["next_skill"] == "mlops"
+    assert result["status"] == SessionStatus.ACTIVE.value
+
+
+def test_switch_skill_to_a_planned_skill_resolves_its_plan_index():
+    # The pointer has to follow the Skill, or the next advance_plan would resume from wherever the
+    # pointer was left and re-ask a Skill already covered.
+    state = _plan_state(["ml_fundamentals", "deep_learning", "mlops"], current_index=0)
+
+    result = _apply(state, "switch_skill", target_skill="mlops")
+
+    assert result["next_skill"] == "mlops"
+    assert result["current_plan_index"] == 2
+    assert result["status"] == SessionStatus.ACTIVE.value
+
+
+def test_switch_skill_to_an_unplanned_skill_keeps_the_current_index():
+    # A Skill that is not in the plan has no index to resolve; holding position is what lets the
+    # Session continue from where it was once the off-plan probe is done.
+    state = _plan_state(["ml_fundamentals", "deep_learning"], current_index=1)
+
+    result = _apply(state, "switch_skill", target_skill="vietnamese_nlp")
+
+    assert result["next_skill"] == "vietnamese_nlp"
+    assert result["current_plan_index"] == 1
+    assert result["status"] == SessionStatus.ACTIVE.value
+
+
+def test_switch_skill_without_a_target_holds_position():
+    state = _plan_state(["ml_fundamentals", "deep_learning"], current_index=1)
+
+    result = _apply(state, "switch_skill")
+
+    assert result["current_plan_index"] == 1
+    assert result["status"] == SessionStatus.ACTIVE.value
+
+
+@pytest.mark.parametrize(
+    ("action", "kwargs", "expected_to_index"),
+    [
+        ("skip_ahead", {"target_plan_index": 2}, 2),
+        ("switch_skill", {"target_skill": "mlops"}, 2),
+    ],
+)
+def test_the_decision_record_reports_the_real_pointer_move(action, kwargs, expected_to_index):
+    # The record is the audit trail for a deviation; from/to indices that do not match what actually
+    # happened make the export describe a Session that was never run.
+    state = _plan_state(["ml_fundamentals", "deep_learning", "mlops"], current_index=0, question_count=3)
+
+    record = _apply(state, action, **kwargs)["supervisor_decisions"][-1]
+
+    assert record["action"] == action
+    assert record["from_plan_index"] == 0
+    assert record["to_plan_index"] == expected_to_index
+    assert record["after_question"] == 3
+    assert record["deviation"] is True
+
+
+def test_decision_records_accumulate_rather_than_replace():
+    state = _plan_state(["ml_fundamentals", "deep_learning", "mlops"])
+    state["supervisor_decisions"] = [{"action": "advance_plan", "after_question": 1}]
+
+    result = _apply(state, "skip_ahead", target_plan_index=2)
+
+    assert len(result["supervisor_decisions"]) == 2
+    assert result["supervisor_decisions"][0]["action"] == "advance_plan"
+
+
+def test_advance_plan_off_the_end_of_the_plan_completes_the_session():
+    # advance_plan carries its own copy of the walk-off-the-end guard, separate from skip_ahead's.
+    # Uncovered, it would leave an ACTIVE Session with no Skill to ask.
+    state = _plan_state(["ml_fundamentals", "deep_learning"], current_index=1)
+
+    result = _apply(state, "advance_plan")
+
+    assert result["next_skill"] is None
+    assert result["status"] == SessionStatus.COMPLETE.value
+    assert result["stop_reason"] == "topic_plan_complete"
+    assert result["supervisor_decisions"][-1]["deviation"] is False
+
+
+def test_the_deterministic_fallback_asks_another_probe_below_the_evidence_bar():
+    # The fallback is what runs when the model's decision is unusable (schema-invalid or a transport
+    # failure). Its most consequential branch: a question that stopped on safety_cap BELOW the
+    # evidence bar must not be advanced past while a seed remains, or the Session banks a
+    # deliberately-unresolved score as if it were settled.
+    state = _plan_state(["mlops", "system_design"])
+    state["transcript"] = [_transcript_item("mlops", score=1.0, stop_reason="safety_cap")]
+    state["skill_metadata"] = {"mlops": {"evidence_bar": 3.0}}
+
+    decision = _deterministic_supervisor_fallback(state)
+
+    assert decision.action is SupervisorAction.EXTRA_QUESTION
+    assert "mlops" in decision.reasoning
+
+
+def test_the_deterministic_fallback_advances_when_the_evidence_is_good_enough():
+    state = _plan_state(["mlops", "system_design"])
+    state["transcript"] = [_transcript_item("mlops", score=4.5, stop_reason="safety_cap")]
+    state["skill_metadata"] = {"mlops": {"evidence_bar": 3.0}}
+
+    assert _deterministic_supervisor_fallback(state).action is SupervisorAction.ADVANCE_PLAN
