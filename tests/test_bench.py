@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -588,3 +589,69 @@ def test_report_marks_unstable_bias_rows_and_renders_tripwires():
 
     assert f"⚠ n<{BIAS_MIN_SAMPLES} — unstable estimate" in report  # english_delivery n=1
     assert "BIAS TRIPWIRE" in report  # correctness drift over n=9
+
+
+def _guide_describes_band(guide: str, band: str) -> bool:
+    """Whether a dimension's guide text describes the given band at all.
+
+    Matched loosely on purpose: the guide phrases bands both as `2 = ...` and as prose ("Drop to 2
+    only when..."), and normalising that wording would mean editing the judge prompt to satisfy a
+    test. What must not happen is a band existing for the labeler and being absent for the judge.
+    """
+    return re.search(rf"\b{re.escape(band)}\b", guide) is not None
+
+
+# Bands a dimension's judge guide does not describe, even though the labeler has an anchor for it.
+# Each entry is a real scale gap of the same class as GH #92/#96 — and closing one is a judge change
+# that needs its own bench measurement, which is why they are recorded here instead of being fixed
+# in passing. The test below fails on any gap NOT listed, so this never grows silently.
+KNOWN_SCALE_GAPS: dict[str, set[str]] = {
+    # `communication` is anchored at 2 for labelers ("rambling or disorganized") but its guide jumps
+    # 1 -> 3, so the judge is scoring a different scale than the labels were set on. Latent rather
+    # than active (measured 0.00 EN/VN delta, bias -0.09), and closing it is a judge change needing
+    # its own k=3 measurement — GH #103.
+    "communication": {"2"},
+}
+
+
+def test_every_anchored_band_exists_in_both_places():
+    """The judge guide and the labelling anchors must describe the same scale.
+
+    GH #92 and GH #96 are the same defect twice: a dimension whose BARS scale has a hole lets the
+    judge resolve that hole on *style*, and idiomatic Vietnamese reads as more authoritative than
+    clumsy English. Filling the hole in one file and not the other reopens it — `rubric.py` is what
+    the judge is told, `cases.yaml` is what the human labeler is told, and a scale they disagree
+    about is a scale nobody is actually using.
+    """
+    from interview_coach.rubric import DIMENSION_GUIDE
+
+    gaps = {
+        dimension: sorted(band for band in bands if not _guide_describes_band(DIMENSION_GUIDE[dimension], band))
+        for dimension, bands in load_bench_data().anchors.items()
+    }
+    unexpected = {
+        dimension: [band for band in bands if band not in KNOWN_SCALE_GAPS.get(dimension, set())]
+        for dimension, bands in gaps.items()
+    }
+
+    assert not any(unexpected.values()), (
+        f"anchored bands the judge guide never mentions: "
+        f"{ {d: b for d, b in unexpected.items() if b} } — the labeler and the judge are on "
+        "different scales. Close the gap, or record it in KNOWN_SCALE_GAPS with its tracking issue."
+    )
+
+
+def test_no_technical_dimension_has_a_hole_in_its_middle_band():
+    """Every scored dimension must have somewhere to put a middle answer.
+
+    This is the invariant behind ADR 0009 addendum (d): *a missing middle anchor is a
+    language-fairness bug*. `correctness` and `communication` were anchored at 3 in GH #92, `depth`
+    and `system_thinking` in GH #96. A dimension that loses its 3 is a latent EN/VN split, so this
+    one has no exemption list.
+    """
+    from interview_coach.rubric import DIMENSION_GUIDE, TECHNICAL_DIMENSIONS
+
+    anchored = load_bench_data().anchors
+    missing = [d for d in TECHNICAL_DIMENSIONS if d in anchored and not _guide_describes_band(DIMENSION_GUIDE[d], "3")]
+
+    assert not missing, f"technical dimensions with no middle band: {missing}"

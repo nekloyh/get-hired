@@ -51,9 +51,20 @@ DIMENSION_GUIDE: dict[str, str] = {
     ),
     "depth": (
         "Beyond surface recall? 1 = shallow/keyword-level; 2 = names concepts without mechanisms; "
+        "3 = states a mechanism but stops there — nothing about what it costs, when it fails, or "
+        "what it trades away; "
         "4 = states the mechanism AND one real trade-off or failure mode — award 4 for that pair "
         "even when brief; do NOT demand edge cases or exhaustive coverage for a 4; "
-        "5 = also covers edge cases or limits of the approach."
+        "5 = also covers edge cases or limits of the approach. "
+        "Deciding 1 vs 2 ONLY: a 2 must introduce at least one idea the question did not already "
+        "supply. An answer that echoes the question's own vocabulary back and asserts that it "
+        "matters has named nothing, so it is a 1 in any language. "
+        "Deciding 2 vs 3 ONLY: a mechanism says HOW the technique produces the effect asked about, "
+        "not merely what it does — 'it switches units off, so it is better' names an operation and "
+        "asserts a benefit with no step between them, so it is a 2 in any language. Neither test "
+        "applies above 3: an answer naming a mechanism and one trade-off is a 4 even if compressed. "
+        "A mechanism with no cost attached is a 3 however fluently or confidently it is phrased, in "
+        "any language; an awkwardly worded answer that does name the trade-off is a 4."
     ),
     "communication": (
         "Clear and well-structured? Judge ORGANIZATION, not fluency: 1 = rambling/confusing; "
@@ -68,10 +79,16 @@ DIMENSION_GUIDE: dict[str, str] = {
         "Reasons about the whole system & trade-offs? Award 4 whenever the answer connects a "
         "diagnosis to the trade-off it drives and a downstream consequence — credit this chain "
         "generously even when stated briefly or implicitly; do not demand textbook phrasing. "
-        "5 = also weighs alternatives and constraints. Drop to 2 only when a fix is named in pure "
+        "5 = also weighs alternatives and constraints. "
+        "3 = the fix is tied to ONE link of that chain — either why it is needed or what it "
+        "affects — but the interaction is asserted rather than traced; monitoring or alerting "
+        "added ALONGSIDE a fix is not reasoning about that fix's effect on the system and does not "
+        "by itself lift a 2 to a 3. "
+        "Drop to 2 only when a fix is named in pure "
         "isolation ('add data', 'use dropout') with no reasoning about why or what it costs; "
         "1 = no systems reasoning at all. Err toward recognizing partial systems reasoning rather "
-        "than withholding credit."
+        "than withholding credit — but an asserted chain is a 3 however fluently or confidently it "
+        "is phrased, in any language."
     ),
     "mlops_awareness": (
         "Aware of production realities (serving, monitoring, drift, retraining)? 1 = none, 5 = strong and concrete."
