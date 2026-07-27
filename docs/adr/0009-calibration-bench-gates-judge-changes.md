@@ -42,9 +42,13 @@ only as a warning. A merge gate with a runtime hole is not a gate.
 
 Decision: **the judge role is pinned to a model with a green bench artifact in `docs/audits/`.**
 Judge-role failover is retry-same-model, degrade, or suspend (ADR 0005's budget-exhaustion
-addendum) — **never a model swap**. Other roles may fail over freely. Implemented by the per-role
-router (ADR 0010, R-18/GH #73) and the typed-failover work (R-09/GH #64); until those land, every
-audit must state which model actually judged.
+addendum) — **never a model swap**. Other roles may fail over freely.
+
+**Both halves have landed.** The per-role router pins the judge to a single provider client with no
+failover wrapper (ADR 0010, R-18/GH #73, PR #95), and the router's blanket `except Exception` is
+gone (R-09/GH #64): failover is now typed to `is_provider_failure`, so a code bug or a
+misconfiguration propagates instead of quietly buying a second provider's answer. Audits should
+still state which model actually judged — that is cheap provenance, not a stopgap.
 
 ### (b) The measurement has a ceiling: labels and repeatability
 

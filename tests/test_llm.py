@@ -9,8 +9,12 @@ from interview_coach import llm as llm_module
 from interview_coach import telemetry
 from interview_coach.config import ProviderName, ProviderSettings, Settings
 from interview_coach.llm import (
+    BREAKER_COOLDOWN_SECONDS,
+    BREAKER_FAILURE_THRESHOLD,
+    EmptyCompletionError,
     GroqClient,
     LLMClient,
+    LLMConfigurationError,
     LLMRouter,
     MimoClient,
     StructuredOutputError,
@@ -35,12 +39,19 @@ def _provider(name: ProviderName) -> ProviderSettings:
 
 
 class _StaticClient(LLMClient):
-    def __init__(self, reply: str) -> None:
+    def __init__(self, reply: str, *, supports_json_schema: bool = True) -> None:
         self.reply = reply
         self.calls = 0
+        self.formats: list[object] = []  # every response_format it was handed, in order
+        self._supports_json_schema = supports_json_schema
+
+    @property
+    def supports_json_schema(self) -> bool:
+        return self._supports_json_schema
 
     def chat(self, messages, *, response_format=None, disable_thinking=False) -> str:
         self.calls += 1
+        self.formats.append(response_format)
         return self.reply
 
 
@@ -52,6 +63,20 @@ class _FailingClient(LLMClient):
     def chat(self, messages, *, response_format=None, disable_thinking=False) -> str:
         self.calls += 1
         raise self.exc
+
+
+class _SwitchableClient(LLMClient):
+    """A client whose failure can be turned off mid-test — for probing breaker recovery."""
+
+    def __init__(self, exc: Exception | None) -> None:
+        self.exc = exc
+        self.calls = 0
+
+    def chat(self, messages, *, response_format=None, disable_thinking=False) -> str:
+        self.calls += 1
+        if self.exc is not None:
+            raise self.exc
+        return "primary-answer"
 
 
 def test_parses_valid_json(make_client):
@@ -182,7 +207,9 @@ def test_router_uses_selected_primary():
 
 
 def test_router_falls_back_on_primary_error():
-    primary = _FailingClient(RuntimeError("boom"))
+    # A real transport failure — since R-09 the failover predicate is typed, and a bare RuntimeError
+    # (which this test used to pass) is now correctly treated as OUR bug, not the provider's.
+    primary = _FailingClient(openai_sdk.APIConnectionError(request=_http_request()))
     fallback = _StaticClient('{"x": 3, "label": "fallback"}')
     router = LLMRouter("mimo", {"mimo": primary, "groq": fallback})
 
@@ -191,6 +218,180 @@ def test_router_falls_back_on_primary_error():
     assert out == Foo(x=3, label="fallback")
     assert primary.calls == 1
     assert fallback.calls == 1
+
+
+# --- R-09: typed failover + per-provider circuit breaker ----------------------------------------
+
+
+def _auth_error() -> Exception:
+    """A revoked/dead API key: the provider answers 401 identically forever."""
+    return openai_sdk.AuthenticationError(
+        "invalid api key", response=httpx.Response(401, request=_http_request()), body=None
+    )
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        TypeError("chat() got an unexpected keyword argument"),
+        ValueError("bad argument"),
+        LLMConfigurationError("mimo is not configured"),
+        StructuredOutputError("model never produced valid output"),
+    ],
+    ids=["type-error", "value-error", "misconfiguration", "structured-output"],
+)
+def test_router_propagates_non_provider_errors_without_failover(exc):
+    # The R-09 core: these are OUR failures, not the provider's. Failing over would spend a second
+    # provider's tokens on the same broken call and return a plausible answer, hiding the defect.
+    primary = _FailingClient(exc)
+    fallback = _StaticClient('{"x": 3, "label": "fallback"}')
+    router = LLMRouter("mimo", {"mimo": primary, "groq": fallback})
+
+    with pytest.raises(type(exc)):
+        router.chat([{"role": "user", "content": "go"}])
+
+    assert primary.calls == 1
+    assert fallback.calls == 0  # never consulted
+
+
+def test_router_fails_over_on_empty_completion():
+    # A provider that answers with nothing IS failing, so it stays failover-worthy — but it is now
+    # a typed EmptyCompletionError rather than a bare ValueError the router cannot tell apart.
+    primary = _FailingClient(EmptyCompletionError("mimo returned empty content"))
+    fallback = _StaticClient("recovered")
+    router = LLMRouter("mimo", {"mimo": primary, "groq": fallback})
+
+    assert router.chat([{"role": "user", "content": "go"}]) == "recovered"
+    assert fallback.calls == 1
+
+
+def test_three_auth_failures_open_the_breaker_and_stop_hitting_the_primary():
+    # The cost bug this issue is about: a dead key used to pay a wasted primary round-trip on EVERY
+    # call, forever. After the threshold the router goes straight to the fallback.
+    primary = _FailingClient(_auth_error())
+    fallback = _StaticClient("fallback-answer")
+    router = LLMRouter("mimo", {"mimo": primary, "groq": fallback})
+
+    for _ in range(BREAKER_FAILURE_THRESHOLD):
+        assert router.chat([{"role": "user", "content": "go"}]) == "fallback-answer"
+    assert primary.calls == BREAKER_FAILURE_THRESHOLD
+    assert router.breaker_is_open("mimo")
+
+    for _ in range(5):
+        assert router.chat([{"role": "user", "content": "go"}]) == "fallback-answer"
+
+    assert primary.calls == BREAKER_FAILURE_THRESHOLD  # not re-hit even once
+    assert fallback.calls == BREAKER_FAILURE_THRESHOLD + 5
+
+
+def test_breaker_half_opens_after_cooldown_and_closes_on_a_successful_probe(monkeypatch):
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(llm_module, "_now", lambda: clock["t"])
+
+    primary = _SwitchableClient(_auth_error())
+    fallback = _StaticClient("fallback-answer")
+    router = LLMRouter("mimo", {"mimo": primary, "groq": fallback})
+
+    for _ in range(BREAKER_FAILURE_THRESHOLD):
+        router.chat([{"role": "user", "content": "go"}])
+    assert router.breaker_is_open("mimo")
+
+    # Still cooling: the primary stays bypassed.
+    clock["t"] += BREAKER_COOLDOWN_SECONDS - 1
+    router.chat([{"role": "user", "content": "go"}])
+    assert primary.calls == BREAKER_FAILURE_THRESHOLD
+    assert router.breaker_is_open("mimo")
+
+    # Cooldown elapsed -> half-open. The provider has recovered, so the probe closes the breaker.
+    clock["t"] += 2
+    assert not router.breaker_is_open("mimo")
+    primary.exc = None
+    assert router.chat([{"role": "user", "content": "go"}]) == "primary-answer"
+    assert primary.calls == BREAKER_FAILURE_THRESHOLD + 1
+    assert not router.breaker_is_open("mimo")
+
+    # Fully closed: traffic is back on the primary and the fallback is idle again.
+    assert router.chat([{"role": "user", "content": "go"}]) == "primary-answer"
+    assert fallback.calls == BREAKER_FAILURE_THRESHOLD + 1
+
+
+def test_failed_half_open_probe_re_opens_the_breaker_for_another_cooldown(monkeypatch):
+    # Otherwise a still-dead provider would be probed by every call once the first cooldown expired.
+    clock = {"t": 500.0}
+    monkeypatch.setattr(llm_module, "_now", lambda: clock["t"])
+
+    primary = _SwitchableClient(_auth_error())
+    router = LLMRouter("mimo", {"mimo": primary, "groq": _StaticClient("fallback-answer")})
+    for _ in range(BREAKER_FAILURE_THRESHOLD):
+        router.chat([{"role": "user", "content": "go"}])
+
+    clock["t"] += BREAKER_COOLDOWN_SECONDS + 1
+    router.chat([{"role": "user", "content": "go"}])  # probe, still dead
+    probed = primary.calls
+    assert probed == BREAKER_FAILURE_THRESHOLD + 1
+    assert router.breaker_is_open("mimo")
+
+    clock["t"] += BREAKER_COOLDOWN_SECONDS - 1  # inside the NEW cooldown
+    router.chat([{"role": "user", "content": "go"}])
+    assert primary.calls == probed  # one probe per cooldown, not one per call
+
+
+def test_a_success_resets_the_failure_count_before_the_breaker_trips():
+    # Intermittent blips must not accumulate into an open breaker across a healthy provider's life.
+    primary = _SwitchableClient(openai_sdk.APIConnectionError(request=_http_request()))
+    router = LLMRouter("mimo", {"mimo": primary, "groq": _StaticClient("fallback-answer")})
+
+    for _ in range(BREAKER_FAILURE_THRESHOLD - 1):
+        router.chat([{"role": "user", "content": "go"}])
+    primary.exc = None
+    router.chat([{"role": "user", "content": "go"}])  # success clears the streak
+    primary.exc = openai_sdk.APIConnectionError(request=_http_request())
+    for _ in range(BREAKER_FAILURE_THRESHOLD - 1):
+        router.chat([{"role": "user", "content": "go"}])
+
+    assert not router.breaker_is_open("mimo")
+
+
+def test_our_own_bugs_never_push_a_provider_toward_the_breaker():
+    primary = _FailingClient(TypeError("bad call site"))
+    router = LLMRouter("mimo", {"mimo": primary, "groq": _StaticClient("fallback-answer")})
+
+    for _ in range(BREAKER_FAILURE_THRESHOLD + 2):
+        with pytest.raises(TypeError):
+            router.chat([{"role": "user", "content": "go"}])
+
+    assert not router.breaker_is_open("mimo")
+
+
+def test_open_breaker_still_probes_the_primary_when_no_fallback_can_serve():
+    # With nothing else able to answer there is nothing to save by skipping, and skipping would
+    # guarantee the primary is never re-probed by real traffic. Availability wins over fail-fast.
+    primary = _SwitchableClient(_auth_error())
+    router = LLMRouter("mimo", {"mimo": primary})
+
+    for _ in range(BREAKER_FAILURE_THRESHOLD):
+        with pytest.raises(openai_sdk.AuthenticationError):
+            router.chat([{"role": "user", "content": "go"}])
+    assert router.breaker_is_open("mimo")
+
+    primary.exc = None
+    assert router.chat([{"role": "user", "content": "go"}]) == "primary-answer"
+
+
+def test_breaker_skip_downgrades_a_strict_grammar_the_fallback_cannot_enforce():
+    # The bypass path must keep the json_schema downgrade the failover path already had, or a
+    # circuit-broken primary turns every structured call into a 400 on the fallback.
+    primary = _FailingClient(_auth_error())
+    fallback = _StaticClient("{}", supports_json_schema=False)
+    router = LLMRouter("mimo", {"mimo": primary, "groq": fallback})
+    schema = {"type": "json_schema", "json_schema": {"name": "foo", "schema": {}}}
+
+    for _ in range(BREAKER_FAILURE_THRESHOLD):
+        router.chat([{"role": "user", "content": "go"}], response_format=schema)
+    router.chat([{"role": "user", "content": "go"}], response_format=schema)
+
+    assert router.breaker_is_open("mimo")
+    assert fallback.formats[-1] == {"type": "json_object"}
 
 
 class _ToolClient(LLMClient):
@@ -239,7 +440,7 @@ def test_router_tool_decline_propagates_without_failover():
 def test_router_tool_transport_error_fails_over():
     # A transport-level failure (timeout/5xx) is a real outage, so failover to a tool-capable
     # fallback is correct.
-    primary = _ToolClient(error=RuntimeError("boom"))
+    primary = _ToolClient(error=openai_sdk.APITimeoutError(request=_http_request()))
     fallback = _ToolClient(result="groq-result")
     router = LLMRouter("mimo", {"mimo": primary, "groq": fallback})
 
@@ -323,9 +524,7 @@ def test_5xx_is_retried_but_4xx_is_not(monkeypatch, fake_openai_factory):
     assert client.chat_json([{"role": "user", "content": "go"}], Foo).x == 2
     assert fake.call_count == 2
 
-    bad_request = openai_sdk.BadRequestError(
-        "bad", response=httpx.Response(400, request=_http_request()), body=None
-    )
+    bad_request = openai_sdk.BadRequestError("bad", response=httpx.Response(400, request=_http_request()), body=None)
     fake2 = fake_openai_factory([bad_request])
     client2 = MimoClient(_provider("mimo"), client=fake2)
     with pytest.raises(openai_sdk.BadRequestError):
@@ -425,9 +624,7 @@ def test_408_and_409_stay_retryable_after_sdk_retries_disabled(monkeypatch, fake
     # max_retries=0 moved retry ownership from the SDK to _create(); the SDK's default policy
     # retried 408/409, so ours must too or hardening would silently narrow recovery.
     monkeypatch.setattr(llm_module, "_sleep", lambda _wait: None)
-    timeout_408 = openai_sdk.APIStatusError(
-        "timeout", response=httpx.Response(408, request=_http_request()), body=None
-    )
+    timeout_408 = openai_sdk.APIStatusError("timeout", response=httpx.Response(408, request=_http_request()), body=None)
     fake = fake_openai_factory([timeout_408, '{"x": 4, "label": "recovered"}'])
     client = MimoClient(_provider("mimo"), client=fake)
     assert client.chat_json([{"role": "user", "content": "go"}], Foo).x == 4
