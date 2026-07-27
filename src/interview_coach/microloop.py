@@ -20,11 +20,12 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Protocol
 
+from . import telemetry
 from .concepts import ConceptStore
 from .evaluator import Evaluation, PanelBudget, evaluate
 from .interviewer import FollowUpUnavailable, generate_follow_up, render_seed_question
 from .language import DEFAULT_LANGUAGE_MODE, rubric_with_delivery
-from .llm import LLMClient
+from .llm import LLMClient, call_counts
 from .seeds import SeedQuestion
 from .skill import SkillState, apply_evaluation
 
@@ -153,6 +154,14 @@ class TurnTrace:
     concept_hit_title: str | None = None
     concept_hit_score: float | None = None
     stop_reason: StopReason | None = None
+    # Provider calls this turn actually cost (R-26). The worst case is far from obvious from the
+    # outside — one judge call, plus up to two structured-output retries, plus three panel voices on
+    # an escalation, each of which can itself retry — so "how many calls did that answer cost?" was
+    # unanswerable without counting. ``llm_calls_by_provider`` is the pair that matters for ADR
+    # 0009: a judge turn that recorded calls against a provider the role was never pinned to is a
+    # silent failover, and this is where it becomes visible after the fact.
+    llm_calls: int = 0
+    llm_calls_by_provider: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -221,9 +230,11 @@ def run_micro_loop(
     panel_budget = PanelBudget.per_question()
 
     while True:
+        calls_before = telemetry.snapshot()
         answer = candidate.answer(question)
         rubric = rubric_with_delivery(seed.rubric, language_mode, answer)
         evaluation = evaluate(client, question, answer, rubric, language_mode=language_mode, panel_budget=panel_budget)
+        llm_calls, llm_calls_by_provider = call_counts(calls_before, telemetry.snapshot())
         turn = Turn(
             question=question,
             answer=answer,
@@ -231,7 +242,11 @@ def run_micro_loop(
             is_follow_up=is_follow_up,
             grounding_concept_id=grounding_concept_id,
             grounding_concept_title=grounding_concept_title,
-            trace=TurnTrace(evaluator_self_critique_triggers=_escalation_triggers(evaluation)),
+            trace=TurnTrace(
+                evaluator_self_critique_triggers=_escalation_triggers(evaluation),
+                llm_calls=llm_calls,
+                llm_calls_by_provider=llm_calls_by_provider,
+            ),
         )
 
         if not evaluation.follow_up_recommended:

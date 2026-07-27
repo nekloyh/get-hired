@@ -5,6 +5,7 @@ import logging
 
 import pytest
 
+from interview_coach import telemetry
 from interview_coach.config import load_settings
 from interview_coach.llm import build_client
 from interview_coach.microloop import (
@@ -478,3 +479,48 @@ def test_live_follow_up_does_not_re_ask_the_question():
     for turn in result.turns:
         if turn.is_follow_up:
             assert turn.question.strip() != seed.question.strip()
+
+
+# --- R-26: per-turn LLM call accounting ---------------------------------------------------------
+
+
+def test_turn_records_the_llm_calls_it_cost(make_client):
+    telemetry.reset()
+    strong = "a strong answer about the bias variance tradeoff"
+    client, _ = make_client([_eval(5, follow_up=False)])
+
+    result = run_micro_loop(client, _seed([strong]), ScriptedCandidate([strong]))
+
+    assert result.turns[0].trace.llm_calls == 1
+    assert result.turns[0].trace.llm_calls_by_provider == (("mimo", 1),)
+
+
+def test_a_retried_judgment_costs_the_turn_more_than_one_call(make_client):
+    # The point of the counter: "<=8 judge calls per answer" is invisible from the outside, so a
+    # turn whose judgment needed a structured-output retry must show 2, not 1.
+    telemetry.reset()
+    strong = "a strong answer about the bias variance tradeoff"
+    client, _ = make_client(["not json at all", _eval(5, follow_up=False)])
+
+    result = run_micro_loop(client, _seed([strong]), ScriptedCandidate([strong]))
+
+    assert result.turns[0].trace.llm_calls == 2
+
+
+def test_each_turn_counts_only_its_own_calls(make_client):
+    # Per-TURN, not cumulative: turn 2 must not inherit turn 1's judge calls, or the number is
+    # useless for spotting which answer was expensive.
+    telemetry.reset()
+    client, _ = make_client(
+        [
+            _eval(2, follow_up=True),
+            _tool(),
+            _followup(question="What mechanism connects the L2 penalty to lower variance?"),
+            _eval(4, follow_up=False),
+        ]
+    )
+    seed = _seed(["a weak answer missing the mechanism", "a better answer naming the mechanism"])
+
+    result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers))
+
+    assert [t.trace.llm_calls for t in result.turns] == [1, 1]

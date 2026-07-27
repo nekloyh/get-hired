@@ -39,7 +39,7 @@ The old blanket list ("multi-judge consensus, modern RAG, cross-session memory, 
 - **Multi-judge consensus** — *reshaped, not deferred.* Debate-as-score-corrector was measured worthless on this judge (verdict moved 0.00 in 10 forced escalations); cheap multi-vote as an **uncertainty** signal is `ADR 0011` (Proposed, gated E4/E5). Do not build score-averaging consensus.
 - **Modern RAG (HyDE / hybrid / rerank)** — *deferral reaffirmed with data:* the toy store scores 47/50 vs embedders' 46–47/50 at current shelf size; the Skill filter does the work. Upgrade triggers are recorded in R-13 (GH #68); revisit when taxonomy-as-data (`ADR 0014`) changes the shelf.
 - **Cross-session transcript memory** — *split:* scoring memory stays decayed priors (`ADR 0006`, unchanged); **coaching memory** on presentation/planning surfaces is allowed by the 0006 addendum and consumed by slice 0035 (GH #83).
-- **Observability** — *split:* a minimal per-call LLM trace is **current work**, not future (silent judge failover is undiagnosable without it — R-26/GH #81); the *dashboard* remains Later (R-28/GH #83).
+- **Observability** — *split:* the minimal per-call LLM trace **landed** (R-26/GH #81) — every provider call logs `llm-call provider= model= ms= prompt= completion= outcome=`, and `TurnTrace.llm_calls_by_provider` puts the per-turn provider split in the export, which is what makes a silent judge failover visible after the fact. The *dashboard* remains Later (R-28/GH #83).
 
 ## Provider note
 

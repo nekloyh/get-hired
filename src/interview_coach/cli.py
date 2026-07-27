@@ -187,6 +187,9 @@ def _print_micro_loop(result: MicroLoopResult) -> None:
         if turn.trace.concept_lookup_query:
             hit = turn.trace.concept_hit_id or "none"
             print(f"  follow_up_lookup: {turn.trace.concept_lookup_query!r} -> {hit}")
+        if turn.trace.llm_calls:
+            split = ", ".join(f"{name} {n}" for name, n in turn.trace.llm_calls_by_provider)
+            print(f"  llm_calls: {turn.trace.llm_calls}" + (f" ({split})" if split else ""))
         if turn.trace.stop_reason:
             print(f"  turn_stop_reason: {turn.trace.stop_reason.value}")
     verdict_by_reason = {
@@ -298,6 +301,9 @@ def _print_session_summary(state: dict) -> None:
             trace = turn["trace"]
             if trace.get("concept_lookup_query"):
                 print(f"     lookup: {trace['concept_lookup_query']!r} -> {trace.get('concept_hit_id') or 'none'}")
+            if trace.get("llm_calls"):
+                split = ", ".join(f"{name} {n}" for name, n in trace.get("llm_calls_by_provider") or ())
+                print(f"     llm_calls: {trace['llm_calls']}" + (f" ({split})" if split else ""))
             if trace.get("stop_reason"):
                 print(f"     turn_stop_reason: {_display_stop_reason(trace['stop_reason'])}")
     if state.get("supervisor_decisions"):
