@@ -1,8 +1,13 @@
 """Provider-routed LLM access with validated structured output.
 
-Agents depend on :class:`LLMClient` only. Provider details live here: MiMo and Groq are
-OpenAI-compatible clients behind an :class:`LLMRouter` that selects ``PRIMARY_PROVIDER`` and falls
-back to the other configured provider on primary call failure.
+Agents depend on :class:`LLMClient` only. Provider details live here: the OpenAI-compatible clients
+sit behind an :class:`LLMRouter` that selects ``PRIMARY_PROVIDER`` and falls back to the other
+configured provider when the primary suffers an *outage*.
+
+Failover is typed (R-09): only :func:`is_provider_failure` errors cross to the fallback, and each
+provider carries a circuit breaker so a persistently dead one stops costing a wasted round-trip on
+every call. Roles that must never change model — the judge above all (ADR 0009 addendum a) — do not
+use this router at all; :func:`build_role_clients` pins them to a single provider.
 """
 
 from __future__ import annotations
@@ -35,6 +40,7 @@ _BACKOFF_SECONDS = (2.0, 5.0, 10.0)
 _MAX_RETRY_AFTER_SECONDS = 30.0  # cap on a provider-suggested Retry-After
 
 _sleep = time.sleep  # module-level so tests can stub the wait out
+_now = time.monotonic  # breaker cooldowns; monotonic so a wall-clock jump cannot un-open a breaker
 
 
 def _quota_exhausted(err: Exception) -> bool:
@@ -96,6 +102,66 @@ class ToolCallingUnsupported(RuntimeError):
     The Interviewer may use this for clients that truly have no tool API, but supported providers
     should surface native tool failures rather than silently degrading.
     """
+
+
+class EmptyCompletionError(ValueError):
+    """The provider answered, but with no usable content.
+
+    Subclasses ``ValueError`` so the pre-R-09 callers that catch ValueError are unaffected, and is
+    typed so the router can count it as a *provider* failure — worth failing over, worth counting
+    against the breaker — while a ValueError raised by our own code still propagates untouched.
+    """
+
+
+def is_provider_failure(err: BaseException) -> bool:
+    """Whether ``err`` is the provider failing, as opposed to us calling it wrong (R-09).
+
+    This is the entire failover predicate. ``openai.APIError`` is the SDK's umbrella over every
+    provider-reported failure — connection, timeout, 4xx and 5xx alike — so the APIError /
+    APIConnectionError / APITimeoutError trio all match it. Everything else is ours: a ``TypeError``
+    from a bad call site, an :class:`LLMConfigurationError` from a half-configured provider, a
+    :class:`StructuredOutputError` the model earned. Those used to be indistinguishable from an
+    outage, so a code bug would silently spend a second provider's tokens and return *something* —
+    hiding the defect behind a plausible answer. They now propagate.
+    """
+    return isinstance(err, (openai.APIError, EmptyCompletionError))
+
+
+# Per-provider circuit breaker (R-09). A provider that failed this many times in a row is not going
+# to serve the next call either — a revoked API key returns 401 identically forever — so the router
+# stops paying its round-trip and goes straight to the fallback. Without this, a dead key costs two
+# round-trips on EVERY call for as long as it stays dead.
+#
+# Retry ownership stays single, unchanged from the free-tier hardening work. The layers are:
+#
+#   1. SDK retries          disabled (`max_retries=0` in ``_openai()``)
+#   2. client ``_create()`` up to ``_TRANSPORT_ATTEMPTS`` with explicit backoff — the ONLY retries
+#   3. router failover      a different provider, never a repeat of the same call
+#   4. router breaker       stop calling a provider that keeps failing
+#
+# Nothing here retries; the breaker counts *post-retry* outcomes, so one tripped breaker step means
+# layer 2 already exhausted its budget. That is why the threshold reads differently per error class
+# and should: a 401 is not retryable, so three failures cost three primary calls (the DoD case),
+# while a 429/5xx costs three fully backed-off rounds before the breaker opens — which is correct,
+# because a provider still 429-ing after its own Retry-After deserves more patience than a dead key.
+BREAKER_FAILURE_THRESHOLD = 3
+# After this long the next call is allowed through as a half-open probe: one real request decides
+# whether the provider is back. A success closes the breaker; a failure re-opens it for another
+# cooldown, so a still-dead provider costs one probe per minute rather than one per call.
+BREAKER_COOLDOWN_SECONDS = 60.0
+
+
+@dataclass
+class _Breaker:
+    """One provider's consecutive-failure state.
+
+    Deliberately unlocked: the rest of this codebase's shared counters (telemetry, the usage ledger)
+    are unsynchronised too, and the worst a torn update can do here is miscount a single failure —
+    which delays or advances an open by one call and self-corrects on the next success.
+    """
+
+    failures: int = 0
+    opened_at: float | None = None
 
 
 class LLMClient(ABC):
@@ -350,7 +416,7 @@ class _OpenAICompatibleClient(LLMClient):
         message = self._create(messages, response_format=response_format, disable_thinking=disable_thinking)
         content = self._extract_content(message)
         if not content.strip():
-            raise ValueError(f"{self.provider_name} returned empty content")
+            raise EmptyCompletionError(f"{self.provider_name} returned empty content")
         return content
 
     @property
@@ -484,7 +550,15 @@ class OpenAIClient(_OpenAICompatibleClient):
 
 
 class LLMRouter(LLMClient):
-    """Select the primary provider and fail over to the configured fallback on primary errors."""
+    """Select the primary provider and fail over to the configured fallback on primary *outages*.
+
+    Failover is typed (R-09): only :func:`is_provider_failure` errors cross to the fallback. A bug
+    in our own call, a configuration error, or a model that could not produce valid output all
+    propagate — masking those behind a second provider's answer is how a defect ships looking fine.
+
+    Each provider additionally carries a circuit breaker, so a persistently dead provider stops
+    costing a wasted round-trip on every single call.
+    """
 
     def __init__(
         self,
@@ -498,6 +572,93 @@ class LLMRouter(LLMClient):
         self._clients = dict(clients)
         if self._primary_provider not in self._clients:
             raise LLMConfigurationError(f"primary provider {self._primary_provider!r} is not configured")
+        self._breakers: dict[ProviderName, _Breaker] = {}
+
+    # --- circuit breaker ------------------------------------------------------------------------
+
+    def breaker_is_open(self, provider: ProviderName) -> bool:
+        """Whether ``provider`` is currently tripped and still inside its cooldown.
+
+        Returns False once the cooldown has elapsed — that is the half-open state, and the caller
+        letting one real request through is what probes recovery. The probe's own outcome
+        (:meth:`_record_success` / :meth:`_record_failure`) then closes or re-opens the breaker, so
+        only one probe per cooldown window ever reaches a provider that is still down.
+        """
+        breaker = self._breakers.get(provider)
+        if breaker is None or breaker.opened_at is None:
+            return False
+        return (_now() - breaker.opened_at) < BREAKER_COOLDOWN_SECONDS
+
+    def _record_success(self, provider: ProviderName) -> None:
+        breaker = self._breakers.get(provider)
+        if breaker is None or (breaker.failures == 0 and breaker.opened_at is None):
+            return
+        if breaker.opened_at is not None:
+            telemetry.incr(f"router.breaker_close.{provider}")
+            logger.info("provider %s answered again; closing its circuit breaker", provider)
+        breaker.failures = 0
+        breaker.opened_at = None
+
+    def _record_failure(self, provider: ProviderName) -> None:
+        breaker = self._breakers.setdefault(provider, _Breaker())
+        breaker.failures += 1
+        if breaker.failures < BREAKER_FAILURE_THRESHOLD:
+            return
+        already_open = breaker.opened_at is not None
+        # Re-stamped on every failure at or past the threshold, so a failed half-open probe starts a
+        # fresh cooldown instead of letting every subsequent call through.
+        breaker.opened_at = _now()
+        if not already_open:
+            telemetry.incr(f"router.breaker_open.{provider}")
+            logger.warning(
+                "provider %s failed %d consecutive times; opening its circuit breaker for %.0fs "
+                "(calls route straight to the fallback until a probe succeeds)",
+                provider,
+                breaker.failures,
+                BREAKER_COOLDOWN_SECONDS,
+            )
+
+    def _call(self, provider: ProviderName, call: Callable[[LLMClient], Any]) -> Any:
+        """Invoke one provider, recording the outcome against its breaker.
+
+        Only provider failures count. A ``TypeError`` from our own call site must not push a healthy
+        provider toward being cut off.
+        """
+        try:
+            result = call(self._clients[provider])
+        except Exception as err:
+            if is_provider_failure(err):
+                self._record_failure(provider)
+            raise
+        self._record_success(provider)
+        return result
+
+    def _usable_fallback(self, *, needs_tools: bool = False) -> LLMClient | None:
+        fallback = self._clients.get(self._fallback_provider)
+        if fallback is None or (needs_tools and not fallback.supports_tool_calls):
+            return None
+        return fallback
+
+    def _skip_primary_for(self, fallback: LLMClient | None) -> bool:
+        """Whether to bypass a tripped primary — only ever when something else can actually serve.
+
+        With no usable fallback there is nothing to save: the call would fail either way, and
+        skipping would additionally guarantee the primary is never re-probed by real traffic. So an
+        open breaker degrades to "try anyway" rather than "fail fast" when it stands alone.
+        """
+        return fallback is not None and self.breaker_is_open(self._primary_provider)
+
+    @staticmethod
+    def _downgraded_format(response_format: ResponseFormat | None, fallback: LLMClient) -> ResponseFormat | None:
+        """Strip a strict grammar the fallback cannot enforce, so an outage does not become a 400."""
+        if (
+            response_format is not None
+            and response_format.get("type") == "json_schema"
+            and not fallback.supports_json_schema
+        ):
+            # Plain JSON mode instead; parse-and-repair carries the schema burden from here.
+            return {"type": "json_object"}
+        return response_format
 
     @property
     def primary_provider(self) -> ProviderName:
@@ -522,15 +683,38 @@ class LLMRouter(LLMClient):
         response_format: ResponseFormat | None = None,
         disable_thinking: bool = False,
     ) -> str:
-        primary = self._clients[self._primary_provider]
-        try:
-            return primary.chat(
+        fallback = self._usable_fallback()
+
+        def on_fallback(client: LLMClient) -> str:
+            return client.chat(
                 messages,
-                response_format=response_format,
+                response_format=self._downgraded_format(response_format, client),
                 disable_thinking=disable_thinking,
             )
+
+        if self._skip_primary_for(fallback):
+            telemetry.incr(f"router.breaker_skip.{self._primary_provider}")
+            logger.warning(
+                "primary LLM provider %s is circuit-broken; routing straight to %s",
+                self._primary_provider,
+                self._fallback_provider,
+            )
+            return self._call(self._fallback_provider, on_fallback)
+
+        try:
+            return self._call(
+                self._primary_provider,
+                lambda client: client.chat(
+                    messages,
+                    response_format=response_format,
+                    disable_thinking=disable_thinking,
+                ),
+            )
         except Exception as err:
-            fallback = self._clients.get(self._fallback_provider)
+            if not is_provider_failure(err):
+                # Our bug, our misconfiguration, or the model's own failure to comply — a second
+                # provider would answer the same broken question and bury the defect.
+                raise
             if fallback is None:
                 logger.warning(
                     "primary LLM provider %s failed and fallback provider %s is not configured: %s",
@@ -539,14 +723,6 @@ class LLMRouter(LLMClient):
                     err,
                 )
                 raise
-            if (
-                response_format is not None
-                and response_format.get("type") == "json_schema"
-                and not fallback.supports_json_schema
-            ):
-                # A strict grammar the fallback cannot enforce must not turn an outage into a 400:
-                # downgrade to plain JSON mode and let parse-and-repair carry the schema burden.
-                response_format = {"type": "json_object"}
             telemetry.incr(f"router.failover.{self._primary_provider}")
             logger.warning(
                 "primary LLM provider %s failed; falling back to %s: %s",
@@ -554,11 +730,7 @@ class LLMRouter(LLMClient):
                 self._fallback_provider,
                 err,
             )
-            return fallback.chat(
-                messages,
-                response_format=response_format,
-                disable_thinking=disable_thinking,
-            )
+            return self._call(self._fallback_provider, on_fallback)
 
     @property
     def supports_tool_calls(self) -> bool:
@@ -572,22 +744,35 @@ class LLMRouter(LLMClient):
         # ToolCallingUnsupported is a capability/decline signal, not a transient outage. Failing over
         # on it would silently hide exactly the tool-call integration problem this path exists to
         # surface, so it propagates. Only transport-level errors trigger failover.
-        primary = self._clients[self._primary_provider]
+        fallback = self._usable_fallback(needs_tools=True)
+
+        def run(client: LLMClient) -> Any:
+            return client.chat_with_tools(messages, **kwargs)
+
+        if self._skip_primary_for(fallback):
+            telemetry.incr(f"router.breaker_skip.{self._primary_provider}")
+            logger.warning(
+                "primary provider %s is circuit-broken; routing tool-call straight to %s",
+                self._primary_provider,
+                self._fallback_provider,
+            )
+            return self._call(self._fallback_provider, run)
+
         try:
-            return primary.chat_with_tools(messages, **kwargs)
+            return self._call(self._primary_provider, run)
         except ToolCallingUnsupported:
             raise
         except Exception as err:
-            fallback = self._clients.get(self._fallback_provider)
-            if fallback is None or not fallback.supports_tool_calls:
+            if not is_provider_failure(err) or fallback is None:
                 raise
+            telemetry.incr(f"router.failover.{self._primary_provider}")
             logger.warning(
                 "primary provider %s tool-call failed; falling back to %s: %s",
                 self._primary_provider,
                 self._fallback_provider,
                 err,
             )
-            return fallback.chat_with_tools(messages, **kwargs)
+            return self._call(self._fallback_provider, run)
 
 
 _CLIENT_CLASSES: dict[ProviderName, type[_OpenAICompatibleClient]] = {
