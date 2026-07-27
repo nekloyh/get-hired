@@ -1,17 +1,29 @@
 import { Building2, CircleGauge, Play, RotateCcw, SlidersHorizontal, UserRound } from 'lucide-react'
 import type { CSSProperties } from 'react'
+import { rotateSessionId } from '../lib/sessionId'
 import { SKILLS, type Health, type SetupForm, type Skill } from '../lib/types'
 
 type Props = {
   form: SetupForm
   health: Health | null
   errors: string[]
+  authToken: string
+  onAuthTokenChange: (token: string) => void
   onChange: (form: SetupForm) => void
   onStart: () => void
   onResume: () => void
 }
 
-export function SetupPanel({ form, health, errors, onChange, onStart, onResume }: Props) {
+export function SetupPanel({
+  form,
+  health,
+  errors,
+  authToken,
+  onAuthTokenChange,
+  onChange,
+  onStart,
+  onResume,
+}: Props) {
   const setClaim = (skill: Skill, value: number) => {
     onChange({ ...form, claimedSkills: { ...form.claimedSkills, [skill]: value } })
   }
@@ -44,9 +56,36 @@ export function SetupPanel({ form, health, errors, onChange, onStart, onResume }
           </select>
         </label>
         <label>
-          Session id
-          <input value={form.sessionId} onChange={(event) => onChange({ ...form, sessionId: event.target.value })} />
+          Session id <span className="hint">(private to this browser)</span>
+          {/* Read-only by design (R-06): a typeable id is how one visitor resumes and exports
+              another's interview. "New session" is the only way to change it. */}
+          <span className="field-row">
+            <input value={form.sessionId} readOnly aria-label="Session id" />
+            <button
+              type="button"
+              className="ghost-button"
+              onClick={() => onChange({ ...form, sessionId: rotateSessionId() })}
+              title="Abandon this Session id and start a fresh one"
+            >
+              New session
+            </button>
+          </span>
         </label>
+        {health?.auth_required ? (
+          <label>
+            Access token <span className="hint">(this server is gated)</span>
+            {/* Typed in, never built in: a `VITE_*` token is inlined into the JS bundle, so anyone
+                who can fetch the app owns the shared secret it is supposed to gate. */}
+            <input
+              type="password"
+              value={authToken}
+              placeholder="COACH_AUTH_TOKEN"
+              autoComplete="off"
+              aria-label="Access token"
+              onChange={(event) => onAuthTokenChange(event.target.value)}
+            />
+          </label>
+        ) : null}
         <label>
           Candidate id <span className="hint">(optional — remembers progress across sessions)</span>
           <input

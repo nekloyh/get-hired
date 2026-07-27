@@ -86,7 +86,13 @@ test.describe('web kill/restart/reconnect (issue 0016)', () => {
     // test:e2e:reconnect script) so the page's fixed API_BASE points at this test's own backend.
     await page.goto('/')
     await page.getByLabel('Mode').selectOption('live')
-    await page.getByLabel('Session id').fill(`pw-reconnect-${Date.now()}`)
+    // R-06: generated per browser, read-only. A fresh context gets its own id, and it must survive
+    // the drop/reconnect below — resume identifies the Session by id, so a rotating one would
+    // orphan the very interview this spec reconnects to.
+    const sessionId = page.getByLabel('Session id')
+    await expect(sessionId).toHaveAttribute('readonly', '')
+    const generatedId = await sessionId.inputValue()
+    expect(generatedId).not.toBe('local-web-session')
     await page.getByLabel('Max questions').fill('2')
     await page.getByRole('button', { name: 'Start' }).click()
 

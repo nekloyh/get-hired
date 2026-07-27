@@ -5,17 +5,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue
+import secrets
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from langgraph.checkpoint.sqlite import SqliteSaver
 from pydantic import BaseModel, Field, ValidationError
+from starlette.status import WS_1008_POLICY_VIOLATION
 
 from .concepts import build_concept_store
 from .config import Settings, load_settings
@@ -67,7 +70,110 @@ class CancelSessionPayload(BaseModel):
     type: Literal["cancel_session"]
 
 
-ClientPayload = StartSessionPayload | ResumeSessionPayload | CandidateAnswerPayload | CancelSessionPayload
+class AuthPayload(BaseModel):
+    """The first frame a client sends when the server is gated (R-07).
+
+    A frame rather than a query parameter on purpose: query strings land in access logs, proxy
+    logs, and browser history, so `?token=` leaks the shared secret to every intermediary.
+    """
+
+    type: Literal["auth"]
+    token: str = ""
+
+
+ClientPayload = StartSessionPayload | ResumeSessionPayload | CandidateAnswerPayload | CancelSessionPayload | AuthPayload
+
+# Browser origins allowed to open a Session socket when no allowlist is configured — the Vite dev
+# server, matching what CORS already permitted before R-07.
+DEFAULT_ALLOWED_ORIGINS: tuple[str, ...] = ("http://localhost:5173", "http://127.0.0.1:5173")
+
+# Hostnames that mean "this machine". An ungated server accepts a browser socket only from these, at
+# any port, so the local dev workflow keeps working while a page on the open internet does not.
+LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+# How long a gated socket may stay open without authenticating. Without a deadline an unauthenticated
+# connection holds a slot indefinitely — free denial of service against a single-worker deployment.
+AUTH_FRAME_TIMEOUT_SECONDS = 10.0
+
+
+def allowed_origins(settings: Settings) -> tuple[str, ...]:
+    """Browser origins permitted to reach this API — one list for CORS and the WS handshake."""
+    configured = [origin.strip() for origin in settings.allowed_origins.split(",") if origin.strip()]
+    return tuple(configured) if configured else DEFAULT_ALLOWED_ORIGINS
+
+
+def _is_loopback_origin(origin: str) -> bool:
+    try:
+        host = urlparse(origin).hostname
+    except ValueError:
+        return False
+    return host in LOOPBACK_HOSTS
+
+
+def origin_allowed(origin: str | None, settings: Settings) -> bool:
+    """Whether a WebSocket handshake carrying ``origin`` may proceed.
+
+    A *missing* Origin passes. That is not a hole: Origin is set by the browser and cannot be forged
+    or omitted by page JavaScript, so the cross-site hijack this guards against always carries one.
+    Absent Origin means a non-browser client (curl, the test client, a native app), which the shared
+    token — not this check — is what actually gates.
+
+    An Origin is checked **whether or not a token is configured**. The same-origin policy does not
+    apply to WebSockets, so any page the operator happens to visit can open a socket to
+    ``ws://127.0.0.1:8000`` and drive a Session — start live interviews on the operator's API key,
+    read the transcript back off the wire — without ever being on the local network. "Unset token =
+    open" is a statement about *network* reach, not a licence for every site in the browser; on an
+    ungated server the policy is therefore loopback-only, which keeps a dev server on any port
+    working and shuts the drive-by out.
+    """
+    if origin is None:
+        return True
+    if not settings.auth_token:
+        return _is_loopback_origin(origin)
+    return origin in allowed_origins(settings)
+
+
+def token_matches(candidate: str, settings: Settings) -> bool:
+    """Constant-time comparison against the shared secret (never ``==`` on a credential).
+
+    Compares UTF-8 *bytes*. ``compare_digest`` refuses ``str`` operands that are not ASCII-only —
+    it raises ``TypeError`` rather than returning False — and ``candidate`` is attacker-controlled,
+    so a client sending ``{"token": "café"}`` would otherwise crash the handler instead of being
+    rejected. ``surrogatepass`` keeps that true for the lone surrogates a JSON body can carry.
+    """
+    return secrets.compare_digest(
+        candidate.encode("utf-8", "surrogatepass"),
+        settings.auth_token.encode("utf-8", "surrogatepass"),
+    )
+
+
+async def receive_json_frame(websocket: WebSocket) -> Any:
+    """Read one client frame as JSON, normalising every malformed-frame failure to ``ValueError``.
+
+    ``receive_json`` assumes a **text** frame: a binary one produces a message dict with no ``text``
+    key and raises ``KeyError``, which is neither a disconnect nor a validation error, so it escapes
+    the endpoint entirely — a traceback and an internal-error close for any client that sends binary
+    JSON. On the pre-auth path that is an unauthenticated crash primitive; in the main loop it kills
+    a live Session. One malformed frame is a client mistake, not a server fault.
+    """
+    try:
+        return await websocket.receive_json()
+    except (KeyError, TypeError, ValueError) as err:
+        raise ValueError(f"expected a text frame containing JSON ({type(err).__name__}: {err})") from err
+
+
+async def authenticate_socket(websocket: WebSocket, settings: Settings) -> bool:
+    """Consume and check the client's opening auth frame. True when the socket may proceed."""
+    if not settings.auth_token:
+        return True
+    try:
+        raw = await asyncio.wait_for(receive_json_frame(websocket), timeout=AUTH_FRAME_TIMEOUT_SECONDS)
+    except (TimeoutError, WebSocketDisconnect, ValueError):
+        return False
+    if not isinstance(raw, dict) or raw.get("type") != "auth":
+        return False
+    return token_matches(str(raw.get("token", "")), settings)
+
 
 # ADR 0005: cancellation is a control signal, never data. A distinct sentinel object put on the
 # answers queue wakes a blocked read immediately and is unambiguous — a genuine empty-string answer
@@ -147,6 +253,43 @@ class WebApiState:
     runtimes: dict[str, RuntimeSession] = field(default_factory=dict)
 
 
+def _validate_auth_settings(settings: Settings) -> None:
+    """Refuse to start on a shared secret that cannot survive the wire.
+
+    HTTP header values are latin-1 on the wire, so a non-ASCII ``COACH_AUTH_TOKEN`` can never
+    round-trip through ``Authorization: Bearer`` — the operator would lock themselves out of their
+    own export endpoint with no error that names the cause. A Vietnamese passphrase is the obvious
+    thing to reach for here, which is exactly why this fails loudly at startup instead.
+    """
+    if settings.auth_token and not settings.auth_token.isascii():
+        raise ValueError(
+            "COACH_AUTH_TOKEN must be ASCII: HTTP headers are latin-1 on the wire, so a non-ASCII "
+            "token cannot round-trip through `Authorization: Bearer` and would reject the operator "
+            "along with everyone else. Generate one with `openssl rand -hex 32`."
+        )
+
+
+def configure_session_logging() -> None:
+    """Make the per-call ``llm-call`` trace visible in whichever process actually serves requests.
+
+    Uvicorn configures logging in the **worker**, and under ``--reload`` that worker is a freshly
+    spawned process where the CLI's own ``basicConfig`` never ran. Uvicorn attaches handlers to its
+    own loggers only, so ``interview_coach`` records reach a bare root logger and die at WARNING —
+    silently, and only in reload mode, which makes the trace look flaky rather than unconfigured.
+    R-26's trace is how a silent judge failover is caught after the fact (ADR 0009 addendum a), so
+    it has to survive every way this app gets started. Module import is the one hook that runs in
+    the serving process either way.
+    """
+    log = logging.getLogger("interview_coach")
+    log.setLevel(logging.INFO)
+    # Only self-configure when nothing else will emit these records; the CLI's basicConfig installs
+    # a root handler, and adding a second one here would print every line twice.
+    if not log.handlers and not logging.getLogger().handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+        log.addHandler(handler)
+
+
 def create_app(
     *,
     settings: Settings | None = None,
@@ -158,11 +301,29 @@ def create_app(
         checkpoint_db=str(checkpoint_db),
         ledger_db=str(ledger_db),
     )
+    _validate_auth_settings(api_state.settings)
     app = FastAPI(title="Adaptive Interview Coach API")
     app.state.web_api = api_state
+    origins = allowed_origins(api_state.settings)
+    if not api_state.settings.auth_token:
+        logger.warning(
+            "COACH_AUTH_TOKEN is unset: every endpoint is OPEN to anything that can reach this "
+            "port (browser sockets are restricted to localhost origins). Fine on localhost, unsafe "
+            "anywhere reachable — set it before exposing this."
+        )
+    elif not api_state.settings.allowed_origins.strip():
+        # Gated but no allowlist: the WS handshake falls back to the Vite dev origins, so the
+        # deployment's own UI gets rejected while `http://localhost:5173` is trusted. Silent in the
+        # logs this reads as "auth is broken"; it is a missing env var.
+        logger.warning(
+            "COACH_AUTH_TOKEN is set but COACH_ALLOWED_ORIGINS is empty: browser sockets are "
+            "restricted to the dev-server origins %s, which will reject your deployed UI. Set "
+            "COACH_ALLOWED_ORIGINS to the origin serving the app.",
+            ", ".join(DEFAULT_ALLOWED_ORIGINS),
+        )
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+        allow_origins=list(origins),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -177,11 +338,25 @@ def create_app(
             "fallback_provider": api_state.settings.fallback_provider,
             "fallback_configured": api_state.settings.fallback_config.configured,
             "demo_available": True,
+            # Lets the UI ask for the shared secret at runtime instead of being built with it baked
+            # in. Advertising *that* a gate exists discloses nothing an unauthorized 401 would not.
+            "auth_required": bool(api_state.settings.auth_token),
         }
 
     @app.websocket("/api/sessions/{session_id}")
     async def session_socket(websocket: WebSocket, session_id: str) -> None:
+        # Origin is checked BEFORE accept(): a rejected cross-site handshake must never become a
+        # live socket, and CORSMiddleware cannot do this — it does not see WebSocket handshakes at
+        # all, which is why the pre-R-07 CORS config guarded nothing here.
+        if not origin_allowed(websocket.headers.get("origin"), api_state.settings):
+            logger.warning("rejected WebSocket handshake from disallowed origin %r", websocket.headers.get("origin"))
+            await websocket.close(code=WS_1008_POLICY_VIOLATION)
+            return
         await websocket.accept()
+        if not await authenticate_socket(websocket, api_state.settings):
+            logger.warning("rejected WebSocket connection: missing or invalid auth frame")
+            await websocket.close(code=WS_1008_POLICY_VIOLATION)
+            return
         # Defined behavior for two tabs on one session_id: reject the second so two graphs can't run
         # concurrently against one checkpoint thread. One live socket per Session id.
         if session_id in api_state.runtimes:
@@ -197,9 +372,8 @@ def create_app(
         api_state.runtimes[session_id] = runtime
         try:
             while True:
-                raw = await websocket.receive_json()
                 try:
-                    payload = _parse_payload(raw)
+                    payload = _parse_payload(await receive_json_frame(websocket))
                 except ValueError as err:
                     emit({"type": "session_error", "error": str(err)})
                     continue
@@ -229,6 +403,11 @@ def create_app(
                         payload,
                         True,
                     )
+                elif isinstance(payload, AuthPayload):
+                    # Already authenticated (or the server is ungated) — a repeat auth frame is a
+                    # harmless no-op rather than an "unknown payload type" error, so a client that
+                    # always sends one works against gated and open servers alike.
+                    continue
                 elif isinstance(payload, CandidateAnswerPayload):
                     runtime.answers.put(payload.answer)
                 else:
@@ -248,7 +427,16 @@ def create_app(
                 api_state.runtimes.pop(session_id, None)
 
     @app.get("/api/sessions/{session_id}/export.md", response_class=PlainTextResponse)
-    def export_markdown(session_id: str) -> str:
+    def export_markdown(session_id: str, authorization: str = Header(default="")) -> str:
+        # The export is the whole transcript — the most disclosure-sensitive thing this API serves.
+        if api_state.settings.auth_token:
+            scheme, _, presented = authorization.partition(" ")
+            if scheme.lower() != "bearer" or not token_matches(presented.strip(), api_state.settings):
+                raise HTTPException(
+                    status_code=401,
+                    detail="Missing or invalid bearer token.",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
         state = api_state.completed_sessions.get(session_id)
         if state is None:
             raise HTTPException(status_code=404, detail="No completed Session found for this Session id.")
@@ -259,6 +447,7 @@ def create_app(
     return app
 
 
+configure_session_logging()
 app = create_app()
 
 
@@ -279,6 +468,8 @@ def _parse_payload(raw: dict[str, Any]) -> ClientPayload:
         model = CandidateAnswerPayload
     elif payload_type == "cancel_session":
         model = CancelSessionPayload
+    elif payload_type == "auth":
+        model = AuthPayload
     else:
         raise ValueError(f"unknown WebSocket payload type: {payload_type!r}")
     try:

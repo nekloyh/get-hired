@@ -78,6 +78,15 @@ class Settings(BaseSettings):
     temperature: float = Field(0.2, validation_alias="LLM_TEMPERATURE")
     timeout_seconds: float = Field(60.0, validation_alias="LLM_TIMEOUT_SECONDS")
 
+    # Web gate (R-07). A single shared secret for the ≤50-user deployment this project targets;
+    # real per-user auth is R-29. UNSET MEANS OPEN, which is the right default for `localhost` dev
+    # and the wrong one the moment this is exposed — hence the startup warning in ``create_app``.
+    auth_token: str = Field("", validation_alias="COACH_AUTH_TOKEN")
+    # Comma-separated browser origins allowed to open a Session socket. One source of truth for both
+    # CORS and the WebSocket Origin check: CORSMiddleware never sees a WS handshake, so a
+    # browser-origin policy that lives only in CORS does not actually guard the socket.
+    allowed_origins: str = Field("", validation_alias="COACH_ALLOWED_ORIGINS")
+
     # ADR 0010: per-role overrides. Empty/None = inherit the primary provider / provider model /
     # global temperature — the pre-0010 behavior, byte-identical.
     role_judge_provider: str = Field("", validation_alias="ROLE_JUDGE_PROVIDER")

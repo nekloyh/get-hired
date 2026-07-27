@@ -1,11 +1,33 @@
 import { CalendarDays, Download, ExternalLink, FileText, Trophy } from 'lucide-react'
-import { exportMarkdownUrl } from '../lib/api'
+import { useState } from 'react'
+import { fetchExportMarkdown } from '../lib/api'
 import { pct } from '../lib/skillMetrics'
 import type { SessionState } from '../lib/types'
 
 export function ReportView({ state }: { state: SessionState | null }) {
+  const [exportError, setExportError] = useState<string | null>(null)
   if (!state || state.status !== 'complete') return null
   const plan = state.study_plan
+
+  const downloadExport = async () => {
+    // React does not await an event handler's promise, so an unhandled rejection here would be a
+    // console line and a button that visibly does nothing — the worst failure mode for the one
+    // control that gets the Candidate their transcript.
+    setExportError(null)
+    try {
+      const markdown = await fetchExportMarkdown(state.session_id)
+      const url = URL.createObjectURL(new Blob([markdown], { type: 'text/markdown' }))
+      const link = document.createElement('a')
+      link.href = url
+      link.download = `interview-${state.session_id}.md`
+      link.click()
+      // Deferred: revoking synchronously after click() races the browser's read of the blob. The
+      // spec does not promise the download has resolved the URL by then.
+      setTimeout(() => URL.revokeObjectURL(url), 0)
+    } catch (error) {
+      setExportError(error instanceof Error ? error.message : 'Export failed.')
+    }
+  }
 
   return (
     <section className="report" aria-label="Final report">
@@ -20,11 +42,25 @@ export function ReportView({ state }: { state: SessionState | null }) {
           <p>{plan?.readiness_rationale ?? state.study_plan_error ?? 'Study Plan was not produced.'}</p>
         </div>
         <div className="report-actions">
-          <a className="icon-button" href={exportMarkdownUrl(state.session_id)} title="Download Markdown export">
+          {/* A button, not a link: `<a href>` cannot carry the Authorization header a gated
+              backend requires (R-07), so the plain link 401'd whenever a token was set. */}
+          <button
+            type="button"
+            className="icon-button"
+            onClick={downloadExport}
+            title="Download Markdown export"
+            aria-label="Download Markdown export"
+          >
             <Download size={18} aria-hidden />
-          </a>
+          </button>
         </div>
       </div>
+
+      {exportError ? (
+        <div className="error-box" role="alert">
+          <p>{exportError}</p>
+        </div>
+      ) : null}
 
       {plan ? (
         <>

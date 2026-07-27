@@ -5,7 +5,9 @@ import { SessionAlert } from './components/SessionAlert'
 import { SetupPanel } from './components/SetupPanel'
 import { SkillBars } from './components/SkillBars'
 import { TopicPlan } from './components/TopicPlan'
-import { fetchHealth, sessionWebSocketUrl } from './lib/api'
+import { authFrame, fetchHealth, sessionWebSocketUrl } from './lib/api'
+import { loadAuthToken, saveAuthToken } from './lib/authToken'
+import { loadSessionId } from './lib/sessionId'
 import {
   addCandidateAnswer,
   initialSession,
@@ -17,7 +19,9 @@ import { SKILLS, type Health, type SessionEvent, type SetupForm } from './lib/ty
 
 const defaultForm: SetupForm = {
   mode: 'auto',
-  sessionId: 'local-web-session',
+  // R-06: unguessable and per-browser, persisted so reconnect/resume still finds the Session. The
+  // old `'local-web-session'` constant let anyone resume or export a stranger's interview.
+  sessionId: loadSessionId(),
   candidateId: '',
   targetRole: 'machine learning engineer',
   targetCompanies: 'Viettel',
@@ -35,6 +39,8 @@ const defaultForm: SetupForm = {
 export function App() {
   const [health, setHealth] = useState<Health | null>(null)
   const [form, setForm] = useState(defaultForm)
+  // R-07: held for the life of the tab, never compiled into the bundle. See lib/authToken.ts.
+  const [authToken, setAuthToken] = useState(loadAuthToken)
   const [session, setSession] = useState(initialSession)
   const [draft, setDraft] = useState('')
   const [setupErrors, setSetupErrors] = useState<string[]>([])
@@ -84,7 +90,13 @@ export function App() {
     }
     const socket = new WebSocket(sessionWebSocketUrl(sessionId))
     socketRef.current = socket
-    socket.onopen = () => socket.send(JSON.stringify(firstMessage))
+    socket.onopen = () => {
+      // R-07: the token rides in the first frame, never the URL — a query string would land in
+      // access logs, proxy logs and browser history. Skipped entirely when the backend is open.
+      const auth = authFrame()
+      if (auth) socket.send(JSON.stringify(auth))
+      socket.send(JSON.stringify(firstMessage))
+    }
     socket.onmessage = (message) => {
       const event = JSON.parse(message.data) as SessionEvent
       setSession((current) => reduceSessionEvent(current, event))
@@ -231,9 +243,14 @@ export function App() {
             </div>
           </section>
           <SetupPanel
+            authToken={authToken}
             errors={errors}
             form={form}
             health={health}
+            onAuthTokenChange={(token) => {
+              setAuthToken(token)
+              saveAuthToken(token)
+            }}
             onChange={setForm}
             onResume={() => connect(true)}
             onStart={() => connect(false)}

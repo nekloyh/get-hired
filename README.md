@@ -4,6 +4,97 @@ A multi-agent system that runs an adaptive mock technical interview. Built prima
 agentic patterns** — see `CLAUDE.md` for the authoritative design and `CONTEXT.md` for the domain
 glossary.
 
+## Quickstart (live) — clone to a real interview in ~10 minutes
+
+You need [uv](https://docs.astral.sh/uv/), Node 18+, and **one OpenAI API key**. Nothing else: no
+Chroma, no second provider, no Docker.
+
+**1. Clone and install** (~4 min, mostly `npm install`)
+
+```bash
+git clone https://github.com/nekloyh/get-hired.git && cd get-hired
+uv sync                      # venv + Python deps (downloads Python 3.12 if needed)
+cd web && npm install && cd ..
+```
+
+**2. Configure one key**
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` and set just these two lines — everything else can stay commented out:
+
+```dotenv
+PRIMARY_PROVIDER=openai
+OPENAI_API_KEY=sk-...your key...
+```
+
+`OPENAI_MODEL` already defaults to `gpt-5.4-mini`, the judge this project validates against
+(see [Judge calibration gate](#judge-calibration-gate-issue-0022--adr-0009)). MiMo is retired and
+Groq does **not** pass the judge bench — leave both commented out.
+
+**3. Start the backend**
+
+```bash
+uv run coach api --port 8000
+```
+
+Check it: `curl -s localhost:8000/api/health` should report `"primary_configured": true`.
+
+**4. Start the UI** (in a second terminal)
+
+```bash
+cd web && npm run dev
+```
+
+**5. Run a one-question live interview**
+
+Open `http://127.0.0.1:5173`, set **Mode** to `live` and **Max questions** to `1`, then press
+**Start**. Answer in your own words and press **Send**.
+
+Expect a **follow-up**: "max questions" caps interview *questions*, not turns, so a single question
+can probe further before it resolves — that is the micro-loop doing its job, not a stuck UI. Answer
+the follow-up too. You then land on a Final Report with a readiness estimate, per-skill bars, and a
+Markdown export button.
+
+> Prefer the terminal? `uv run coach session --max-questions 1` does the same thing without the UI.
+> No API key at all? Set **Mode** to `demo` — the whole flow runs on a deterministic fake model.
+
+### If something goes wrong
+
+| Symptom | Cause |
+| --- | --- |
+| `"primary_configured": false` | `.env` is missing `OPENAI_API_KEY`, or `PRIMARY_PROVIDER` is not `openai`. |
+| UI loads but `live` mode errors instantly | The backend cannot reach the provider — check the `coach api` terminal for the `llm-call ... outcome=error:` line, which names the real failure. |
+| `insufficient_quota` | The day's OpenAI allowance is spent. `uv run coach usage` shows what this repo has recorded today. |
+| Browser cannot reach the API | The UI expects `http://127.0.0.1:8000`; override with `VITE_API_URL` if you moved it. |
+
+### Exposing it beyond localhost
+
+The API ships **open** — no auth — because that is the right default for `localhost`, and the wrong
+one anywhere else (`coach api` warns about this on startup). Before putting it on a network:
+
+```dotenv
+COACH_AUTH_TOKEN=<openssl rand -hex 32>           # ASCII only — the server refuses to start otherwise
+COACH_ALLOWED_ORIGINS=https://your-ui-host        # comma-separated; set it, or your UI is rejected
+```
+
+With a token set, the transcript export requires `Authorization: Bearer <token>` and the Session
+WebSocket must present the token in its first frame from an allowlisted `Origin`. The UI **prompts
+for the token at runtime** and keeps it in `sessionStorage`; there is deliberately no build-time
+`VITE_*` token, because Vite inlines those into `assets/index-*.js` — a secret shipped inside the
+app it is meant to gate is readable by anyone who can fetch the app. This is a single shared secret
+sized for a handful of trusted users; per-user accounts are tracked separately (R-29).
+
+Without a token the API is open to whatever can reach the port, but browser sockets are still
+restricted to `localhost`/`127.0.0.1` origins. That matters even for a purely local setup: the
+same-origin policy does not apply to WebSockets, so any page you visit could otherwise open a socket
+to your own backend and run interviews on your API key.
+
+Your Session id is generated per browser and stored in `localStorage`, so a reload can resume an
+interview in progress. It is read-only in the UI; use **New session** to start a fresh one.
+
 ## Status
 
 **Slice 0027 — Panel Verdict: cost-gated committee debrief.** When the Evaluator's own signals say
@@ -75,7 +166,7 @@ Requires [uv](https://docs.astral.sh/uv/).
 ```bash
 uv sync                 # create the venv + install deps (downloads Python 3.12 if needed)
 uv sync --extra rag     # optional: install Chroma + sentence-transformers for persistent RAG
-cp .env.example .env    # then fill in your MiMo/Groq credentials
+cp .env.example .env    # then set PRIMARY_PROVIDER=openai and OPENAI_API_KEY (see Quickstart)
 cd web && npm install   # install the React UI toolchain
 ```
 
@@ -114,7 +205,8 @@ cd web && npm run dev
 ```
 
 Then open `http://127.0.0.1:5173`. Choose `demo` mode to run without credentials; choose `live` once
-`.env` has the selected provider configured.
+`.env` has the selected provider configured. See [Quickstart](#quickstart-live--clone-to-a-real-interview-in-10-minutes)
+for the first-run walkthrough and for the auth settings needed before exposing this beyond localhost.
 
 ## Content packs (issue 0025 / ADR 0008)
 

@@ -789,6 +789,11 @@ def _cmd_ingest_resources(client: ClientArg, args: argparse.Namespace) -> int:
 def _cmd_api(client: ClientArg, args: argparse.Namespace) -> int:
     import uvicorn
 
+    # Logging for the server lives in `web_api.configure_session_logging`, not here: with `--reload`
+    # uvicorn serves from a spawned subprocess that never runs this function, so anything configured
+    # at this point is simply absent from the process that handles requests — which is where R-26's
+    # per-call `llm-call provider=... model=... outcome=...` trace has to be visible for a silent
+    # judge failover to be diagnosable at all. Uvicorn keeps its own log config (banner, access log).
     uvicorn.run(
         "interview_coach.web_api:app",
         host=args.host,
