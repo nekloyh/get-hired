@@ -1,3 +1,37 @@
+# RESOLVED 2026-07-27 (GH #92) — all six cases admitted into data/bench/cases.yaml.
+#
+# This file is now a provenance record, not a queue: it preserves the DRAFT labels so the amendments
+# below can be audited against what was originally proposed. It is still not loaded by the bench.
+#
+#   case                                 disposition
+#   ------------------------------------ ---------------------------------------------------------
+#   mlops_retraining_weak_en             ADMITTED as drafted
+#   mlops_rollout_strong_en              ADMITTED as drafted
+#   mlops_train_serve_skew_medium_en     ADMITTED as drafted
+#   en_dl_batchnorm_broken_english       AMENDED — dropped `language_mode: mixed` (see below)
+#   mixed_mlops_drift_mid_delivery       AMENDED — renamed `mixed_mlops_drift_technical`; dropped the
+#                                        english_delivery label/weight (VN-dominant answer, so
+#                                        production's rubric_with_delivery would never activate the
+#                                        dimension); mlops_awareness un-zeroed and labelled 4
+#   en_sd_idempotency_strong_delivery    AMENDED — dropped `language_mode: mixed` (see below)
+#
+# The two `language_mode` amendments were found at admission, not in the delegated review: both
+# drafts set `language_mode: mixed` on an English-language answer, which breaks the invariant that
+# non-mixed cases keep the byte-stable `en` judge prompt. It is the same defect class the review
+# caught on mixed_mlops_drift — labelling a prompt configuration production would not build for that
+# answer. english_delivery activates on the rubric WEIGHT, not the session mode, so both cases still
+# score the dimension (precedent: en_ml_leakage_broken_english).
+#
+# Resulting label counts: mlops_awareness 4 -> 8 (= BIAS_MIN_SAMPLES, estimate now grounded);
+# english_delivery 3 -> 5, still under 8 — its ⚠ instability flag stays until 2-3 more EN-dominant
+# delivery cases exist (broken / mid / strong). That remains the next forge target.
+#
+# Admission was held until the median-of-k gate landed (ADR 0009 addendum d) in the same PR: moving
+# cases in changes the gate's composition, so a red run under the old single-draw gate would have
+# been uninterpretable — new-case failure or the known dl_overfitting_weak_vi flake?
+#
+# --- ORIGINAL HEADER (2026-07-11), kept verbatim -------------------------------------------------
+#
 # PENDING HUMAN VALIDATION — not loaded by the bench until moved into cases.yaml.
 #
 # Why these exist: the bias table's two thinnest dimensions are statistically ungrounded —

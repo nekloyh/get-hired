@@ -29,12 +29,25 @@ TECHNICAL_DIMENSIONS: tuple[str, ...] = tuple(d for d in DIMENSIONS if d != "eng
 # exemplars the calibration bench (issue 0022) labels against — without them the judge inflated
 # correctness (+0.53) and under-credited system_thinking (−0.53), banking system-reasoning merit as
 # raw correctness. Keep these in sync with `data/bench/cases.yaml:anchors`.
+#
+# The `correctness` 3 anchor was added 2026-07-27 (GH #92). Its absence was a measured defect, not a
+# cosmetic gap: with anchors at 1/2/4/5 and nothing at 3, "names the right technique but justifies it
+# with a bare 'so it is better'" had no home, so the judge fell off whichever side the *phrasing*
+# suggested. On the `dl_overfitting_weak` pair — the same answer in two languages, human-labelled 3 —
+# it scored the English 2/2/2 and the Vietnamese 4/4/4 across three runs: a two-point language split
+# on identical content, and the reason the VN twin sat above its band top. `communication`, which
+# already had a 3 anchor, split by only one point on the same pair.
 DIMENSION_GUIDE: dict[str, str] = {
     "correctness": (
         "Are the claims technically accurate? 1 = mostly wrong/misleading; "
         "2 = a real technical error or a vague half-right statement; "
+        "3 = nothing wrong, but the claim is left as a bare assertion — the right technique or term "
+        "is named and the justification is an unsupported 'so it is better' / 'it helps', with no "
+        "mechanism given; "
         "4 = accurate with the key mechanism stated correctly, even if not exhaustive; "
-        "5 = precise AND complete. Being merely correct is a 4, not a 5 — reserve 5 for no gaps."
+        "5 = precise AND complete. Being merely correct is a 4, not a 5 — reserve 5 for no gaps. "
+        "A bare assertion cannot reach 4 however fluently or confidently it is phrased, in any "
+        "language; an awkwardly worded but mechanism-bearing claim is a 4."
     ),
     "depth": (
         "Beyond surface recall? 1 = shallow/keyword-level; 2 = names concepts without mechanisms; "
@@ -44,10 +57,12 @@ DIMENSION_GUIDE: dict[str, str] = {
     ),
     "communication": (
         "Clear and well-structured? Judge ORGANIZATION, not fluency: 1 = rambling/confusing; "
-        "3 = readable sentences but unscoped or meandering; 4 = ordered and well-scoped "
-        "(claim -> mechanism -> example), no filler; 5 = also concise with clear signposting. "
+        "3 = readable sentences but unscoped or meandering, OR a bare claim with nothing after it "
+        "to organize; 4 = ordered and well-scoped (claim -> mechanism -> example), no filler; "
+        "5 = also concise with clear signposting. "
         "Fluent phrasing alone is a 3, not a 4 — an eloquent but disorganized answer earns no "
-        "communication credit for its eloquence."
+        "communication credit for its eloquence, and an answer too short to HAVE a structure "
+        "cannot score 4 for sounding natural."
     ),
     "system_thinking": (
         "Reasons about the whole system & trade-offs? Award 4 whenever the answer connects a "
@@ -59,8 +74,7 @@ DIMENSION_GUIDE: dict[str, str] = {
         "than withholding credit."
     ),
     "mlops_awareness": (
-        "Aware of production realities (serving, monitoring, drift, retraining)? "
-        "1 = none, 5 = strong and concrete."
+        "Aware of production realities (serving, monitoring, drift, retraining)? 1 = none, 5 = strong and concrete."
     ),
     "english_delivery": (
         "How clearly is the answer DELIVERED in English — wording, sentence structure, "

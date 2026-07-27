@@ -79,4 +79,11 @@ or provider.
 ## Continued by (2026-07-19 remediation)
 
 - Repeatability + label provenance are now ADR 0009 addendum (b) — k=3 flake data in GH #92 and docs/audits/calibration-bench-2026-07-19.md.
+- **Resolved 2026-07-27 (GH #92), ADR 0009 addendum (d):** the gate is **median-of-k (k=3)** at the
+  production temperature, `coach bench --k` controls it, and a case whose runs straddle its band edge
+  is reported as a tripwire. The 2026-07-11 pending cases were admitted in the same PR (35 cases;
+  mlops_awareness reaches n=8). Evidence: docs/audits/calibration-bench-2026-07-27.md.
 - Label freeze + live-query replay: R-15 (GH #70). Backup-judge program: R-17 (GH #72).
+- Still open after #92: `english_delivery` sits at n=5, below `BIAS_MIN_SAMPLES=8`, so its bias
+  estimate keeps the ⚠ unstable flag. Closing it needs 2–3 more EN-dominant delivery cases
+  (broken / mid / strong) — the next forge target.
