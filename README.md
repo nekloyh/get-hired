@@ -51,8 +51,12 @@ cd web && npm run dev
 **5. Run a one-question live interview**
 
 Open `http://127.0.0.1:5173`, set **Mode** to `live` and **Max questions** to `1`, then press
-**Start**. Answer the question in your own words and press **Send**. You should land on a Final
-Report with a readiness estimate, per-skill bars, and a Markdown export button.
+**Start**. Answer in your own words and press **Send**.
+
+Expect a **follow-up**: "max questions" caps interview *questions*, not turns, so a single question
+can probe further before it resolves — that is the micro-loop doing its job, not a stuck UI. Answer
+the follow-up too. You then land on a Final Report with a readiness estimate, per-skill bars, and a
+Markdown export button.
 
 > Prefer the terminal? `uv run coach session --max-questions 1` does the same thing without the UI.
 > No API key at all? Set **Mode** to `demo` — the whole flow runs on a deterministic fake model.
