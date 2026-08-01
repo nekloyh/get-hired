@@ -375,7 +375,7 @@ def decide_next_move(
     try:
         return client.chat_json(messages, SupervisorDecision, validators=validators, max_retries=1)
     except StructuredOutputError as err:
-        fallback = _deterministic_supervisor_fallback(state)
+        fallback = _deterministic_supervisor_fallback(state, bank=bank)
         logger.warning(
             "Supervisor LLM decision failed validation after retry; using deterministic fallback %s: %s",
             fallback.action.value,
@@ -389,7 +389,7 @@ def decide_next_move(
         # question_node (records `failed`) and study_plan_node (records `study_plan_error`). Logged and
         # recorded distinctly from the schema-fallback path so the export shows the degrade honestly.
         fallback = _deterministic_supervisor_fallback(
-            state, reason_prefix="Deterministic fallback after a provider transport error"
+            state, reason_prefix="Deterministic fallback after a provider transport error", bank=bank
         )
         logger.warning(
             "Supervisor LLM decision failed with a provider/transport error (%s: %s); using deterministic fallback %s",
@@ -464,12 +464,15 @@ def _apply_supervisor_decision(
 
 
 def _deterministic_supervisor_fallback(
-    state: SessionState, *, reason_prefix: str = "Deterministic fallback"
+    state: SessionState, *, reason_prefix: str = "Deterministic fallback", bank: QuestionBank | None = None
 ) -> SupervisorDecision:
     # ``reason_prefix`` lets the transport-error backstop (issue 0020) record a distinct reasoning
     # string from the schema-invalid fallback while sharing the same deterministic decision logic.
+    # ``bank`` must be the Session's loaded pack: this decision is returned straight to the caller,
+    # so no validator ever re-checks it, and an extra_question the pack cannot serve raises
+    # SeedQuestionsExhausted downstream and burns the slot as a `failed` row (#110, ADR 0008).
     attempts = _attempts_by_skill(state)
-    if _extra_probe_required(state, attempts):
+    if _extra_probe_required(state, attempts, bank):
         last_skill = _last_probed_skill(state)
         return SupervisorDecision(
             action=SupervisorAction.EXTRA_QUESTION,
@@ -505,7 +508,7 @@ def _build_supervisor_messages(state: SessionState, bank: QuestionBank | None = 
         f"SKILL STATES:\n{_skill_state_summary(state)}\n\n"
         f"RESOLVED QUESTION EVIDENCE:\n{evidence}\n\n"
         f"SEED AVAILABILITY (a Skill with 0 left cannot be probed again):\n{seed_availability}\n\n"
-        f"NEXT ACTION SEMANTICS:\n{_next_action_semantics(state)}\n\n"
+        f"NEXT ACTION SEMANTICS:\n{_next_action_semantics(state, bank)}\n\n"
         "Choose the next Macro-loop move. Prefer advance_plan unless the evidence justifies a "
         "deviation. A consistently strong Candidate may end early; weak or uncertain evidence may "
         "justify extra_question or switch_skill — but only toward a Skill that still has seeds left.\n"
@@ -568,8 +571,14 @@ def _make_supervisor_validators(state: SessionState, bank: QuestionBank | None =
     return [validate]
 
 
-def _extra_probe_required(state: SessionState, attempts: Mapping[str, int], bank: QuestionBank | None = None) -> bool:
-    """Whether advancing would discard unresolved, below-bar evidence while another seed remains."""
+def _extra_probe_required(state: SessionState, attempts: Mapping[str, int], bank: QuestionBank | None) -> bool:
+    """Whether advancing would discard unresolved, below-bar evidence while another seed remains.
+
+    ``bank`` is required rather than defaulted: ``None`` still means the built-in reference bank, but
+    two of this function's three call sites used to omit it and silently measure a loaded pack's
+    Session against the reference inventory (#110). Every seed rail below is spelled the same way, so
+    mypy — not a future reader — catches the omission.
+    """
     items = transcript_items(state)
     if not items:
         return False
@@ -633,7 +642,7 @@ def _attempts_by_skill(state: SessionState) -> dict[str, int]:
     return counts
 
 
-def _has_unused_seed(skill: str | None, attempts: Mapping[str, int], bank: QuestionBank | None = None) -> bool:
+def _has_unused_seed(skill: str | None, attempts: Mapping[str, int], bank: QuestionBank | None) -> bool:
     """True when ``skill`` still has a seed question that has not been asked this Session."""
     if not skill:
         return False
@@ -695,7 +704,7 @@ def _evidence_summary(state: SessionState) -> str:
     return "\n".join(rows) or "- none"
 
 
-def _seed_availability_summary(state: SessionState, bank: QuestionBank | None = None) -> str:
+def _seed_availability_summary(state: SessionState, bank: QuestionBank | None) -> str:
     attempts = _attempts_by_skill(state)
     lines = []
     for skill in SKILLS:
@@ -705,7 +714,7 @@ def _seed_availability_summary(state: SessionState, bank: QuestionBank | None = 
     return "\n".join(lines)
 
 
-def _next_action_semantics(state: SessionState) -> str:
+def _next_action_semantics(state: SessionState, bank: QuestionBank | None) -> str:
     current = state.get("current_plan_index", 0)
     current_skill = state.get("next_skill")
     advance_target = _advance_plan_target_skill(state)
@@ -721,7 +730,7 @@ def _next_action_semantics(state: SessionState) -> str:
             "treat it as unresolved evidence, not normal resolution."
         ),
     ]
-    if _extra_probe_required(state, attempts):
+    if _extra_probe_required(state, attempts, bank):
         last_skill = _last_probed_skill(state)
         lines.append(
             f"- The last {last_skill} question stopped by safety_cap below its evidence bar and another seed remains; "
