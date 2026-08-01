@@ -19,7 +19,7 @@ from interview_coach.microloop import (
 )
 from interview_coach.rubric import Rubric
 from interview_coach.seeds import SEED_QUESTIONS
-from interview_coach.skill import SkillState
+from interview_coach.skill import SkillState, apply_evaluation
 
 # A single-dimension rubric keeps the scripted Evaluator replies tiny and focuses these tests on the
 # loop's control flow rather than the Evaluator's internals (covered in test_evaluator.py).
@@ -32,18 +32,21 @@ def _seed(answers, question="Explain the bias–variance tradeoff."):
     return SeedQuestion(skill="ml_fundamentals", question=question, rubric=_RUBRIC, answers=tuple(answers))
 
 
-def _eval(score: int, *, follow_up: bool, confidence: float = 0.8) -> str:
+def _eval(score: int, *, follow_up: bool, confidence: float = 0.8, weighted: float | None = None) -> str:
     # weighted_score == the single technical dimension score, so the slice-0003 cross-check never
     # trips here. english_delivery is scored because the en-mode loop activates it on every
     # substantial (>= 5 words) English answer (issue 0024); a 4 keeps the delivery-fixes validator
     # quiet. Scripted answers in these tests must therefore be >= 5 English words.
+    # ``weighted`` decouples the declared weighted_score from the dimension score for the R-24 tests,
+    # which need two turns whose scores differ by more than the integer grid allows; keep any
+    # divergence under WEIGHTED_SCORE_TOLERANCE or the cross-check will rewrite the confidence.
     return json.dumps(
         {
             "dimensions": {
                 "correctness": {"score": score, "evidence": "no evidence"},
                 "english_delivery": {"score": 4, "evidence": "no evidence"},
             },
-            "weighted_score": float(score),
+            "weighted_score": float(score) if weighted is None else weighted,
             "confidence": confidence,
             "follow_up_recommended": follow_up,
             "follow_up_rationale": "n/a",
@@ -181,6 +184,34 @@ def test_question_resolves_to_the_last_score(make_client):
     result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers))
     assert result.resolved_evaluation is result.turns[-1].evaluation
     assert result.resolved_evaluation.weighted_score == pytest.approx(4.0)
+
+
+def test_strong_seed_survives_a_weak_follow_up_in_the_posterior(make_client):
+    # R-24: display and belief are deliberately split. The transcript still resolves to the LAST
+    # turn (an exchange has to read as arriving somewhere), but the Beta posterior now reads the
+    # WHOLE exchange — a strong seed followed by one weak follow-up must land strictly between the
+    # two single-turn posteriors, not on top of the weak one. Before R-24 the strong seed answer
+    # contributed exactly zero pseudo-counts, so every follow-up the Evaluator asked for silently
+    # erased the answer that motivated it.
+    client, _ = make_client(
+        [
+            _eval(4, follow_up=True, weighted=4.5),
+            _tool(),
+            _followup(),
+            _eval(2, follow_up=False, weighted=2.0),
+        ]
+    )
+    seed = _seed(["a strong seed answer naming the mechanism", "a much weaker follow-up answer here"])
+    result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers))
+
+    assert len(result.turns) == 2
+    # Display semantics pinned: "fixing" this by resolving to the best turn is also wrong.
+    assert result.resolved_evaluation.weighted_score == pytest.approx(2.0)
+
+    neutral = SkillState.neutral(seed.skill)
+    strong_only = apply_evaluation(neutral, result.turns[0].evaluation)
+    weak_only = apply_evaluation(neutral, result.turns[1].evaluation)
+    assert weak_only.mastery < result.skill_state.mastery < strong_only.mastery
 
 
 def test_safety_cap_halts_pathological_loop_and_logs_a_guardrail_trip(make_client, caplog):

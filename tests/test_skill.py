@@ -7,7 +7,9 @@ from interview_coach.skill import (
     CONFIDENCE_WEIGHT_FLOOR,
     EVIDENCE_WEIGHT,
     SkillState,
+    aggregate_evidence_weight,
     apply_evaluation,
+    apply_evaluations,
     confidence_weight,
     evidence_weight_for,
     panel_agreement_weight,
@@ -193,6 +195,101 @@ def test_contested_verdict_moves_posterior_less_than_consensus_at_identical_scor
     consensus = apply_evaluation(before, _panel_evaluation(5.0, disagreement=0.0))
     contested = apply_evaluation(before, _panel_evaluation(5.0, disagreement=3.0))
     assert consensus.mastery > contested.mastery > before.mastery
+
+
+# --- R-24: the question, not the turn, is the unit of evidence -----------------------------------
+
+
+def test_single_turn_fold_is_bit_identical_to_the_pre_r24_update():
+    # The compatibility pin, and it must be EXACT, not approx: a one-turn question divides by 1.0,
+    # which is lossless in IEEE-754, so every existing checkpoint and golden reproduces byte for
+    # byte. This is the tripwire if anyone later swaps the divisor for a normalised-total or softmax
+    # scheme that only *looks* equal at n=1.
+    #
+    # The pre-R-24 formula is spelled out here rather than called through ``apply_evaluation``,
+    # which today delegates to ``apply_evaluations`` — comparing the two would be a tautology that
+    # holds no matter what the fold does.
+    neutral = SkillState.neutral("ml_fundamentals")
+    ev = _evaluation(4.0, confidence=0.7)
+    pre_r24 = neutral.observe(score_to_quality(4.0), weight=evidence_weight_for(ev))
+
+    folded = apply_evaluations(neutral, [ev])
+
+    assert (folded.alpha, folded.beta) == (pre_r24.alpha, pre_r24.beta)
+    assert folded == apply_evaluation(neutral, ev)  # and the one-item wrapper stays a wrapper
+
+
+def test_turn_count_never_multiplies_a_questions_evidence():
+    # The whole reason the fold divides by len(turns): the number of turns is the Evaluator's
+    # chattiness, not the Candidate's competence. Folding each turn at full weight would let a
+    # 4-turn question outvote a 1-turn one 4:1 (8.0 pseudo-counts vs 2.0) for a reason no candidate
+    # can influence — that naive fix is exactly what this test rejects.
+    neutral = SkillState.neutral("ml_fundamentals")
+    ev = _evaluation(4.0, confidence=1.0)
+
+    one = apply_evaluations(neutral, [ev])
+    four = apply_evaluations(neutral, [ev] * 4)
+
+    assert four.alpha + four.beta == pytest.approx(one.alpha + one.beta)
+    assert four.alpha + four.beta - (neutral.alpha + neutral.beta) == pytest.approx(EVIDENCE_WEIGHT)
+
+
+def test_a_low_confidence_question_folds_the_floor_regardless_of_turn_count():
+    # "~EVIDENCE_WEIGHT per question ± floor effects": a wholly unconfident 3-turn exchange still
+    # adds the floor's worth of evidence, not three times it and not zero.
+    neutral = SkillState.neutral("ml_fundamentals")
+    shaky = _evaluation(4.0, confidence=0.0)
+
+    folded = apply_evaluations(neutral, [shaky] * 3)
+
+    added = folded.alpha + folded.beta - (neutral.alpha + neutral.beta)
+    assert added == pytest.approx(EVIDENCE_WEIGHT * CONFIDENCE_WEIGHT_FLOOR)
+
+
+def test_aggregate_evidence_weight_equals_the_pseudo_counts_folded():
+    # The export's ``evidence_weight`` and the belief update must not be able to drift apart: this
+    # asserts the reported total IS the total that moved the Beta, for a mixed question (one plain
+    # low-confidence turn, one panel-escalated turn) where the two dispatches disagree.
+    neutral = SkillState.neutral("ml_fundamentals")
+    evaluations = [_evaluation(4.0, confidence=0.3), _panel_evaluation(4.0, disagreement=3.5)]
+
+    folded = apply_evaluations(neutral, evaluations)
+
+    added = folded.alpha + folded.beta - (neutral.alpha + neutral.beta)
+    assert aggregate_evidence_weight(evaluations) == pytest.approx(added)
+
+
+def test_panel_and_plain_turns_keep_their_own_dispatch_inside_a_question():
+    # A question can mix an unescalated seed turn with a panel-escalated follow-up. Each turn must
+    # still weigh by *its own* signal (0021 confidence vs 0027 committee agreement); collapsing the
+    # question onto a single dispatch would silently re-price the escalated turn.
+    neutral = SkillState.neutral("ml_fundamentals")
+    plain = _evaluation(5.0, confidence=0.9)
+    contested = _panel_evaluation(5.0, disagreement=4.0, confidence=0.9)
+
+    folded = apply_evaluations(neutral, [plain, contested])
+
+    expected = neutral.observe(1.0, weight=confidence_weight(0.9) / 2.0).observe(
+        1.0, weight=panel_agreement_weight(4.0) / 2.0
+    )
+    assert (folded.alpha, folded.beta) == (expected.alpha, expected.beta)
+    # And the escalated turn really was discounted: pricing it by confidence instead would have
+    # folded strictly more evidence.
+    by_confidence = apply_evaluations(neutral, [plain, _evaluation(5.0, confidence=0.9)])
+    assert folded.alpha + folded.beta < by_confidence.alpha + by_confidence.beta
+
+
+def test_a_question_with_no_turns_is_a_programming_error():
+    # A question that scored nothing must never reach the fold: the FAILED path keeps the prior and
+    # skips the update entirely (ADR 0005). Silently returning the state unchanged would hide a
+    # caller that lost its turns.
+    with pytest.raises(ValueError):
+        apply_evaluations(SkillState.neutral("ml_fundamentals"), [])
+
+
+def test_aggregate_evidence_weight_of_no_turns_is_zero_evidence():
+    # The export's counterpart to the above: a failed question reports zero weight, never a crash.
+    assert aggregate_evidence_weight([]) == 0.0
 
 
 # --- R-20: the single rehydration point ----------------------------------------------------------

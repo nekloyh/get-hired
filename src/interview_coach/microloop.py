@@ -4,8 +4,13 @@ The cycle that owns a single question end-to-end: the Interviewer asks → the C
 Evaluator scores the turn and flags ``follow_up_recommended`` → if a Follow-up is flagged *and* the
 safety cap is not hit, the Interviewer generates one targeting the gap and we repeat → otherwise stop
 and keep the last score. The Evaluator's flag is the stop logic; the cap is only a guardrail against a
-pathological loop, and tripping it is logged distinctly from a normal resolution. On exit the resolved
-score updates the Skill state (slice 0002).
+pathological loop, and tripping it is logged distinctly from a normal resolution.
+
+Display and belief split on exit (R-24, ADR 0002's evidence-aggregation addendum). The transcript
+resolves to the *last* turn's score, because an exchange has to read as a conversation that arrived
+somewhere. The Skill state folds *every* turn (slice 0002), because a strong seed answer followed by
+one weak follow-up is not the same evidence as a weak answer alone — keeping only the last turn made
+every Follow-up erase the answer that motivated it. The two numbers are allowed to disagree.
 
 Orchestration is deliberately plain Python — LangGraph is deferred to slice 0010 (ADR 0004). The only
 tool-using agent is still the Interviewer; the micro-loop just passes the active Skill into
@@ -27,7 +32,7 @@ from .interviewer import FollowUpUnavailable, generate_follow_up, render_seed_qu
 from .language import DEFAULT_LANGUAGE_MODE, rubric_with_delivery
 from .llm import LLMClient, call_counts
 from .seeds import SeedQuestion
-from .skill import SkillState, apply_evaluation
+from .skill import SkillState, apply_evaluations
 
 logger = logging.getLogger(__name__)
 
@@ -188,7 +193,13 @@ class MicroLoopResult:
 
     @property
     def resolved_evaluation(self) -> Evaluation:
-        """The kept score: the last turn's evaluation (slice 0005 keeps the last, not the best)."""
+        """The *displayed* score: the last turn's evaluation (slice 0005 keeps the last, not the best).
+
+        Display and belief are deliberately split (R-24), and they are allowed to disagree: the
+        transcript keeps the last turn so the exchange reads as a conversation that arrived
+        somewhere, while ``skill_state`` folds every turn — a strong seed pulled down by one weak
+        follow-up shows 2.0 here and a posterior above the weak-only one.
+        """
         return self.turns[-1].evaluation
 
 
@@ -206,8 +217,9 @@ def run_micro_loop(
     """Resolve one question end-to-end, returning the exchange and the updated Skill state.
 
     ``state`` is the Skill's belief coming in (a Session threads it across questions in the macro-loop,
-    slice 0010); it defaults to the neutral prior. The Evaluator scores *every* turn and the last score
-    is what the question resolves to — even when the safety cap fires. ``language_mode`` (issue 0024)
+    slice 0010); it defaults to the neutral prior. The Evaluator scores *every* turn: the last score is
+    what the question *resolves to* for display — even when the safety cap fires — while all of them
+    fold into the returned belief at a per-turn share (R-24). ``language_mode`` (issue 0024)
     renders the seed question in the Session's language, makes follow-ups speak it, and activates
     ``english_delivery`` per answer — deterministically, so a vn Session can never score delivery.
     """
@@ -313,10 +325,10 @@ def run_micro_loop(
         grounding_concept_id = follow_up.concept_id
         grounding_concept_title = follow_up.concept_title
 
-    resolved = turns[-1].evaluation
     return MicroLoopResult(
         skill=seed.skill,
         turns=tuple(turns),
         stop_reason=stop_reason,
-        skill_state=apply_evaluation(state, resolved),
+        # The belief reads the WHOLE exchange, not just the turn the transcript resolves to (R-24).
+        skill_state=apply_evaluations(state, [turn.evaluation for turn in turns]),
     )

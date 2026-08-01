@@ -42,6 +42,10 @@ None — can start immediately.
   `evidence_weight = confidence_weight(resolved.confidence)` (same function `apply_evaluation` uses, so
   it can't drift), and `_dump_failed_question` stores `0.0`. The exporter renders it on each question's
   resolved-score line.
+  *Superseded by R-24 (GH #79):* the belief now folds every turn, so the recorded weight is the
+  **total across turns** (`aggregate_evidence_weight`), not the resolved turn's. Identical for a
+  single-turn question, which is why no checkpoint or golden moved. See ADR 0002's
+  evidence-aggregation addendum.
 - Degraded/failed questions are unchanged: the supervisor still skips `apply_evaluation` and keeps the
   prior, and the recorded weight is `0.0`.
 

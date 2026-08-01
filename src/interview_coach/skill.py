@@ -13,7 +13,7 @@ Diagnostic, slice 0009).
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -160,24 +160,68 @@ class SkillState:
 def evidence_weight_for(evaluation: Evaluation) -> float:
     """THE evidence weight for one judgment — the single source of truth (issues 0021/0027).
 
-    Panel-escalated questions weigh by committee agreement; everything else by the Evaluator's
-    confidence. Both the belief update (:func:`apply_evaluation`) and the transcript's recorded
-    ``evidence_weight`` (supervisor's dump) must call this same function, or the export lies about
-    the weight that was actually applied.
+    Panel-escalated judgments weigh by committee agreement; everything else by the Evaluator's
+    confidence. This is the *per-turn* weight, and every consumer routes through it: the belief
+    update (:func:`apply_evaluations`) and the transcript's recorded ``evidence_weight``
+    (:func:`aggregate_evidence_weight`, in the Supervisor's dump) must call this same function, or
+    the export lies about the weight that was actually applied.
     """
     if evaluation.panel is not None:
         return panel_agreement_weight(evaluation.panel.disagreement)
     return confidence_weight(evaluation.confidence)
 
 
+def apply_evaluations(state: SkillState, evaluations: Sequence[Evaluation]) -> SkillState:
+    """Fold one *question* — every turn the Micro-loop scored — into a Skill's belief (R-24).
+
+    Every turn is evidence: the loop keeps only the last turn's score for display, and folding only
+    that one meant a strong seed answer followed by one weak follow-up contributed literally zero
+    pseudo-counts — every Follow-up the Evaluator asked for silently erased the answer that
+    motivated it (ADR 0002, evidence-aggregation addendum).
+
+    But the *number* of turns is the Evaluator's chattiness, not the Candidate's competence: folding
+    each turn at its full weight would let a 4-turn question outvote a 1-turn one 4:1 for a reason no
+    candidate can influence, and the Beta's α+β is precisely what the Supervisor reads as "how sure
+    are we". Dividing each turn's own weight by the turn count keeps a question's total at the *mean*
+    per-turn weight, so the question is the unit of evidence and the turn is only how it is
+    apportioned. Each turn keeps its own dispatch through :func:`evidence_weight_for`, so a
+    panel-escalated follow-up inside an unescalated question is still priced by committee agreement.
+
+    n == 1 divides by 1.0, which is exact in IEEE-754: a single-turn question updates bit for bit as
+    it did before R-24, which is why no persisted checkpoint or golden moves.
+    """
+    if not evaluations:
+        raise ValueError("a question folds at least one turn of evidence")
+    share = float(len(evaluations))
+    for evaluation in evaluations:
+        state = state.observe(
+            score_to_quality(evaluation.weighted_score),
+            weight=evidence_weight_for(evaluation) / share,
+        )
+    return state
+
+
+def aggregate_evidence_weight(evaluations: Sequence[Evaluation]) -> float:
+    """Total pseudo-counts one question folds — the number :func:`apply_evaluations` actually adds.
+
+    Kept next to the updater so the export cannot drift from the belief: it is the same mean, and a
+    question with no scored turns (a crash — ADR 0005 keeps the prior and skips the fold) reports
+    zero evidence rather than raising, because the export still has to render that row.
+    """
+    if not evaluations:
+        return 0.0
+    return sum(evidence_weight_for(evaluation) for evaluation in evaluations) / len(evaluations)
+
+
 def apply_evaluation(state: SkillState, evaluation: Evaluation) -> SkillState:
-    """Update a Skill's belief from an Evaluator judgment (consumes slice 0001's output).
+    """Update a Skill's belief from a single Evaluator judgment (consumes slice 0001's output).
 
     Evidence weight scales with the Evaluator's confidence (issue 0021), or with committee
     agreement on a panel-escalated question (issue 0027): shaky or contested judgments move the
     posterior less than confident, consensual ones at the same score.
+
+    A one-turn question, and there is exactly one implementation: the general case — a Micro-loop
+    exchange of several turns — is :func:`apply_evaluations`. Kept for the genuinely single-shot
+    judgments (``coach eval``, the Diagnostic's priors) rather than making every caller wrap a list.
     """
-    return state.observe(
-        score_to_quality(evaluation.weighted_score),
-        weight=evidence_weight_for(evaluation),
-    )
+    return apply_evaluations(state, (evaluation,))

@@ -39,8 +39,10 @@ prompted: a validator (`interviewer._make_validators`, the extension point for 0
 rejects a Follow-up whose normalized question restates the original, and the `chat_json` retry
 regenerates. The Evaluator's flag is the stop logic; `max_turns` (default 4 = 1 question + 3 follow-ups) is a
 guardrail whose trip is a distinct `StopReason.SAFETY_CAP` logged at WARNING, separate from the INFO
-`RESOLVED` path. The last turn's score is kept either way and folded into the Skill state via slice
-0002's `apply_evaluation`. The fixture **Candidate** is `ScriptedCandidate` over the three seed
+`RESOLVED` path. The last turn's score is kept either way **for display** (`resolved_evaluation`);
+since R-24 (GH #79) the Skill state folds **every** turn via slice 0002's `apply_evaluations`, each
+at a `1/len(turns)` share so turn count is not a weight multiplier — see ADR 0002's
+evidence-aggregation addendum. The fixture **Candidate** is `ScriptedCandidate` over the three seed
 questions in `seeds.py`. `coach interview` runs it; covered by `tests/test_microloop.py` +
 `tests/test_interviewer.py` (offline, with live sanity checks marked `live`).
 

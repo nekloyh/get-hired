@@ -28,7 +28,7 @@ from dataclasses import asdict, dataclass, field, fields
 from typing import Any
 
 from .microloop import MicroLoopResult, StopReason
-from .skill import SkillState, evidence_weight_for
+from .skill import SkillState, aggregate_evidence_weight
 
 _READ_VIEW_ERROR = (
     "to_dict() is a write-path API: this view was built from an existing dict, and re-serializing it "
@@ -135,9 +135,12 @@ class TranscriptItem:
             "stop_reason": result.stop_reason.value,
             "resolved_weighted_score": result.resolved_evaluation.weighted_score,
             "resolved_confidence": result.resolved_evaluation.confidence,
-            # The evidence weight actually folded into the belief (issues 0021/0027), so the scaling
-            # is auditable in the export. Same function apply_evaluation uses — one source of truth.
-            "evidence_weight": evidence_weight_for(result.resolved_evaluation),
+            # The *total* evidence weight folded into the belief across every turn (issues
+            # 0021/0027, R-24), so the scaling is auditable in the export. Since R-24 the belief
+            # reads the whole exchange, so the last turn's weight is no longer the weight applied —
+            # it differs whenever turns disagree in confidence or one of them escalated to a panel.
+            # Same function apply_evaluations sums — one source of truth.
+            "evidence_weight": aggregate_evidence_weight([turn.evaluation for turn in result.turns]),
             "skill_state": result.skill_state.to_dict(),
             "turns": [_dump_turn(turn) for turn in result.turns],
         }
