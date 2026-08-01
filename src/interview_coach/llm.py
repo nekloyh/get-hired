@@ -113,6 +113,17 @@ class EmptyCompletionError(ValueError):
     """
 
 
+# What ``provider_label`` reports for a client that carries no provider identity at all: the demo
+# client, and every test fake. It is also the exemption predicate for the free-tier budget rails
+# (R-25) — nothing without a provider spends a provider's allowance, so no rail may fire on one.
+UNKNOWN_PROVIDER = "unknown"
+
+
+def provider_label(client: LLMClient) -> str:
+    """Provider name for budget checks / report headers — router or pinned role client alike."""
+    return str(getattr(client, "primary_provider", None) or getattr(client, "provider_name", UNKNOWN_PROVIDER))
+
+
 def is_provider_failure(err: BaseException) -> bool:
     """Whether ``err`` is the provider failing, as opposed to us calling it wrong (R-09).
 

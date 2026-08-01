@@ -263,7 +263,12 @@ def test_call_counts_ignores_unrelated_telemetry_movement():
     assert per_provider == (("groq", 2),)  # mimo did not move, so it is not in this turn's split
 
 
-def test_per_call_line_carries_provider_model_latency_tokens_and_outcome(make_client, caplog):
+def test_per_call_line_carries_provider_model_latency_tokens_and_outcome(make_client, caplog, tmp_path, monkeypatch):
+    # The scripted `usage` block makes this the one trace test that also writes a ledger row; without
+    # a tmp ledger it lands in the repo's real logs/usage-ledger.jsonl. That was cosmetic when the
+    # ledger only fed a printed warning — R-25 turned it into a rail that REFUSES Sessions, so test
+    # spend must never count against a real day's budget.
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(tmp_path / "usage-ledger.jsonl"))
     client, _ = make_client(
         [{"content": '{"x": 1, "label": "a"}', "usage": {"prompt_tokens": 11, "completion_tokens": 7}}]
     )

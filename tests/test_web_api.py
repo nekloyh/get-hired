@@ -14,8 +14,10 @@ from fastapi.testclient import TestClient
 from starlette.status import WS_1008_POLICY_VIOLATION
 from starlette.websockets import WebSocketDisconnect
 
-from interview_coach import web_api
+from interview_coach import usage, web_api
 from interview_coach.config import Settings
+from interview_coach.demo_llm import DemoLLMClient
+from interview_coach.llm import RoleClients
 from interview_coach.web_api import (
     ResumeSessionPayload,
     configure_session_logging,
@@ -1303,3 +1305,197 @@ def test_the_suite_never_writes_into_the_operators_own_log_file(tmp_path):
 
     assert proc.returncode == 0, proc.stdout[-4000:]
     assert not log_file.exists(), f"collection wrote to COACH_LOG_FILE:\n{log_file.read_text(encoding='utf-8')[:2000]}"
+# --- R-25: the free-tier budget rail on the web surface ------------------------------------------
+
+
+class _ProviderDemoClient(DemoLLMClient):
+    """A demo brain carrying a provider identity, so the budget rails apply to it.
+
+    Plain DemoLLMClient is exempt by design (``provider_label`` -> "unknown"), which is what keeps
+    every demo-mode test above untouched.
+    """
+
+    provider_name = "mimo"
+
+
+class _MeteredDemoClient(_ProviderDemoClient):
+    """Bills 100 tokens per provider call to the ledger, so spend grows as the Session runs."""
+
+    def chat_json(self, *args, **kwargs):
+        usage.record_usage("mimo", "test-model", prompt_tokens=100, completion_tokens=0)
+        return super().chat_json(*args, **kwargs)
+
+
+def _live_client(tmp_path, monkeypatch, *, token: str = "", brain=None):
+    """A TestClient whose `live` mode runs the demo brain — no provider is ever contacted."""
+    make_brain = brain or _ProviderDemoClient
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(tmp_path / "usage-ledger.jsonl"))
+    # The rails read os.environ directly, so clear them: a budget exported in a developer's shell
+    # must not make these tests behave differently from CI.
+    for name in ("LLM_DAILY_TOKEN_BUDGET", "LLM_SESSION_TOKEN_BUDGET", "COACH_DAILY_QUESTION_CAP"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(web_api, "build_client", lambda settings: make_brain())
+    monkeypatch.setattr(web_api, "build_role_clients", lambda settings, client: RoleClients.single(client))
+    settings = Settings(
+        _env_file=None,
+        primary_provider="mimo",
+        mimo_api_key="test",
+        mimo_base_url="http://test",
+        mimo_model="test-model",
+        auth_token=token,
+        concept_store="memory",
+    )
+    app = create_app(
+        settings=settings,
+        checkpoint_db=tmp_path / "checkpoints.sqlite",
+        ledger_db=tmp_path / "ledger.json",
+        exports_dir=tmp_path / "exports",
+    )
+    return TestClient(app)
+
+
+def _start_live(ws, **overrides):
+    ws.send_json({"type": "start_session", "mode": "live", "max_questions": 1, **overrides})
+
+
+def _expect_question(ws):
+    """Wait for the Interviewer's question, failing fast if the Session terminated instead.
+
+    Plain ``_receive_until(ws, "question")`` blocks forever when a rail misfires and the Session
+    ends before asking anything — so a broken rail would hang CI rather than redden it.
+    """
+    event = _receive_until_any(ws, {"question", "session_error", "session_completed"})
+    assert event["type"] == "question", f"Session ended before asking a question: {event}"
+    return event
+
+
+def test_live_session_refuses_to_start_when_the_day_is_spent(tmp_path, monkeypatch):
+    # AC (b) on the web surface: a refusal event, and NO session_started — the Candidate must not
+    # see an interview begin that cannot be paid for.
+    client = _live_client(tmp_path, monkeypatch)
+    monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "10")
+    usage.record_usage("mimo", "test-model", prompt_tokens=10, completion_tokens=0)
+
+    with client.websocket_connect("/api/sessions/spent") as ws:
+        _start_live(ws)
+        event = ws.receive_json()
+
+    assert event["type"] == "session_error"
+    assert "00:00 UTC" in event["error"]
+
+
+def test_a_funded_live_session_still_starts(tmp_path, monkeypatch):
+    # The other direction: with budget available the rail is silent and the Session runs.
+    client = _live_client(tmp_path, monkeypatch, brain=_MeteredDemoClient)
+
+    with client.websocket_connect("/api/sessions/funded") as ws:
+        _start_live(ws)
+        started = ws.receive_json()
+        assert started["type"] == "session_started"
+        _expect_question(ws)
+        ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+        completed = _receive_until(ws, "session_completed")
+
+    assert completed["state"]["status"] == "complete"
+    # Every token it spent — Diagnostic through Study Plan — is attributed to the Session id, which
+    # is what `coach usage` reads. Nothing escaped into the unattributed "" bucket.
+    assert set(usage.sessions_for_day()) == {"funded"}
+
+
+def test_demo_mode_is_exempt_from_every_budget_rail(tmp_path, monkeypatch):
+    # THE exemption predicate on the web surface. Demo mode carries no provider identity, so it
+    # spends nobody's allowance and no rail may fire on it — not the daily gate, not the product
+    # cap. Forcing `metered = True` turns this into a session_error.
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(tmp_path / "usage-ledger.jsonl"))
+    monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "0")
+    monkeypatch.setenv("COACH_DAILY_QUESTION_CAP", "0")
+    client = _test_client(tmp_path)
+
+    with client.websocket_connect("/api/sessions/demo-exempt") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+        assert ws.receive_json()["type"] == "session_started"
+        _expect_question(ws)
+        ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+        completed = _receive_until(ws, "session_completed")
+
+    assert completed["state"]["status"] == "complete"
+    assert usage.questions_today(usage.token_identity("")) == 0  # nothing reserved against the cap
+
+
+def test_daily_question_cap_refuses_a_new_live_session(tmp_path, monkeypatch):
+    # AC (d): a questions/day product cap per token identity, from env.
+    client = _live_client(tmp_path, monkeypatch, token="s3cret-shared-token")
+    monkeypatch.setenv("COACH_DAILY_QUESTION_CAP", "0")
+
+    with client.websocket_connect("/api/sessions/capped") as ws:
+        ws.send_json({"type": "auth", "token": "s3cret-shared-token"})
+        _start_live(ws)
+        event = ws.receive_json()
+
+    assert event["type"] == "session_error"
+    assert "COACH_DAILY_QUESTION_CAP" in event["error"]
+
+
+def test_the_question_cap_is_reserved_at_start_not_at_completion(tmp_path, monkeypatch):
+    # A cap that only counts FINISHED Sessions is bypassed by abandoning them, so the reservation
+    # happens up front — and it reserves the Session's OWN question count, not a flat one.
+    client = _live_client(tmp_path, monkeypatch)
+    monkeypatch.setenv("COACH_DAILY_QUESTION_CAP", "2")
+
+    with client.websocket_connect("/api/sessions/first") as ws:
+        _start_live(ws, max_questions=2)
+        assert ws.receive_json()["type"] == "session_started"
+        _expect_question(ws)
+        ws.send_json({"type": "cancel_session"})  # abandoned, never completed
+        _receive_until(ws, "session_error")
+
+    assert usage.questions_today(usage.token_identity("")) == 2
+    with client.websocket_connect("/api/sessions/second") as ws:
+        _start_live(ws)
+        event = ws.receive_json()
+
+    assert event["type"] == "session_error"
+    assert "COACH_DAILY_QUESTION_CAP" in event["error"]
+
+
+def test_resuming_a_live_session_does_not_recharge_the_question_cap(tmp_path, monkeypatch):
+    # A resume finishes questions that were already reserved when the Session started. Charging
+    # again would make the cap punish exactly the suspend-and-resume ADR 0005 asks for.
+    client = _live_client(tmp_path, monkeypatch)
+    monkeypatch.setenv("COACH_DAILY_QUESTION_CAP", "1")
+
+    with client.websocket_connect("/api/sessions/resumed") as ws:
+        _start_live(ws)
+        assert ws.receive_json()["type"] == "session_started"
+        _expect_question(ws)
+        ws.send_json({"type": "cancel_session"})
+        _receive_until(ws, "session_error")
+
+    with client.websocket_connect("/api/sessions/resumed") as ws:
+        ws.send_json({"type": "resume_session", "mode": "live"})
+        started = ws.receive_json()
+
+    assert started["type"] == "session_started"  # not a cap refusal
+    assert usage.questions_today(usage.token_identity("")) == 1
+
+
+def test_a_mid_session_breach_suspends_instead_of_completing(tmp_path, monkeypatch):
+    # AC (c) on the web surface: a visible session_error, no session_completed — never a
+    # `failed`-and-advance (ADR 0005) and never a silent stall.
+    client = _live_client(tmp_path, monkeypatch, brain=_MeteredDemoClient)
+    # 150 sits between the Diagnostic's 100 (so the Session is allowed to START and ask Q1) and the
+    # spend after Q1 resolves — which is what makes this a MID-Session breach and not a start gate.
+    monkeypatch.setenv("LLM_SESSION_TOKEN_BUDGET", "150")
+
+    with client.websocket_connect("/api/sessions/breach") as ws:
+        _start_live(ws, max_questions=2)
+        assert ws.receive_json()["type"] == "session_started"
+        _expect_question(ws)  # Q1 really was asked before the rail fired
+        ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+        event = _receive_until_any(ws, {"session_error", "session_completed"})
+
+    assert event["type"] == "session_error"
+    assert "suspended" in event["error"].lower()
+    assert "LLM_SESSION_TOKEN_BUDGET" in event["error"]
+    # A suspended Session is not a finished one: nothing was persisted as complete.
+    assert client.get("/api/sessions/breach/export.md").status_code in (404, 409)

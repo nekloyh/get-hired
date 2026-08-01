@@ -14,7 +14,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from interview_coach import cli
+from interview_coach import cli, usage
+from interview_coach.demo_llm import DemoLLMClient
 from interview_coach.diagnostic import CandidateProfile, DiagnosticResult, TopicPlanSource, diagnose
 from interview_coach.eval_harness import GoldenAnswerCase, GoldenAnswerResult
 from interview_coach.evaluator import DimensionScore, Evaluation
@@ -336,7 +337,11 @@ def test_session_language_flag_reaches_the_summary(tmp_path, monkeypatch, capsys
     )
 
     assert rc == 0
-    assert "language_mode: mixed" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "language_mode: mixed" in out
+    # --no-live is a branch of the streaming loop now (R-25 needs the node boundary the rail hangs
+    # off), so its suppression of live updates has to stay pinned.
+    assert "LIVE UPDATE" not in out
 
 
 def test_session_rejects_unknown_language_flag(tmp_path, capsys):
@@ -478,3 +483,306 @@ def test_the_exported_log_file_does_not_outlive_the_test_that_exported_it():
     # tmp_path pytest deletes on the way out. conftest's autouse teardown is what sweeps it, and
     # deleting that fixture left the whole suite green until this assertion existed.
     assert "COACH_LOG_FILE" not in os.environ
+# --- R-25: the free-tier budget rail on the CLI surface ------------------------------------------
+
+
+class _ProviderDemoClient(DemoLLMClient):
+    """A demo brain that carries a provider identity.
+
+    DemoLLMClient is exempt from every budget rail BY DESIGN (``provider_label`` -> "unknown": it
+    spends nobody's allowance), which is exactly what keeps the rest of the suite untouched — and
+    also what makes it useless for testing the rail. This double is the smallest thing that is
+    subject to the rail while still running a Session deterministically and offline.
+    """
+
+    provider_name = "mimo"
+
+
+def _tmp_ledger(monkeypatch, tmp_path):
+    """Point the ledger at tmp_path — a rail test must never write to the repo's real ledger.
+
+    Also clears the rail's env vars: they are read straight from ``os.environ``, so a developer with
+    a low budget exported in their shell would otherwise get different results from CI.
+    """
+    ledger = tmp_path / "usage-ledger.jsonl"
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
+    for name in ("LLM_DAILY_TOKEN_BUDGET", "LLM_SESSION_TOKEN_BUDGET", "COACH_DAILY_QUESTION_CAP"):
+        monkeypatch.delenv(name, raising=False)
+    return ledger
+
+
+def test_a_suspend_still_shows_the_question_that_was_just_resolved(tmp_path, capsys):
+    # A live Session that suspends must acknowledge the answer the Candidate just gave — it IS in
+    # the checkpoint. Checking the rail before printing makes a suspend look like it ate the answer.
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    demo = DemoLLMClient()
+    db_path = tmp_path / "ordering.sqlite"
+    session_id = "ordering"
+
+    def stop_after_the_first_question(state):
+        return "out of budget" if state.get("question_count", 0) >= 1 else None
+
+    with SqliteSaver.from_conn_string(str(db_path)) as checkpointer:
+        graph = build_session_graph(demo, checkpointer=checkpointer)
+        state = initial_session_state(session_id, _demo_diagnostic(), max_questions=3, started_at=0.0)
+        with pytest.raises(cli.SessionBudgetSuspended):
+            cli._run_session_graph(
+                graph, state, session_config(session_id), live=True, budget_stop=stop_after_the_first_question
+            )
+
+    captured = capsys.readouterr()
+    assert "LIVE UPDATE: QUESTION 1 RESOLVED" in captured.out
+    assert "SESSION SUSPENDED" in captured.err
+
+
+def test_session_refuses_to_start_into_a_spent_daily_budget(tmp_path, monkeypatch, capsys):
+    # AC (b): the Session refuses to START rather than dying partway in. Deleting the gate in
+    # _cmd_session makes this return 0 and spend a real Diagnostic call.
+    _tmp_ledger(monkeypatch, tmp_path)
+    monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "1000")
+    usage.record_usage("mimo", "test-model", prompt_tokens=900, completion_tokens=50)
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: _ProviderDemoClient())
+
+    def _never(*args, **kwargs):
+        raise AssertionError("the start gate must refuse BEFORE any token is spent")
+
+    monkeypatch.setattr(cli, "diagnose_or_degrade", _never)
+
+    rc = cli.main(
+        [
+            "session",
+            "--scripted",
+            "--no-live",
+            "--max-questions",
+            "2",
+            "--session-id",
+            "broke",
+            "--checkpoint-db",
+            str(tmp_path / "c.sqlite"),
+        ]
+    )
+
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "00:00 UTC" in err  # the remedy is named, not just the refusal
+    assert f"~{usage.estimated_session_tokens(2):,}" in err  # ...and the estimate it was refused against
+
+
+def test_session_starts_when_the_day_can_fund_it(tmp_path, monkeypatch, capsys):
+    # The other direction of the same gate: a rail that fires on compliant behaviour is a bug.
+    _tmp_ledger(monkeypatch, tmp_path)
+    monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", str(usage.estimated_session_tokens(1)))
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: _ProviderDemoClient())
+
+    rc = cli.main(
+        [
+            "session",
+            "--scripted",
+            "--no-live",
+            "--max-questions",
+            "1",
+            "--session-id",
+            "funded",
+            "--checkpoint-db",
+            str(tmp_path / "c.sqlite"),
+        ]
+    )
+
+    assert rc == 0
+    assert "00:00 UTC" not in capsys.readouterr().err
+
+
+def test_demo_mode_is_exempt_from_every_budget_rail(tmp_path, monkeypatch, capsys):
+    # THE exemption predicate. DemoLLMClient carries no provider identity, so it spends nobody's
+    # allowance and every rail must be inert for it — that is what keeps demo mode free and the rest
+    # of this suite unchanged. Forcing `metered = True` makes this refuse with rc 2.
+    _tmp_ledger(monkeypatch, tmp_path)
+    monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "0")
+    monkeypatch.setenv("LLM_SESSION_TOKEN_BUDGET", "0")
+    monkeypatch.setenv("COACH_DAILY_QUESTION_CAP", "0")
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: DemoLLMClient())
+
+    rc = cli.main(
+        [
+            "session",
+            "--scripted",
+            "--no-live",
+            "--max-questions",
+            "1",
+            "--session-id",
+            "demo-exempt",
+            "--checkpoint-db",
+            str(tmp_path / "c.sqlite"),
+        ]
+    )
+
+    assert rc == 0
+    assert "(complete)" in capsys.readouterr().out
+
+
+def test_the_rail_counts_only_the_questions_actually_left(tmp_path, monkeypatch, capsys):
+    # The mid-Session estimate must use max_questions MINUS the ones already resolved. Dropping the
+    # subtraction keeps charging for questions that are already paid for, and suspends a Session
+    # that can comfortably afford the rest of itself.
+    class _Metered(_ProviderDemoClient):
+        def chat_json(self, *args, **kwargs):
+            usage.record_usage("mimo", "test-model", prompt_tokens=500, completion_tokens=0)
+            return super().chat_json(*args, **kwargs)
+
+    _tmp_ledger(monkeypatch, tmp_path)
+    # Exactly what the start gate demands for 2 questions — and, once Q1 is resolved and paid for,
+    # comfortably more than the one question that is genuinely left.
+    monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", str(usage.estimated_session_tokens(2)))
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: _Metered())
+
+    rc = cli.main(
+        [
+            "session",
+            "--scripted",
+            "--no-live",
+            "--max-questions",
+            "2",
+            "--session-id",
+            "counts-left",
+            "--checkpoint-db",
+            str(tmp_path / "c.sqlite"),
+        ]
+    )
+
+    assert rc == 0
+    assert "(complete)" in capsys.readouterr().out
+
+
+def test_budget_breach_suspends_and_never_records_a_failed_question(tmp_path, monkeypatch, capsys):
+    # THE issue's test (ADR 0005's third category). A mid-Session budget breach must SUSPEND:
+    #   - never `failed`-and-advance (that is fake evidence about the Candidate),
+    #   - never a silent stall,
+    #   - and the checkpoint must still be resumable to completion.
+    # Without the rail the Session runs straight to `complete`. With the stop mis-sited INSIDE the
+    # graph it is caught by question_node's `except Exception` net and becomes stop_reason="failed",
+    # which assertion (b) below catches.
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    from interview_coach.supervisor import resumable_session_state
+
+    demo = _ProviderDemoClient()
+    _tmp_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: demo)
+
+    db_path = tmp_path / "suspend.sqlite"
+    session_id = "budget-breach"
+    _suspend_after_first_question(demo, db_path, session_id)
+    capsys.readouterr()
+
+    # The day is spent: resuming cannot fund the remaining questions.
+    monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "10")
+    usage.record_usage("mimo", "test-model", prompt_tokens=10, completion_tokens=0)
+
+    rc = cli.main(
+        [
+            "session",
+            "--resume",
+            "--scripted",
+            "--no-live",
+            "--session-id",
+            session_id,
+            "--checkpoint-db",
+            str(db_path),
+        ]
+    )
+    err = capsys.readouterr().err
+
+    # (a) it suspended, loudly, with the remedy — exit 2 is this CLI's "refused, not crashed".
+    assert rc == 2
+    assert "SUSPENDED" in err
+    assert "coach session --resume" in err
+
+    with SqliteSaver.from_conn_string(str(db_path)) as checkpointer:
+        graph = build_session_graph(demo, checkpointer=checkpointer)
+        state = resumable_session_state(graph, session_id)
+        # (b) THE ADR 0005 clause: no zero-evidence `failed` question was manufactured.
+        assert len(state["transcript"]) == 1
+        assert [item["stop_reason"] for item in state["transcript"]] == ["resolved"]
+        # (c) suspended, not completed and not aborted.
+        assert state["status"] == "active"
+
+    # (d) with the budget restored the same Session id resumes and completes, keeping Q1.
+    monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "2500000")
+    rc = cli.main(
+        [
+            "session",
+            "--resume",
+            "--scripted",
+            "--no-live",
+            "--session-id",
+            session_id,
+            "--checkpoint-db",
+            str(db_path),
+        ]
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    with SqliteSaver.from_conn_string(str(db_path)) as checkpointer:
+        graph = build_session_graph(demo, checkpointer=checkpointer)
+        state = resumable_session_state(graph, session_id)
+        assert state["status"] == "complete"
+        assert len(state["transcript"]) > 1
+        assert state["transcript"][0]["stop_reason"] == "resolved"
+    assert "(complete)" in out
+
+
+def test_session_ledger_rows_carry_the_session_id(tmp_path, monkeypatch):
+    # AC: `coach usage` shows per-session rows — which needs attribution on the rows themselves.
+    # This pins the ContextVar surviving into langgraph's node execution, end to end.
+    _tmp_ledger(monkeypatch, tmp_path)
+
+    class _Recording(_ProviderDemoClient):
+        def chat_json(self, *args, **kwargs):
+            usage.record_usage("mimo", "test-model", prompt_tokens=3, completion_tokens=1)
+            return super().chat_json(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: _Recording())
+
+    rc = cli.main(
+        [
+            "session",
+            "--scripted",
+            "--no-live",
+            "--max-questions",
+            "1",
+            "--session-id",
+            "attributed",
+            "--checkpoint-db",
+            str(tmp_path / "c.sqlite"),
+        ]
+    )
+
+    assert rc == 0
+    per_session = usage.sessions_for_day()
+    assert set(per_session) == {"attributed"}  # nothing escaped the scope into the "" bucket
+    assert per_session["attributed"] > 0
+
+
+def test_usage_command_shows_per_session_rows(tmp_path, monkeypatch, capsys):
+    _tmp_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    with usage.session_scope("interview-42"):
+        usage.record_usage("mimo", "test-model", prompt_tokens=1200, completion_tokens=300)
+    usage.record_usage("mimo", "test-model", prompt_tokens=40, completion_tokens=10)
+
+    assert cli.main(["usage"]) == 0
+
+    out = capsys.readouterr().out
+    assert "interview-42" in out
+    assert "1,500" in out
+    assert "unattributed" in out  # bench/forge/one-off spend stays honestly separate
+    assert f"{usage.session_token_budget():,}" in out
+    assert str(usage.daily_question_cap()) in out

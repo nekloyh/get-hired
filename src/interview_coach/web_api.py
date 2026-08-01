@@ -11,7 +11,7 @@ import secrets
 import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -41,7 +41,7 @@ from .diagnostic import CandidateProfile, diagnose_or_degrade
 from .exporter import export_session_markdown, render_session_markdown
 from .language import DEFAULT_LANGUAGE_MODE
 from .ledger import load_priors, save_posteriors
-from .llm import LLMClient, build_client, build_role_clients
+from .llm import UNKNOWN_PROVIDER, LLMClient, build_client, build_role_clients, provider_label
 from .microloop import CandidateInputUnavailable, CandidateIntent
 from .resources import build_resource_store
 from .supervisor import (
@@ -52,6 +52,15 @@ from .supervisor import (
     initial_session_state,
     session_config,
     skill_states_from_state,
+)
+from .usage import (
+    SessionBudgetSuspended,
+    budget_stop_reason,
+    question_cap_reason,
+    record_questions,
+    session_scope,
+    start_refusal_reason,
+    token_identity,
 )
 
 logger = logging.getLogger(__name__)
@@ -747,6 +756,25 @@ def _run_session_thread(
         # ADR 0010: demo mode's client is not a router, so the bundle collapses to single-client
         # semantics; live mode pins the judge and applies any ROLE_* overrides.
         roles = build_role_clients(api_state.settings, client)
+        # R-25: the free-tier rails, checked before ANY token is spent. A client with no provider
+        # identity (demo mode, test fakes) spends nobody's allowance, so both gates are inert for it.
+        provider = provider_label(roles.judge)
+        metered = provider != UNKNOWN_PROVIDER
+        if metered and not resume:
+            assert isinstance(payload, StartSessionPayload)
+            identity = token_identity(api_state.settings.auth_token)
+            refusal = question_cap_reason(identity, questions=payload.max_questions) or start_refusal_reason(
+                provider, questions=payload.max_questions
+            )
+            if refusal is not None:
+                # No `session_started`: the Candidate must never watch an interview begin that
+                # cannot be paid for.
+                logger.warning("refused to start Session %s: %s", runtime.session_id, refusal)
+                runtime.emit({"type": "session_error", "error": refusal})
+                return
+            # Reserved at START, not at completion: a cap that only counts finished Sessions is
+            # bypassed by abandoning them.
+            record_questions(identity, payload.max_questions)
         # R-13: the measured path is the default path. Demo mode stays in-memory on purpose — it
         # runs on a fake model for UX review, and building a Chroma index (first run: downloading an
         # embedding model) to serve fake questions would be a slow answer to a question nobody asked.
@@ -761,7 +789,16 @@ def _run_session_thread(
             embedding_model=embedder,
         )
         resource_store = build_resource_store("memory", seed=True)
-        with SqliteSaver.from_conn_string(api_state.checkpoint_db) as checkpointer:
+
+        def budget_stop(state: Mapping[str, Any]) -> str | None:
+            if not metered:
+                return None
+            left = int(state.get("max_questions", 0)) - int(state.get("question_count", 0))
+            return budget_stop_reason(runtime.session_id, provider, questions_left=left)
+
+        # The scope attributes every provider call this Session makes — the graph runs on this same
+        # thread, so the ContextVar reaches every node.
+        with SqliteSaver.from_conn_string(api_state.checkpoint_db) as checkpointer, session_scope(runtime.session_id):
             graph = build_session_graph(
                 roles,
                 checkpointer=checkpointer,
@@ -801,7 +838,7 @@ def _run_session_thread(
                     "resumed": resume,
                 }
             )
-            final_state = _stream_graph(graph, initial_state, config, runtime)
+            final_state = _stream_graph(graph, initial_state, config, runtime, budget_stop=budget_stop)
         if final_state is not None:
             api_state.completed_sessions[runtime.session_id] = final_state
             # Persist posteriors for a returning Candidate (0023); candidate_id rides in the state so a
@@ -818,6 +855,12 @@ def _run_session_thread(
             # record written afterwards races the browser (and the test) that is already reacting.
             logger.info("Session %r finished: status=%s", runtime.session_id, final_state.get("status"))
             runtime.emit({"type": "session_completed", "state": final_state})
+    except SessionBudgetSuspended as err:
+        # ADR 0005's third category: budget exhaustion. Its own branch, ABOVE the completion block —
+        # a suspended Session must never emit session_completed or be persisted as if it finished.
+        # The checkpoint is durable, so the UI's resume picks it up once the budget allows.
+        logger.warning("Session %s suspended on a budget rail: %s", runtime.session_id, err)
+        runtime.emit({"type": "session_error", "error": f"Session suspended: {err}"})
     except CandidateIntent as err:
         # ADR 0005 / issue 0017: the Candidate asked to stop (web cancel/disconnect). This is intent,
         # not an infrastructure failure — a distinct control-flow branch. The supervisor re-raises it
@@ -871,12 +914,26 @@ def _persist_export(api_state: WebApiState, session_id: str, final_state: dict[s
 
 
 def _stream_graph(
-    graph, initial_state: Mapping[str, Any] | None, config: dict[str, Any], runtime: RuntimeSession
+    graph,
+    initial_state: Mapping[str, Any] | None,
+    config: dict[str, Any],
+    runtime: RuntimeSession,
+    *,
+    budget_stop: Callable[[Mapping[str, Any]], str | None] | None = None,
 ) -> dict:
+    """Drive the graph, converting the two out-of-band stop conditions into typed signals.
+
+    The budget rail sits next to the cancel check on purpose (R-25): raised HERE, outside the graph,
+    it can never reach ``question_node``'s ``except Exception`` net and be recorded as a
+    zero-evidence ``failed`` question — the corruption ADR 0005 forbids. It is the same shape as the
+    cancel path rather than a fourth degrade path.
+    """
     final_state: dict[str, Any] | None = None
     for event in graph.stream(initial_state, config, stream_mode="values"):
         if runtime.cancelled.is_set():
             raise CandidateInputUnavailable("Session was cancelled.")
+        if budget_stop is not None and (reason := budget_stop(event)):
+            raise SessionBudgetSuspended(reason)
         final_state = dict(event)
         runtime.emit({"type": "state_update", "state": final_state})
     if final_state is None:
