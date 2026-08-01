@@ -24,7 +24,7 @@ import logging
 import os
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -60,7 +60,15 @@ from .fixtures import QUESTION, STRONG_ANSWER, WEAK_ANSWER
 from .forge import MAX_DRAFTS, ForgeError, render_forge_report, run_forge, write_forge_outputs
 from .language import DEFAULT_LANGUAGE_MODE, LANGUAGE_MODES
 from .ledger import load_priors, save_posteriors
-from .llm import LLMClient, RoleClients, build_client, build_role_clients, ensure_role_clients
+from .llm import (
+    UNKNOWN_PROVIDER,
+    LLMClient,
+    RoleClients,
+    build_client,
+    build_role_clients,
+    ensure_role_clients,
+    provider_label,
+)
 from .microloop import (
     DEFAULT_MAX_TURNS,
     CandidateIntent,
@@ -86,18 +94,30 @@ from .supervisor import (
     skill_states_from_state,
 )
 from .ui import render_skill_state_rows
-from .usage import daily_token_budget, remaining_today, usage_for_day, utc_date
+from .usage import (
+    WORST_CASE_TOKENS_PER_CALL,
+    SessionBudgetSuspended,
+    begin_session_run,
+    clear_run_rails_for_resume,
+    daily_question_cap,
+    daily_token_budget,
+    estimated_session_tokens,
+    remaining_today,
+    session_budget_guard,
+    session_scope,
+    session_token_budget,
+    sessions_for_day,
+    start_refusal_reason,
+    usage_for_day,
+    utc_date,
+    worst_case_session_calls,
+)
 
 ANSWERS = {"strong": STRONG_ANSWER, "weak": WEAK_ANSWER}
 
 # What every subcommand receives (ADR 0010): the per-role bundle from main(), a bare client when a
 # test drives a command directly, or None on the offline path. ``ensure_role_clients`` normalizes.
 type ClientArg = RoleClients | LLMClient | None
-
-
-def _provider_label(client: LLMClient) -> str:
-    """Provider name for budget checks / report headers — router or pinned role client alike."""
-    return str(getattr(client, "primary_provider", None) or getattr(client, "provider_name", "unknown"))
 
 
 def _model_label(client: LLMClient) -> str:
@@ -345,11 +365,28 @@ def _print_live_question_update(state: dict, item: dict, question_number: int) -
 
 
 def _run_session_graph(
-    graph, state: Mapping[str, Any] | None, config: dict, *, live: bool, already_seen: int = 0
+    graph,
+    state: Mapping[str, Any] | None,
+    config: dict,
+    *,
+    live: bool,
+    already_seen: int = 0,
+    budget_stop: Callable[[Mapping[str, Any]], str | None] | None = None,
 ) -> dict:
-    if not live:
-        return graph.invoke(state, config)
+    """Drive the Session graph, printing live updates and enforcing the budget rail between nodes.
 
+    ``--no-live`` streams too rather than calling ``invoke``: the two are equal (an identical
+    Session id gives ``graph.invoke(...) == the last streamed value``, zero differing keys — pinned
+    by the ``--no-live`` tests), and only the streaming form has a node boundary at which the rail
+    can suspend. Without the collapse, ``--no-live`` — a perfectly ordinary live-provider mode —
+    would have no rail at all.
+
+    ``budget_stop`` is checked at each ``stream_mode="values"`` event, which includes the input
+    state BEFORE the first node runs. Raising HERE, outside the graph, is the whole design (ADR
+    0005): a stop raised inside a node lands in ``question_node``'s ``except Exception`` net and
+    becomes a zero-evidence ``failed`` question. The checkpoint is already durable at each event, so
+    breaking out leaves a Session that ``--resume`` picks up exactly where it stopped.
+    """
     # On resume, ``already_seen`` is the number of questions already resolved in the checkpoint, so
     # the stream prints only genuinely new questions instead of replaying history as live (issue 0019).
     final: dict | None = None
@@ -357,11 +394,16 @@ def _run_session_graph(
     for event in graph.stream(state, config, stream_mode="values"):
         final = dict(event)
         transcript = final.get("transcript", [])
-        if len(transcript) <= seen_questions:
-            continue
-        for question_index in range(seen_questions, len(transcript)):
-            _print_live_question_update(final, transcript[question_index], question_index + 1)
-        seen_questions = len(transcript)
+        if live and len(transcript) > seen_questions:
+            for question_index in range(seen_questions, len(transcript)):
+                _print_live_question_update(final, transcript[question_index], question_index + 1)
+            seen_questions = len(transcript)
+        # Checked AFTER the live update, so the question the Candidate just finished is acknowledged
+        # before the suspend banner — it IS in the checkpoint, and a suspend that looks like it ate
+        # the last answer is indistinguishable from a crash.
+        if budget_stop is not None and (reason := budget_stop(final)):
+            print(f"\n=== SESSION SUSPENDED (budget) ===\n{reason}", file=sys.stderr)
+            raise SessionBudgetSuspended(reason)
     if final is None:
         raise RuntimeError("Session graph produced no final state")
     return final
@@ -442,7 +484,29 @@ def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
         persist_dir=args.resource_persist_dir,
         seed=not args.no_seed_resources,
     )
-    with SqliteSaver.from_conn_string(args.checkpoint_db) as checkpointer:
+    # R-25: the provider whose daily allowance this Session actually spends — the judge role, same
+    # as the bench and forge preflights read. A client with no provider identity (demo, test fakes)
+    # spends nobody's allowance, so every rail below is inert for it.
+    provider = provider_label(roles.judge)
+    metered = provider != UNKNOWN_PROVIDER
+    if metered and not args.resume and (refusal := start_refusal_reason(provider, questions=args.max_questions)):
+        # Refuse BEFORE the Diagnostic call: a start gate that has already spent tokens is not one.
+        print(f"Refusing to start this Session: {refusal}", file=sys.stderr)
+        return 2
+
+    budget_stop = (
+        session_budget_guard(
+            args.session_id,
+            provider,
+            max_turns=args.max_turns,
+            complete_status=SessionStatus.COMPLETE.value,
+        )
+        if metered
+        else None
+    )
+
+    # The scope covers the Diagnostic call too, so every token this Session spends is attributed.
+    with SqliteSaver.from_conn_string(args.checkpoint_db) as checkpointer, session_scope(args.session_id):
         candidate_factory = None if args.scripted else lambda seed: InteractiveCandidate()
         graph = build_session_graph(
             roles,
@@ -475,9 +539,27 @@ def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
                         f"--language {args.language!r} is ignored on --resume",
                         file=sys.stderr,
                     )
+                if metered and (
+                    cleared := clear_run_rails_for_resume(
+                        args.session_id,
+                        provider,
+                        max_questions=int(resumed.get("max_questions", args.max_questions)),
+                        max_turns=args.max_turns,
+                    )
+                ):
+                    # The rails that latch on this run's own state cannot clear themselves, so a
+                    # resume that did not clear them would re-trip at stream event 0 forever. Said
+                    # out loud because a grant of more budget is exactly the thing a user must not
+                    # discover from the ledger a day later.
+                    print(f"note: resuming clears the budget stop — {cleared}", file=sys.stderr)
                 _print_resume_recap(resumed)
                 final = _run_session_graph(
-                    graph, None, config, live=not args.no_live, already_seen=len(resumed.get("transcript", []))
+                    graph,
+                    None,
+                    config,
+                    live=not args.no_live,
+                    already_seen=len(resumed.get("transcript", [])),
+                    budget_stop=budget_stop,
                 )
             else:
                 existing = resumable_session_state(graph, args.session_id)
@@ -490,6 +572,12 @@ def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
                     target_companies=tuple(args.company),
                     claimed_skills=dict(args.claim),
                 )
+                if metered:
+                    # Stamp this run's baseline before the Diagnostic — the first token it spends
+                    # must land on THIS run's side of the line. Without it the rail would measure
+                    # everything the id ever spent, and --session-id defaults to one constant, so
+                    # the day's third interview would suspend for spending nothing of its own.
+                    begin_session_run(args.session_id)
                 carried = load_priors(args.ledger_db, args.candidate, now=time.time())
                 diagnostic = diagnose_or_degrade(
                     profile,
@@ -505,7 +593,17 @@ def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
                     ledger_prior_mastery=carried.raw_mastery if carried else None,
                     language_mode=args.language or DEFAULT_LANGUAGE_MODE,
                 )
-                final = _run_session_graph(graph, state, config, live=not args.no_live)
+                final = _run_session_graph(graph, state, config, live=not args.no_live, budget_stop=budget_stop)
+        except SessionBudgetSuspended:
+            # ADR 0005's third category: budget exhaustion is anticipated scarcity, not intent and
+            # not an infrastructure failure. The reason is already on stderr; add the exact command
+            # that picks the Session back up, because a suspend without a resume path is a stall.
+            print(
+                f"Resume it with: coach session --resume --session-id {args.session_id} "
+                f"--checkpoint-db {args.checkpoint_db}",
+                file=sys.stderr,
+            )
+            return 2
         except CandidateIntent as err:
             # ADR 0005 / issue 0018: the Candidate asked to stop (EOF/Ctrl-D, or a scripted Candidate
             # with nothing left). Abort cleanly with the designed exit code — no partial "complete"
@@ -663,7 +761,7 @@ def _cmd_bench(client: ClientArg, args: argparse.Namespace) -> int:
     # The bench measures the JUDGE role (ADR 0009c): with a role override in play, the pinned judge
     # client — not the session router — is what runs, and the report is labeled with its identity.
     judge = roles.judge
-    provider = _provider_label(judge)
+    provider = provider_label(judge)
     k = max(1, int(args.k))
     budget = daily_token_budget()
     usage_before = usage_for_day()
@@ -724,10 +822,29 @@ def _cmd_usage(client: ClientArg, args: argparse.Namespace) -> int:
             f"{provider}: {stats['total']:,} tokens across {stats['calls']} call(s) "
             f"({stats['prompt']:,} prompt + {stats['completion']:,} completion)"
         )
+    per_session = sessions_for_day()
+    if attributed := {sid: spent for sid, spent in per_session.items() if sid}:
+        # R-25: which Session id spent what. "Per id", not "per run", and labeled as such — an id is
+        # reused across runs, which is the whole reason the rail measures a per-run delta instead.
+        # Unattributed rows are batch tools (bench, forge, one-off commands), not a Session that
+        # lost its label — they are shown apart rather than hidden.
+        print("\nPer Session id today (all runs on that id):")
+        for session_id, spent in sorted(attributed.items()):
+            print(f"  {session_id}: {spent:,} tokens")
+    if loose := per_session.get(""):
+        print(f"  unattributed (bench/forge/one-off): {loose:,} tokens")
     budget = daily_token_budget()
     settings = load_settings()
     primary = settings.primary_provider
-    print(f"Primary ({primary}): ~{remaining_today(primary):,} of {budget:,} daily tokens left by our count.")
+    print(f"\nPrimary ({primary}): ~{remaining_today(primary):,} of {budget:,} daily tokens left by our count.")
+    default_calls = worst_case_session_calls(DEFAULT_MAX_QUESTIONS, DEFAULT_MAX_TURNS)
+    print(
+        f"Per-run budget for a default {DEFAULT_MAX_QUESTIONS}x{DEFAULT_MAX_TURNS} Session: "
+        f"{session_token_budget(max_questions=DEFAULT_MAX_QUESTIONS, max_turns=DEFAULT_MAX_TURNS):,} tokens "
+        f"({default_calls} worst-case provider calls x {WORST_CASE_TOKENS_PER_CALL:,}); "
+        f"measured Sessions run ~{estimated_session_tokens(DEFAULT_MAX_QUESTIONS):,}."
+    )
+    print(f"Daily question cap: {daily_question_cap()} question(s) per token identity.")
     return 0
 
 
@@ -740,7 +857,7 @@ def _cmd_forge(client: ClientArg, args: argparse.Namespace) -> int:
     judge = roles.judge
     # Same preflight as the bench: gate 3 spends ~4+ calls per surviving draft, and a forge run
     # started blind into a nearly-dead quota dies mid-queue with a half-written review file.
-    provider = _provider_label(judge)
+    provider = provider_label(judge)
     print(
         f"Daily budget check ({provider}): ~{remaining_today(provider):,} of "
         f"{daily_token_budget():,} tokens left by our count."

@@ -11,7 +11,7 @@ import secrets
 import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -41,8 +41,8 @@ from .diagnostic import CandidateProfile, diagnose_or_degrade
 from .exporter import export_session_markdown, render_session_markdown
 from .language import DEFAULT_LANGUAGE_MODE
 from .ledger import load_priors, save_posteriors
-from .llm import LLMClient, build_client, build_role_clients
-from .microloop import CandidateInputUnavailable, CandidateIntent
+from .llm import UNKNOWN_PROVIDER, LLMClient, build_client, build_role_clients, provider_label
+from .microloop import DEFAULT_MAX_TURNS, CandidateInputUnavailable, CandidateIntent
 from .resources import build_resource_store
 from .supervisor import (
     DEFAULT_MAX_ELAPSED_SECONDS,
@@ -52,6 +52,17 @@ from .supervisor import (
     initial_session_state,
     session_config,
     skill_states_from_state,
+)
+from .usage import (
+    SessionBudgetSuspended,
+    begin_session_run,
+    clear_run_rails_for_resume,
+    question_cap_reason,
+    record_questions,
+    session_budget_guard,
+    session_scope,
+    start_refusal_reason,
+    token_identity,
 )
 
 logger = logging.getLogger(__name__)
@@ -747,12 +758,49 @@ def _run_session_thread(
         # ADR 0010: demo mode's client is not a router, so the bundle collapses to single-client
         # semantics; live mode pins the judge and applies any ROLE_* overrides.
         roles = build_role_clients(api_state.settings, client)
+        # R-25: the free-tier rails, checked before ANY token is spent. A client with no provider
+        # identity (demo mode, test fakes) spends nobody's allowance, so both gates are inert for it.
+        provider = provider_label(roles.judge)
+        metered = provider != UNKNOWN_PROVIDER
+        checkpoint_values = _checkpoint_values(api_state, runtime.session_id) if resume else {}
+        max_questions = (
+            int(checkpoint_values.get("max_questions", DEFAULT_MAX_QUESTIONS))
+            if resume
+            else cast("StartSessionPayload", payload).max_questions
+        )
+        if metered and not resume:
+            assert isinstance(payload, StartSessionPayload)
+            identity = token_identity(api_state.settings.auth_token)
+            refusal = question_cap_reason(identity, questions=payload.max_questions) or start_refusal_reason(
+                provider, questions=payload.max_questions
+            )
+            if refusal is not None:
+                # No `session_started`: the Candidate must never watch an interview begin that
+                # cannot be paid for.
+                logger.warning("refused to start Session %r: %s", runtime.session_id, refusal)
+                runtime.emit({"type": "session_error", "error": refusal})
+                return
+            # Reserved at START, not at completion: a cap that only counts finished Sessions is
+            # bypassed by abandoning them.
+            record_questions(identity, payload.max_questions)
+        if metered and resume:
+            # The Candidate clicked resume. The per-run ceiling and the insufficient_quota latch
+            # both hang on this run's own state, so nothing but this clears them — and a resume
+            # that cannot clear them re-suspends at stream event 0 forever, which is the stall
+            # ADR 0005 forbids and which a Candidate with no shell has no way around.
+            if cleared := clear_run_rails_for_resume(
+                runtime.session_id,
+                provider,
+                max_questions=max_questions,
+                max_turns=DEFAULT_MAX_TURNS,
+            ):
+                logger.warning("Session %r resumed past a budget stop: %s", runtime.session_id, cleared)
         # R-13: the measured path is the default path. Demo mode stays in-memory on purpose — it
         # runs on a fake model for UX review, and building a Chroma index (first run: downloading an
         # embedding model) to serve fake questions would be a slow answer to a question nobody asked.
         # R-14: the embedder follows the Session's language. BGE is English-only and collapses
         # Vietnamese onto a hub, so a vn/mixed Session retrieving with it ranks near-randomly.
-        language_mode = _session_language_mode(api_state, runtime.session_id, payload, resume)
+        language_mode = _session_language_mode(payload, resume, checkpoint_values)
         embedder = embedder_for_language(language_mode)
         concept_store = build_concept_store(
             "memory" if runtime.mode == "demo" else api_state.settings.concept_store,
@@ -761,7 +809,23 @@ def _run_session_thread(
             embedding_model=embedder,
         )
         resource_store = build_resource_store("memory", seed=True)
-        with SqliteSaver.from_conn_string(api_state.checkpoint_db) as checkpointer:
+
+        # The same guard the CLI installs, built from the same factory — the two surfaces must not
+        # be able to disagree about when a Session suspends or what it is told.
+        budget_stop = (
+            session_budget_guard(
+                runtime.session_id,
+                provider,
+                max_turns=DEFAULT_MAX_TURNS,
+                complete_status=SessionStatus.COMPLETE.value,
+            )
+            if metered
+            else None
+        )
+
+        # The scope attributes every provider call this Session makes — the graph runs on this same
+        # thread, so the ContextVar reaches every node.
+        with SqliteSaver.from_conn_string(api_state.checkpoint_db) as checkpointer, session_scope(runtime.session_id):
             graph = build_session_graph(
                 roles,
                 checkpointer=checkpointer,
@@ -773,6 +837,12 @@ def _run_session_thread(
             initial_state = None
             if not resume:
                 assert isinstance(payload, StartSessionPayload)
+                if metered:
+                    # Stamp this run's baseline before the Diagnostic spends anything. The browser
+                    # persists ONE Session id in localStorage and reuses it for every fresh start
+                    # until the Candidate asks for a new one, so without a baseline the rail would
+                    # charge each new interview for every interview that came before it.
+                    begin_session_run(runtime.session_id)
                 profile = CandidateProfile(
                     target_role=payload.target_role,
                     target_companies=tuple(payload.target_companies),
@@ -801,7 +871,7 @@ def _run_session_thread(
                     "resumed": resume,
                 }
             )
-            final_state = _stream_graph(graph, initial_state, config, runtime)
+            final_state = _stream_graph(graph, initial_state, config, runtime, budget_stop=budget_stop)
         if final_state is not None:
             api_state.completed_sessions[runtime.session_id] = final_state
             # Persist posteriors for a returning Candidate (0023); candidate_id rides in the state so a
@@ -818,6 +888,12 @@ def _run_session_thread(
             # record written afterwards races the browser (and the test) that is already reacting.
             logger.info("Session %r finished: status=%s", runtime.session_id, final_state.get("status"))
             runtime.emit({"type": "session_completed", "state": final_state})
+    except SessionBudgetSuspended as err:
+        # ADR 0005's third category: budget exhaustion. Its own branch, ABOVE the completion block —
+        # a suspended Session must never emit session_completed or be persisted as if it finished.
+        # The checkpoint is durable, so the UI's resume picks it up once the budget allows.
+        logger.warning("Session %r suspended on a budget rail: %s", runtime.session_id, err)
+        runtime.emit({"type": "session_error", "error": f"Session suspended: {err}"})
     except CandidateIntent as err:
         # ADR 0005 / issue 0017: the Candidate asked to stop (web cancel/disconnect). This is intent,
         # not an infrastructure failure — a distinct control-flow branch. The supervisor re-raises it
@@ -830,31 +906,38 @@ def _run_session_thread(
         runtime.emit({"type": "session_error", "error": f"{type(err).__name__}: {err}"})
 
 
-def _session_language_mode(
-    api_state: WebApiState,
-    session_id: str,
-    payload: StartSessionPayload | ResumeSessionPayload,
-    resume: bool,
-) -> str:
-    """The Session's language mode, known BEFORE the graph is built (R-14).
+def _checkpoint_values(api_state: WebApiState, session_id: str) -> Mapping[str, Any]:
+    """A resumed Session's stored state, read BEFORE the graph is built.
 
-    A fresh Session carries it on the start payload. A *resumed* one does not — the payload has only
-    a mode — so it has to come out of the checkpoint, or resuming a Vietnamese Session would silently
-    rebuild its retrieval on the English embedder and rank near-randomly for the rest of the
-    interview. Falls back to the default on any read failure: a missing checkpoint is the
-    "unknown session" path, which the graph reports far better than a crash in here would.
+    A resume payload carries only a mode, so everything the driver must know up front —
+    ``language_mode`` for the embedder, ``max_questions`` for the budget rail — comes from here.
+    Returns ``{}`` on any read failure: a missing checkpoint is the "unknown session" path, which
+    the graph reports far better than a crash in here would.
     """
-    if not resume:
-        return getattr(payload, "language_mode", DEFAULT_LANGUAGE_MODE)
     try:
         with SqliteSaver.from_conn_string(api_state.checkpoint_db) as checkpointer:
             checkpoint = checkpointer.get(cast("Any", session_config(session_id)))
         raw: Mapping[str, Any] = cast("Mapping[str, Any]", checkpoint or {})
-        values: Mapping[str, Any] = raw.get("channel_values") or {}
-        return str(values.get("language_mode") or DEFAULT_LANGUAGE_MODE)
+        return cast("Mapping[str, Any]", raw.get("channel_values") or {})
     except Exception:
-        logger.warning("could not read language_mode for resumed Session %r", session_id, exc_info=True)
-        return DEFAULT_LANGUAGE_MODE
+        logger.warning("could not read the checkpoint for resumed Session %r", session_id, exc_info=True)
+        return {}
+
+
+def _session_language_mode(
+    payload: StartSessionPayload | ResumeSessionPayload,
+    resume: bool,
+    checkpoint_values: Mapping[str, Any],
+) -> str:
+    """The Session's language mode, known BEFORE the graph is built (R-14).
+
+    A fresh Session carries it on the start payload. A *resumed* one does not, so it has to come out
+    of the checkpoint, or resuming a Vietnamese Session would silently rebuild its retrieval on the
+    English embedder and rank near-randomly for the rest of the interview.
+    """
+    if not resume:
+        return getattr(payload, "language_mode", DEFAULT_LANGUAGE_MODE)
+    return str(checkpoint_values.get("language_mode") or DEFAULT_LANGUAGE_MODE)
 
 
 def _persist_export(api_state: WebApiState, session_id: str, final_state: dict[str, Any]) -> None:
@@ -871,14 +954,31 @@ def _persist_export(api_state: WebApiState, session_id: str, final_state: dict[s
 
 
 def _stream_graph(
-    graph, initial_state: Mapping[str, Any] | None, config: dict[str, Any], runtime: RuntimeSession
+    graph,
+    initial_state: Mapping[str, Any] | None,
+    config: dict[str, Any],
+    runtime: RuntimeSession,
+    *,
+    budget_stop: Callable[[Mapping[str, Any]], str | None] | None = None,
 ) -> dict:
+    """Drive the graph, converting the two out-of-band stop conditions into typed signals.
+
+    The budget rail sits next to the cancel check on purpose (R-25): raised HERE, outside the graph,
+    it can never reach ``question_node``'s ``except Exception`` net and be recorded as a
+    zero-evidence ``failed`` question — the corruption ADR 0005 forbids. It is the same shape as the
+    cancel path rather than a fourth degrade path.
+    """
     final_state: dict[str, Any] | None = None
     for event in graph.stream(initial_state, config, stream_mode="values"):
         if runtime.cancelled.is_set():
             raise CandidateInputUnavailable("Session was cancelled.")
         final_state = dict(event)
         runtime.emit({"type": "state_update", "state": final_state})
+        # Checked AFTER the state goes out, exactly as the CLI prints the live update first: the
+        # question the Candidate just resolved IS in the checkpoint, and a suspend that arrives with
+        # no state carrying it looks to the UI like a crash that ate the last answer.
+        if budget_stop is not None and (reason := budget_stop(final_state)):
+            raise SessionBudgetSuspended(reason)
     if final_state is None:
         raise RuntimeError("Session graph produced no final state")
     return final_state

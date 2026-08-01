@@ -8,7 +8,7 @@ import pytest
 from pydantic import BaseModel
 
 from interview_coach import llm as llm_module
-from interview_coach import telemetry
+from interview_coach import telemetry, usage
 from interview_coach.config import ProviderName, ProviderSettings, Settings
 from interview_coach.llm import (
     BREAKER_COOLDOWN_SECONDS,
@@ -263,7 +263,12 @@ def test_call_counts_ignores_unrelated_telemetry_movement():
     assert per_provider == (("groq", 2),)  # mimo did not move, so it is not in this turn's split
 
 
-def test_per_call_line_carries_provider_model_latency_tokens_and_outcome(make_client, caplog):
+def test_per_call_line_carries_provider_model_latency_tokens_and_outcome(make_client, caplog, tmp_path, monkeypatch):
+    # The scripted `usage` block makes this the one trace test that also writes a ledger row; without
+    # a tmp ledger it lands in the repo's real logs/usage-ledger.jsonl. That was cosmetic when the
+    # ledger only fed a printed warning — R-25 turned it into a rail that REFUSES Sessions, so test
+    # spend must never count against a real day's budget.
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(tmp_path / "usage-ledger.jsonl"))
     client, _ = make_client(
         [{"content": '{"x": 1, "label": "a"}', "usage": {"prompt_tokens": 11, "completion_tokens": 7}}]
     )
@@ -598,8 +603,9 @@ def test_transport_backoff_honors_retry_after_header(monkeypatch, fake_openai_fa
     assert waits == [1.0]
 
 
-def test_insufficient_quota_fails_fast_without_backoff(monkeypatch, fake_openai_factory):
+def test_insufficient_quota_fails_fast_without_backoff(monkeypatch, tmp_path, fake_openai_factory):
     # When the DAY's allowance is spent, waiting cannot help — burn zero time and fail loudly.
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(tmp_path / "ledger.jsonl"))
     waits: list[float] = []
     monkeypatch.setattr(llm_module, "_sleep", waits.append)
     fake = fake_openai_factory([_rate_limited(message="You exceeded your current quota: insufficient_quota")])
@@ -610,6 +616,12 @@ def test_insufficient_quota_fails_fast_without_backoff(monkeypatch, fake_openai_
 
     assert fake.call_count == 1
     assert waits == []
+    # ADR 0005's addendum calls insufficient_quota the DETECTION half of budget exhaustion; this
+    # latch is what carries it to the session-behaviour half (R-25). Without it the exception is
+    # swallowed by question_node's failure-isolation net and the fact is lost, so the Session
+    # cascades into zero-evidence `failed` questions and exits 0.
+    assert usage.quota_exhausted_today("mimo")
+    assert not usage.quota_exhausted_today("openai")  # per provider, never a global kill switch
 
 
 def test_transport_backoff_gives_up_after_bounded_attempts(monkeypatch, fake_openai_factory):
@@ -706,11 +718,13 @@ def test_json_schema_ignored_on_unsupporting_client(fake_openai_factory):
     assert fake.chat.completions.calls[0]["response_format"] == {"type": "json_object"}
 
 
-def test_router_downgrades_grammar_for_schema_less_fallback(fake_openai_factory):
+def test_router_downgrades_grammar_for_schema_less_fallback(monkeypatch, tmp_path, fake_openai_factory):
     from interview_coach.llm import OpenAIClient
 
     # Primary (openai, grammar-capable) dies; fallback (mimo) cannot enforce the grammar. The
     # failover must downgrade to json_object rather than turn an outage into a 400.
+    # The tmp ledger keeps the quota latch this raise writes out of the repo's real one.
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(tmp_path / "ledger.jsonl"))
     fake_primary = fake_openai_factory([_rate_limited(message="quota: insufficient_quota")])
     fake_fallback = fake_openai_factory(['{"x": 9, "label": "fallback"}'])
     router = LLMRouter(
@@ -738,3 +752,20 @@ def test_408_and_409_stay_retryable_after_sdk_retries_disabled(monkeypatch, fake
     client = MimoClient(_provider("mimo"), client=fake)
     assert client.chat_json([{"role": "user", "content": "go"}], Foo).x == 4
     assert fake.call_count == 2
+
+
+def test_provider_label_prefers_the_router_identity_over_a_wrapped_client():
+    # `provider_label` is the exemption predicate for every R-25 budget rail, so which name wins
+    # decides whose allowance the Session is charged against. A router WRAPS concrete clients: its
+    # `primary_provider` is the account that pays, and the wrapped client's `provider_name` is not.
+    # No shipped class carries both today; the precedence is pinned so that the day one does, the
+    # rails do not silently start metering the wrong provider.
+    from types import SimpleNamespace
+
+    from interview_coach.llm import UNKNOWN_PROVIDER, provider_label
+
+    assert provider_label(SimpleNamespace(primary_provider="openai", provider_name="groq")) == "openai"
+    assert provider_label(SimpleNamespace(provider_name="groq")) == "groq"
+    assert provider_label(SimpleNamespace(primary_provider="openai")) == "openai"
+    # The demo client and every test fake land here — nothing without a provider spends an allowance.
+    assert provider_label(SimpleNamespace()) == UNKNOWN_PROVIDER

@@ -26,7 +26,7 @@ from pydantic import BaseModel, ValidationError
 
 from . import telemetry
 from .config import ProviderName, ProviderSettings, RoleName, Settings
-from .usage import record_usage
+from .usage import record_quota_exhausted, record_usage
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +111,17 @@ class EmptyCompletionError(ValueError):
     typed so the router can count it as a *provider* failure — worth failing over, worth counting
     against the breaker — while a ValueError raised by our own code still propagates untouched.
     """
+
+
+# What ``provider_label`` reports for a client that carries no provider identity at all: the demo
+# client, and every test fake. It is also the exemption predicate for the free-tier budget rails
+# (R-25) — nothing without a provider spends a provider's allowance, so no rail may fire on one.
+UNKNOWN_PROVIDER = "unknown"
+
+
+def provider_label(client: LLMClient) -> str:
+    """Provider name for budget checks / report headers — router or pinned role client alike."""
+    return str(getattr(client, "primary_provider", None) or getattr(client, "provider_name", UNKNOWN_PROVIDER))
 
 
 def is_provider_failure(err: BaseException) -> bool:
@@ -428,6 +439,13 @@ class _OpenAICompatibleClient(LLMClient):
                         self.provider_name,
                         "logs/usage-ledger.jsonl",
                     )
+                    # ADR 0005's addendum names insufficient_quota as the DETECTION half of budget
+                    # exhaustion and GH #80 as the session-behaviour half. Latching it here is what
+                    # joins them: this exception is about to be swallowed by question_node's
+                    # failure-isolation net, so the fact that the quota is dead has to outlive it —
+                    # otherwise the Session cascades into zero-evidence `failed` questions and exits
+                    # 0 with a Study Plan built from nothing.
+                    record_quota_exhausted(self.provider_name)
                     raise
                 if not will_retry:
                     raise
