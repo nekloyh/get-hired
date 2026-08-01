@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
+import stat
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -259,6 +262,138 @@ def test_failed_publish_keeps_the_old_ledger_and_leaves_no_temp_file(tmp_path, m
     # os.replace is only atomic within a single filesystem and raises EXDEV across a mount boundary,
     # which is exactly what the Docker /state volume is.
     assert published_from and published_from[0].parent == tmp_path
+
+
+def test_staged_bytes_are_fsynced_before_the_name_is_published(tmp_path, monkeypatch):
+    # Rename is atomic w.r.t. concurrent readers but says nothing about durability: the directory
+    # entry can reach disk before the data does, so an unsynced publish lets a container restart
+    # expose `ledger.json` as a name pointing at zero bytes — every Candidate in it cold-started by a
+    # crash that this module's whole point is to survive. No in-process test can pull the power cord,
+    # so the ceiling here is the fd: `st_ino` proves the sync landed on *the* staged file (not some
+    # unrelated descriptor) and the call ordering proves it landed *before* the name went live.
+    path = tmp_path / "ledger.json"
+    real_fsync, real_replace = os.fsync, os.replace
+    synced_inodes: list[int] = []
+    syncs_before_publish: list[int] = []
+
+    def spy_fsync(fd):
+        synced_inodes.append(os.fstat(fd).st_ino)
+        return real_fsync(fd)
+
+    def spy_replace(src, dst, *args, **kwargs):
+        syncs_before_publish.append(len(synced_inodes))
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+    monkeypatch.setattr(os, "replace", spy_replace)
+    save_posteriors(path, "alice", {"mlops": SkillState("mlops", alpha=8.0, beta=2.0)}, now=0.0)
+
+    assert syncs_before_publish == [1]  # exactly one sync, and it completed before publication
+    # Rename preserves the inode, so this is the staged file that became the ledger — the bytes now
+    # reachable under the published name are the bytes that were forced to disk.
+    assert path.stat().st_ino == synced_inodes[0]
+
+
+def test_a_write_that_dies_mid_flight_leaves_no_tempfile_behind(tmp_path, monkeypatch, caplog):
+    # ENOSPC arrives at `write`, not at `replace` — the disk fills while the buffer drains. That path
+    # only cleans up if the tempfile's name is bound *before* the write is attempted; bind it after
+    # and every failed save strands one `.ledger.json.*.tmp`, so a full disk fills further each time a
+    # Session ends and the operator's `ls` shows litter instead of one ledger.
+    path = tmp_path / "ledger.json"
+    save_posteriors(path, "alice", {"mlops": SkillState("mlops", alpha=8.0, beta=2.0)}, now=0.0)
+    before = path.read_bytes()
+
+    real_named_temporary_file = tempfile.NamedTemporaryFile
+
+    def half_written_tempfile(*args, **kwargs):
+        handle = real_named_temporary_file(*args, **kwargs)
+
+        def die_mid_write(_payload):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        handle.write = die_mid_write
+        return handle
+
+    monkeypatch.setattr(tempfile, "NamedTemporaryFile", half_written_tempfile)
+    for _ in range(3):  # repeated, because the leak is one file *per* failed Session
+        save_posteriors(path, "bob", {"mlops": SkillState("mlops", alpha=2.0, beta=8.0)}, now=0.0)
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["ledger.json"]
+    assert path.read_bytes() == before  # a half-written save is a no-op, not a truncation
+    assert "not persisted" in caplog.text
+
+
+def test_a_tempfile_that_never_opens_still_never_raises(tmp_path, monkeypatch, caplog):
+    # A read-only /state mount fails at *creation*, before anything is staged, so the cleanup has no
+    # name to unlink — the failure path has to tolerate having got nowhere. Without that guard the
+    # handler dies on its own cleanup and the OSError escapes a function whose caller (`postmortem`)
+    # is entitled to assume it cannot, failing a Session that had already finished successfully.
+    path = tmp_path / "ledger.json"
+
+    def refuse_to_open(*args, **kwargs):
+        raise OSError(errno.EROFS, "Read-only file system")
+
+    monkeypatch.setattr(tempfile, "NamedTemporaryFile", refuse_to_open)
+    save_posteriors(path, "alice", {"mlops": SkillState("mlops", alpha=8.0, beta=2.0)}, now=0.0)
+
+    assert "not persisted" in caplog.text
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_cleanup_that_itself_fails_still_never_raises(tmp_path, caplog, monkeypatch):
+    # The failure path's own cleanup runs on the same sick disk that caused the failure, so the unlink
+    # can fail too. `save_posteriors` is contractually forbidden to raise — losing coaching memory must
+    # never fail an otherwise-complete Session — and an unsuppressed cleanup error would be exactly the
+    # exception the caller was promised could not happen, thrown from the handler meant to absorb one.
+    path = tmp_path / "ledger.json"
+
+    def exploding_replace(src, dst, *args, **kwargs):
+        raise OSError(errno.EIO, "I/O error")
+
+    def exploding_unlink(self, *args, **kwargs):
+        raise OSError(errno.EIO, "I/O error")
+
+    monkeypatch.setattr(os, "replace", exploding_replace)
+    monkeypatch.setattr(Path, "unlink", exploding_unlink)
+
+    save_posteriors(path, "alice", {"mlops": SkillState("mlops", alpha=8.0, beta=2.0)}, now=0.0)
+
+    assert "not persisted" in caplog.text  # still warns: swallowed, not silently skipped
+
+
+def test_published_ledger_is_owner_only(tmp_path):
+    # The publish path tightens the on-disk mode 0644 -> 0600: NamedTemporaryFile creates 0600 and
+    # os.replace carries the source's mode onto the target rather than restoring the old one. Intended
+    # for per-Candidate data, but it is a real behaviour change on an existing deployment's file, so
+    # CI owns it instead of a commit message.
+    path = tmp_path / "ledger.json"
+    path.write_text("{}", encoding="utf-8")
+    path.chmod(0o644)
+
+    save_posteriors(path, "alice", {"mlops": SkillState("mlops", alpha=8.0, beta=2.0)}, now=0.0)
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_publish_survives_a_mount_boundary_around_the_state_dir(tmp_path, monkeypatch, caplog):
+    # The deployed ledger lives on the Docker /state volume, which is a different filesystem from the
+    # image. os.replace is only atomic within one filesystem and raises EXDEV across a boundary, so a
+    # tempfile staged under the system temp dir would publish fine on a dev laptop and fail on every
+    # save in production. This emulates the kernel's rule — rename across directories that are not
+    # siblings is EXDEV — so staging anywhere but next to the target loses the record outright.
+    path = tmp_path / "ledger.json"
+    real_replace = os.replace
+
+    def replace_within_one_filesystem(src, dst, *args, **kwargs):
+        if Path(src).parent != Path(dst).parent:
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", replace_within_one_filesystem)
+    save_posteriors(path, "alice", {"mlops": SkillState("mlops", alpha=8.0, beta=2.0)}, now=0.0)
+
+    assert load_priors(path, "alice", now=0.0).raw_mastery["mlops"] == pytest.approx(0.8)
+    assert "not persisted" not in caplog.text
 
 
 # --- two-session invariant (ADR 0002 / 0006) ----------------------------------------------------
