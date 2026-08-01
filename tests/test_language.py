@@ -55,6 +55,34 @@ def test_code_switched_vietnamese_stays_vietnamese():
     )
 
 
+def test_toneless_vietnamese_is_not_english():
+    # The diacritic ratio is 0.0 here — the text carries no Vietnamese-specific letter at all — so
+    # only the function-word signal can catch it. Without that second signal a whole Vietnamese
+    # answer reads as English, which is the failure R-23 exists to keep dead.
+    assert not answer_is_english(
+        "Overfitting la khi model hoc thuoc du lieu train, khong tong quat hoa duoc nen ket qua tren tap test rat te."
+    )
+
+
+def test_english_with_rare_vietnamese_lookalike_tokens_stays_english():
+    # One hit ("la") over 21 tokens clears neither gate, so English prose survives loosening either
+    # threshold alone. What this pins is the word list: "va" is the Vietnamese "and" and the most
+    # tempting entry to add, and adding it lands two hits (the tokenizer splits "va_scores") at ratio
+    # 0.095 — past both gates — which would silently strip english_delivery from English answers.
+    assert answer_is_english(
+        "We ship an a la carte feature flag and a va_scores column, but this whole explanation is plain English prose."
+    )
+
+
+def test_toneless_code_switched_vietnamese_stays_vietnamese():
+    # The toneless twin of the case above: Vietnamese grammar carrying English jargon, typed the way
+    # the target users actually type. The diacriticked version short-circuits on the letter ratio and
+    # never reaches this branch.
+    assert not answer_is_english(
+        "Minh se dung read-through cache, neu miss thi fallback ve database, va set TTL khoang 5 phut cho hot key."
+    )
+
+
 def test_english_quoting_one_vietnamese_term_stays_english():
     assert answer_is_english(
         'Vietnamese word segmentation matters because a token like "từ ghép" spans two syllables '
@@ -92,6 +120,18 @@ def test_mixed_mode_activates_delivery_only_on_english_answers():
     vn = rubric_with_delivery(_RUBRIC, "mixed", "Em sẽ dùng cache read-through với TTL ngắn.")
     assert "english_delivery" in en.active
     assert "english_delivery" not in vn.active
+
+
+def test_mixed_mode_never_activates_delivery_on_toneless_vietnamese():
+    # R-23's production symptom: a Vietnamese answer graded on English delivery because the text
+    # carried no tone marks. The fixture is 22 words, well clear of _MIN_DELIVERY_WORDS, so a green
+    # result here can only come from the detector and never from the too-short-to-grade floor.
+    rubric = rubric_with_delivery(
+        _RUBRIC,
+        "mixed",
+        "Overfitting la khi model hoc thuoc du lieu train, khong tong quat hoa duoc nen ket qua tren tap test rat te.",
+    )
+    assert "english_delivery" not in rubric.active
 
 
 def test_vn_mode_never_activates_delivery_even_on_english_answers():

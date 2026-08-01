@@ -457,3 +457,28 @@ def test_lookup_without_language_preference_raises_on_empty_shelf():
     store = InMemoryConceptStore([])
     with _pytest.raises(LookupError):
         _lookup_with_widening(store, "q", skill="mlops", language=None)
+
+
+def test_vn_mode_follow_up_validator_accepts_toneless_vietnamese():
+    # A vn Session's Interviewer must not burn its one retry rejecting its own valid follow-up just
+    # because the candidate-facing question was typed without tone marks (R-23). The English twin
+    # still has to be rejected, or require_vietnamese would be a no-op.
+    from interview_coach.interviewer import _make_validators
+
+    # get_lookup returning None disarms require_grounding, isolating the language gate.
+    validators = _make_validators("What is overfitting?", lambda: None, "vn")
+
+    toneless = FollowUp(
+        question="Neu model cua ban overfit thi ban se lam gi de giam variance ma khong pha vo bias?",
+        targets="depth: khong noi duoc cach giam variance",
+    )
+    for validate in validators:
+        validate(toneless)
+
+    english = FollowUp(
+        question="How would you reduce variance without breaking the bias tradeoff?",
+        targets="depth: no mechanism given",
+    )
+    with pytest.raises(ValueError, match="Vietnamese-language"):
+        for validate in validators:
+            validate(english)
