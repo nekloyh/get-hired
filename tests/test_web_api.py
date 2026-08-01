@@ -1321,9 +1321,15 @@ class _ProviderDemoClient(DemoLLMClient):
 class _MeteredDemoClient(_ProviderDemoClient):
     """Bills 100 tokens per provider call to the ledger, so spend grows as the Session runs."""
 
+    tokens_per_call = 100
+
     def chat_json(self, *args, **kwargs):
-        usage.record_usage("mimo", "test-model", prompt_tokens=100, completion_tokens=0)
+        usage.record_usage("mimo", "test-model", prompt_tokens=self.tokens_per_call, completion_tokens=0)
         return super().chat_json(*args, **kwargs)
+
+
+class _ExpensiveDemoClient(_MeteredDemoClient):
+    tokens_per_call = 500
 
 
 def _live_client(tmp_path, monkeypatch, *, token: str = "", brain=None):
@@ -1492,10 +1498,75 @@ def test_a_mid_session_breach_suspends_instead_of_completing(tmp_path, monkeypat
         assert ws.receive_json()["type"] == "session_started"
         _expect_question(ws)  # Q1 really was asked before the rail fired
         ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
-        event = _receive_until_any(ws, {"session_error", "session_completed"})
+        # "question" is in the wait set only so a rail that fails to fire ends this test instead of
+        # blocking forever on a Q2 nobody is going to answer.
+        event = _receive_until_any(ws, {"session_error", "session_completed", "question"})
 
-    assert event["type"] == "session_error"
+    assert event["type"] == "session_error", f"the rail did not suspend after Q1: {event}"
     assert "suspended" in event["error"].lower()
     assert "LLM_SESSION_TOKEN_BUDGET" in event["error"]
     # A suspended Session is not a finished one: nothing was persisted as complete.
     assert client.get("/api/sessions/breach/export.md").status_code in (404, 409)
+
+
+def test_a_refused_live_session_never_starts_the_interview(tmp_path, monkeypatch):
+    # The refusal must RETURN, not just emit. Dropping the `return` still puts session_error first on
+    # the wire — every socket-level assertion keeps passing — while the interview runs anyway on a
+    # budget that was just declared insufficient. Driving the thread function directly is what makes
+    # "and then nothing else happened" observable.
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(tmp_path / "usage-ledger.jsonl"))
+    monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "10")
+    monkeypatch.delenv("LLM_SESSION_TOKEN_BUDGET", raising=False)
+    monkeypatch.delenv("COACH_DAILY_QUESTION_CAP", raising=False)
+    usage.record_usage("mimo", "test-model", prompt_tokens=10, completion_tokens=0)
+    monkeypatch.setattr(web_api, "build_client", lambda settings: _ProviderDemoClient())
+    monkeypatch.setattr(web_api, "build_role_clients", lambda settings, client: RoleClients.single(client))
+
+    settings = Settings(
+        _env_file=None,
+        primary_provider="mimo",
+        mimo_api_key="test",
+        mimo_base_url="http://test",
+        mimo_model="test-model",
+        concept_store="memory",
+    )
+    api_state = web_api.WebApiState(
+        settings=settings,
+        checkpoint_db=str(tmp_path / "checkpoints.sqlite"),
+        ledger_db=str(tmp_path / "ledger.json"),
+        exports_dir=str(tmp_path / "exports"),
+    )
+    events: list[dict] = []
+    runtime = web_api.RuntimeSession(session_id="refused", mode="live", emit=events.append)
+    # Pre-queued so that a Session which wrongly starts still terminates instead of blocking here.
+    runtime.answers.put("An answer nobody should ever have been asked for.")
+
+    web_api._run_session_thread(
+        api_state,
+        runtime,
+        web_api.StartSessionPayload(type="start_session", max_questions=1),
+        False,
+    )
+
+    assert [event["type"] for event in events] == ["session_error"]
+    assert "00:00 UTC" in events[0]["error"]
+    assert usage.session_spend("refused") == 0  # and not a single token was spent under its name
+
+
+def test_the_web_rail_counts_only_the_questions_actually_left(tmp_path, monkeypatch):
+    # The web driver's mid-Session estimate must subtract the questions already resolved, exactly as
+    # the CLI's does. Charging for questions that are already paid for suspends a Session that can
+    # comfortably afford the rest of itself.
+    client = _live_client(tmp_path, monkeypatch, brain=_ExpensiveDemoClient)
+    monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", str(usage.estimated_session_tokens(2)))
+
+    with client.websocket_connect("/api/sessions/two-questions") as ws:
+        _start_live(ws, max_questions=2)
+        assert ws.receive_json()["type"] == "session_started"
+        for _ in range(2):
+            _expect_question(ws)
+            ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+        event = _receive_until_any(ws, {"session_completed", "session_error"}, limit=60)
+
+    assert event["type"] == "session_completed", f"a fundable Session was suspended: {event}"
+    assert event["state"]["question_count"] == 2

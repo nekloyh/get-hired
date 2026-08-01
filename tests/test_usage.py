@@ -28,6 +28,7 @@ from interview_coach.usage import (
     start_refusal_reason,
     token_identity,
     usage_for_day,
+    utc_date,
 )
 
 
@@ -173,6 +174,20 @@ def test_question_rows_are_invisible_to_the_token_reader(tmp_path, monkeypatch):
     # The mixed-row design rests on this: a question row must never be read as token spend.
     assert usage_for_day() == {}
     assert sessions_for_day() == {}
+
+
+def test_only_rows_marked_as_questions_are_counted(tmp_path, monkeypatch):
+    # The cap counts `kind: "questions"` rows, not "any row carrying an identity". One ledger file
+    # holds several row shapes, so the marker — not a coincidence of which keys happen to be present
+    # — is what makes a row a question reservation.
+    ledger = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
+    unmarked = {"ts": utc_date() + "T00:00:00+00:00", "identity": "id-1", "questions": 99}
+    ledger.write_text(json.dumps(unmarked) + "\n", encoding="utf-8")
+
+    assert questions_today("id-1") == 0
+    record_questions("id-1", 2)
+    assert questions_today("id-1") == 2
 
 
 def test_question_rows_from_another_day_do_not_count(tmp_path, monkeypatch):
