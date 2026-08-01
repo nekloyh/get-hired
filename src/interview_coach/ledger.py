@@ -18,9 +18,13 @@ logged warning; it never crashes a Session.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
+import os
+import tempfile
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +40,18 @@ SECONDS_PER_DAY = 86_400.0
 # a next-day return keeps almost all of last Session's signal while a months-later return is nearly a
 # cold start — honest epistemics without a hard cliff.
 LEDGER_HALF_LIFE_DAYS = 30.0
+
+# Serialises the whole load-modify-save in `save_posteriors`. The web API runs every Session on its
+# own thread and saves posteriors when it completes, so two Candidates finishing together race the
+# same file: without this, the later writer merges into a stale read and silently drops the earlier
+# Candidate's record — infrastructure noise corrupting Skill evidence, which ADR 0005 forbids.
+# A process-local Lock suffices only because the server is documented single-process (docs/deploy.md
+# §6 "Do not add workers"; R-12/#67 adds the guard that enforces it). Multi-process — R-29's Postgres
+# store — needs real locking, not this. Readers deliberately do NOT take it: publication is an atomic
+# rename, so a reader sees the whole old file or the whole new one, and holding it on the hot
+# start-of-Session path would only add contention plus a deadlock surface (`postmortem` already
+# chains load_states → save_posteriors around it).
+_SAVE_LOCK = threading.Lock()
 
 
 def decay_beta(
@@ -172,28 +188,55 @@ def save_posteriors(
 ) -> None:
     """Persist a Candidate's final per-Skill posteriors, merging into any existing ledger.
 
+    The merge is serialised under ``_SAVE_LOCK`` and published by atomic rename, so concurrent
+    completions cannot lose each other's records and a save that dies mid-flight leaves the previous
+    ledger intact rather than a truncated file that cold-starts every Candidate in it.
+
     Never raises on a write problem: failing to record memory must not fail an otherwise-complete
     Session — it logs a warning and moves on.
     """
     if not candidate_id:
         return
     target = Path(path)
-    data: dict[str, object] = {}
-    try:
-        if target.exists():
-            loaded = json.loads(target.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                data = loaded
-    except (OSError, json.JSONDecodeError) as err:
-        logger.warning("Skill ledger at %s unreadable before save (%s); overwriting.", path, err)
-    data[candidate_id] = {
-        "completed_at": now,
-        "skills": {
-            skill: {"alpha": state.alpha, "beta": state.beta}
-            for skill, state in skill_states.items()
-        },
-    }
-    try:
-        target.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-    except OSError as err:
-        logger.warning("Could not write Skill ledger at %s (%s); Session memory not persisted.", path, err)
+    with _SAVE_LOCK:
+        data: dict[str, object] = {}
+        try:
+            if target.exists():
+                loaded = json.loads(target.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+        except (OSError, json.JSONDecodeError) as err:
+            logger.warning("Skill ledger at %s unreadable before save (%s); overwriting.", path, err)
+        data[candidate_id] = {
+            "completed_at": now,
+            "skills": {
+                skill: {"alpha": state.alpha, "beta": state.beta}
+                for skill, state in skill_states.items()
+            },
+        }
+        tmp_path: Path | None = None
+        try:
+            # The tempfile must be a sibling of the target: os.replace is only atomic within one
+            # filesystem and raises EXDEV across a mount boundary (the Docker /state volume is one).
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=target.parent,
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                tmp_path = Path(handle.name)  # bound first, so a failed write still gets cleaned up
+                handle.write(json.dumps(data, indent=2, sort_keys=True))
+                handle.flush()
+                # Rename is atomic w.r.t. readers but says nothing about durability: without fsync a
+                # container restart can publish a name pointing at unflushed (zero) bytes.
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, target)
+        except OSError as err:
+            # This handler is inside a function contractually forbidden to raise, so the cleanup must
+            # not become what escapes it — hence suppress rather than a second bare unlink.
+            if tmp_path is not None:
+                with contextlib.suppress(OSError):
+                    tmp_path.unlink()
+            logger.warning("Could not write Skill ledger at %s (%s); Session memory not persisted.", path, err)
