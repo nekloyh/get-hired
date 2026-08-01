@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+from interview_coach.bank import load_pack
 from interview_coach.diagnostic import CandidateProfile, diagnose
 from interview_coach.evaluator import DimensionScore, Evaluation
 from interview_coach.microloop import MicroLoopResult, ScriptedCandidate, StopReason, Turn
@@ -16,6 +18,7 @@ from interview_coach.supervisor import (
     SupervisorAction,
     SupervisorDecision,
     _apply_supervisor_decision,
+    _build_supervisor_messages,
     _deterministic_supervisor_fallback,
     _last_probed_skill,
     _make_supervisor_validators,
@@ -1032,3 +1035,66 @@ def test_extra_question_on_an_empty_transcript_keeps_the_planned_skill():
     state["transcript"] = []
 
     assert _apply(state, "extra_question")["next_skill"] == "ml_fundamentals"
+
+
+# --- #110: every Supervisor seed rail measures against the LOADED pack ---------------------------
+#
+# ADR 0008: the built-in bank is merely the reference pack, so a rail that counts seeds against
+# QUESTION_BANK while a pack is loaded is reading someone else's inventory. Only the validator path
+# threaded `bank`; the deterministic degrade and the prompt's NEXT ACTION SEMANTICS block did not.
+
+_FPT_PACK = Path(__file__).resolve().parents[1] / "data" / "packs" / "fpt"
+
+
+def _pack_exhausted_state(pack):
+    """A Skill probed to the PACK's limit, its last probe safety_cap below the bar.
+
+    This is the exact state where the two banks disagree: the pack says "no seed left, advance",
+    the built-in bank says "seeds remain, probe again". Everything is computed from the pack so the
+    fixture tracks whatever the shipped pack holds.
+    """
+    probes = seed_count("mlops", bank=pack)
+    # Load-bearing premise: if the pack ever grows past the built-in bank the disagreement inverts
+    # and these tests would pass for the wrong reason. Fail loudly instead.
+    assert probes < seed_count("mlops")
+    state = _plan_state(["mlops", "system_design"], question_count=probes)
+    state["transcript"] = [_transcript_item("mlops") for _ in range(probes - 1)] + [
+        _transcript_item("mlops", score=1.0, stop_reason="safety_cap")
+    ]
+    state["skill_metadata"] = {"mlops": {"evidence_bar": 3.0}}
+    return state, probes
+
+
+@pytest.mark.parametrize(
+    "replies",
+    [
+        [ConnectionError("provider timed out")],
+        ["not json", "still not json"],  # chat_json runs max_retries=1, i.e. two attempts
+    ],
+    ids=["transport", "schema_invalid"],
+)
+def test_the_deterministic_degrade_measures_seeds_against_the_loaded_pack(make_client, replies):
+    # Both degrade paths (ADR 0005) are covered because the fallback is *constructed in code and
+    # returned*, so the validators never see it — nothing downstream catches an impossible probe.
+    # Asking for a seed the pack cannot serve raises SeedQuestionsExhausted in question_node and
+    # burns the slot as a zero-evidence `failed` row, on a Session that is already degraded.
+    pack = load_pack(_FPT_PACK).questions
+    state, _ = _pack_exhausted_state(pack)
+    client, _ = make_client(replies)
+
+    decision = decide_next_move(client, state, now=lambda: 0.0, question_bank=pack)
+
+    assert decision.action is SupervisorAction.ADVANCE_PLAN
+
+
+def test_the_prompt_cannot_promise_a_seed_the_pack_does_not_have():
+    # The two assertions pin the self-contradiction, not one line's wording: on the buggy build the
+    # same prompt body told the model mlops had 0 seeds left AND that another seed remained. The
+    # first assertion also guards the already-correct SEED AVAILABILITY block against a regression.
+    pack = load_pack(_FPT_PACK).questions
+    state, probes = _pack_exhausted_state(pack)
+
+    body = _build_supervisor_messages(state, pack)[1]["content"]
+
+    assert f"- mlops: probed {probes}/{probes} seeds (0 left)" in body
+    assert "another seed remains" not in body
