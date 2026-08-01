@@ -197,9 +197,16 @@ def load_retrieval_labels(path: str | Path | None = None) -> tuple[RetrievalCase
             raise RetrievalEvalError(
                 f"{target}: case {case_id!r} has source {source!r}, expected one of {_VALID_SOURCES}"
             )
-        expected = raw["expected"] or []
+        # No `or []` normalisation here. `raw["expected"] or []` short-circuits on every falsy value —
+        # a bare `expected:`, `{}`, `0`, `""` — and turns it into "harvested, not yet labelled", which
+        # drops the row out of the DENOMINATOR without a word. That silent-denominator-shrink is the
+        # exact failure class this file exists to fence, so a malformed `expected` is loud instead.
+        expected = raw["expected"]
         if not isinstance(expected, list) or any(not isinstance(item, str) for item in expected):
-            raise RetrievalEvalError(f"{target}: case {case_id!r} `expected` must be a list of concept note ids")
+            raise RetrievalEvalError(
+                f"{target}: case {case_id!r} `expected` must be a list of concept note ids "
+                f"(use `[]` for a harvested-but-unlabelled row), got {expected!r}"
+            )
         cases.append(
             RetrievalCase(
                 case_id=case_id,
@@ -227,7 +234,16 @@ def unknown_expected_concepts(cases: Iterable[RetrievalCase]) -> tuple[str, ...]
 
 
 def evaluate_retrieval(cases: Iterable[RetrievalCase], lookup: LookupFn) -> RetrievalReport:
-    """Replay every labelled case through ``lookup`` with its **frozen** filters."""
+    """Replay every labelled case through ``lookup`` with its **frozen** filters.
+
+    Fidelity claim, stated narrowly. Production reaches the store through
+    ``interviewer._lookup_with_widening``, which on ``LookupError`` retries once with
+    ``language=None``. This replays the *served* branch only, and a widened lookup lands in
+    ``errors`` rather than being re-run unfiltered — deliberately: scoring a row frozen with
+    ``language: vi`` against an unfiltered call is the audit's third defect, and letting the eval
+    silently drop a frozen filter would put it back. So replay == production exactly while
+    ``errors`` is empty, and a test pins that it is empty for every frozen row today.
+    """
     outcomes: list[RetrievalOutcome] = []
     unlabelled: list[RetrievalCase] = []
     errors: list[tuple[RetrievalCase, str]] = []
@@ -354,17 +370,30 @@ def _unfilter(value: str) -> str | None:
 def harvest_lookup_calls(root: str | Path, known: Iterable[RetrievalCase] = ()) -> tuple[HarvestedLookup, ...]:
     """Scan Markdown exports and JSON Session/replay artifacts for logged ``concept_lookup_query``.
 
-    De-duplicated on (query, skill, language) and against the queries already frozen, so a re-harvest
-    of the same export directory proposes nothing.
+    De-duplicated on (query, skill, language) — both in-run and against the frozen set, on the same
+    key — so a re-harvest of the same export directory proposes nothing.
+
+    The frozen side must key on the full triple, not the query text. All 62 frozen rows were
+    generated in en-mode, and since #69 a vn/mixed Session both filters on ``language: "vi"`` and
+    embeds with a different model (e5). Keying on query text alone would mean that the moment a
+    string is frozen with ``language: null``, the same string logged from a vn Session can never be
+    harvested — biasing the only mechanism for growing toward the AC's 150+ target against ever
+    admitting the vn call shape.
+
+    Raises ``FileNotFoundError`` when ``root`` is not a directory: ``rglob`` on a missing path yields
+    nothing, so a typo'd export dir would otherwise report "nothing new to harvest" — success, and
+    affirmatively false.
     """
     directory = Path(root)
-    frozen = {case.query for case in known}
+    if not directory.is_dir():
+        raise FileNotFoundError(f"{directory}: not a directory — there is nothing to harvest from")
+    frozen = {(case.query, case.skill, case.language) for case in known}
     seen: set[tuple[str, str | None, str | None]] = set()
     harvested: list[HarvestedLookup] = []
 
     def admit(query: str, skill: str | None, language: str | None, origin: str) -> None:
         key = (query, skill, language)
-        if query in frozen or key in seen:
+        if key in frozen or key in seen:
             return
         seen.add(key)
         harvested.append(HarvestedLookup(query=query, skill=skill, language=language, origin=origin))

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import importlib.util
 import json
+import sys
+from collections import Counter
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -195,6 +200,46 @@ def test_an_unknown_source_is_rejected(tmp_path):
         load_retrieval_labels(path)
 
 
+@pytest.mark.parametrize(
+    "literal",
+    ["", "{}", "0", '""'],
+    ids=["bare-key", "empty-mapping", "number", "empty-string"],
+)
+def test_a_malformed_expected_is_rejected_not_silently_read_as_unlabelled(tmp_path, literal):
+    """The silent-denominator-shrink hole, and it was open.
+
+    `expected = raw["expected"] or []` short-circuits on EVERY falsy value before the isinstance
+    check ever runs, so each of these four parsed as "harvested, not yet labelled" — reported,
+    never scored, gone from the denominator without a word. A typo'd row quietly making hit@1 a
+    smaller measurement is precisely the class R-15 exists to fence, and the loader's docstring
+    already promised to fail loud on it. `[]` stays the one way to say unlabelled, and it has to be
+    written deliberately.
+    """
+    path = _write(tmp_path, _row(expected=literal))
+
+    with pytest.raises(RetrievalEvalError, match="expected"):
+        load_retrieval_labels(path)
+
+
+def test_an_explicit_empty_list_is_the_one_way_to_say_unlabelled(tmp_path):
+    """The control for the four above: `[]` must still load, or the harvest stubs (`expected: []`)
+    would be unloadable and the whole pending-file convention would break."""
+    (case,) = load_retrieval_labels(_write(tmp_path, _row(expected="[]")))
+
+    assert case.expected == ()
+    assert not case.is_labelled
+
+
+def test_the_frozen_file_writes_every_expected_as_an_explicit_list():
+    """Belt and braces on the loader fix: no frozen row may rely on falsy-to-unlabelled coercion,
+    so every one of the 62 must round-trip as a real list — labelled or explicitly empty."""
+    cases = load_retrieval_labels()
+
+    assert len(cases) == _FROZEN_CASE_COUNT
+    assert all(isinstance(case.expected, tuple) for case in cases)
+    assert all(case.is_labelled for case in cases)
+
+
 def test_a_complete_row_loads(tmp_path):
     """The control for the four rejection tests above: the fixture is only wrong where they make it
     wrong, so `pytest.raises` cannot be passing for an unrelated reason."""
@@ -264,6 +309,112 @@ def test_the_english_seed_rows_carry_no_language_filter():
     assert {c.language for c in other} == {None}
 
 
+def test_the_vi_filter_returns_the_same_hit_ids_it_would_without_the_filter():
+    """The measurement the test above only claims in prose.
+
+    The frozen file's header says the vi filter "changes no current number" because every note on
+    the vietnamese_nlp shelf is already `language: vi`. That was an unenforced assertion in a
+    docstring, which is how a caveat rots. Here it is a check: replay the whole frozen set twice,
+    once as frozen and once with every language filter stripped, and compare hit ids row by row.
+
+    Two failure directions, both worth a red. If the shelf gains an English note the filtered and
+    unfiltered rankings diverge and the frozen filter becomes load-bearing — a reviewer needs to know
+    the published number can now move for a reason that is not a ranker change. If instead the filter
+    stops being applied at all, this goes green while `test_a_live_case_is_replayed_with_the_filters
+    _it_was_logged_with` goes red, which is the pair reading correctly.
+    """
+    cases = load_retrieval_labels()
+    store = InMemoryConceptStore(SEED_CONCEPTS)
+
+    frozen = evaluate_retrieval(cases, _store_lookup(store))
+    unfiltered = evaluate_retrieval(tuple(replace(c, language=None) for c in cases), _store_lookup(store))
+
+    assert [o.hit_id for o in frozen.outcomes] == [o.hit_id for o in unfiltered.outcomes]
+    assert (frozen.hits, frozen.n_scored) == (unfiltered.hits, unfiltered.n_scored) == (59, 62)
+
+
+def test_no_frozen_row_needs_the_production_widening_retry():
+    """The narrow half of the fidelity claim, pinned.
+
+    Production reaches the store through `interviewer._lookup_with_widening`, which retries once
+    with `language=None` on LookupError; `evaluate_retrieval` calls `lookup_concept` straight and
+    files a LookupError as unservable instead. Those two agree exactly as long as no frozen row ever
+    takes the widening branch — i.e. as long as `errors` is empty. It is, for all 62 rows, so the
+    replay is the production call today. The day a row becomes unservable this goes red, which is
+    the day the divergence starts to matter and someone has to decide which behaviour the eval wants.
+    """
+    report = evaluate_retrieval(load_retrieval_labels(), _store_lookup(InMemoryConceptStore(SEED_CONCEPTS)))
+
+    assert report.errors == ()
+    assert report.unlabelled == ()
+
+
+# --- the headline number, scored end to end ------------------------------------------------------
+
+
+def test_the_frozen_set_is_fifty_nine_seed_rows_and_three_live_rows():
+    """The 59/3 split is load-bearing and was previously only prose. 59 is the seed enumeration off
+    the bank at 184f5a2 — the number that shows the 2026-07-11 audit's 50 had drifted. 3 is how far
+    the production-shaped half actually reaches, and `by_source` exists to keep those two apart.
+    Asserting only the total 62 lets every row be relabelled `seed` with nothing going red."""
+    counts = Counter(case.source for case in load_retrieval_labels())
+
+    assert counts == {"seed": 59, "live": 3}
+    assert sum(counts.values()) == _FROZEN_CASE_COUNT
+
+
+def test_the_frozen_set_scores_fifty_nine_of_sixty_two_on_the_in_memory_shelf():
+    """The number this whole issue exists to protect, actually computed in CI.
+
+    Every other scoring test runs on hand-built two-note fixtures with a single-element `expected`,
+    so the aggregation was pinned but the *headline* was not: narrowing the hit predicate from
+    "the top note is one of the acceptable labels" to "the top note is the first label" left the
+    whole suite green while this moved 59/62 (95.2%) -> 48/62 (77.4%). The in-memory shelf is used
+    deliberately — it needs no rag extras and the whole replay takes ~0.01s — so the guard runs on
+    every default `pytest -q`, not only where chromadb happens to be installed.
+
+    This is a floor, not the production path: `scripts/retrieval_eval.py` measures Chroma + BGE and
+    stamps which store it used. If a concepts.yaml edit moves this number, that is the eval doing
+    its job — re-measure and update the literal in the same diff.
+    """
+    report = evaluate_retrieval(load_retrieval_labels(), _store_lookup(InMemoryConceptStore(SEED_CONCEPTS)))
+
+    assert (report.hits, report.n_scored) == (59, 62)
+    assert report.hit_rate == pytest.approx(0.951612903225806, abs=1e-12)
+    assert report.by_source == {"seed": (56, 59), "live": (3, 3)}
+
+
+def test_multi_label_rows_are_where_the_headline_lives():
+    """Why "acceptable hits" is plural, quantified on the real set.
+
+    21 of the 62 frozen rows carry 2-4 acceptable ids — the 2026-07-11 ratchet is largely *made* of
+    such appends (+mlops_experiment_tracking, +mlops_data_validation, +vietnamese_nlp_vncorenlp) —
+    and 11 of the 59 hits land on a label that is not the first entry. Those 11 are the exact
+    distance between 59/62 and 48/62, so a reader who wants to know how much of the headline rests
+    on multi-label semantics is looking at a measured number rather than at this sentence.
+    """
+    cases = load_retrieval_labels()
+    report = evaluate_retrieval(cases, _store_lookup(InMemoryConceptStore(SEED_CONCEPTS)))
+
+    assert sum(1 for case in cases if len(case.expected) > 1) == 21
+    assert sum(1 for o in report.outcomes if o.hit and o.hit_id != o.case.expected[0]) == 11
+    assert sum(1 for o in report.outcomes if o.hit_id == o.case.expected[0]) == 48
+
+
+def test_a_hit_on_any_acceptable_label_counts_not_only_the_first():
+    """The predicate itself, away from the shelf: `expected` is a set of acceptable hits, and the
+    order they were written in carries no meaning."""
+    cases = (
+        _case("first", expected=("a", "b")),
+        _case("second", expected=("b", "a")),
+        _case("neither", expected=("b", "c")),
+    )
+
+    report = evaluate_retrieval(cases, _fixed_lookup("a"))
+
+    assert {o.case.case_id: o.hit for o in report.outcomes} == {"first": True, "second": True, "neither": False}
+
+
 # --- scoring -------------------------------------------------------------------------------------
 
 
@@ -322,6 +473,19 @@ def test_per_skill_hit_rates_are_reported():
     assert report.by_skill == {"mlops": (1, 1), "deep_learning": (0, 1)}
 
 
+def test_an_unfiltered_case_is_grouped_under_any_not_under_none():
+    """`case.skill or "any"` is the only place a null Skill filter gets a name. Left as None it
+    would be an unsortable key next to the strings — `sorted(by_skill)` raises — so the fallback is
+    load-bearing for the report, not cosmetic. "any" also matches how the export renders a null
+    filter, which is what `_unfilter` reads back on harvest."""
+    cases = (_case("a", skill=None, expected=("a",)), _case("b", skill="mlops", expected=("a",)))
+
+    report = evaluate_retrieval(cases, _fixed_lookup("a"))
+
+    assert report.by_skill == {"any": (1, 1), "mlops": (1, 1)}
+    assert "| any | 1/1 |" in render_retrieval_report(report, store="memory", embedding_model="none", checksum="c")
+
+
 # --- Wilson interval (AC-b) ----------------------------------------------------------------------
 
 
@@ -331,6 +495,26 @@ def test_wilson_interval_matches_published_endpoints():
     catch a z of 2 instead of 1.959964 and a dropped z^2/4n^2 term."""
     assert wilson_interval(0, 10) == pytest.approx((0.0, 0.27753), abs=1e-5)
     assert wilson_interval(10, 10) == pytest.approx((0.72247, 1.0), abs=1e-5)
+
+
+def test_wilson_interval_matches_interior_reference_points():
+    """The two endpoints above are blind to the variance term, and that blindness was a real hole.
+
+    At x=0 and x=n the factor `phat * (1 - phat)` is IDENTICALLY ZERO, so deleting it from the
+    half-width leaves both of them — and mirror symmetry, and the narrows-with-n check — completely
+    unchanged. The mutant survived the whole suite while the interval at the real operating point
+    (59/62) collapsed from [86.7%, 98.3%] to [89.6%, 95.4%]: width 0.116 -> 0.058. Laundering a
+    62-sample result as twice the precision it has is exactly what `wilson_interval`'s own docstring
+    says Wilson is here to prevent, and hit@1-with-a-CI is this issue's stated deliverable. So the
+    reference set needs at least one point where the term is non-zero.
+
+    59/62 is the frozen set's live operating point; 5/10 is p-hat = 0.5, where the term is at its
+    maximum. Both endpoints re-derived independently at 50 significant digits with `decimal` (z =
+    1.9599639845400545345521376207289648827582310510462, the two-sided 95% normal quantile). The
+    float path agrees to ~1e-16; 1e-12 is slack for that, and 0.029 clear of the mutant.
+    """
+    assert wilson_interval(59, 62) == pytest.approx((0.86711962072676038, 0.98340831414941929), abs=1e-12)
+    assert wilson_interval(5, 10) == pytest.approx((0.23659309051256395, 0.76340690948743605), abs=1e-12)
 
 
 def test_wilson_interval_is_mirror_symmetric():
@@ -427,6 +611,37 @@ def test_an_all_unlabelled_report_refuses_to_print_a_hit_rate():
     assert "no labelled cases" in text
 
 
+def test_the_report_names_every_miss_and_what_the_ranker_returned_instead():
+    """The misses section is the only part of the report anyone can act on: a bare 59/62 tells you
+    a number moved, the miss list tells you which query and which wrong note. The whole block was
+    deletable with the suite still green."""
+    cases = (_case("hit", expected=("a",)), _case("gone", query="q2", expected=("x", "y"), source="live"))
+
+    text = render_retrieval_report(
+        evaluate_retrieval(cases, _fixed_lookup("a")), store="memory", embedding_model="none", checksum="abc"
+    )
+
+    assert "### Misses" in text
+    assert "`gone` (live) -> `a` (score 0.500); expected one of `x, y`" in text
+    assert "`hit`" not in text  # a hit is not a miss; listing it would make the section unreadable
+
+
+def test_the_report_names_every_unservable_lookup():
+    """An unservable row is out of the denominator, so it is invisible in the headline by design —
+    which makes printing it the only thing that stops a shelf/filter break from reading as a quiet
+    n going down. Deleting this section left the suite green."""
+
+    def lookup(query, skill, language):
+        raise LookupError("no concept notes match skill='ghost'")
+
+    text = render_retrieval_report(
+        evaluate_retrieval((_case("a"),), lookup), store="memory", embedding_model="none", checksum="abc"
+    )
+
+    assert "### Unservable (1)" in text
+    assert "`a`: no concept notes match skill='ghost'" in text
+
+
 # --- harvest (stdout only, never writes) ----------------------------------------------------------
 
 
@@ -459,6 +674,56 @@ def test_the_markdown_export_records_the_lookup_filters():
     text = render_session_markdown(state)
 
     assert "Concept lookup: `monitoring for drift` (skill=`mlops`, language=`vi`) -> `mlops_drift_monitoring`" in text
+
+
+def test_the_harvester_reads_what_the_real_exporter_actually_writes(tmp_path):
+    """The seam, round-tripped end to end instead of at both ends separately.
+
+    `exporter._append_transcript` writes the lookup line and `_MD_LOOKUP_RE` parses it, each holding
+    its own independent literal. The writer test above pins the render string and every harvest test
+    hand-writes its own input, so the two literals were free to drift apart: changing the render's
+    `(skill=...)` to `[skill=...]` and updating its pinning test in lockstep left the suite green
+    while harvesting real export output returned nothing at all — the accumulation path toward the
+    150+ target silently yielding zero forever. Nothing here is hand-written: the exporter produces
+    the text, the harvester consumes it, and the query/filters have to survive the trip.
+    """
+    state = {
+        "session_id": "s",
+        "transcript": [
+            {
+                "skill": "vietnamese_nlp",
+                "turns": [
+                    {
+                        "question": "q",
+                        "answer": "a",
+                        "evaluation": {},
+                        "trace": {
+                            "concept_lookup_query": "phân đoạn từ tiếng Việt | PhoBERT",
+                            "concept_lookup_skill": "vietnamese_nlp",
+                            "concept_lookup_language": "vi",
+                            "concept_hit_id": "vietnamese_nlp_phobert",
+                        },
+                    },
+                    {
+                        "question": "q2",
+                        "answer": "a2",
+                        "evaluation": {},
+                        "trace": {"concept_lookup_query": "drift", "concept_hit_id": "mlops_drift_monitoring"},
+                    },
+                ],
+            }
+        ],
+    }
+    (tmp_path / "export.md").write_text(render_session_markdown(state), encoding="utf-8")
+
+    harvested = harvest_lookup_calls(tmp_path)
+
+    # The pipe-bearing Vietnamese query survives `_md`'s escape; the second turn logged no filters,
+    # so it comes back as the unfiltered shape a human must resolve before it can be frozen.
+    assert {(h.query, h.skill, h.language) for h in harvested} == {
+        ("phân đoạn từ tiếng Việt | PhoBERT", "vietnamese_nlp", "vi"),
+        ("drift", None, None),
+    }
 
 
 def test_harvest_reads_markdown_exports_and_json_replays(tmp_path):
@@ -531,6 +796,56 @@ def test_harvest_skips_queries_already_frozen(tmp_path):
     assert "nothing new to harvest" in render_harvest_stubs(())
 
 
+def test_a_query_frozen_in_en_mode_does_not_block_the_same_text_from_a_vn_session(tmp_path):
+    """The frozen-side dedupe must key on the full (query, skill, language) triple, like the in-run
+    one, not on the query text.
+
+    All 62 frozen rows were generated in en-mode, and since #69 a vn/mixed Session both filters on
+    `language: "vi"` and embeds with a different model (e5). Keyed on text alone, the moment a
+    string is frozen with `language: null` the identical string logged from a vn Session can never
+    be harvested — so `--harvest`, the only mechanism for growing the set toward 150+, was
+    structurally incapable of ever admitting the vn call shape. That is a different lookup, and it
+    is the one whose ranking nobody has measured.
+    """
+    frozen = _case("f", query="drift monitoring", skill="mlops", language=None)
+    (tmp_path / "a.md").write_text(
+        "Concept lookup: `drift monitoring` (skill=`mlops`, language=`vi`) -> `x`\n"
+        "Concept lookup: `drift monitoring` (skill=`mlops`, language=`any`) -> `x`\n",
+        encoding="utf-8",
+    )
+
+    harvested = harvest_lookup_calls(tmp_path, known=(frozen,))
+
+    assert [(h.query, h.skill, h.language) for h in harvested] == [("drift monitoring", "mlops", "vi")]
+
+
+def test_harvest_dedupes_on_the_filters_not_on_the_query_text_alone(tmp_path):
+    """The in-run half of the same rule. One string logged under three different filter shapes is
+    three different lookups with three different candidate sets; collapsing them to one would drop
+    two rows a human never got to see. The exact repeat is still collapsed."""
+    (tmp_path / "a.md").write_text(
+        "Concept lookup: `drift` (skill=`mlops`, language=`any`) -> `x`\n"
+        "Concept lookup: `drift` (skill=`mlops`, language=`vi`) -> `x`\n"
+        "Concept lookup: `drift` (skill=`ml_fundamentals`, language=`any`) -> `x`\n"
+        "Concept lookup: `drift` (skill=`mlops`, language=`any`) -> `y`\n",
+        encoding="utf-8",
+    )
+
+    harvested = harvest_lookup_calls(tmp_path)
+
+    assert [(h.skill, h.language) for h in harvested] == [("mlops", None), ("mlops", "vi"), ("ml_fundamentals", None)]
+
+
+def test_harvest_refuses_a_directory_that_does_not_exist(tmp_path):
+    """`rglob` on a missing path yields nothing, so a typo'd export dir printed "nothing new to
+    harvest: every logged query is already in the frozen set." and exited 0 — a success message that
+    is affirmatively false. Silence has to be distinguishable from an empty scan."""
+    with pytest.raises(FileNotFoundError, match="nothing to harvest"):
+        harvest_lookup_calls(tmp_path / "typo")
+
+    assert harvest_lookup_calls(tmp_path) == ()  # the control: a real but empty dir is still empty
+
+
 def test_a_harvested_stub_round_trips_through_the_loader(tmp_path):
     """The stub is the human's editing surface, so it has to be a loadable row once `expected` is
     filled — otherwise the pending-file convention hands the reviewer a syntax error."""
@@ -562,3 +877,58 @@ def test_harvest_stubs_are_unlabelled_and_never_written(tmp_path):
     assert "expected: []" in stubs
     assert "some new query" in stubs
     assert labels_checksum(DEFAULT_LABELS_PATH) == before
+
+
+# --- the CLI's exit codes (the gate half) ---------------------------------------------------------
+
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _cli():
+    """Import `scripts/retrieval_eval.py` by path — `scripts/` is not a package (same idiom as
+    `tests/test_serde_golden.py`)."""
+    spec = importlib.util.spec_from_file_location("retrieval_eval_cli", _REPO_ROOT / "scripts" / "retrieval_eval.py")
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_cli_exits_non_zero_when_nothing_was_scored(monkeypatch, capsys):
+    """A run in which every case was unservable printed "no labelled cases were scored — nothing to
+    report" and still exited 0. The module already refuses `hits / max(1, n)` for exactly this
+    reason — a vacuous green is not a measurement — but that rule stopped at the property boundary,
+    and it is the exit code that a gate actually reads."""
+    module = _cli()
+    monkeypatch.setattr(module, "load_retrieval_labels", lambda: (_case("a", skill="no_such_shelf"),))
+
+    assert module.main(store_kind="memory") == 1
+    assert "nothing was measured" in capsys.readouterr().err
+
+
+def test_the_cli_exits_zero_on_a_scored_report(monkeypatch, capsys):
+    """The control: the same path with one servable, labelled case must still be green, or the
+    check above would pass by making the script always fail."""
+    module = _cli()
+    monkeypatch.setattr(
+        module,
+        "load_retrieval_labels",
+        lambda: (_case("a", query="drift monitoring", skill="mlops", expected=("mlops_drift_monitoring",)),),
+    )
+
+    assert module.main(store_kind="memory") == 0
+    assert "hit@1: 1/1" in capsys.readouterr().out
+
+
+def test_the_cli_exits_non_zero_when_the_harvest_directory_is_missing(tmp_path, capsys):
+    """`--harvest` on a typo'd path reported success with a false message. It must be loud instead,
+    and it must still be silent-and-green on a real directory that simply holds nothing new."""
+    module = _cli()
+
+    assert module.main(harvest=str(tmp_path / "typo")) == 1
+    assert "cannot harvest" in capsys.readouterr().err
+
+    assert module.main(harvest=str(tmp_path)) == 0
+    assert "nothing new to harvest" in capsys.readouterr().out
