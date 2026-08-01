@@ -777,7 +777,7 @@ def _run_session_thread(
             if refusal is not None:
                 # No `session_started`: the Candidate must never watch an interview begin that
                 # cannot be paid for.
-                logger.warning("refused to start Session %s: %s", runtime.session_id, refusal)
+                logger.warning("refused to start Session %r: %s", runtime.session_id, refusal)
                 runtime.emit({"type": "session_error", "error": refusal})
                 return
             # Reserved at START, not at completion: a cap that only counts finished Sessions is
@@ -794,7 +794,7 @@ def _run_session_thread(
                 max_questions=max_questions,
                 max_turns=DEFAULT_MAX_TURNS,
             ):
-                logger.warning("Session %s resumed past a budget stop: %s", runtime.session_id, cleared)
+                logger.warning("Session %r resumed past a budget stop: %s", runtime.session_id, cleared)
         # R-13: the measured path is the default path. Demo mode stays in-memory on purpose — it
         # runs on a fake model for UX review, and building a Chroma index (first run: downloading an
         # embedding model) to serve fake questions would be a slow answer to a question nobody asked.
@@ -892,7 +892,7 @@ def _run_session_thread(
         # ADR 0005's third category: budget exhaustion. Its own branch, ABOVE the completion block —
         # a suspended Session must never emit session_completed or be persisted as if it finished.
         # The checkpoint is durable, so the UI's resume picks it up once the budget allows.
-        logger.warning("Session %s suspended on a budget rail: %s", runtime.session_id, err)
+        logger.warning("Session %r suspended on a budget rail: %s", runtime.session_id, err)
         runtime.emit({"type": "session_error", "error": f"Session suspended: {err}"})
     except CandidateIntent as err:
         # ADR 0005 / issue 0017: the Candidate asked to stop (web cancel/disconnect). This is intent,

@@ -1253,11 +1253,15 @@ def test_a_newline_in_the_session_id_cannot_forge_a_resume_warning(tmp_path, cap
     api_state.checkpoint_db = str(tmp_path)  # a directory: sqlite cannot open it
 
     with caplog.at_level(logging.WARNING, logger="interview_coach.web_api"):
+        # R-25 split the read from the interpretation: `_checkpoint_values` is the half that touches
+        # the untrusted id and logs, `_session_language_mode` is pure. Both still have to degrade.
+        values = web_api._checkpoint_values(api_state, forged)
         payload = ResumeSessionPayload(type="resume_session", mode="demo")
-        mode = web_api._session_language_mode(api_state, forged, payload, True)
+        mode = web_api._session_language_mode(payload, True, values)
 
+    assert values == {}
     assert mode == "en"  # still degrades rather than crashing the resume
-    messages = [r.getMessage() for r in caplog.records if "language_mode" in r.getMessage()]
+    messages = [r.getMessage() for r in caplog.records if "resumed Session" in r.getMessage()]
     assert messages, "the resume read-failure path logged nothing to check"
     assert all("\n" not in message for message in messages)
 
