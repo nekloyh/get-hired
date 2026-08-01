@@ -15,6 +15,10 @@ services:
       COACH_LEDGER_DB: /app/state/skill-ledger.json
       COACH_EXPORTS_DIR: /app/state/exports
       COACH_STATIC_DIR: /app/web/dist
+      # Same reason, and load-bearing: /app is root-owned 755 and the app runs as uid 10001, so any
+      # relative path inherited from .env would fail `mkdir` and degrade to stderr-only — losing the
+      # `llm-call` trace across the restart it exists to survive. Only the state volume is writable.
+      COACH_LOG_FILE: /app/state/logs/coach-api.log
     volumes:
       # Everything that must survive a restart or a redeploy. Losing this volume loses in-flight
       # Sessions (checkpoints), every report not yet downloaded (R-08), and cross-session Skill

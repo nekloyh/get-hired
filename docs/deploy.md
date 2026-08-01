@@ -100,9 +100,22 @@ Back it up with `docker run --rm -v coach-state:/state -v "$PWD:/backup" alpine 
 **Do not add workers.** `runtimes` and `completed_sessions` are per-process dicts and the checkpoint
 store is SQLite, so a second worker gets a resume request for a Session it has never heard of, and
 two processes write the same SQLite file. `WEB_CONCURRENCY` and `--workers` are not supported; the
-image's `CMD` runs one worker on purpose. (A guard that refuses to start on `WEB_CONCURRENCY>1` is
-tracked as R-12/#67.) One worker handles this workload comfortably — a Session spends nearly all of
-its wall time waiting on the model, and each one runs on its own thread.
+image's `CMD` runs one worker on purpose. **The server now refuses to start** on `WEB_CONCURRENCY>1`
+or `--workers >1` (R-12) — the check runs when `interview_coach.web_api` is imported, so under
+`coach api` and `uvicorn …:app` it fires before a port is bound: uvicorn's `config.load_app()` runs
+ahead of `bind_socket()` and `Multiprocess(...)`. It resolves a repeated `--workers` the way uvicorn
+does (last one wins), and an explicit `--workers` shadows `WEB_CONCURRENCY`, because a guard that
+reads the command line differently from the launcher both misses and misfires.
+It matches the long form `--workers` only; the short `-w` is not sniffed, because `-w` means
+something else in too many other commands to claim on sight.
+Scope: **gunicorn is not covered.** It is not a dependency and not in the image, and its default
+`preload_app=False` binds the port and logs `Listening at:` *before* forking and importing the app —
+so the guard would fire in the children, after the port was already bound. Run this app under
+uvicorn.
+`WEB_CONCURRENCY` is the one that bites without being typed: `docker-compose.yml` passes `.env`
+through wholesale and uvicorn reads the variable itself. One worker handles this workload comfortably
+— a Session spends nearly all of its wall time waiting on the model, and each one runs on its own
+thread.
 
 Scaling past one host means R-29 (Postgres checkpointer + real accounts), not more workers.
 
@@ -118,6 +131,18 @@ The `llm-call provider=… model=… ms=… outcome=…` line (R-26) is the one 
 failover visible after the fact. If you ever see the judge role on a provider it is not pinned to,
 that is a bug worth reporting — ADR 0009 says the judge never fails over onto another model.
 
+Server logs are INFO by default and go to stderr, which `docker compose logs` shows but a container
+restart discards. To keep them, `docker-compose.yml` sets `COACH_LOG_FILE=/app/state/logs/coach-api.log`
+in its `environment:` block — it rotates at 10 MB and keeps 5 files. The path **must** be on the
+state volume: `/app` is `root:root` 755 and the container runs as uid 10001 `coach`, so anything
+else fails `mkdir` and degrades to stderr-only. That is why the value is set there rather than left
+to `.env`, whose copy of the key is a host path for a local checkout (`coach api --log-file …`).
+An unwritable path degrades to stderr with a warning rather than refusing to start; losing the log
+is not worth losing the deployment — but it does mean a wrong path is quiet, so check for
+`is not writable` in the first lines of `docker compose logs app`.
+Lifecycle records to grep for: `Session '…' socket connected`, `Session '…' finished: status=…`,
+and `Session '…' cancelled by Candidate intent`.
+
 ## 8. Verified, not asserted
 
 Every claim above was executed against real containers on 2026-07-27:
@@ -130,3 +155,21 @@ Every claim above was executed against real containers on 2026-07-27:
 - An export written **before** the restart was still served afterwards from the volume.
 - The Playwright reconnect spec passed pointed at the container:
   `npm run test:e2e:container` (stops and starts the container instead of a local process).
+
+§6 and §7 were re-executed on 2026-08-01, against real uvicorn 0.48.0 and the real image
+(source bind-mounted over `/app/src`, which the image installs editable):
+
+- `uvicorn --workers 1 --workers 4 …:app` → refused, **zero** `Started server process` lines. The
+  mirror `--workers 4 --workers 1` → starts, one process: the guard follows uvicorn's own
+  last-one-wins resolution rather than a guess. (`uvicorn.main.main.make_context(...)`
+  `.params["workers"]` returns 4 and 1 respectively; `main.run()` calls `config.load_app()` before
+  `config.bind_socket()`, which is what makes "before the port" true.)
+- `docker run -e WEB_CONCURRENCY=4 <image>` (the image's own `CMD`) → **exit 2**, the guard's
+  message, no traceback, no port bound.
+- `docker run -e COACH_LOG_FILE=logs/coach-api.log <image>` — the value `.env.example` used to
+  suggest — → `PermissionError: [Errno 13] Permission denied: 'logs'`, degraded to stderr-only.
+  `/app` is `root:root` 755 and the process is uid 10001. With `/app/state/logs/coach-api.log` on
+  the volume the directory is created and the `llm-call` line is in the file.
+- `docker compose config` with that same `COACH_LOG_FILE=logs/coach-api.log` in `.env` →
+  `COACH_LOG_FILE: /app/state/logs/coach-api.log`: the `environment:` block overrides `env_file`.
+- gunicorn is **not** verified and not covered — see §6.

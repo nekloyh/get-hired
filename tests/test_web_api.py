@@ -1,14 +1,28 @@
 from __future__ import annotations
 
+import logging
+import os
+import subprocess
+import sys
 from datetime import UTC, datetime
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 from starlette.status import WS_1008_POLICY_VIOLATION
 from starlette.websockets import WebSocketDisconnect
 
+from interview_coach import web_api
 from interview_coach.config import Settings
-from interview_coach.web_api import ResumeSessionPayload, create_app, export_path
+from interview_coach.web_api import (
+    ResumeSessionPayload,
+    configure_session_logging,
+    create_app,
+    export_path,
+    guard_single_worker,
+)
 
 
 def _app(tmp_path):
@@ -557,9 +571,7 @@ def test_a_restored_export_is_still_gated_by_the_token(tmp_path):
     gated = _gated_client(tmp_path)
 
     assert gated.get("/api/sessions/gated-restart/export.md").status_code == 401
-    authorized = gated.get(
-        "/api/sessions/gated-restart/export.md", headers={"Authorization": f"Bearer {_TOKEN}"}
-    )
+    authorized = gated.get("/api/sessions/gated-restart/export.md", headers={"Authorization": f"Bearer {_TOKEN}"})
     assert authorized.status_code == 200
 
 
@@ -812,9 +824,7 @@ def test_a_resumed_session_keeps_its_language_for_retrieval(tmp_path):
         ws.send_json({"type": "candidate_answer", "answer": "Câu trả lời demo về drift."})
         _receive_until(ws, "session_completed", limit=40)
 
-    resumed = _session_language_mode(
-        app.state.web_api, "vn-session", ResumeSessionPayload(type="resume_session"), True
-    )
+    resumed = _session_language_mode(app.state.web_api, "vn-session", ResumeSessionPayload(type="resume_session"), True)
 
     assert resumed == "vn"
 
@@ -856,3 +866,440 @@ def test_the_startup_sweep_actually_runs(tmp_path):
 
     with SqliteSaver.from_conn_string(str(db)) as checkpointer:
         assert _threads(checkpointer) == set()
+
+
+# --- R-12: single-worker guard + server logging defaults -----------------------------------------
+
+
+def _server_env(**overrides: str) -> dict[str, str]:
+    """This process's environment minus the two variables conftest clears, plus explicit overrides.
+
+    Subprocess tests have to state the worker/log configuration they mean; inheriting whatever the
+    developer exported is how the suite would test something other than what it says.
+    """
+    inherited = {k: v for k, v in os.environ.items() if k not in {"WEB_CONCURRENCY", "COACH_LOG_FILE"}}
+    return {**inherited, **overrides}
+
+
+def test_web_concurrency_above_one_refuses_to_start():
+    # The silent route: nobody types this, it arrives from `.env` through compose's `env_file`, and
+    # uvicorn resolves it itself (`if workers is None and "WEB_CONCURRENCY" in os.environ`).
+    with pytest.raises(RuntimeError, match="WEB_CONCURRENCY"):
+        guard_single_worker(env={"WEB_CONCURRENCY": "2"}, argv=["uvicorn"])
+
+
+@pytest.mark.parametrize("argv", [["uvicorn", "--workers", "4"], ["uvicorn", "--workers=4"]])
+def test_a_workers_flag_above_one_refuses_to_start(argv):
+    with pytest.raises(RuntimeError, match="--workers"):
+        guard_single_worker(env={}, argv=argv)
+
+
+@pytest.mark.parametrize(
+    ("env", "argv"),
+    [
+        ({}, ["uvicorn"]),
+        ({"WEB_CONCURRENCY": "1"}, ["uvicorn"]),
+        ({}, ["uvicorn", "--workers", "1"]),
+        ({}, ["uvicorn", "--workers=1"]),
+    ],
+)
+def test_one_worker_is_allowed(env, argv):
+    # The over-fire guard: a truthiness check on WEB_CONCURRENCY would reject `=1`, which is exactly
+    # what a careful operator sets after reading docs/deploy.md §6.
+    guard_single_worker(env=env, argv=argv)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["uvicorn", "--workers", "1", "--workers", "4", "interview_coach.web_api:app"],
+        ["uvicorn", "--workers=1", "--workers=4", "interview_coach.web_api:app"],
+    ],
+)
+def test_a_repeated_workers_flag_resolves_the_way_uvicorn_resolves_it(argv):
+    # uvicorn's `--workers` is a plain click option (no multiple=True), so the LAST occurrence wins:
+    # `main.make_context("uvicorn", [...]).params["workers"]` returns 4 for both of these on uvicorn
+    # 0.48.0. Stopping at the first occurrence let this start four processes with the guard silent.
+    with pytest.raises(RuntimeError, match="--workers"):
+        guard_single_worker(env={}, argv=argv)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["uvicorn", "--workers", "4", "--workers", "1", "interview_coach.web_api:app"],
+        ["uvicorn", "--workers=4", "--workers=1", "interview_coach.web_api:app"],
+    ],
+)
+def test_a_repeated_workers_flag_ending_in_one_is_allowed(argv):
+    # The mirror, and the worse half for ops: uvicorn runs exactly one worker here, so refusing would
+    # answer a corrected command line with "drop --workers, or set it to 1" — what was just done.
+    guard_single_worker(env={}, argv=argv)
+
+
+def test_an_explicit_workers_flag_shadows_web_concurrency():
+    # uvicorn consults WEB_CONCURRENCY only `if workers is None` (config.py), so the flag decides in
+    # both directions. Reading the environment first would refuse a correct command line and, worse,
+    # would judge a `--workers 4` run by a WEB_CONCURRENCY nobody set.
+    guard_single_worker(env={"WEB_CONCURRENCY": "4"}, argv=["uvicorn", "--workers", "1"])
+
+    with pytest.raises(RuntimeError, match="--workers"):
+        guard_single_worker(env={"WEB_CONCURRENCY": "1"}, argv=["uvicorn", "--workers", "4"])
+
+
+@pytest.mark.parametrize(
+    ("env", "argv"),
+    [
+        ({"WEB_CONCURRENCY": "auto"}, ["uvicorn", "--workers", "auto"]),
+        # A typo in the flag still shadows the environment: click rejects the value before Config
+        # ever looks at WEB_CONCURRENCY, so refusing here would blame a variable that is not in play.
+        ({"WEB_CONCURRENCY": "4"}, ["uvicorn", "--workers", "auto"]),
+    ],
+)
+def test_a_non_integer_workers_value_is_left_to_uvicorn(env, argv):
+    # Raising ValueError on someone's typo would be a worse failure than the one being prevented.
+    guard_single_worker(env=env, argv=argv)
+
+
+def test_the_refusal_explains_why_and_what_to_do():
+    with pytest.raises(RuntimeError) as excinfo:
+        guard_single_worker(env={"WEB_CONCURRENCY": "2"}, argv=["uvicorn"])
+
+    message = str(excinfo.value)
+    assert "runtimes" in message and "completed_sessions" in message
+    assert "SQLite" in message
+    assert "docs/deploy.md" in message
+
+
+def test_the_remedy_names_the_channel_that_actually_set_the_value():
+    # An operator who left WEB_CONCURRENCY in `.env` cannot "drop --workers", and one who typed the
+    # flag has nothing to unset. A constant string here satisfied every other test in the suite.
+    with pytest.raises(RuntimeError, match="unset WEB_CONCURRENCY"):
+        guard_single_worker(env={"WEB_CONCURRENCY": "2"}, argv=["uvicorn"])
+
+    with pytest.raises(RuntimeError, match="drop --workers"):
+        guard_single_worker(env={}, argv=["uvicorn", "--workers", "2"])
+
+
+def test_the_guard_runs_when_the_module_is_merely_imported():
+    # The load-bearing call site. A guard wired only into `coach api` is bypassed by exactly the two
+    # commands docs/deploy.md and the image use — so this pins the module-scope call, in a subprocess
+    # because the guard has already run (and passed) in this one. No port is bound, no uvicorn spawns.
+    proc = subprocess.run(
+        [sys.executable, "-c", "import interview_coach.web_api"],
+        env=_server_env(WEB_CONCURRENCY="4"),
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode != 0
+    assert "WEB_CONCURRENCY" in proc.stderr and "docs/deploy.md" in proc.stderr
+
+
+def test_the_guard_reads_the_real_command_line(tmp_path):
+    # `argv=None -> sys.argv` is the only argv this code ever sees in production, and every other
+    # test injects a list — so that default had no coverage at all and could be replaced with `[]`
+    # with the whole suite still green. A script file, not `-c`, because `-c` gives sys.argv[0]='-c'
+    # and swallows the flags into it.
+    script = tmp_path / "boot.py"
+    script.write_text("import interview_coach.web_api\n", encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, str(script), "--workers", "4"],
+        env=_server_env(),
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode != 0
+    assert "--workers" in proc.stderr and "docs/deploy.md" in proc.stderr
+
+
+@pytest.fixture
+def restore_session_logging():
+    """`interview_coach` is a process-global logger: a leaked file handler holds tmp_path open."""
+    log = logging.getLogger("interview_coach")
+    existing = list(log.handlers)
+    level = log.level
+    yield
+    for handler in [h for h in log.handlers if h not in existing]:
+        log.removeHandler(handler)
+        handler.close()
+    log.setLevel(level)
+
+
+def test_the_log_file_receives_records_the_console_gets(tmp_path, restore_session_logging):
+    log_file = tmp_path / "sub" / "coach.log"
+
+    configure_session_logging(log_file=str(log_file))
+    logging.getLogger("interview_coach.web_api").info("llm-call provider=openai outcome=ok")
+
+    assert log_file.is_file()  # the parent directory is created rather than demanded
+    # The whole formatted line, not just the message: dropping `rotating.setFormatter(formatter)`
+    # left the suite green while the file recorded a bare message with no level and no logger name —
+    # so a `WARNING interview_coach.llm:` failover line and an INFO trace line became
+    # indistinguishable in the one copy that survives a restart, which is the copy that matters.
+    assert "INFO interview_coach.web_api: llm-call provider=openai outcome=ok" in log_file.read_text(encoding="utf-8")
+
+
+def test_a_blank_log_file_path_installs_no_file_sink(monkeypatch, tmp_path, restore_session_logging):
+    # `COACH_LOG_FILE=` with a stray space is what a hand-edited `.env` produces, and `.strip()` is
+    # the only thing standing between that and a log file literally named "   " in the server's
+    # working directory. Removing the `.strip()` left the suite green. chdir'd into tmp_path so the
+    # mutant's droppings land there rather than in the repo.
+    monkeypatch.chdir(tmp_path)
+
+    configure_session_logging(log_file="   ")
+
+    handlers = logging.getLogger("interview_coach").handlers
+    assert [h for h in handlers if isinstance(h, RotatingFileHandler)] == []
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_log_file_env_var_is_actually_read_by_the_serving_process(tmp_path):
+    # The whole `coach api --log-file` feature hangs on one argument at module scope, and nothing
+    # joined the two halves: one test spied on `os.environ` after the CLI wrote it, the other called
+    # `configure_session_logging(log_file=...)` directly. Dropping the argument — turning the flag
+    # into a no-op in the only process that matters — left the whole suite green. This crosses the
+    # seam for real: set the variable, import the module, and require a record on disk.
+    log_file = tmp_path / "state" / "coach-api.log"
+    script = tmp_path / "boot.py"
+    script.write_text(
+        "import logging\n"
+        "import interview_coach.web_api  # noqa: F401 - importing it is what installs the handler\n"
+        "logging.getLogger('interview_coach.web_api').info('llm-call provider=openai outcome=ok')\n"
+        "logging.shutdown()\n",
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        env=_server_env(COACH_LOG_FILE=str(log_file)),
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert log_file.is_file(), f"COACH_LOG_FILE was never read; stderr was:\n{proc.stderr}"
+    assert "llm-call provider=openai outcome=ok" in log_file.read_text(encoding="utf-8")
+
+
+def test_the_log_file_is_bounded(restore_session_logging, tmp_path):
+    # Unbounded is the failure this sink would otherwise introduce: a long-lived container writing
+    # every `llm-call` line fills the state volume that also holds the checkpoints and the exports.
+    configure_session_logging(log_file=str(tmp_path / "coach.log"))
+
+    rotating = [h for h in logging.getLogger("interview_coach").handlers if isinstance(h, RotatingFileHandler)]
+    assert len(rotating) == 1
+    assert (rotating[0].maxBytes, rotating[0].backupCount) == (10 * 1024 * 1024, 5)  # documented in deploy.md §7
+
+
+def test_an_unwritable_log_file_warns_instead_of_killing_the_server(tmp_path, caplog, restore_session_logging):
+    # ADR 0005's degrade side: an unwritable log path must never turn a working deployment dead.
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="interview_coach.web_api"):
+        configure_session_logging(log_file=str(blocker / "coach.log"))
+
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+
+def _complete_a_demo_session(client, session_id: str) -> None:
+    with client.websocket_connect(f"/api/sessions/{session_id}") as ws:
+        ws.send_json(
+            {
+                "type": "start_session",
+                "mode": "demo",
+                "target_role": "machine learning engineer",
+                "target_companies": ["Viettel"],
+                "claimed_skills": {"mlops": 3},
+                "max_questions": 1,
+                "language_mode": "en",
+            }
+        )
+        _receive_until(ws, "session_started")
+        _receive_until(ws, "question")
+        ws.send_json(
+            {
+                "type": "candidate_answer",
+                "answer": "I would compare training and validation behavior and watch for leakage.",
+            }
+        )
+        _receive_until(ws, "session_completed", limit=40)
+
+
+def test_a_connected_socket_is_visible_at_default_verbosity(tmp_path, caplog):
+    # The automated form of R-12's DoD manual check: connect and finish have to be greppable in the
+    # server log, otherwise a deployed Session is invisible between its first frame and a 500.
+    # No `caplog.at_level` on purpose — forcing the level here is what let the *default* drop to
+    # WARNING with this test still green, which is precisely the regression it is supposed to catch.
+    _complete_a_demo_session(_test_client(tmp_path), "lifecycle-1")
+
+    messages = [record.getMessage() for record in caplog.records if record.levelno == logging.INFO]
+    # The id is quoted because it is client-supplied and percent-decoded: a raw %s would let a
+    # newline in the URL path forge log lines, the same untrusted-input care `export_path` takes.
+    assert any("connected" in message and "'lifecycle-1'" in message for message in messages)
+    assert any("finished" in message and "'lifecycle-1'" in message for message in messages)
+
+
+def test_the_finished_record_is_written_before_the_client_is_told(tmp_path, monkeypatch):
+    # The emit is what hands control back to the client: the browser is already navigating to the
+    # report by the time it returns, so a record written after it races the thing it describes.
+    # Pinned rather than asserted in a commit message — swapping the two lines left the suite green.
+    order: list[str] = []
+
+    class _Ordering(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if "finished" in record.getMessage():
+                order.append("log")
+
+    emit_through = web_api.EventEmitter.__call__
+
+    def _record_then_emit(self, event):
+        if event.get("type") == "session_completed":
+            order.append("emit")
+        emit_through(self, event)
+
+    monkeypatch.setattr(web_api.EventEmitter, "__call__", _record_then_emit)
+    handler = _Ordering()
+    logging.getLogger("interview_coach.web_api").addHandler(handler)
+    try:
+        _complete_a_demo_session(_test_client(tmp_path), "ordering-1")
+    finally:
+        logging.getLogger("interview_coach.web_api").removeHandler(handler)
+
+    assert order == ["log", "emit"]
+
+
+def test_a_newline_in_the_session_id_cannot_forge_a_cancel_record(tmp_path, caplog):
+    # `/api/sessions/{session_id}` is percent-decoded before it reaches the handler, so `%0A` puts a
+    # real newline in the id. The connect/finish records were quoted; cancel and error were not, and
+    # they are the two an attacker can reach on demand.
+    client = _test_client(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="interview_coach.web_api"):
+        with client.websocket_connect("/api/sessions/forged%0AINFO:%20granted%20admin") as ws:
+            ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+            _receive_until(ws, "session_started")
+            _receive_until(ws, "question")
+            ws.send_json({"type": "cancel_session"})
+            _receive_until(ws, "session_error")
+
+    cancelled = [r.getMessage() for r in caplog.records if "cancelled by Candidate intent" in r.getMessage()]
+    assert cancelled, "the cancel path logged nothing to check"
+    assert all("\n" not in message for message in cancelled)
+    assert any("granted admin" in message for message in cancelled)  # still legible, just escaped
+
+
+def test_a_newline_in_the_session_id_cannot_forge_a_failure_record(tmp_path, caplog, monkeypatch):
+    # The other half of `session_error`, and the half that survived reverting `%r` to `%s` with the
+    # full suite green: cancel needs the Candidate to press stop, but *this* branch catches every
+    # graph or provider failure, and the attacker picks both the id and (via a flaky provider) the
+    # moment. Any exception out of the session thread lands here, so a raise from the graph build
+    # stands in for the provider blowing up mid-question.
+    def _explode(*args, **kwargs):
+        raise RuntimeError("provider exploded")
+
+    monkeypatch.setattr(web_api, "build_session_graph", _explode)
+    client = _test_client(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="interview_coach.web_api"):
+        with client.websocket_connect("/api/sessions/forged%0AINFO:%20granted%20admin") as ws:
+            ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+            _receive_until(ws, "session_error")
+
+    failed = [r.getMessage() for r in caplog.records if r.getMessage().endswith(" failed")]
+    assert failed, "the failure path logged nothing to check"
+    assert all("\n" not in message for message in failed)
+    assert any("granted admin" in message for message in failed)
+
+
+def test_a_newline_in_the_session_id_cannot_forge_an_export_failure_record(tmp_path, caplog, monkeypatch):
+    # Volunteered along with the two above and then left unpinned, so `%s` came back for free. A full
+    # disk on a Session whose id was chosen by whoever opened the socket is the whole reachability
+    # story; `export_path` already digests the id for the *filename*, which is exactly why nobody
+    # noticed the raw id still reaching the log line.
+    forged = "forged\nINFO interview_coach.llm: llm-call provider=openai outcome=ok"
+
+    def _no_disk(*args, **kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(web_api, "export_session_markdown", _no_disk)
+    api_state = _app(tmp_path).state.web_api
+
+    with caplog.at_level(logging.ERROR, logger="interview_coach.web_api"):
+        web_api._persist_export(api_state, forged, {"session_id": forged})
+
+    messages = [r.getMessage() for r in caplog.records if "Markdown export" in r.getMessage()]
+    assert messages, "the export failure path logged nothing to check"
+    assert all("\n" not in message for message in messages)
+
+
+def test_a_newline_in_the_session_id_cannot_forge_a_resume_warning(tmp_path, caplog):
+    # The resume path reads the checkpoint before the graph exists, and a checkpoint DB it cannot
+    # open is an ordinary operational failure (wrong mount, wrong permissions) — pointing it at a
+    # directory is the cheapest honest way to produce one.
+    forged = "forged\nWARNING interview_coach: judge failed over to groq"
+    api_state = _app(tmp_path).state.web_api
+    api_state.checkpoint_db = str(tmp_path)  # a directory: sqlite cannot open it
+
+    with caplog.at_level(logging.WARNING, logger="interview_coach.web_api"):
+        payload = ResumeSessionPayload(type="resume_session", mode="demo")
+        mode = web_api._session_language_mode(api_state, forged, payload, True)
+
+    assert mode == "en"  # still degrades rather than crashing the resume
+    messages = [r.getMessage() for r in caplog.records if "language_mode" in r.getMessage()]
+    assert messages, "the resume read-failure path logged nothing to check"
+    assert all("\n" not in message for message in messages)
+
+
+def test_a_newline_in_a_checkpoint_thread_id_cannot_forge_a_prune_record(caplog):
+    # A checkpoint thread id *is* a Session id — `session_config(session_id)` puts it there — so the
+    # sweep's failure record is the same untrusted string arriving by a longer road. It was still
+    # `%s`, and it is the one record here that runs at startup, with nobody watching.
+    forged = "forged\nINFO interview_coach.web_api: Session 'x' finished: status=complete"
+    entry = SimpleNamespace(
+        config={"configurable": {"thread_id": forged}},
+        checkpoint={"ts": "2020-01-01T00:00:00+00:00"},
+    )
+
+    class _Unprunable:
+        def list(self, _config):
+            return [entry]
+
+        def delete_thread(self, thread_id):
+            raise RuntimeError("database is locked")
+
+    with caplog.at_level(logging.WARNING, logger="interview_coach.web_api"):
+        assert web_api.prune_checkpoints(_Unprunable(), max_age_seconds=1.0, now=1e12) == []
+
+    messages = [r.getMessage() for r in caplog.records if "checkpoint thread" in r.getMessage()]
+    assert messages, "the prune failure path logged nothing to check"
+    assert all("\n" not in message for message in messages)
+
+
+def test_the_suite_never_writes_into_the_operators_own_log_file(tmp_path):
+    # `COACH_LOG_FILE` is read at web_api *import*, which under pytest happens during collection —
+    # so `set -a; . .env` with the path `.env.example` documents turned `uv run pytest` into a suite
+    # that reddened `test_the_log_file_is_bounded` (two RotatingFileHandlers on the process-global
+    # logger) and, far worse, appended 1,939 lines into the operator's real server log, 415 of them
+    # counterfeit `llm-call provider=mimo ... outcome=ok` records. That is the trace ADR 0009
+    # addendum a reads to find a silent judge failover, so those are fabricated evidence. The
+    # conftest pop is the fix, and only a subprocess can observe it: by the time any in-process test
+    # runs, this process's collection is long over and the damage would already be done.
+    log_file = tmp_path / "coach-api.log"
+
+    proc = subprocess.run(
+        [
+            *[sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+            "tests/test_web_api.py::test_the_log_file_is_bounded",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=_server_env(COACH_LOG_FILE=str(log_file)),
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stdout[-4000:]
+    assert not log_file.exists(), f"collection wrote to COACH_LOG_FILE:\n{log_file.read_text(encoding='utf-8')[:2000]}"
