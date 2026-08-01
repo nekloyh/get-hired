@@ -34,15 +34,7 @@ ENGLISH_DELIVERY_WEIGHT = 1.0
 # and all tone-marked vowels (both bare-vowel tones like "à" and stacked forms like "ậ"). Shared
 # accented letters (é, à, ô, ...) do appear in European loanwords, so detection is by *ratio*, not
 # presence — see :func:`answer_is_english`.
-_VIETNAMESE_CHARS = frozenset(
-    "ăâđêôơư"
-    "àáảãạằắẳẵặầấẩẫậ"
-    "èéẻẽẹềếểễệ"
-    "ìíỉĩị"
-    "òóỏõọồốổỗộờớởỡợ"
-    "ùúủũụừứửữự"
-    "ỳýỷỹỵ"
-)
+_VIETNAMESE_CHARS = frozenset("ăâđêôơưàáảãạằắẳẵặầấẩẫậèéẻẽẹềếểễệìíỉĩịòóỏõọồốổỗộờớởỡợùúủũụừứửữựỳýỷỹỵ")
 
 # An English answer quoting one Vietnamese term (e.g. "từ ghép" in an answer about segmentation)
 # stays English; a code-switched Vietnamese answer full of English jargon is still saturated with
@@ -54,37 +46,62 @@ _VIETNAMESE_RATIO_THRESHOLD = 0.03
 # second deterministic signal catches it: high-frequency Vietnamese function words in their
 # unaccented form.
 #
-# The list is NOT disjoint from English, and cannot be: unaccented Vietnamese syllables are two to
-# five letters and something always collides. What every entry IS curated against is *recurrence in
-# English technical prose* — a token that can appear twice in one English answer defeats the
-# min-hit gate by itself, and then english_delivery silently stops activating (ADR 0007) on a
-# perfectly English answer. That is why "em" (the EM algorithm; an em dash), "la" (`ls -la`, a la
-# carte, the LA region), "vi" (the editor) and "du" (`du -sh`) are absent — each was measured taking
-# an ordinary English answer over both gates on its own — and "lieu" with them, since "in lieu of"
-# needs only one companion hit. What remains is either a non-word in English ("khong", "duoc",
-# "hoac", ...) or an incidental that appears at most once in a technical answer: "dung" and "nay"
-# are dictionary words no technical answer uses, "cho" is a surname (Cho et al., the GRU paper),
-# "va" a US state code. Those survive on the gates rather than on curation — BOTH a minimum hit
-# count AND a token-density floor must clear, so one stray token can never flip an English answer.
+# The list is NOT disjoint from English and cannot be — unaccented Vietnamese syllables are two to
+# five letters, so something always collides. Curating the collisions away was tried and fails in
+# both directions at once: dropping every colliding word ("la", "vi", "du", ...) also drops the two
+# commonest shapes in a Vietnamese technical answer, the copula definition ("X **la** ...") and the
+# example framing ("**vi du** ve ..."), while the words that survive curation still collide in pairs.
+# So the collisions are handled structurally instead, by splitting the list in two:
+#
+#   * anchors (below) are tokens English simply does not use, so their presence IS the evidence;
+#   * corroborators are ordinary English tokens — they may add to the count, never carry a verdict.
+#
+# A Vietnamese verdict therefore always rests on at least one token that is not an English word.
+# That is the whole safety property, and it is what makes the residual English collisions harmless
+# rather than merely unlikely: an English answer full of "BI", "VA", "EM", "Cho" and "vi" reaches a
+# high hit count and still classifies English, because none of those is an anchor.
+#
+# Two dictionary words sit among the anchors on judgement, not structure: "dung" and "nay" are
+# English words ("dung"; the archaic "nay") that a technical interview answer never reaches for,
+# and both are load-bearing for Vietnamese recall. Everything else here is a non-word in English.
 # fmt: off
-_VIETNAMESE_FUNCTION_WORDS = frozenset(
+_VN_ANCHOR_WORDS = frozenset(
     {
         "khong", "duoc", "nhung", "khi", "neu", "hoac", "cua", "chua", "moi",
-        "nen", "nao", "vao", "cung", "minh", "vay", "toi", "va", "bi", "anh",
-        "gi", "khac", "voi", "cho", "nay", "trong", "truoc", "sau", "giua",
-        "cach", "dung", "hieu", "biet", "phai", "nhieu", "theo", "hinh",
-        "giai", "thich",
+        "nen", "nao", "vao", "cung", "minh", "vay", "toi", "anh", "khac",
+        "voi", "nay", "trong", "truoc", "sau", "giua", "cach", "dung", "hieu",
+        "biet", "phai", "nhieu", "theo", "hinh", "giai", "thich", "tren",
+        "nhu", "thi", "thay", "het",
     }
 )
+
+# Ordinary English tokens that are also high-frequency Vietnamese. Demoting rather than deleting is
+# what lets the list stay a *frequency* list: "la"/"vi"/"du"/"lieu" carry the copula and example
+# framings, "va" ("and") and "bi" (the passive marker) are the two #78's AC names, and the three
+# acronyms are why this tier exists rather than a shorter blocklist — "cac" is CAC, "se" is SE,
+# "gi" is GI, all three at home in the data/BI prose this detector must leave alone.
+#
+# Membership in both tiers is deliberately redundant: a Vietnamese sentence normally trips several
+# entries, so removing any one word rarely changes a verdict, and no per-word necessity is claimed.
+# What the tests do pin is the part that matters — the tier each word sits in, and the thin answers
+# (exactly one anchor plus one corroborator) where a deletion would cost real recall.
+_VN_CORROBORATING_WORDS = frozenset(
+    {"la", "vi", "du", "em", "va", "bi", "cho", "ve", "lieu", "cac", "se", "gi"}
+)
 # fmt: on
+_VIETNAMESE_FUNCTION_WORDS = _VN_ANCHOR_WORDS | _VN_CORROBORATING_WORDS
+
+# Counted over DISTINCT words, not occurrences. A word that recurs in one English answer ("the BI
+# layer ... the BI dashboards") would otherwise clear the minimum on its own, which is how a single
+# unlucky list entry used to convict a whole English answer.
 _VN_WORD_MIN_HITS = 2
 _VN_WORD_RATIO_THRESHOLD = 0.08
 
-# A hyphen- or underscore-joined compound is ONE token. Splitting on the joiner manufactures
-# function-word hits out of English technical vocabulary that never stands alone: "bi-gram" and
-# "bi-directional" would each donate a bare "bi", "va_scores" a bare "va" — two hits from one
-# English sentence, exactly the recurrence the curation above is meant to exclude.
-_TOKEN_PATTERN = re.compile(r"[^\W\d_]+(?:[-_][^\W\d_]+)*")
+# A hyphen-, underscore- or apostrophe-joined compound is ONE token. Splitting on the joiner
+# manufactures function-word hits out of English that never stands alone: "bi-gram" would donate a
+# bare "bi", "va_scores" a bare "va", and — the one that reaches almost every English answer — every
+# "we've"/"I've"/"they've" would donate a bare "ve".
+_TOKEN_PATTERN = re.compile(r"[^\W\d_]+(?:[-_'’][^\W\d_]+)*")
 
 # Fenced blocks and inline code spans are language-neutral: a Vietnamese answer that pastes a long
 # Python snippet must not read as English because the code diluted the prose ratio.
@@ -94,9 +111,11 @@ _CODE_PATTERN = re.compile(r"```.*?```|`[^`]*`", re.DOTALL)
 def answer_is_english(text: str) -> bool:
     """Whether ``text`` reads as English (deterministic — no LLM in the activation path).
 
-    Two signals over the prose (code blocks stripped first): the ratio of Vietnamese-specific
-    letters, and the density of unaccented Vietnamese function words — either marks the text as
-    Vietnamese. Empty or symbol-only text is not English: there is no delivery to score.
+    Two signals over the prose (code blocks stripped first), either of which marks the text as
+    Vietnamese: the ratio of Vietnamese-specific letters, and the density of *distinct* unaccented
+    Vietnamese function words — the latter only when at least one of them is a word English does
+    not use, so English prose cannot be convicted by its own vocabulary. Empty or symbol-only text
+    is not English: there is no delivery to score.
     """
     prose = unicodedata.normalize("NFC", _CODE_PATTERN.sub(" ", text)).lower()
     alpha = [ch for ch in prose if ch.isalpha()]
@@ -106,8 +125,14 @@ def answer_is_english(text: str) -> bool:
     if vietnamese / len(alpha) > _VIETNAMESE_RATIO_THRESHOLD:
         return False
     tokens = _TOKEN_PATTERN.findall(prose)
-    hits = sum(1 for token in tokens if token in _VIETNAMESE_FUNCTION_WORDS)
-    if tokens and hits >= _VN_WORD_MIN_HITS and hits / len(tokens) >= _VN_WORD_RATIO_THRESHOLD:
+    hits = {token for token in tokens if token in _VIETNAMESE_FUNCTION_WORDS}
+    if (
+        tokens
+        and len(hits) >= _VN_WORD_MIN_HITS
+        and len(hits) / len(tokens) >= _VN_WORD_RATIO_THRESHOLD
+        # ...and the evidence is not made up entirely of words English also uses.
+        and hits & _VN_ANCHOR_WORDS
+    ):
         return False
     return True
 
@@ -132,11 +157,7 @@ def rubric_with_delivery(rubric: Rubric, language_mode: str, answer: str) -> Rub
     and a ``vn`` Session never activates the dimension at all (issue 0024 acceptance criterion).
     Question packs never carry the dimension themselves; it is injected here, per answer.
     """
-    active = (
-        language_mode != "vn"
-        and len(answer.split()) >= _MIN_DELIVERY_WORDS
-        and answer_is_english(answer)
-    )
+    active = language_mode != "vn" and len(answer.split()) >= _MIN_DELIVERY_WORDS and answer_is_english(answer)
     currently = rubric.weights.get("english_delivery", 0.0) > 0
     if active == currently:
         return rubric
