@@ -128,16 +128,21 @@ def _append_transcript(lines: list[str], session_state: Mapping[str, Any]) -> No
             lines.append(f"**Candidate:** {_md(turn.answer)}")
             if turn.grounding_concept_id:
                 lines.append("")
-                lines.append(
-                    f"Grounded by: `{_md(turn.grounding_concept_id)}` ({_md(turn.grounding_concept_title)})"
-                )
+                lines.append(f"Grounded by: `{_md(turn.grounding_concept_id)}` ({_md(turn.grounding_concept_title)})")
             _append_evaluation(lines, turn.evaluation)
             trace = turn.trace
             if trace.evaluator_self_critique_triggers:
                 lines.append(f"Self-critique triggers: `{_md(', '.join(trace.evaluator_self_critique_triggers))}`")
             if trace.concept_lookup_query:
+                # The filters are rendered, not just the query, because the export is the only
+                # durable record of a live lookup (checkpoints are reaped at a 7-day TTL) and
+                # therefore the only source R-15's eval can replay from. A query harvested without
+                # its Skill/language filters replays as a call production never makes — exactly the
+                # defect the 2026-07-11 audit's unfiltered script had (ADR 0007).
                 lines.append(
-                    f"Concept lookup: `{_md(trace.concept_lookup_query)}` -> "
+                    f"Concept lookup: `{_md(trace.concept_lookup_query)}` "
+                    f"(skill=`{_md(trace.concept_lookup_skill or 'any')}`, "
+                    f"language=`{_md(trace.concept_lookup_language or 'any')}`) -> "
                     f"`{_md(trace.concept_hit_id or 'none')}`"
                 )
             if calls := trace.llm_calls:

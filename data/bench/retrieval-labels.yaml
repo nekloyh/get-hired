@@ -1,0 +1,573 @@
+# Frozen concept-retrieval eval set (issue R-15 / GH #70).
+#
+# THIS FILE IS THE EVAL SET. Nothing that computes a retrieval score is allowed to write it.
+# `scripts/retrieval_eval.py` only reads it, and `tests/test_retrieval_eval.py` pins its sha256 —
+# so any edit, including an edit to these comments, turns CI red until the pin is updated in the
+# same diff. That two-place edit is the "explicit PR note" the AC asks for.
+#
+# WHY IT IS FROZEN. The 2026-07-11 audit
+# (docs/audits/concept-retrieval-review-2026-07-11.md) derived its eval live from
+# `questions.yaml`: queries from `follow_up_seeds`, ground truth from `expected_concepts`. Two
+# things went wrong with that.
+#   1. The ratchet. The agent running the eval scored 43/50, judged four of its own misses to be
+#      label defects, edited `expected_concepts` (+mlops_experiment_tracking, +mlops_data_validation,
+#      +vietnamese_nlp_vncorenlp) and one note tag, and reported 47/50. One-way, upward, self-graded.
+#      ADR 0009 addendum (b) names exactly this failure class for the judge bench; retrieval had no
+#      equivalent guard.
+#   2. Silent drift of the denominator. The audit measured 50 lookups. The same enumeration on the
+#      bank at 184f5a2 yields 59 — the bank grew and the eval followed it with nobody noticing, so a
+#      published retrieval score was not even comparable to itself across commits.
+# Both are fixed the same way: every query below is a LITERAL string, not a template re-joined at
+# run time, and every label is a literal list. The bank can now move without moving the eval.
+#
+# THE 2026-07-11 LABEL AMENDMENTS ARE CARRIED IN AS-IS. This file freezes the ratchet where it
+# stopped; it does not re-litigate it. Re-judging those four labels inside the PR that builds the
+# freeze would be one more self-graded edit.
+#
+# FIELDS (all required on every row; `skill` and `language` must be present even when null).
+#   id        unique, stable.
+#   source    "seed"  a follow-up need enumerated from the bank, frozen at 184f5a2.
+#             "live"  a real `TurnTrace.concept_lookup_query` written by the model in a Session.
+#   origin    where the row came from, precisely enough to re-check it by hand.
+#   skill     the Skill filter to replay with. Production ALWAYS sets one.
+#   language  the language filter to replay with, frozen — never recomputed at run time.
+#   query     the literal lookup string.
+#   expected  hand-labelled acceptable hits (note ids). An EMPTY list means "harvested, not yet
+#             labelled": the row is reported but never scored, so a growing backlog can never push
+#             hit@1 down and create pressure to label optimistically.
+#
+# LANGUAGE FILTER — the third audit defect. The old script called `lookup_concept(store, query,
+# skill=skill)` with no language at all, a call production never makes: `_preferred_lookup_language`
+# (interviewer.py) returns "vi" for any `vietnamese_nlp` lookup and for every lookup in a vn/mixed
+# Session (ADR 0007). The `language` below is that function's answer for a default en-mode Session,
+# computed once at generation time and frozen. Honest caveat: on the shelf as it stands today all
+# six `vietnamese_nlp` notes are already `language: vi`, so the filter selects the same candidates
+# as the Skill filter alone and the frozen value changes no current number. It stops being a no-op
+# the moment an English note lands on that shelf — which is precisely when an unfiltered eval would
+# start quietly measuring a call production cannot make.
+#
+# SEED QUERIES ARE STILL A TEMPLATE, and that half of the audit defect is NOT fixed here. A seed
+# query is `"<follow_up_seed> — <question text>"`; production queries are written by the model.
+# Only the `source: live` rows are production-shaped, and there are three of them. The template is
+# kept verbatim so the frozen number stays comparable to the 43/50 → 47/50 → 46/50 history; the fix
+# is to grow the live half toward the 150+ target (`scripts/retrieval_eval.py --harvest`).
+#
+# ADMITTING A NEW ROW — the reviewer's obligations, in order:
+#   1. `data/exports/` is gitignored as Candidate transcript data. A live query promoted into this
+#      file is a fragment of a real interview crossing that boundary. Read every admitted string and
+#      redact anything that identifies a Candidate.
+#   2. Label from the concept shelf, not from what the store returned. Grading a query with the
+#      answer the ranker gave is the ratchet wearing a different hat.
+#   3. Harvest is stdout-only by construction. Stubs land in
+#      `data/bench/pending-retrieval-queries-<date>.yaml` (the ADR-0009 pending-cases convention)
+#      and a human moves them here.
+#
+# THE THREE LIVE ROWS BELOW WERE LABELLED BY THE SAME AGENT THAT BUILT THIS FILE, and their labels
+# agree with the hit the ranker recorded (each `origin` says so). They therefore cannot falsify the
+# ranker that produced them. Read the headline number with that in mind — `scripts/retrieval_eval.py`
+# reports seed and live hit@1 separately for this reason.
+#
+# EMBEDDER INDEPENDENCE. A row is (query, filters, expected note ids). Re-ingesting the shelf under
+# a different embedder does not invalidate it. Renaming an id in `data/concepts.yaml` does — the
+# script warns when a label names a note that is no longer on the shelf.
+#
+# Generated from the question bank at 184f5a2 (45 questions, 40 concept notes) by a throwaway
+# script, on 2026-08-01.
+
+version: 1
+cases:
+  - id: seed-deep_learning-0001
+    source: seed
+    origin: "questions.yaml deep_learning[0].follow_up_seeds[0] @ 184f5a2"
+    skill: "deep_learning"
+    language: null
+    query: "Ask for the gradient-flow mechanism in terms of the Jacobian. — Explain why residual connections help train deep neural networks, and name one failure mode they do not automatically solve."
+    expected: [deep_learning_residual_connections]
+
+  - id: seed-deep_learning-0002
+    source: seed
+    origin: "questions.yaml deep_learning[1].follow_up_seeds[0] @ 184f5a2"
+    skill: "deep_learning"
+    language: null
+    query: "Probe the train/inference statistics mismatch and when it bites. — Why does batch normalization speed up training, and when can it behave surprisingly or hurt?"
+    expected: [deep_learning_batch_normalization]
+
+  - id: seed-deep_learning-0003
+    source: seed
+    origin: "questions.yaml deep_learning[2].follow_up_seeds[0] @ 184f5a2"
+    skill: "deep_learning"
+    language: null
+    query: "Ask which single technique they would reach for first and why. — What causes vanishing or exploding gradients in deep networks, and what concrete techniques keep training stable?"
+    expected: [deep_learning_residual_connections]
+
+  - id: seed-deep_learning-0004
+    source: seed
+    origin: "questions.yaml deep_learning[2].follow_up_seeds[1] @ 184f5a2"
+    skill: "deep_learning"
+    language: null
+    query: "Push for the role of initialization versus normalization. — What causes vanishing or exploding gradients in deep networks, and what concrete techniques keep training stable?"
+    expected: [deep_learning_residual_connections]
+
+  - id: seed-deep_learning-0005
+    source: seed
+    origin: "questions.yaml deep_learning[3].follow_up_seeds[0] @ 184f5a2"
+    skill: "deep_learning"
+    language: null
+    query: "Ask why L2 regularization inside Adam is not equivalent to weight decay. — When would you choose SGD with momentum over Adam, and what does AdamW change?"
+    expected: [deep_learning_optimizers]
+
+  - id: seed-deep_learning-0006
+    source: seed
+    origin: "questions.yaml deep_learning[4].follow_up_seeds[0] @ 184f5a2"
+    skill: "deep_learning"
+    language: null
+    query: "Ask why the surviving activations are scaled by 1/(1−p) during training. — Explain how dropout behaves at training versus inference time. What bug does forgetting eval mode cause?"
+    expected: [deep_learning_dropout]
+
+  - id: seed-deep_learning-0007
+    source: seed
+    origin: "questions.yaml deep_learning[5].follow_up_seeds[0] @ 184f5a2"
+    skill: "deep_learning"
+    language: null
+    query: "Push for what \"path length\" means for gradient flow between distant tokens. — Why did attention replace recurrence for long sequences? Include the cost that came with it."
+    expected: [deep_learning_attention]
+
+  - id: seed-deep_learning-0008
+    source: seed
+    origin: "questions.yaml deep_learning[6].follow_up_seeds[0] @ 184f5a2"
+    skill: "deep_learning"
+    language: null
+    query: "Ask what catastrophic forgetting is and which knob controls it. — You have 2,000 labeled examples and a pretrained backbone. Do you fine-tune everything or freeze it and train a head? How do you decide?"
+    expected: [deep_learning_transfer_learning]
+
+  - id: seed-deep_learning-0009
+    source: seed
+    origin: "questions.yaml deep_learning[7].follow_up_seeds[0] @ 184f5a2"
+    skill: "deep_learning"
+    language: null
+    query: "Ask why warmup specifically stabilizes Adam early in training. — Your transformer's training loss spikes to NaN within the first few hundred steps. What is your debugging order?"
+    expected: [deep_learning_lr_schedules]
+
+  - id: seed-deep_learning-0010
+    source: seed
+    origin: "questions.yaml deep_learning[8].follow_up_seeds[0] @ 184f5a2"
+    skill: "deep_learning"
+    language: null
+    query: "Ask what double descent implies for choosing model size. — Deep networks can memorize completely random labels, yet they generalize on real data. How do you reconcile that, and what does it change in practice?"
+    expected: [deep_learning_generalization]
+
+  - id: seed-ml_fundamentals-0001
+    source: seed
+    origin: "questions.yaml ml_fundamentals[0].follow_up_seeds[0] @ 184f5a2"
+    skill: "ml_fundamentals"
+    language: null
+    query: "Push for a concrete numeric diagnosis from a train/validation error pair. — Explain the bias–variance tradeoff and how it guides model selection and regularization. What do you watch on the learning curves?"
+    expected: [ml_fundamentals_bias_variance, ml_fundamentals_l2_regularization]
+
+  - id: seed-ml_fundamentals-0002
+    source: seed
+    origin: "questions.yaml ml_fundamentals[0].follow_up_seeds[1] @ 184f5a2"
+    skill: "ml_fundamentals"
+    language: null
+    query: "Ask which fix they would try first and why, given a wide generalization gap. — Explain the bias–variance tradeoff and how it guides model selection and regularization. What do you watch on the learning curves?"
+    expected: [ml_fundamentals_bias_variance, ml_fundamentals_l2_regularization]
+
+  - id: seed-ml_fundamentals-0003
+    source: seed
+    origin: "questions.yaml ml_fundamentals[1].follow_up_seeds[0] @ 184f5a2"
+    skill: "ml_fundamentals"
+    language: null
+    query: "Probe the penalty-to-variance mechanism, not just \"smaller weights\". — Why does L2 regularization reduce overfitting, and how would you choose its strength?"
+    expected: [ml_fundamentals_l2_regularization]
+
+  - id: seed-ml_fundamentals-0004
+    source: seed
+    origin: "questions.yaml ml_fundamentals[1].follow_up_seeds[1] @ 184f5a2"
+    skill: "ml_fundamentals"
+    language: null
+    query: "Ask how they would search the regularization strength concretely. — Why does L2 regularization reduce overfitting, and how would you choose its strength?"
+    expected: [ml_fundamentals_l2_regularization]
+
+  - id: seed-ml_fundamentals-0005
+    source: seed
+    origin: "questions.yaml ml_fundamentals[2].follow_up_seeds[0] @ 184f5a2"
+    skill: "ml_fundamentals"
+    language: null
+    query: "Ask for a concrete leakage trap and the fold scheme that avoids it. — Explain how k-fold cross-validation works and when it can still mislead you."
+    expected: [ml_fundamentals_cv_leakage]
+
+  - id: seed-ml_fundamentals-0006
+    source: seed
+    origin: "questions.yaml ml_fundamentals[3].follow_up_seeds[0] @ 184f5a2"
+    skill: "ml_fundamentals"
+    language: null
+    query: "Ask why ROC-AUC can look optimistic under heavy imbalance while PR-AUC does not. — Your fraud model reports 99% accuracy, but the business says it misses most fraud. Which metrics do you look at instead, and why?"
+    expected: [ml_fundamentals_classification_metrics]
+
+  - id: seed-ml_fundamentals-0007
+    source: seed
+    origin: "questions.yaml ml_fundamentals[3].follow_up_seeds[1] @ 184f5a2"
+    skill: "ml_fundamentals"
+    language: null
+    query: "Push for how they would set the alert threshold given a fixed review-queue capacity. — Your fraud model reports 99% accuracy, but the business says it misses most fraud. Which metrics do you look at instead, and why?"
+    expected: [ml_fundamentals_classification_metrics]
+
+  - id: seed-ml_fundamentals-0008
+    source: seed
+    origin: "questions.yaml ml_fundamentals[4].follow_up_seeds[0] @ 184f5a2"
+    skill: "ml_fundamentals"
+    language: null
+    query: "Probe where resampling belongs relative to the train/validation split, and why. — You have a 1-to-100 imbalanced dataset. Walk me through training and evaluating a classifier on it without fooling yourself."
+    expected: [ml_fundamentals_class_imbalance, ml_fundamentals_classification_metrics]
+
+  - id: seed-ml_fundamentals-0009
+    source: seed
+    origin: "questions.yaml ml_fundamentals[5].follow_up_seeds[0] @ 184f5a2"
+    skill: "ml_fundamentals"
+    language: null
+    query: "Ask why tree ensembles are insensitive to monotone feature transforms. — Which models need feature scaling and which do not? Give me the reasoning, not just the list."
+    expected: [ml_fundamentals_feature_scaling]
+
+  - id: seed-ml_fundamentals-0010
+    source: seed
+    origin: "questions.yaml ml_fundamentals[5].follow_up_seeds[1] @ 184f5a2"
+    skill: "ml_fundamentals"
+    language: null
+    query: "Probe where the scaler must be fit to avoid leakage. — Which models need feature scaling and which do not? Give me the reasoning, not just the list."
+    expected: [ml_fundamentals_feature_scaling]
+
+  - id: seed-ml_fundamentals-0011
+    source: seed
+    origin: "questions.yaml ml_fundamentals[6].follow_up_seeds[0] @ 184f5a2"
+    skill: "ml_fundamentals"
+    language: null
+    query: "Ask what boosting's sequential residual fitting means for label noise. — Compare random forests and gradient boosting: how does each reduce error, and when would you pick one over the other?"
+    expected: [ml_fundamentals_ensembles]
+
+  - id: seed-ml_fundamentals-0012
+    source: seed
+    origin: "questions.yaml ml_fundamentals[7].follow_up_seeds[0] @ 184f5a2"
+    skill: "ml_fundamentals"
+    language: null
+    query: "Push past \"it's the standard pairing\" to the gradient behavior when the model is confidently wrong. — Why is cross-entropy preferred over squared error for training classifiers?"
+    expected: [ml_fundamentals_cross_entropy]
+
+  - id: seed-ml_fundamentals-0013
+    source: seed
+    origin: "questions.yaml ml_fundamentals[8].follow_up_seeds[0] @ 184f5a2"
+    skill: "ml_fundamentals"
+    language: null
+    query: "Ask what happens to the ratio of nearest to farthest distances as dimensionality grows. — Your kNN classifier works well on 10 features but collapses on 1,000. What is happening geometrically, and what do you do about it?"
+    expected: [ml_fundamentals_curse_dimensionality]
+
+  - id: seed-mlops-0001
+    source: seed
+    origin: "questions.yaml mlops[0].follow_up_seeds[0] @ 184f5a2"
+    skill: "mlops"
+    language: null
+    query: "Ask what specifically gates retraining beyond a drift alert firing. — How would you monitor a production model for data drift and decide when retraining is actually justified?"
+    expected: [mlops_drift_monitoring]
+
+  - id: seed-mlops-0002
+    source: seed
+    origin: "questions.yaml mlops[1].follow_up_seeds[0] @ 184f5a2"
+    skill: "mlops"
+    language: null
+    query: "Ask for the exact metric and threshold that triggers an automatic rollback. — How would you roll out a new model version safely, and how would you detect and roll back a regression?"
+    expected: [mlops_model_rollout]
+
+  - id: seed-mlops-0003
+    source: seed
+    origin: "questions.yaml mlops[2].follow_up_seeds[0] @ 184f5a2"
+    skill: "mlops"
+    language: null
+    query: "Probe the single most likely cause of train/prod divergence and the check for it. — A model scores well in a notebook but degrades in production. How would you make the pipeline reproducible and catch this class of failure early?"
+    expected: [mlops_drift_monitoring, mlops_model_rollout, mlops_experiment_tracking, mlops_data_validation]
+
+  - id: seed-mlops-0004
+    source: seed
+    origin: "questions.yaml mlops[2].follow_up_seeds[1] @ 184f5a2"
+    skill: "mlops"
+    language: null
+    query: "Ask what they version to make a run reproducible. — A model scores well in a notebook but degrades in production. How would you make the pipeline reproducible and catch this class of failure early?"
+    expected: [mlops_drift_monitoring, mlops_model_rollout, mlops_experiment_tracking, mlops_data_validation]
+
+  - id: seed-mlops-0005
+    source: seed
+    origin: "questions.yaml mlops[3].follow_up_seeds[0] @ 184f5a2"
+    skill: "mlops"
+    language: null
+    query: "Ask what exactly gets logged per training run to make it reproducible. — A teammate asks \"which data and code produced the model that is in production right now?\" What infrastructure makes that answerable in minutes?"
+    expected: [mlops_experiment_tracking]
+
+  - id: seed-mlops-0006
+    source: seed
+    origin: "questions.yaml mlops[4].follow_up_seeds[0] @ 184f5a2"
+    skill: "mlops"
+    language: null
+    query: "Ask what the promotion gate checks beyond the headline metric. — What does CI/CD look like for an ML pipeline compared to a normal service, and where does continuous training fit?"
+    expected: [mlops_ci_cd_models]
+
+  - id: seed-mlops-0007
+    source: seed
+    origin: "questions.yaml mlops[5].follow_up_seeds[0] @ 184f5a2"
+    skill: "mlops"
+    language: null
+    query: "Ask which pipeline boundary the check belongs at and who gets paged. — An upstream team changed a column's unit and your model quietly degraded for two weeks. What should have caught it, and where?"
+    expected: [mlops_data_validation, mlops_drift_monitoring]
+
+  - id: seed-mlops-0008
+    source: seed
+    origin: "questions.yaml mlops[6].follow_up_seeds[0] @ 184f5a2"
+    skill: "mlops"
+    language: null
+    query: "Probe why evaluating on data logged under the old policy biases the offline estimate. — Your offline metric improved by 3%, but the A/B test shows no business lift. What explains the gap, and what do you trust?"
+    expected: [mlops_online_evaluation]
+
+  - id: seed-mlops-0009
+    source: seed
+    origin: "questions.yaml mlops[7].follow_up_seeds[0] @ 184f5a2"
+    skill: "mlops"
+    language: null
+    query: "Ask what forces a move from batch to real-time serving. — When is batch inference the right serving choice over a real-time endpoint?"
+    expected: [mlops_serving_modes]
+
+  - id: seed-mlops-0010
+    source: seed
+    origin: "questions.yaml mlops[8].follow_up_seeds[0] @ 184f5a2"
+    skill: "mlops"
+    language: null
+    query: "Ask how they would get unbiased labels when the model blocks the very outcomes it needs to learn from. — Your fraud model's labels arrive 60 days late, and the model itself decides which transactions get blocked. What does this do to evaluation and retraining?"
+    expected: [mlops_feedback_loops]
+
+  - id: seed-mlops-0011
+    source: seed
+    origin: "questions.yaml mlops[9].follow_up_seeds[0] @ 184f5a2"
+    skill: "mlops"
+    language: null
+    query: "Ask what they would monitor in the first hour, before any fraud label has matured. — You own a fraud model that is deployed in real time. Two weeks after launch, the business reports a small but steady drop in approval quality, but the offline validation metrics from the last training run still look strong. How would you design a monitoring and retraining plan that distinguishes data drift from label delay, and what signals would trigger a retrain versus a rollback?"
+    expected: [mlops_drift_monitoring, mlops_feedback_loops, mlops_model_rollout]
+
+  - id: seed-mlops-0012
+    source: seed
+    origin: "questions.yaml mlops[9].follow_up_seeds[1] @ 184f5a2"
+    skill: "mlops"
+    language: null
+    query: "Ask how delayed labels change the retrain-versus-rollback decision. — You own a fraud model that is deployed in real time. Two weeks after launch, the business reports a small but steady drop in approval quality, but the offline validation metrics from the last training run still look strong. How would you design a monitoring and retraining plan that distinguishes data drift from label delay, and what signals would trigger a retrain versus a rollback?"
+    expected: [mlops_drift_monitoring, mlops_feedback_loops, mlops_model_rollout]
+
+  - id: seed-mlops-0013
+    source: seed
+    origin: "questions.yaml mlops[9].follow_up_seeds[2] @ 184f5a2"
+    skill: "mlops"
+    language: null
+    query: "Ask when they would roll back instead of retraining. — You own a fraud model that is deployed in real time. Two weeks after launch, the business reports a small but steady drop in approval quality, but the offline validation metrics from the last training run still look strong. How would you design a monitoring and retraining plan that distinguishes data drift from label delay, and what signals would trigger a retrain versus a rollback?"
+    expected: [mlops_drift_monitoring, mlops_feedback_loops, mlops_model_rollout]
+
+  - id: seed-mlops-0014
+    source: seed
+    origin: "questions.yaml mlops[10].follow_up_seeds[0] @ 184f5a2"
+    skill: "mlops"
+    language: null
+    query: "Ask which checks run at each pipeline boundary and which of them block training. — A team wants to add CI/CD to an ML pipeline that trains a churn model daily, validates data at each boundary, and publishes models to a registry. Describe the pipeline stages you would automate, the checks you would place before training and before deployment, and how experiment tracking and lineage should be used to make a failed release reproducible."
+    expected: [mlops_ci_cd_models, mlops_data_validation, mlops_experiment_tracking]
+
+  - id: seed-mlops-0015
+    source: seed
+    origin: "questions.yaml mlops[10].follow_up_seeds[1] @ 184f5a2"
+    skill: "mlops"
+    language: null
+    query: "Ask what metadata the registry must store for a failed release to be reproducible. — A team wants to add CI/CD to an ML pipeline that trains a churn model daily, validates data at each boundary, and publishes models to a registry. Describe the pipeline stages you would automate, the checks you would place before training and before deployment, and how experiment tracking and lineage should be used to make a failed release reproducible."
+    expected: [mlops_ci_cd_models, mlops_data_validation, mlops_experiment_tracking]
+
+  - id: seed-mlops-0016
+    source: seed
+    origin: "questions.yaml mlops[10].follow_up_seeds[2] @ 184f5a2"
+    skill: "mlops"
+    language: null
+    query: "Ask how they would reproduce a bad model version from lineage alone. — A team wants to add CI/CD to an ML pipeline that trains a churn model daily, validates data at each boundary, and publishes models to a registry. Describe the pipeline stages you would automate, the checks you would place before training and before deployment, and how experiment tracking and lineage should be used to make a failed release reproducible."
+    expected: [mlops_ci_cd_models, mlops_data_validation, mlops_experiment_tracking]
+
+  - id: seed-mlops-0017
+    source: seed
+    origin: "questions.yaml mlops[11].follow_up_seeds[0] @ 184f5a2"
+    skill: "mlops"
+    language: null
+    query: "Ask which metrics differ between offline and online evaluation and why the gap appears. — You are choosing how to evaluate and serve a recommendation model for a product with three usage patterns: nightly batch scoring for email, low-latency real-time ranking in the app, and a streaming feature pipeline for fresh events. How would you compare offline and online evaluation for this system, and what rollout strategy would you use to safely move from an offline-approved model to production across these serving modes?"
+    expected: [mlops_online_evaluation, mlops_serving_modes, mlops_model_rollout]
+
+  - id: seed-mlops-0018
+    source: seed
+    origin: "questions.yaml mlops[11].follow_up_seeds[1] @ 184f5a2"
+    skill: "mlops"
+    language: null
+    query: "Ask how they would stage the rollout across the three serving modes. — You are choosing how to evaluate and serve a recommendation model for a product with three usage patterns: nightly batch scoring for email, low-latency real-time ranking in the app, and a streaming feature pipeline for fresh events. How would you compare offline and online evaluation for this system, and what rollout strategy would you use to safely move from an offline-approved model to production across these serving modes?"
+    expected: [mlops_online_evaluation, mlops_serving_modes, mlops_model_rollout]
+
+  - id: seed-mlops-0019
+    source: seed
+    origin: "questions.yaml mlops[11].follow_up_seeds[2] @ 184f5a2"
+    skill: "mlops"
+    language: null
+    query: "Ask what rollback signals they would define per serving mode. — You are choosing how to evaluate and serve a recommendation model for a product with three usage patterns: nightly batch scoring for email, low-latency real-time ranking in the app, and a streaming feature pipeline for fresh events. How would you compare offline and online evaluation for this system, and what rollout strategy would you use to safely move from an offline-approved model to production across these serving modes?"
+    expected: [mlops_online_evaluation, mlops_serving_modes, mlops_model_rollout]
+
+  - id: seed-system_design-0001
+    source: seed
+    origin: "questions.yaml system_design[0].follow_up_seeds[0] @ 184f5a2"
+    skill: "system_design"
+    language: null
+    query: "Ask how they guarantee point-in-time-correct features for training. — Design a high-level architecture for an online feature store used by a real-time ML ranking service. What consistency risks matter?"
+    expected: [system_design_feature_store]
+
+  - id: seed-system_design-0002
+    source: seed
+    origin: "questions.yaml system_design[1].follow_up_seeds[0] @ 184f5a2"
+    skill: "system_design"
+    language: null
+    query: "Ask what specifically breaks the p99 under a cold cache and how they prevent it. — Design the serving path for a recommendation API under a strict p99 latency budget. What do you cache, and what breaks under load?"
+    expected: [system_design_serving_latency]
+
+  - id: seed-system_design-0003
+    source: seed
+    origin: "questions.yaml system_design[2].follow_up_seeds[0] @ 184f5a2"
+    skill: "system_design"
+    language: null
+    query: "Ask what they shed first and how they avoid a retry storm. — Your inference API is getting more requests than it can serve. How do you design the system to degrade gracefully instead of falling over?"
+    expected: [system_design_backpressure]
+
+  - id: seed-system_design-0004
+    source: seed
+    origin: "questions.yaml system_design[2].follow_up_seeds[1] @ 184f5a2"
+    skill: "system_design"
+    language: null
+    query: "Probe the difference between queueing and load shedding under sustained overload. — Your inference API is getting more requests than it can serve. How do you design the system to degrade gracefully instead of falling over?"
+    expected: [system_design_backpressure]
+
+  - id: seed-system_design-0005
+    source: seed
+    origin: "questions.yaml system_design[3].follow_up_seeds[0] @ 184f5a2"
+    skill: "system_design"
+    language: null
+    query: "Ask how they handle late-arriving events without corrupting the aggregates. — Design the data pipeline feeding a fraud model whose features must be fresh within a minute. Batch, streaming, or both — and why?"
+    expected: [system_design_streaming_pipelines]
+
+  - id: seed-system_design-0006
+    source: seed
+    origin: "questions.yaml system_design[4].follow_up_seeds[0] @ 184f5a2"
+    skill: "system_design"
+    language: null
+    query: "Probe why \"exactly-once delivery\" from the broker alone does not save the consumer. — Your payment events are delivered at-least-once. How do you keep duplicates from double-charging customers downstream?"
+    expected: [system_design_delivery_semantics]
+
+  - id: seed-system_design-0007
+    source: seed
+    origin: "questions.yaml system_design[5].follow_up_seeds[0] @ 184f5a2"
+    skill: "system_design"
+    language: null
+    query: "Ask what breaks first when replicas scale but the database does not. — Traffic to your model API doubles every month. What has to be true about the service so you can scale it by just adding replicas?"
+    expected: [system_design_scaling_basics]
+
+  - id: seed-system_design-0008
+    source: seed
+    origin: "questions.yaml system_design[6].follow_up_seeds[0] @ 184f5a2"
+    skill: "system_design"
+    language: null
+    query: "Ask what goes wrong if two embedding-model versions write into one index. — Design semantic search over 50 million documents with a 100ms latency budget. Why not exact nearest neighbor, and what operational problems does the index bring?"
+    expected: [system_design_vector_search]
+
+  - id: seed-system_design-0009
+    source: seed
+    origin: "questions.yaml system_design[7].follow_up_seeds[0] @ 184f5a2"
+    skill: "system_design"
+    language: null
+    query: "Ask how the limiter itself avoids becoming a single point of failure. — Design rate limiting for a public API. Which algorithm, where does it live, and what does the client experience?"
+    expected: [system_design_rate_limiting]
+
+  - id: seed-system_design-0010
+    source: seed
+    origin: "questions.yaml system_design[8].follow_up_seeds[0] @ 184f5a2"
+    skill: "system_design"
+    language: null
+    query: "Ask how bounded staleness is enforced and observed rather than assumed. — Your feature store is replicated across two regions and a network partition hits mid-traffic. Walk me through the consistency choices and what your ranking model actually experiences."
+    expected: [system_design_replication_consistency, system_design_feature_store]
+
+  - id: seed-vietnamese_nlp-0001
+    source: seed
+    origin: "questions.yaml vietnamese_nlp[0].follow_up_seeds[0] @ 184f5a2"
+    skill: "vietnamese_nlp"
+    language: "vi"
+    query: "Ask for a compound-word example where syllable splitting breaks an entity. — What makes Vietnamese word segmentation important for NLP models, and when might a subword transformer reduce that need?"
+    expected: [vietnamese_nlp_word_segmentation, vietnamese_nlp_vncorenlp]
+
+  - id: seed-vietnamese_nlp-0002
+    source: seed
+    origin: "questions.yaml vietnamese_nlp[1].follow_up_seeds[0] @ 184f5a2"
+    skill: "vietnamese_nlp"
+    language: "vi"
+    query: "Ask how they build parallel data for the restoration model. — How would you handle diacritic restoration for noisy Vietnamese user text, and why does it matter downstream?"
+    expected: [vietnamese_nlp_diacritic_restoration]
+
+  - id: seed-vietnamese_nlp-0003
+    source: seed
+    origin: "questions.yaml vietnamese_nlp[2].follow_up_seeds[0] @ 184f5a2"
+    skill: "vietnamese_nlp"
+    language: "vi"
+    query: "Ask why segmenting the input before PhoBERT matters. — For a Vietnamese text classifier (e.g. a Zalo-style intent task), why might PhoBERT beat a multilingual model, and what preprocessing does it assume?"
+    expected: [vietnamese_nlp_phobert, vietnamese_nlp_vncorenlp]
+
+  - id: seed-vietnamese_nlp-0004
+    source: seed
+    origin: "questions.yaml vietnamese_nlp[2].follow_up_seeds[1] @ 184f5a2"
+    skill: "vietnamese_nlp"
+    language: "vi"
+    query: "Probe when a multilingual model would still be the better choice. — For a Vietnamese text classifier (e.g. a Zalo-style intent task), why might PhoBERT beat a multilingual model, and what preprocessing does it assume?"
+    expected: [vietnamese_nlp_phobert, vietnamese_nlp_vncorenlp]
+
+  - id: seed-vietnamese_nlp-0005
+    source: seed
+    origin: "questions.yaml vietnamese_nlp[3].follow_up_seeds[0] @ 184f5a2"
+    skill: "vietnamese_nlp"
+    language: "vi"
+    query: "Ask why the normalization must run in both the training and serving paths. — Two Vietnamese strings look identical on screen but fail equality checks and dictionary lookups. What is going on, and where in the pipeline do you fix it?"
+    expected: [vietnamese_nlp_unicode_normalization]
+
+  - id: seed-vietnamese_nlp-0006
+    source: seed
+    origin: "questions.yaml vietnamese_nlp[4].follow_up_seeds[0] @ 184f5a2"
+    skill: "vietnamese_nlp"
+    language: "vi"
+    query: "Ask which they would fund first with a limited budget — normalization rules or in-domain labels — and why. — You are building an intent classifier for Zalo-style chat messages full of teencode and mixed Vietnamese-English. What do your preprocessing and data strategy look like?"
+    expected: [vietnamese_nlp_teencode, vietnamese_nlp_diacritic_restoration]
+
+  - id: seed-vietnamese_nlp-0007
+    source: seed
+    origin: "questions.yaml vietnamese_nlp[5].follow_up_seeds[0] @ 184f5a2"
+    skill: "vietnamese_nlp"
+    language: "vi"
+    query: "Probe the train/serve segmentation mismatch and how it silently degrades PhoBERT. — Design the end-to-end NLP stack for a Vietnamese customer-support chatbot: normalization, segmentation, model choice, and the noisy-input reality. Where do the risky bets hide?"
+    expected: [vietnamese_nlp_phobert, vietnamese_nlp_word_segmentation, vietnamese_nlp_teencode]
+
+  - id: live-mlops-0001
+    source: live
+    origin: "data/replay/deep-learning-strong.json final_state.transcript[1].turns[0].trace @ 184f5a2 (recorded hit: mlops_drift_monitoring)"
+    skill: "mlops"
+    language: null
+    query: "monitoring production models for data drift"
+    expected: [mlops_drift_monitoring]
+
+  - id: live-mlops-0002
+    source: live
+    origin: "data/replay/deep-learning-strong.json final_state.transcript[1].turns[1].trace @ 184f5a2 (recorded hit: mlops_drift_monitoring; near-duplicate of live-mlops-0001)"
+    skill: "mlops"
+    language: null
+    query: "monitoring production model for data drift"
+    expected: [mlops_drift_monitoring]
+
+  - id: live-mlops-0003
+    source: live
+    origin: "data/replay/deep-learning-strong.json final_state.transcript[1].turns[2].trace @ 184f5a2 (recorded hit: mlops_drift_monitoring; near-duplicate of live-mlops-0001)"
+    skill: "mlops"
+    language: null
+    query: "monitoring production model for data drift and retraining triggers"
+    expected: [mlops_drift_monitoring]
