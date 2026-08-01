@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
+import time
+from pathlib import Path
 
 import pytest
 
@@ -182,6 +186,79 @@ def test_load_states_corrupt_or_non_finite_degrades_to_cold_start(tmp_path):
         encoding="utf-8",
     )
     assert load_states(path, "alice", now=0.0) is None
+
+
+# --- atomic publish + save serialisation (R-10) -------------------------------------------------
+
+
+def test_concurrent_saves_for_different_candidates_both_persist(tmp_path, monkeypatch):
+    # The web API runs every Session on its own thread and saves posteriors when it completes, so two
+    # Candidates finishing together hit this function concurrently. A bare read-modify-write loses
+    # whichever record was read before the other thread's write landed — infrastructure noise erasing
+    # a Candidate's Skill evidence, which ADR 0005 forbids. Widening the read→write window with a
+    # sleep makes the race deterministic rather than GIL-dependent (a naive two-thread test passes on
+    # the broken code by luck); under the lock thread B just waits, so this stays ~0.1s.
+    path = tmp_path / "ledger.json"
+    save_posteriors(path, "carol", {"mlops": SkillState("mlops", alpha=4.0, beta=4.0)}, now=0.0)
+
+    real_read_text = Path.read_text
+
+    def slow_read_text(self, *args, **kwargs):
+        raw = real_read_text(self, *args, **kwargs)
+        if self == path:
+            time.sleep(0.05)
+        return raw
+
+    monkeypatch.setattr(Path, "read_text", slow_read_text)
+    barrier = threading.Barrier(2)  # outside the critical section — inside it, the lock would deadlock
+
+    def save(candidate_id: str, alpha: float, beta: float) -> None:
+        barrier.wait()
+        states = {"mlops": SkillState("mlops", alpha=alpha, beta=beta)}
+        save_posteriors(path, candidate_id, states, now=0.0)
+
+    threads = [
+        threading.Thread(target=save, args=("alice", 9.0, 1.0)),
+        threading.Thread(target=save, args=("bob", 2.0, 1.0)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    monkeypatch.undo()
+
+    # Both new records AND the pre-existing one survive the merge — losing "carol" would mean the
+    # winning writer had merged into a stale read.
+    assert sorted(json.loads(path.read_text(encoding="utf-8"))) == ["alice", "bob", "carol"]
+    assert load_priors(path, "alice", now=0.0).raw_mastery["mlops"] == pytest.approx(0.9)
+    assert load_priors(path, "bob", now=0.0).raw_mastery["mlops"] == pytest.approx(2.0 / 3.0)
+
+
+def test_failed_publish_keeps_the_old_ledger_and_leaves_no_temp_file(tmp_path, monkeypatch, caplog):
+    # The never-raise contract, sharpened: a truncating write that dies mid-flight leaves a half file
+    # that every later load reads as malformed, cold-starting every Candidate in it. Publishing by
+    # rename means a failed save is a no-op — the previous ledger is still there, byte-identical —
+    # and the abandoned tempfile must not accumulate one-per-Session on a failing disk.
+    path = tmp_path / "ledger.json"
+    save_posteriors(path, "alice", {"mlops": SkillState("mlops", alpha=8.0, beta=2.0)}, now=0.0)
+    before = path.read_bytes()
+
+    published_from = []
+
+    def exploding_replace(src, dst, *args, **kwargs):
+        published_from.append(Path(src))
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", exploding_replace)
+    save_posteriors(path, "bob", {"mlops": SkillState("mlops", alpha=2.0, beta=8.0)}, now=0.0)
+
+    assert path.read_bytes() == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["ledger.json"]
+    assert "not persisted" in caplog.text
+    # The staged file has to be a sibling of the target, not somewhere under the system temp dir:
+    # os.replace is only atomic within a single filesystem and raises EXDEV across a mount boundary,
+    # which is exactly what the Docker /state volume is.
+    assert published_from and published_from[0].parent == tmp_path
 
 
 # --- two-session invariant (ADR 0002 / 0006) ----------------------------------------------------
