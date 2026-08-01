@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import time
 from collections.abc import Mapping
@@ -810,6 +811,26 @@ def _cmd_api(client: ClientArg, args: argparse.Namespace) -> int:
     # at this point is simply absent from the process that handles requests — which is where R-26's
     # per-call `llm-call provider=... model=... outcome=...` trace has to be visible for a silent
     # judge failover to be diagnosable at all. Uvicorn keeps its own log config (banner, access log).
+    # For the same reason `--log-file` is handed over as an env var: it is the only channel that
+    # crosses the spawn boundary into the process that actually writes the records. Set it before
+    # web_api is imported below, since that import is what installs the file handler in-process.
+    if args.log_file:
+        os.environ["COACH_LOG_FILE"] = args.log_file
+    # R-12: web_api runs the same guard at import — that is the copy that covers
+    # `uvicorn interview_coach.web_api:app --workers 4`, which never reaches this function. Repeating
+    # it here is only about the message: `coach api` is the image's CMD, and a module-scope raise
+    # would otherwise reach the operator as a traceback out of uvicorn's app loader. The import
+    # itself is not extra work — `uvicorn.run` on an import string loads the same module a few lines
+    # down, in this same process (`config.load_app()`, reload or not).
+    try:
+        from .web_api import guard_single_worker
+
+        # argv=[] on purpose: `coach api` has no --workers flag, so argparse has already rejected
+        # one, and sniffing this process's argv here would only read someone else's command line.
+        guard_single_worker(argv=[])
+    except RuntimeError as err:
+        print(str(err), file=sys.stderr)
+        return 2
     uvicorn.run(
         "interview_coach.web_api:app",
         host=args.host,
@@ -1169,6 +1190,14 @@ def main(argv: list[str] | None = None) -> int:
     api_parser.add_argument("--host", default="127.0.0.1")
     api_parser.add_argument("--port", type=int, default=8000)
     api_parser.add_argument("--reload", action="store_true")
+    api_parser.add_argument(
+        "--log-file",
+        default="",
+        help=(
+            "Also write the server log (session lifecycle + the per-call `llm-call` trace) to this "
+            "file, rotating at 10 MB × 5. Default: stderr only, which a container restart discards."
+        ),
+    )
     api_parser.set_defaults(func=_cmd_api, requires_llm=False)
 
     # Default to the newest slice when no subcommand is given.

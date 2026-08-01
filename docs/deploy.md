@@ -100,9 +100,15 @@ Back it up with `docker run --rm -v coach-state:/state -v "$PWD:/backup" alpine 
 **Do not add workers.** `runtimes` and `completed_sessions` are per-process dicts and the checkpoint
 store is SQLite, so a second worker gets a resume request for a Session it has never heard of, and
 two processes write the same SQLite file. `WEB_CONCURRENCY` and `--workers` are not supported; the
-image's `CMD` runs one worker on purpose. (A guard that refuses to start on `WEB_CONCURRENCY>1` is
-tracked as R-12/#67.) One worker handles this workload comfortably — a Session spends nearly all of
-its wall time waiting on the model, and each one runs on its own thread.
+image's `CMD` runs one worker on purpose. **The server now refuses to start** on `WEB_CONCURRENCY>1`
+or `--workers >1` (R-12) — the check runs when `interview_coach.web_api` is imported, so it fires
+before a port is bound whether you came in through `coach api`, `uvicorn …:app`, or gunicorn. It
+matches the long form `--workers` only; gunicorn's short `-w` is not sniffed, because `-w` means
+something else in too many other commands to claim on sight.
+`WEB_CONCURRENCY` is the one that bites without being typed: `docker-compose.yml` passes `.env`
+through wholesale and uvicorn reads the variable itself. One worker handles this workload comfortably
+— a Session spends nearly all of its wall time waiting on the model, and each one runs on its own
+thread.
 
 Scaling past one host means R-29 (Postgres checkpointer + real accounts), not more workers.
 
@@ -117,6 +123,13 @@ docker compose up -d --build        # redeploy; the state volume is untouched
 The `llm-call provider=… model=… ms=… outcome=…` line (R-26) is the one that makes a silent judge
 failover visible after the fact. If you ever see the judge role on a provider it is not pinned to,
 that is a bug worth reporting — ADR 0009 says the judge never fails over onto another model.
+
+Server logs are INFO by default and go to stderr, which `docker compose logs` shows but a container
+restart discards. To keep them, set `COACH_LOG_FILE` (or pass `coach api --log-file`) to a path on
+the state volume — it rotates at 10 MB and keeps 5 files. An unwritable path degrades to stderr with
+a warning rather than refusing to start; losing the log is not worth losing the deployment.
+Lifecycle records to grep for: `Session '…' socket connected`, `Session '…' finished: status=…`,
+and `Session … cancelled by Candidate intent`.
 
 ## 8. Verified, not asserted
 

@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import queue
 import re
 import secrets
+import sys
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from hashlib import sha256
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import urlparse
@@ -304,7 +308,55 @@ def _validate_auth_settings(settings: Settings) -> None:
         )
 
 
-def configure_session_logging() -> None:
+def _requested_workers(env: Mapping[str, str], argv: Sequence[str]) -> tuple[int, str] | None:
+    """The worker count someone asked for, and which channel asked, or None when nobody did.
+
+    A value that is not an integer is uvicorn's own error to report — raising ``ValueError`` on a
+    typo would be a worse failure than the one this guard exists to prevent.
+    """
+    for index, token in enumerate(argv):
+        raw = token[len("--workers=") :] if token.startswith("--workers=") else None
+        if raw is None and token == "--workers" and index + 1 < len(argv):
+            raw = argv[index + 1]
+        if raw is not None:
+            with suppress(ValueError):
+                return int(raw), "--workers"
+    with suppress(ValueError, KeyError):
+        return int(env["WEB_CONCURRENCY"]), "WEB_CONCURRENCY"
+    return None
+
+
+def guard_single_worker(env: Mapping[str, str] | None = None, argv: Sequence[str] | None = None) -> None:
+    """Refuse to serve from more than one process, before a socket is bound or a worker forked.
+
+    Called at module import rather than only from ``coach api`` because the CLI is not the only way
+    in: ``uvicorn interview_coach.web_api:app --workers 4`` and a gunicorn ``--workers`` never touch
+    it. At import time uvicorn is still in ``config.load_app()``, which runs *before* ``bind_socket``
+    and before ``Multiprocess(...)`` — so raising here kills the launcher rather than half-starting a
+    fleet. ``WEB_CONCURRENCY`` is checked because it is the route nobody types: compose feeds `.env`
+    into the container wholesale and uvicorn resolves the variable itself.
+
+    A hard failure, not a degrade. ADR 0005's degrade stance protects skill evidence from
+    infrastructure noise; this fires before any Session exists, so there is no evidence to protect
+    and a warning would buy silently-lost interviews instead.
+    """
+    requested = _requested_workers(env if env is not None else os.environ, argv if argv is not None else sys.argv)
+    if requested is None:
+        return
+    workers, channel = requested
+    if workers <= 1:
+        return
+    fix = f"drop {channel}" if channel.startswith("--") else f"unset {channel}"
+    raise RuntimeError(
+        f"{channel}={workers} asks for {workers} worker processes; this server supports exactly one. "
+        "`runtimes` and `completed_sessions` are per-process dicts and the checkpoint store is a "
+        "single SQLite file, so a second worker would answer a reconnect for a Session it has never "
+        f"heard of while two processes write one checkpoint DB. Run exactly one worker ({fix}, or "
+        "set it to 1). See docs/deploy.md §6; scaling past one host is R-29."
+    )
+
+
+def configure_session_logging(log_file: str = "") -> None:
     """Make the per-call ``llm-call`` trace visible in whichever process actually serves requests.
 
     Uvicorn configures logging in the **worker**, and under ``--reload`` that worker is a freshly
@@ -314,15 +366,34 @@ def configure_session_logging() -> None:
     R-26's trace is how a silent judge failover is caught after the fact (ADR 0009 addendum a), so
     it has to survive every way this app gets started. Module import is the one hook that runs in
     the serving process either way.
+
+    ``log_file`` is what makes that trace outlive a container restart. It arrives through the
+    environment (``COACH_LOG_FILE``, like ``COACH_USAGE_LEDGER``) rather than ``Settings`` for the
+    same spawned-subprocess reason as above, and so that logging is up before Settings validation
+    can raise on something unrelated.
     """
     log = logging.getLogger("interview_coach")
     log.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(levelname)s %(name)s: %(message)s")
     # Only self-configure when nothing else will emit these records; the CLI's basicConfig installs
     # a root handler, and adding a second one here would print every line twice.
     if not log.handlers and not logging.getLogger().handlers:
         handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+        handler.setFormatter(formatter)
         log.addHandler(handler)
+    if not log_file.strip():
+        return
+    try:
+        path = Path(log_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rotating = RotatingFileHandler(path, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    except OSError:
+        # ADR 0005's degrade side, applied to a support concern: an unwritable log path is a reason
+        # to lose the file sink, never a reason for a working deployment to refuse to come back up.
+        logger.warning("COACH_LOG_FILE=%s is not writable; logging to stderr only", log_file, exc_info=True)
+        return
+    rotating.setFormatter(formatter)
+    log.addHandler(rotating)
 
 
 def prune_checkpoints(checkpointer: Any, *, max_age_seconds: float, now: float) -> list[str]:
@@ -466,6 +537,9 @@ def create_app(
         runtime = RuntimeSession(session_id=session_id, mode="pending", emit=emit)
         sender = asyncio.create_task(_send_events(websocket, outgoing))
         api_state.runtimes[session_id] = runtime
+        # %r, not %s: the id is a client-supplied URL path segment that Starlette percent-decodes, so
+        # a newline in it would forge log lines — the same untrusted-input care `export_path` takes.
+        logger.info("Session %r socket connected", session_id)
         try:
             while True:
                 try:
@@ -588,7 +662,8 @@ def _mount_static_ui(app: FastAPI, static_dir: str | Path) -> None:
     logger.info("serving the built UI from %s", directory)
 
 
-configure_session_logging()
+guard_single_worker()
+configure_session_logging(os.environ.get("COACH_LOG_FILE", ""))
 app = create_app()
 
 
@@ -719,6 +794,9 @@ def _run_session_thread(
                     skill_states_from_state(final_state),
                     now=time.time(),
                 )
+            # Logged before the emit, not after: the emit is what hands control to the client, and a
+            # record written afterwards races the browser (and the test) that is already reacting.
+            logger.info("Session %r finished: status=%s", runtime.session_id, final_state.get("status"))
             runtime.emit({"type": "session_completed", "state": final_state})
     except CandidateIntent as err:
         # ADR 0005 / issue 0017: the Candidate asked to stop (web cancel/disconnect). This is intent,
@@ -730,7 +808,6 @@ def _run_session_thread(
     except Exception as err:  # noqa: BLE001 - API boundary converts graph/provider failures to events
         logger.exception("Session %s failed", runtime.session_id)
         runtime.emit({"type": "session_error", "error": f"{type(err).__name__}: {err}"})
-
 
 
 def _session_language_mode(

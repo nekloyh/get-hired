@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import logging
+import os
+import subprocess
+import sys
 from datetime import UTC, datetime
+from logging.handlers import RotatingFileHandler
 
 import pytest
 from fastapi.testclient import TestClient
@@ -8,7 +13,13 @@ from starlette.status import WS_1008_POLICY_VIOLATION
 from starlette.websockets import WebSocketDisconnect
 
 from interview_coach.config import Settings
-from interview_coach.web_api import ResumeSessionPayload, create_app, export_path
+from interview_coach.web_api import (
+    ResumeSessionPayload,
+    configure_session_logging,
+    create_app,
+    export_path,
+    guard_single_worker,
+)
 
 
 def _app(tmp_path):
@@ -557,9 +568,7 @@ def test_a_restored_export_is_still_gated_by_the_token(tmp_path):
     gated = _gated_client(tmp_path)
 
     assert gated.get("/api/sessions/gated-restart/export.md").status_code == 401
-    authorized = gated.get(
-        "/api/sessions/gated-restart/export.md", headers={"Authorization": f"Bearer {_TOKEN}"}
-    )
+    authorized = gated.get("/api/sessions/gated-restart/export.md", headers={"Authorization": f"Bearer {_TOKEN}"})
     assert authorized.status_code == 200
 
 
@@ -812,9 +821,7 @@ def test_a_resumed_session_keeps_its_language_for_retrieval(tmp_path):
         ws.send_json({"type": "candidate_answer", "answer": "Câu trả lời demo về drift."})
         _receive_until(ws, "session_completed", limit=40)
 
-    resumed = _session_language_mode(
-        app.state.web_api, "vn-session", ResumeSessionPayload(type="resume_session"), True
-    )
+    resumed = _session_language_mode(app.state.web_api, "vn-session", ResumeSessionPayload(type="resume_session"), True)
 
     assert resumed == "vn"
 
@@ -856,3 +863,143 @@ def test_the_startup_sweep_actually_runs(tmp_path):
 
     with SqliteSaver.from_conn_string(str(db)) as checkpointer:
         assert _threads(checkpointer) == set()
+
+
+# --- R-12: single-worker guard + server logging defaults -----------------------------------------
+
+
+def test_web_concurrency_above_one_refuses_to_start():
+    # The silent route: nobody types this, it arrives from `.env` through compose's `env_file`, and
+    # uvicorn resolves it itself (`if workers is None and "WEB_CONCURRENCY" in os.environ`).
+    with pytest.raises(RuntimeError, match="WEB_CONCURRENCY"):
+        guard_single_worker(env={"WEB_CONCURRENCY": "2"}, argv=["uvicorn"])
+
+
+@pytest.mark.parametrize("argv", [["uvicorn", "--workers", "4"], ["uvicorn", "--workers=4"]])
+def test_a_workers_flag_above_one_refuses_to_start(argv):
+    with pytest.raises(RuntimeError, match="--workers"):
+        guard_single_worker(env={}, argv=argv)
+
+
+@pytest.mark.parametrize(
+    ("env", "argv"),
+    [
+        ({}, ["uvicorn"]),
+        ({"WEB_CONCURRENCY": "1"}, ["uvicorn"]),
+        ({}, ["uvicorn", "--workers", "1"]),
+        ({}, ["uvicorn", "--workers=1"]),
+    ],
+)
+def test_one_worker_is_allowed(env, argv):
+    # The over-fire guard: a truthiness check on WEB_CONCURRENCY would reject `=1`, which is exactly
+    # what a careful operator sets after reading docs/deploy.md §6.
+    guard_single_worker(env=env, argv=argv)
+
+
+def test_a_non_integer_workers_value_is_left_to_uvicorn():
+    # Raising ValueError on someone's typo would be a worse failure than the one being prevented.
+    guard_single_worker(env={"WEB_CONCURRENCY": "auto"}, argv=["uvicorn", "--workers", "auto"])
+
+
+def test_the_refusal_explains_why_and_what_to_do():
+    with pytest.raises(RuntimeError) as excinfo:
+        guard_single_worker(env={"WEB_CONCURRENCY": "2"}, argv=["uvicorn"])
+
+    message = str(excinfo.value)
+    assert "runtimes" in message and "completed_sessions" in message
+    assert "SQLite" in message
+    assert "docs/deploy.md" in message
+
+
+def test_the_guard_runs_when_the_module_is_merely_imported():
+    # The load-bearing call site. A guard wired only into `coach api` is bypassed by exactly the two
+    # commands docs/deploy.md and the image use — so this pins the module-scope call, in a subprocess
+    # because the guard has already run (and passed) in this one. No port is bound, no uvicorn spawns.
+    proc = subprocess.run(
+        [sys.executable, "-c", "import interview_coach.web_api"],
+        env={**os.environ, "WEB_CONCURRENCY": "4"},
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode != 0
+    assert "WEB_CONCURRENCY" in proc.stderr and "docs/deploy.md" in proc.stderr
+
+
+@pytest.fixture
+def restore_session_logging():
+    """`interview_coach` is a process-global logger: a leaked file handler holds tmp_path open."""
+    log = logging.getLogger("interview_coach")
+    existing = list(log.handlers)
+    level = log.level
+    yield
+    for handler in [h for h in log.handlers if h not in existing]:
+        log.removeHandler(handler)
+        handler.close()
+    log.setLevel(level)
+
+
+def test_the_log_file_receives_records_the_console_gets(tmp_path, restore_session_logging):
+    log_file = tmp_path / "sub" / "coach.log"
+
+    configure_session_logging(log_file=str(log_file))
+    logging.getLogger("interview_coach.web_api").info("llm-call provider=openai outcome=ok")
+
+    assert log_file.is_file()  # the parent directory is created rather than demanded
+    assert "llm-call provider=openai outcome=ok" in log_file.read_text(encoding="utf-8")
+
+
+def test_the_log_file_is_bounded(restore_session_logging, tmp_path):
+    # Unbounded is the failure this sink would otherwise introduce: a long-lived container writing
+    # every `llm-call` line fills the state volume that also holds the checkpoints and the exports.
+    configure_session_logging(log_file=str(tmp_path / "coach.log"))
+
+    rotating = [h for h in logging.getLogger("interview_coach").handlers if isinstance(h, RotatingFileHandler)]
+    assert len(rotating) == 1
+    assert (rotating[0].maxBytes, rotating[0].backupCount) == (10 * 1024 * 1024, 5)  # documented in deploy.md §7
+
+
+def test_an_unwritable_log_file_warns_instead_of_killing_the_server(tmp_path, caplog, restore_session_logging):
+    # ADR 0005's degrade side: an unwritable log path must never turn a working deployment dead.
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="interview_coach.web_api"):
+        configure_session_logging(log_file=str(blocker / "coach.log"))
+
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+
+def test_a_connected_socket_is_visible_at_default_verbosity(tmp_path, caplog):
+    # The automated form of R-12's DoD manual check: connect and finish have to be greppable in the
+    # server log, otherwise a deployed Session is invisible between its first frame and a 500.
+    client = _test_client(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="interview_coach.web_api"):
+        with client.websocket_connect("/api/sessions/lifecycle-1") as ws:
+            ws.send_json(
+                {
+                    "type": "start_session",
+                    "mode": "demo",
+                    "target_role": "machine learning engineer",
+                    "target_companies": ["Viettel"],
+                    "claimed_skills": {"mlops": 3},
+                    "max_questions": 1,
+                    "language_mode": "en",
+                }
+            )
+            _receive_until(ws, "session_started")
+            _receive_until(ws, "question")
+            ws.send_json(
+                {
+                    "type": "candidate_answer",
+                    "answer": "I would compare training and validation behavior and watch for leakage.",
+                }
+            )
+            _receive_until(ws, "session_completed", limit=40)
+
+    messages = [record.getMessage() for record in caplog.records if record.levelno == logging.INFO]
+    # The id is quoted because it is client-supplied and percent-decoded: a raw %s would let a
+    # newline in the URL path forge log lines, the same untrusted-input care `export_path` takes.
+    assert any("connected" in message and "'lifecycle-1'" in message for message in messages)
+    assert any("finished" in message and "'lifecycle-1'" in message for message in messages)

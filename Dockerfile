@@ -63,5 +63,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 
 # Single worker, not a default worth tuning: `runtimes` and `completed_sessions` are per-process
 # dicts and the checkpoint DB is SQLite, so a second worker would route a resume to a process that
-# has never heard of the Session. Documented in docs/deploy.md; the guard itself is R-12.
+# has never heard of the Session. Documented in docs/deploy.md §6, and enforced at web_api import
+# (R-12) — a `WEB_CONCURRENCY` arriving via compose's `env_file` refuses to start rather than fork.
 CMD ["coach", "api", "--host", "0.0.0.0", "--port", "8000"]
