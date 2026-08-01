@@ -813,7 +813,7 @@ def test_a_resumed_session_keeps_its_language_for_retrieval(tmp_path):
     # R-14's real hazard: the resume payload carries no language_mode, so without reading it back
     # out of the checkpoint a resumed Vietnamese Session would silently rebuild its retrieval on the
     # English embedder and rank near-randomly for the rest of the interview.
-    from interview_coach.web_api import _session_language_mode
+    from interview_coach.web_api import _checkpoint_values, _session_language_mode
 
     # Run the Session to completion before reading: while a question is pending the graph is blocked
     # INSIDE the node, so no checkpoint for that step has been written yet and reading here would be
@@ -826,17 +826,23 @@ def test_a_resumed_session_keeps_its_language_for_retrieval(tmp_path):
         ws.send_json({"type": "candidate_answer", "answer": "Câu trả lời demo về drift."})
         _receive_until(ws, "session_completed", limit=40)
 
-    resumed = _session_language_mode(app.state.web_api, "vn-session", ResumeSessionPayload(type="resume_session"), True)
+    values = _checkpoint_values(app.state.web_api, "vn-session")
+    resumed = _session_language_mode(ResumeSessionPayload(type="resume_session"), True, values)
 
     assert resumed == "vn"
+    # R-25 reads the same checkpoint for the budget rail: a resumed Session's ceiling is sized from
+    # the max_questions it actually declared, not from a default guessed at resume time.
+    assert values["max_questions"] == 1
 
 
 def test_an_unknown_session_falls_back_to_the_default_language(tmp_path):
-    from interview_coach.web_api import _session_language_mode
+    from interview_coach.web_api import _checkpoint_values, _session_language_mode
 
     api_state = _app(tmp_path).state.web_api
+    values = _checkpoint_values(api_state, "never-existed")
 
-    assert _session_language_mode(api_state, "never-existed", ResumeSessionPayload(type="resume_session"), True) == "en"
+    assert values == {}
+    assert _session_language_mode(ResumeSessionPayload(type="resume_session"), True, values) == "en"
 
 
 def test_the_startup_sweep_actually_runs(tmp_path):
@@ -1485,7 +1491,7 @@ def test_resuming_a_live_session_does_not_recharge_the_question_cap(tmp_path, mo
     assert usage.questions_today(usage.token_identity("")) == 1
 
 
-def test_a_mid_session_breach_suspends_instead_of_completing(tmp_path, monkeypatch):
+def test_a_mid_session_breach_suspends_instead_of_completing(tmp_path, monkeypatch, caplog):
     # AC (c) on the web surface: a visible session_error, no session_completed — never a
     # `failed`-and-advance (ADR 0005) and never a silent stall.
     client = _live_client(tmp_path, monkeypatch, brain=_MeteredDemoClient)
@@ -1493,20 +1499,38 @@ def test_a_mid_session_breach_suspends_instead_of_completing(tmp_path, monkeypat
     # spend after Q1 resolves — which is what makes this a MID-Session breach and not a start gate.
     monkeypatch.setenv("LLM_SESSION_TOKEN_BUDGET", "150")
 
-    with client.websocket_connect("/api/sessions/breach") as ws:
+    seen: list[dict] = []
+    with caplog.at_level(logging.DEBUG), client.websocket_connect("/api/sessions/breach") as ws:
         _start_live(ws, max_questions=2)
         assert ws.receive_json()["type"] == "session_started"
         _expect_question(ws)  # Q1 really was asked before the rail fired
         ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
-        # "question" is in the wait set only so a rail that fails to fire ends this test instead of
-        # blocking forever on a Q2 nobody is going to answer.
-        event = _receive_until_any(ws, {"session_error", "session_completed", "question"})
+        for _ in range(40):
+            # "question" ends the loop only so a rail that fails to fire reddens this test instead
+            # of blocking forever on a Q2 nobody is going to answer.
+            seen.append(ws.receive_json())
+            if seen[-1]["type"] in {"session_error", "session_completed", "question"}:
+                break
 
+    event = seen[-1]
     assert event["type"] == "session_error", f"the rail did not suspend after Q1: {event}"
     assert "suspended" in event["error"].lower()
     assert "LLM_SESSION_TOKEN_BUDGET" in event["error"]
     # A suspended Session is not a finished one: nothing was persisted as complete.
     assert client.get("/api/sessions/breach/export.md").status_code in (404, 409)
+    # The state carrying the question the Candidate just resolved goes out BEFORE the suspend. The
+    # CLI prints its live update first for the same reason: a suspend that arrives with no state
+    # carrying the last answer is indistinguishable, to the UI, from a crash that ate it.
+    states = [item for item in seen if item["type"] == "state_update"]
+    assert states, "the suspend arrived with no state carrying the resolved question"
+    assert states[-1]["state"]["question_count"] == 1
+    # And it is a DESIGNED suspend, not an unhandled crash. Without the dedicated
+    # `except SessionBudgetSuspended` branch the exception falls into the generic net, which logs
+    # `logger.exception("Session %s failed")` at ERROR — while every assertion above still passes,
+    # because the exception CLASS NAME supplies the "suspended" substring.
+    web_errors = [r for r in caplog.records if r.levelno >= logging.ERROR and r.name == "interview_coach.web_api"]
+    assert web_errors == []
+    assert any("suspended on a budget rail" in r.getMessage() for r in caplog.records)
 
 
 def test_a_refused_live_session_never_starts_the_interview(tmp_path, monkeypatch):
@@ -1570,3 +1594,57 @@ def test_the_web_rail_counts_only_the_questions_actually_left(tmp_path, monkeypa
 
     assert event["type"] == "session_completed", f"a fundable Session was suspended: {event}"
     assert event["state"]["question_count"] == 2
+
+
+def test_a_new_interview_on_the_same_browser_id_is_not_suspended(tmp_path, monkeypatch):
+    # web/src/lib/sessionId.ts persists ONE id per browser, and connect(false) — the fresh-start
+    # path — reuses it verbatim. While the rail measured the id, the next brand-new interview never
+    # received a question at all, and each bricked attempt still burned a real Diagnostic call.
+    client = _live_client(tmp_path, monkeypatch, brain=_MeteredDemoClient)
+
+    def one_interview(expect: str) -> dict:
+        with client.websocket_connect("/api/sessions/same-browser") as ws:
+            _start_live(ws, max_questions=1)
+            assert ws.receive_json()["type"] == "session_started"
+            _expect_question(ws)
+            ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+            event = _receive_until_any(ws, {"session_completed", "session_error"}, limit=60)
+        assert event["type"] == expect, f"{event}"
+        return event
+
+    # Interview 1 with the rail effectively off, to measure what one of these costs.
+    monkeypatch.setenv("LLM_SESSION_TOKEN_BUDGET", "10000000")
+    one_interview("session_completed")
+    one_run = usage.session_run_spend("same-browser")
+    assert one_run > 0
+
+    # 2.5x one interview: more than any single run needs, less than three of them summed.
+    monkeypatch.setenv("LLM_SESSION_TOKEN_BUDGET", str(int(one_run * 2.5)))
+    one_interview("session_completed")
+    one_interview("session_completed")
+    assert usage.session_spend("same-browser") > int(one_run * 2.5)
+
+
+def test_a_suspended_web_session_can_actually_be_resumed(tmp_path, monkeypatch):
+    # ADR 0005 requires a suspend to OFFER resume, and a web Candidate cannot edit
+    # LLM_SESSION_TOKEN_BUDGET — so before this the UI's only "remedy" was an infinite resume loop
+    # that re-suspended at stream event 0 every time. The resume must make real progress.
+    client = _live_client(tmp_path, monkeypatch, brain=_MeteredDemoClient)
+    monkeypatch.setenv("LLM_SESSION_TOKEN_BUDGET", "150")
+
+    with client.websocket_connect("/api/sessions/breach-resume") as ws:
+        _start_live(ws, max_questions=2)
+        assert ws.receive_json()["type"] == "session_started"
+        _expect_question(ws)
+        ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+        event = _receive_until_any(ws, {"session_error", "session_completed", "question"})
+    assert event["type"] == "session_error", f"the rail did not suspend after Q1: {event}"
+
+    with client.websocket_connect("/api/sessions/breach-resume") as ws:
+        ws.send_json({"type": "resume_session", "mode": "live"})
+        assert ws.receive_json()["type"] == "session_started"
+        # The load-bearing assertion: Q2 is actually asked. `_expect_question` fails fast on the
+        # session_error a re-suspend at stream event 0 would produce instead.
+        resumed = _expect_question(ws)
+
+    assert resumed["type"] == "question"

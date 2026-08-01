@@ -95,18 +95,22 @@ from .supervisor import (
 )
 from .ui import render_skill_state_rows
 from .usage import (
+    WORST_CASE_TOKENS_PER_CALL,
     SessionBudgetSuspended,
-    budget_stop_reason,
+    begin_session_run,
+    clear_run_rails_for_resume,
     daily_question_cap,
     daily_token_budget,
     estimated_session_tokens,
     remaining_today,
+    session_budget_guard,
     session_scope,
     session_token_budget,
     sessions_for_day,
     start_refusal_reason,
     usage_for_day,
     utc_date,
+    worst_case_session_calls,
 )
 
 ANSWERS = {"strong": STRONG_ANSWER, "weak": WEAK_ANSWER}
@@ -490,11 +494,16 @@ def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
         print(f"Refusing to start this Session: {refusal}", file=sys.stderr)
         return 2
 
-    def budget_stop(state: Mapping[str, Any]) -> str | None:
-        if not metered:
-            return None
-        left = int(state.get("max_questions", 0)) - int(state.get("question_count", 0))
-        return budget_stop_reason(args.session_id, provider, questions_left=left)
+    budget_stop = (
+        session_budget_guard(
+            args.session_id,
+            provider,
+            max_turns=args.max_turns,
+            complete_status=SessionStatus.COMPLETE.value,
+        )
+        if metered
+        else None
+    )
 
     # The scope covers the Diagnostic call too, so every token this Session spends is attributed.
     with SqliteSaver.from_conn_string(args.checkpoint_db) as checkpointer, session_scope(args.session_id):
@@ -530,6 +539,19 @@ def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
                         f"--language {args.language!r} is ignored on --resume",
                         file=sys.stderr,
                     )
+                if metered and (
+                    cleared := clear_run_rails_for_resume(
+                        args.session_id,
+                        provider,
+                        max_questions=int(resumed.get("max_questions", args.max_questions)),
+                        max_turns=args.max_turns,
+                    )
+                ):
+                    # The rails that latch on this run's own state cannot clear themselves, so a
+                    # resume that did not clear them would re-trip at stream event 0 forever. Said
+                    # out loud because a grant of more budget is exactly the thing a user must not
+                    # discover from the ledger a day later.
+                    print(f"note: resuming clears the budget stop — {cleared}", file=sys.stderr)
                 _print_resume_recap(resumed)
                 final = _run_session_graph(
                     graph,
@@ -550,6 +572,12 @@ def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
                     target_companies=tuple(args.company),
                     claimed_skills=dict(args.claim),
                 )
+                if metered:
+                    # Stamp this run's baseline before the Diagnostic — the first token it spends
+                    # must land on THIS run's side of the line. Without it the rail would measure
+                    # everything the id ever spent, and --session-id defaults to one constant, so
+                    # the day's third interview would suspend for spending nothing of its own.
+                    begin_session_run(args.session_id)
                 carried = load_priors(args.ledger_db, args.candidate, now=time.time())
                 diagnostic = diagnose_or_degrade(
                     profile,
@@ -796,9 +824,11 @@ def _cmd_usage(client: ClientArg, args: argparse.Namespace) -> int:
         )
     per_session = sessions_for_day()
     if attributed := {sid: spent for sid, spent in per_session.items() if sid}:
-        # R-25: which Session spent what. Unattributed rows are batch tools (bench, forge, one-off
-        # commands), not a Session that lost its label — they are shown apart rather than hidden.
-        print("\nPer Session today:")
+        # R-25: which Session id spent what. "Per id", not "per run", and labeled as such — an id is
+        # reused across runs, which is the whole reason the rail measures a per-run delta instead.
+        # Unattributed rows are batch tools (bench, forge, one-off commands), not a Session that
+        # lost its label — they are shown apart rather than hidden.
+        print("\nPer Session id today (all runs on that id):")
         for session_id, spent in sorted(attributed.items()):
             print(f"  {session_id}: {spent:,} tokens")
     if loose := per_session.get(""):
@@ -807,10 +837,12 @@ def _cmd_usage(client: ClientArg, args: argparse.Namespace) -> int:
     settings = load_settings()
     primary = settings.primary_provider
     print(f"\nPrimary ({primary}): ~{remaining_today(primary):,} of {budget:,} daily tokens left by our count.")
+    default_calls = worst_case_session_calls(DEFAULT_MAX_QUESTIONS, DEFAULT_MAX_TURNS)
     print(
-        f"Per-Session budget: {session_token_budget():,} tokens "
-        f"(a {DEFAULT_MAX_QUESTIONS}-question Session is estimated at "
-        f"~{estimated_session_tokens(DEFAULT_MAX_QUESTIONS):,})."
+        f"Per-run budget for a default {DEFAULT_MAX_QUESTIONS}x{DEFAULT_MAX_TURNS} Session: "
+        f"{session_token_budget(max_questions=DEFAULT_MAX_QUESTIONS, max_turns=DEFAULT_MAX_TURNS):,} tokens "
+        f"({default_calls} worst-case provider calls x {WORST_CASE_TOKENS_PER_CALL:,}); "
+        f"measured Sessions run ~{estimated_session_tokens(DEFAULT_MAX_QUESTIONS):,}."
     )
     print(f"Daily question cap: {daily_question_cap()} question(s) per token identity.")
     return 0

@@ -26,7 +26,7 @@ from pydantic import BaseModel, ValidationError
 
 from . import telemetry
 from .config import ProviderName, ProviderSettings, RoleName, Settings
-from .usage import record_usage
+from .usage import record_quota_exhausted, record_usage
 
 logger = logging.getLogger(__name__)
 
@@ -439,6 +439,13 @@ class _OpenAICompatibleClient(LLMClient):
                         self.provider_name,
                         "logs/usage-ledger.jsonl",
                     )
+                    # ADR 0005's addendum names insufficient_quota as the DETECTION half of budget
+                    # exhaustion and GH #80 as the session-behaviour half. Latching it here is what
+                    # joins them: this exception is about to be swallowed by question_node's
+                    # failure-isolation net, so the fact that the quota is dead has to outlive it —
+                    # otherwise the Session cascades into zero-evidence `failed` questions and exits
+                    # 0 with a Study Plan built from nothing.
+                    record_quota_exhausted(self.provider_name)
                     raise
                 if not will_retry:
                     raise
