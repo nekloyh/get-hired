@@ -6,6 +6,8 @@ import subprocess
 import sys
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -569,9 +571,7 @@ def test_a_restored_export_is_still_gated_by_the_token(tmp_path):
     gated = _gated_client(tmp_path)
 
     assert gated.get("/api/sessions/gated-restart/export.md").status_code == 401
-    authorized = gated.get(
-        "/api/sessions/gated-restart/export.md", headers={"Authorization": f"Bearer {_TOKEN}"}
-    )
+    authorized = gated.get("/api/sessions/gated-restart/export.md", headers={"Authorization": f"Bearer {_TOKEN}"})
     assert authorized.status_code == 200
 
 
@@ -824,9 +824,7 @@ def test_a_resumed_session_keeps_its_language_for_retrieval(tmp_path):
         ws.send_json({"type": "candidate_answer", "answer": "Câu trả lời demo về drift."})
         _receive_until(ws, "session_completed", limit=40)
 
-    resumed = _session_language_mode(
-        app.state.web_api, "vn-session", ResumeSessionPayload(type="resume_session"), True
-    )
+    resumed = _session_language_mode(app.state.web_api, "vn-session", ResumeSessionPayload(type="resume_session"), True)
 
     assert resumed == "vn"
 
@@ -1037,7 +1035,25 @@ def test_the_log_file_receives_records_the_console_gets(tmp_path, restore_sessio
     logging.getLogger("interview_coach.web_api").info("llm-call provider=openai outcome=ok")
 
     assert log_file.is_file()  # the parent directory is created rather than demanded
-    assert "llm-call provider=openai outcome=ok" in log_file.read_text(encoding="utf-8")
+    # The whole formatted line, not just the message: dropping `rotating.setFormatter(formatter)`
+    # left the suite green while the file recorded a bare message with no level and no logger name —
+    # so a `WARNING interview_coach.llm:` failover line and an INFO trace line became
+    # indistinguishable in the one copy that survives a restart, which is the copy that matters.
+    assert "INFO interview_coach.web_api: llm-call provider=openai outcome=ok" in log_file.read_text(encoding="utf-8")
+
+
+def test_a_blank_log_file_path_installs_no_file_sink(monkeypatch, tmp_path, restore_session_logging):
+    # `COACH_LOG_FILE=` with a stray space is what a hand-edited `.env` produces, and `.strip()` is
+    # the only thing standing between that and a log file literally named "   " in the server's
+    # working directory. Removing the `.strip()` left the suite green. chdir'd into tmp_path so the
+    # mutant's droppings land there rather than in the repo.
+    monkeypatch.chdir(tmp_path)
+
+    configure_session_logging(log_file="   ")
+
+    handlers = logging.getLogger("interview_coach").handlers
+    assert [h for h in handlers if isinstance(h, RotatingFileHandler)] == []
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_the_log_file_env_var_is_actually_read_by_the_serving_process(tmp_path):
@@ -1174,3 +1190,116 @@ def test_a_newline_in_the_session_id_cannot_forge_a_cancel_record(tmp_path, capl
     assert cancelled, "the cancel path logged nothing to check"
     assert all("\n" not in message for message in cancelled)
     assert any("granted admin" in message for message in cancelled)  # still legible, just escaped
+
+
+def test_a_newline_in_the_session_id_cannot_forge_a_failure_record(tmp_path, caplog, monkeypatch):
+    # The other half of `session_error`, and the half that survived reverting `%r` to `%s` with the
+    # full suite green: cancel needs the Candidate to press stop, but *this* branch catches every
+    # graph or provider failure, and the attacker picks both the id and (via a flaky provider) the
+    # moment. Any exception out of the session thread lands here, so a raise from the graph build
+    # stands in for the provider blowing up mid-question.
+    def _explode(*args, **kwargs):
+        raise RuntimeError("provider exploded")
+
+    monkeypatch.setattr(web_api, "build_session_graph", _explode)
+    client = _test_client(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="interview_coach.web_api"):
+        with client.websocket_connect("/api/sessions/forged%0AINFO:%20granted%20admin") as ws:
+            ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+            _receive_until(ws, "session_error")
+
+    failed = [r.getMessage() for r in caplog.records if r.getMessage().endswith(" failed")]
+    assert failed, "the failure path logged nothing to check"
+    assert all("\n" not in message for message in failed)
+    assert any("granted admin" in message for message in failed)
+
+
+def test_a_newline_in_the_session_id_cannot_forge_an_export_failure_record(tmp_path, caplog, monkeypatch):
+    # Volunteered along with the two above and then left unpinned, so `%s` came back for free. A full
+    # disk on a Session whose id was chosen by whoever opened the socket is the whole reachability
+    # story; `export_path` already digests the id for the *filename*, which is exactly why nobody
+    # noticed the raw id still reaching the log line.
+    forged = "forged\nINFO interview_coach.llm: llm-call provider=openai outcome=ok"
+
+    def _no_disk(*args, **kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(web_api, "export_session_markdown", _no_disk)
+    api_state = _app(tmp_path).state.web_api
+
+    with caplog.at_level(logging.ERROR, logger="interview_coach.web_api"):
+        web_api._persist_export(api_state, forged, {"session_id": forged})
+
+    messages = [r.getMessage() for r in caplog.records if "Markdown export" in r.getMessage()]
+    assert messages, "the export failure path logged nothing to check"
+    assert all("\n" not in message for message in messages)
+
+
+def test_a_newline_in_the_session_id_cannot_forge_a_resume_warning(tmp_path, caplog):
+    # The resume path reads the checkpoint before the graph exists, and a checkpoint DB it cannot
+    # open is an ordinary operational failure (wrong mount, wrong permissions) — pointing it at a
+    # directory is the cheapest honest way to produce one.
+    forged = "forged\nWARNING interview_coach: judge failed over to groq"
+    api_state = _app(tmp_path).state.web_api
+    api_state.checkpoint_db = str(tmp_path)  # a directory: sqlite cannot open it
+
+    with caplog.at_level(logging.WARNING, logger="interview_coach.web_api"):
+        payload = ResumeSessionPayload(type="resume_session", mode="demo")
+        mode = web_api._session_language_mode(api_state, forged, payload, True)
+
+    assert mode == "en"  # still degrades rather than crashing the resume
+    messages = [r.getMessage() for r in caplog.records if "language_mode" in r.getMessage()]
+    assert messages, "the resume read-failure path logged nothing to check"
+    assert all("\n" not in message for message in messages)
+
+
+def test_a_newline_in_a_checkpoint_thread_id_cannot_forge_a_prune_record(caplog):
+    # A checkpoint thread id *is* a Session id — `session_config(session_id)` puts it there — so the
+    # sweep's failure record is the same untrusted string arriving by a longer road. It was still
+    # `%s`, and it is the one record here that runs at startup, with nobody watching.
+    forged = "forged\nINFO interview_coach.web_api: Session 'x' finished: status=complete"
+    entry = SimpleNamespace(
+        config={"configurable": {"thread_id": forged}},
+        checkpoint={"ts": "2020-01-01T00:00:00+00:00"},
+    )
+
+    class _Unprunable:
+        def list(self, _config):
+            return [entry]
+
+        def delete_thread(self, thread_id):
+            raise RuntimeError("database is locked")
+
+    with caplog.at_level(logging.WARNING, logger="interview_coach.web_api"):
+        assert web_api.prune_checkpoints(_Unprunable(), max_age_seconds=1.0, now=1e12) == []
+
+    messages = [r.getMessage() for r in caplog.records if "checkpoint thread" in r.getMessage()]
+    assert messages, "the prune failure path logged nothing to check"
+    assert all("\n" not in message for message in messages)
+
+
+def test_the_suite_never_writes_into_the_operators_own_log_file(tmp_path):
+    # `COACH_LOG_FILE` is read at web_api *import*, which under pytest happens during collection —
+    # so `set -a; . .env` with the path `.env.example` documents turned `uv run pytest` into a suite
+    # that reddened `test_the_log_file_is_bounded` (two RotatingFileHandlers on the process-global
+    # logger) and, far worse, appended 1,939 lines into the operator's real server log, 415 of them
+    # counterfeit `llm-call provider=mimo ... outcome=ok` records. That is the trace ADR 0009
+    # addendum a reads to find a silent judge failover, so those are fabricated evidence. The
+    # conftest pop is the fix, and only a subprocess can observe it: by the time any in-process test
+    # runs, this process's collection is long over and the damage would already be done.
+    log_file = tmp_path / "coach-api.log"
+
+    proc = subprocess.run(
+        [
+            *[sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+            "tests/test_web_api.py::test_the_log_file_is_bounded",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=_server_env(COACH_LOG_FILE=str(log_file)),
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stdout[-4000:]
+    assert not log_file.exists(), f"collection wrote to COACH_LOG_FILE:\n{log_file.read_text(encoding='utf-8')[:2000]}"

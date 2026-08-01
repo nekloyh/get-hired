@@ -96,8 +96,7 @@ def _harness_result(score: float, *, expected_min: float = 1.0, expected_max: fl
         ),
         evaluation=Evaluation(
             dimensions={
-                dim: DimensionScore(score=round(score), evidence="no evidence")
-                for dim in QUESTION.rubric.active
+                dim: DimensionScore(score=round(score), evidence="no evidence") for dim in QUESTION.rubric.active
             },
             weighted_score=score,
             confidence=0.8,
@@ -176,10 +175,7 @@ def test_run_session_graph_prints_live_skill_state_updates(make_client, capsys):
         [
             json.dumps(
                 {
-                    "dimensions": {
-                        dim: {"score": 5, "evidence": "no evidence"}
-                        for dim in DIMENSIONS
-                    },
+                    "dimensions": {dim: {"score": 5, "evidence": "no evidence"} for dim in DIMENSIONS},
                     "weighted_score": 5.0,
                     "confidence": 0.8,
                     "follow_up_recommended": False,
@@ -310,9 +306,7 @@ def test_session_refuses_to_restart_over_inflight_checkpoint(tmp_path, monkeypat
     monkeypatch.setattr(cli, "build_client", lambda settings: DemoLLMClient())
     monkeypatch.setattr(cli, "resumable_session_state", lambda graph, session_id: {"status": "active"})
 
-    rc = cli.main(
-        ["session", "--scripted", "--session-id", "busy", "--checkpoint-db", str(tmp_path / "c.sqlite")]
-    )
+    rc = cli.main(["session", "--scripted", "--session-id", "busy", "--checkpoint-db", str(tmp_path / "c.sqlite")])
 
     assert rc == 2
     assert "already in progress" in capsys.readouterr().err
@@ -475,3 +469,12 @@ def test_log_file_flag_reaches_the_serving_process(uvicorn_spy, tmp_path):
     assert cli.main(["api", "--log-file", str(log_file)]) == 0
     assert os.environ["COACH_LOG_FILE"] == str(log_file)
     assert len(uvicorn_spy) == 1
+
+
+def test_the_exported_log_file_does_not_outlive_the_test_that_exported_it():
+    # Deliberately order-coupled to the test directly above — a leak is by definition something the
+    # *next* test sees, and no test can assert its own teardown. `_cmd_api` writes into the real
+    # os.environ (it has to; that is the only channel a `--reload` subprocess reads), pointing at a
+    # tmp_path pytest deletes on the way out. conftest's autouse teardown is what sweeps it, and
+    # deleting that fixture left the whole suite green until this assertion existed.
+    assert "COACH_LOG_FILE" not in os.environ

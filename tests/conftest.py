@@ -15,13 +15,27 @@ from interview_coach import telemetry
 from interview_coach.config import ProviderSettings, Settings
 from interview_coach.llm import GroqClient, LLMRouter, MimoClient
 
-# At conftest import, not in a fixture, and deliberately: `interview_coach.web_api` runs
-# `guard_single_worker()` at module scope, and that import happens during *collection* — an autouse
-# fixture runs far too late. A developer with WEB_CONCURRENCY exported for some other project would
-# otherwise get "Interrupted: 1 error during collection" and zero of the tests, from a variable that
-# has nothing to do with this repo. The guard's real call site is still pinned, in a subprocess with
-# WEB_CONCURRENCY set explicitly (tests/test_web_api.py).
+# At conftest import, not in a fixture, and deliberately: `interview_coach.web_api` runs BOTH of its
+# module-scope environment readers — `guard_single_worker()` and `configure_session_logging(...)` —
+# while pytest is *collecting*, long before any autouse fixture can run. A developer who exported
+# either variable for some other reason must not have it decide what this suite does.
+#
+# WEB_CONCURRENCY would abort the run: "Interrupted: 1 error during collection", zero tests, from a
+# variable that has nothing to do with this repo. COACH_LOG_FILE is worse than an abort, because it
+# looks like it works. Uncomment the `COACH_LOG_FILE=logs/coach-api.log` line `.env.example`
+# documents, `set -a; . .env` as one does, and collection attaches a second RotatingFileHandler to
+# the process-global `interview_coach` logger — one no fixture can remove, because it predates every
+# snapshot a fixture could take. The suite then appends its fixtures' output — measured at 1,939
+# lines / 208 KB, 415 of them `llm-call provider=mimo model=test-model ... outcome=ok` — into the
+# operator's real server log. That trace is the artifact ADR 0009 addendum a leans on to detect a
+# silent judge failover after the fact, so counterfeits in it are not noise; they are fabricated
+# evidence about the judge, written by a command whose whole job was to tell the truth.
+#
+# Both real call sites stay pinned in subprocesses that set the variable explicitly
+# (tests/test_web_api.py), and this pop itself is pinned by
+# `test_the_suite_never_writes_into_the_operators_own_log_file`.
 os.environ.pop("WEB_CONCURRENCY", None)
+os.environ.pop("COACH_LOG_FILE", None)
 
 
 @pytest.fixture(autouse=True)
@@ -32,20 +46,17 @@ def _reset_telemetry():
 
 
 @pytest.fixture(autouse=True)
-def _restore_coach_log_file():
+def _clear_coach_log_file():
     """`_cmd_api` writes COACH_LOG_FILE into os.environ on purpose, so a test cannot just delenv it.
 
     ``monkeypatch.delenv(..., raising=False)`` records no undo when the variable was absent, so the
-    value a CLI test causes to be *created* survives into every later test in the session — where it
-    would attach a file handler pointing at a deleted tmp_path.
+    value a CLI test causes to be *created* would survive into every later test in the session —
+    where it would attach a file handler pointing at a deleted tmp_path. Teardown only: the
+    operator's own value is already gone, popped at import above, so there is nothing to save here
+    and pretending otherwise would be a branch no test can reach.
     """
-    saved = os.environ.get("COACH_LOG_FILE")
-    os.environ.pop("COACH_LOG_FILE", None)
     yield
-    if saved is None:
-        os.environ.pop("COACH_LOG_FILE", None)
-    else:
-        os.environ["COACH_LOG_FILE"] = saved
+    os.environ.pop("COACH_LOG_FILE", None)
 
 
 class _FakeFunction:

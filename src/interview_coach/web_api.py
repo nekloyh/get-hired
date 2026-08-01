@@ -447,7 +447,9 @@ def prune_checkpoints(checkpointer: Any, *, max_age_seconds: float, now: float) 
         try:
             checkpointer.delete_thread(thread_id)
         except Exception:
-            logger.warning("could not prune checkpoint thread %s", thread_id, exc_info=True)
+            # %r: a checkpoint thread id *is* a Session id, so this string came from a URL path
+            # segment however indirectly — a round trip through SQLite launders nothing.
+            logger.warning("could not prune checkpoint thread %r", thread_id, exc_info=True)
             continue
         pruned.append(thread_id)
     if pruned:
