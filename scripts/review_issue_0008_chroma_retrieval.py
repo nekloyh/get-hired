@@ -1,5 +1,11 @@
 """Concept-retrieval relevance review on the REAL Chroma store (issue 0008 follow-up).
 
+SUPERSEDED for scoring by ``scripts/retrieval_eval.py`` (R-15, GH #70) — do NOT publish a hit rate
+from here. The eval below is rebuilt from ``questions.yaml`` on every run, so its denominator moves
+whenever the bank grows (50 lookups at the 2026-07-11 audit, 59 at 184f5a2) and its ground truth is
+editable by the same agent reading the score. Retained only for the Vietnamese-note reachability
+probe at the end, which the frozen-label eval does not cover.
+
 The 2026-07-11 review pass (`docs/audits/concept-retrieval-review-2026-07-11.md`) ran on
 `InMemoryConceptStore` because chromadb was not installed, making its 47/50 a *floor* with three
 documented toy-ranker artifacts. This script repeats the exact same 50-lookup method against the
@@ -79,7 +85,7 @@ def main(embedding_model: str = BGE_SMALL_EN) -> int:
         for m in misses:
             score = "n/a" if m["score"] is None else f"{m['score']:.3f}"
             print(
-                f"- **{m['skill']}** seed *\"{m['seed']}\"* -> `{m['got']}` (score {score}); "
+                f'- **{m["skill"]}** seed *"{m["seed"]}"* -> `{m["got"]}` (score {score}); '
                 f"expected one of `{', '.join(m['expected'])}`"
             )
         print()
