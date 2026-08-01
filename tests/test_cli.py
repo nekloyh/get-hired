@@ -1048,3 +1048,37 @@ def test_a_resume_retries_the_provider_once_and_re_suspends_if_it_is_still_dead(
     assert rc == 0
     assert "retrying mimo after an insufficient_quota stop" in err
     assert not usage.quota_exhausted_today("mimo")
+
+
+def test_the_derived_ceiling_is_silent_on_a_worst_case_session_and_still_stops_a_runaway(tmp_path, monkeypatch, capsys):
+    # Both directions on the DEFAULT — no LLM_SESSION_TOKEN_BUDGET — because a ceiling that only
+    # ever gets exercised at a test-shrunk value is not the ceiling that ships. The old 103,000
+    # failed the first half of this by its own arithmetic: it counted one provider call per logical
+    # step and priced each at the MEAN, so a Session of big prompts breached a rail it should never
+    # have been able to reach.
+    def brain(tokens_per_call):
+        class _Billing(_ProviderDemoClient):
+            def chat_json(self, *args, **kwargs):
+                usage.record_usage("mimo", "test-model", prompt_tokens=tokens_per_call, completion_tokens=0)
+                return super().chat_json(*args, **kwargs)
+
+        return _Billing()
+
+    _tmp_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+
+    # Compliant: a full 5-question interview where EVERY call is the size of the largest one ever
+    # recorded in the ledger. A rail that fires here is a bug.
+    monkeypatch.setattr(cli, "build_client", lambda settings: brain(usage.LARGEST_MEASURED_CALL_TOKENS))
+    assert cli.main(_session_argv("compliant", tmp_path / "ok.sqlite", questions="5")) == 0
+    assert "SUSPENDED" not in capsys.readouterr().err
+
+    # Runaway: the same Session at 120k a call. Still stopped — and stopped by the derived default,
+    # with no env var for the operator to have set in advance.
+    monkeypatch.setattr(cli, "build_client", lambda settings: brain(120_000))
+    assert cli.main(_session_argv("berserk", tmp_path / "runaway.sqlite", questions="5")) == 2
+    err = capsys.readouterr().err
+    assert "runaway, not a long interview" in err
+    # And it was stopped well short of eating the day, which is what "nothing bounds a single
+    # session" asked for.
+    assert usage.session_run_spend("berserk") < usage.DEFAULT_DAILY_TOKEN_BUDGET // 2

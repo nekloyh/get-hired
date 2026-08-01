@@ -78,28 +78,35 @@ def daily_token_budget() -> int:
 
 # --- measured facts, re-derived from logs/usage-ledger.jsonl (1,431 rows on main @184f5a2) -------
 #
-# Gap-clustered (>10 min) the 1,380 openai/gpt-5.4-mini rows into 10 clusters. Five carry the
-# `coach session` signature — a ~450p/240c Diagnostic, then repeating evaluator/interviewer triples,
-# then a ~1,800p planner call — as opposed to the 455- and 778-call bench sweeps:
+# The ledger is gitignored runtime state, so no test can re-read it; what a test CAN pin is that
+# every number below it derives still follows from it, which is what test_usage.py does. To re-take
+# the measurements themselves, gap-cluster (>10 min) the openai/gpt-5.4-mini rows and read off the
+# clusters carrying the `coach session` signature — a ~450p/240c Diagnostic, then repeating
+# evaluator/interviewer triples, then a ~1,800p planner call — as opposed to the bench sweeps:
 #   2026-07-11T13:21  16 calls  26,866 tok  (1,679/call — the heaviest Session measured)
 #   2026-07-27T05:12   4 calls   5,596 tok  (1,399/call)
 #   2026-07-27T07:36  11 calls  14,616 tok  (1,329/call)
 #   2026-07-27T12:21   5 calls   6,836 tok  (1,367/call)
 #   2026-07-27T12:42  17 calls  21,891 tok  (1,288/call — 1 Diagnostic + 5x3 + 1 planner)
 # The two bench sweeps are the largest *sustained* per-call means on record: 1,720/call over 455
-# calls and 1,956/call over 778. The single largest call ever recorded is 2,663 tokens.
+# calls and 1,956/call over 778.
 
 HEAVIEST_MEASURED_SESSION_TOKENS = 26_866
-# The single largest provider call in the ledger. This — not any mean — is the right per-call figure
-# for a CEILING: a runaway is precisely the case where the expensive call is the one that repeats,
-# so a rail sized on the average would fire on a legitimate Session made of big prompts.
+# The single largest provider call in the whole ledger. This — not any mean — is the per-call figure
+# a CEILING must use: a runaway is precisely the case where the expensive call is the one that
+# repeats, so a rail sized on the average fires on a legitimate Session made of big prompts.
 LARGEST_MEASURED_CALL_TOKENS = 2_663
-WORST_CASE_TOKENS_PER_CALL = 2_700
+# The opening call of each Session-shaped cluster — the Diagnostic — measured 681, 692, 694 and 993.
+# One runs per Session, so the estimate carries the largest.
+HEAVIEST_MEASURED_DIAGNOSTIC_TOKENS = 993
 
-# Measured Diagnostic calls ranged 681–993 tokens; one Diagnostic runs per Session.
-SESSION_SETUP_TOKENS = 1_000
-# 26,866 less its 993-token Diagnostic, over 5 questions = 5,175/question, rounded up.
-SESSION_TOKENS_PER_QUESTION = 5_200
+# Everything below is DERIVED from the three measurements above, rounded up to the next 100 so the
+# numbers read as estimates rather than as false precision. test_usage.py re-does each division, so
+# a hand-nudged constant reddens instead of quietly re-sizing a rail.
+MEASUREMENT_ROUNDING = 100
+WORST_CASE_TOKENS_PER_CALL = 2_700  # ceil(2,663 / 100) * 100
+SESSION_SETUP_TOKENS = 1_000  # ceil(993 / 100) * 100
+SESSION_TOKENS_PER_QUESTION = 5_200  # ceil((26,866 - 993) / 5 / 100) * 100
 
 # The daily allowance restated in product units: 2,500,000 / 5,200. Deliberately NOT a small
 # per-user number — with one shared secret (R-07) the identity bucket IS the whole deployment, so a

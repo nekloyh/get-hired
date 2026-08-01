@@ -752,3 +752,20 @@ def test_408_and_409_stay_retryable_after_sdk_retries_disabled(monkeypatch, fake
     client = MimoClient(_provider("mimo"), client=fake)
     assert client.chat_json([{"role": "user", "content": "go"}], Foo).x == 4
     assert fake.call_count == 2
+
+
+def test_provider_label_prefers_the_router_identity_over_a_wrapped_client():
+    # `provider_label` is the exemption predicate for every R-25 budget rail, so which name wins
+    # decides whose allowance the Session is charged against. A router WRAPS concrete clients: its
+    # `primary_provider` is the account that pays, and the wrapped client's `provider_name` is not.
+    # No shipped class carries both today; the precedence is pinned so that the day one does, the
+    # rails do not silently start metering the wrong provider.
+    from types import SimpleNamespace
+
+    from interview_coach.llm import UNKNOWN_PROVIDER, provider_label
+
+    assert provider_label(SimpleNamespace(primary_provider="openai", provider_name="groq")) == "openai"
+    assert provider_label(SimpleNamespace(provider_name="groq")) == "groq"
+    assert provider_label(SimpleNamespace(primary_provider="openai")) == "openai"
+    # The demo client and every test fake land here — nothing without a provider spends an allowance.
+    assert provider_label(SimpleNamespace()) == UNKNOWN_PROVIDER

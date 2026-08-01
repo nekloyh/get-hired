@@ -97,6 +97,19 @@ def test_malformed_lines_are_skipped(tmp_path, monkeypatch):
     assert usage_for_day()["openai"]["calls"] == 2
 
 
+def test_a_half_written_token_row_is_skipped_whole(tmp_path, monkeypatch):
+    # Tolerant, not lenient: a row missing one of its token fields is dropped entirely rather than
+    # read as "0 of that field". Half-counting a corrupt line under-reports the day's spend, and the
+    # daily budget rail is the only thing standing between a free tier and a dead quota.
+    ledger = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
+    truncated = {"ts": utc_date() + "T00:00:00+00:00", "provider": "openai", "model": "m", "completion_tokens": 5}
+    ledger.write_text(json.dumps(truncated) + "\n", encoding="utf-8")
+
+    assert usage_for_day() == {}
+    assert sessions_for_day() == {}
+
+
 def test_record_usage_never_raises_on_io_failure(tmp_path):
     # A ledger line lost to IO is noise; a crashed live judgment is not.
     unwritable = tmp_path / "dir-as-file"
@@ -189,11 +202,25 @@ def test_the_worst_case_arithmetic_is_pinned():
     assert worst_case_session_tokens(5, 4) == 766_800
 
 
+def test_every_sizing_constant_still_follows_from_its_measurement():
+    # The ledger is gitignored runtime state, so no test can re-read the three measurements. What a
+    # test CAN pin is that everything derived from them still follows — which is the mutation that
+    # actually matters: a bare `!= 5_200` would be a change detector, but a constant that no longer
+    # follows from its measurement has silently re-sized a rail.
+    import math
+
+    rounding = usage.MEASUREMENT_ROUNDING
+    up = lambda value: math.ceil(value / rounding) * rounding  # noqa: E731
+
+    assert WORST_CASE_TOKENS_PER_CALL == up(LARGEST_MEASURED_CALL_TOKENS)
+    assert SESSION_SETUP_TOKENS == up(usage.HEAVIEST_MEASURED_DIAGNOSTIC_TOKENS)
+    heaviest_questions = HEAVIEST_MEASURED_SESSION_TOKENS - usage.HEAVIEST_MEASURED_DIAGNOSTIC_TOKENS
+    assert SESSION_TOKENS_PER_QUESTION == up(heaviest_questions / 5)
+
+
 def test_the_ceiling_is_bracketed_by_what_the_ledger_measured():
-    # Above: a ceiling a real Session can reach fires on compliant behaviour, so the per-call figure
-    # must cover the single largest call ever recorded, not any mean — a runaway is precisely the
-    # case where the expensive call is the one that repeats.
-    assert WORST_CASE_TOKENS_PER_CALL >= LARGEST_MEASURED_CALL_TOKENS
+    # Above: a ceiling a real Session can reach fires on compliant behaviour, so the whole ceiling
+    # must dwarf the heaviest Session ever measured.
     assert worst_case_session_tokens(5, 4) > 20 * HEAVIEST_MEASURED_SESSION_TOKENS
     # Below: a ceiling one Session cannot fit under three times over is not bounding anything, which
     # is the thing the issue asked for ("nothing bounds a single session").
@@ -375,6 +402,20 @@ def test_a_run_spans_the_utc_rollover(tmp_path, monkeypatch):
 
     assert session_run_spend("s") == 400
     assert session_spend("s") == 0  # today's per-id view honestly shows nothing
+
+
+def test_the_run_spend_never_goes_negative(tmp_path, monkeypatch):
+    # A baseline is a snapshot of the id's lifetime spend, so lifetime cannot normally fall below it
+    # — unless the ledger is rotated, truncated or repointed under a live Session. That is precisely
+    # when the rail must not disarm itself: a negative "spent" reads as infinite headroom, and the
+    # runaway the rail exists to stop would run unbounded.
+    ledger = _ledger(tmp_path, monkeypatch)
+    stale_baseline = {"ts": utc_date() + "T00:00:00+00:00", "kind": "session_run", "session": "s", "baseline": 5_000}
+    ledger.write_text(json.dumps(stale_baseline) + "\n", encoding="utf-8")
+    with session_scope("s"):
+        record_usage("openai", "m", prompt_tokens=100, completion_tokens=0)
+
+    assert session_run_spend("s") == 0
 
 
 def test_reading_the_run_spend_never_forgives_anything(tmp_path, monkeypatch):
