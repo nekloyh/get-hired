@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from interview_coach import language
 from interview_coach.language import (
     DEFAULT_LANGUAGE_MODE,
     ENGLISH_DELIVERY_WEIGHT,
@@ -64,20 +65,83 @@ def test_toneless_vietnamese_is_not_english():
     )
 
 
-def test_english_with_rare_vietnamese_lookalike_tokens_stays_english():
-    # One hit ("la") over 21 tokens clears neither gate, so English prose survives loosening either
-    # threshold alone. What this pins is the word list: "va" is the Vietnamese "and" and the most
-    # tempting entry to add, and adding it lands two hits (the tokenizer splits "va_scores") at ratio
-    # 0.095 — past both gates — which would silently strip english_delivery from English answers.
+def test_toneless_vietnamese_with_bi_and_va_is_not_english():
+    # The exact panel symptom R-23 was filed on. It reaches only one hit ("em", 1/17 = 0.059) against
+    # the word list this issue inherited, so it shipped as English; "bi" and "va" — the two words the
+    # AC names — are what carry it. Every other content word here is English jargon or a toneless
+    # syllable no curated list can hold, which is why the AC picked these two.
+    assert not answer_is_english(
+        "Model bi overfit tren tap train, em se them dropout va early stopping roi do lai metric."
+    )
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        # "em": the EM algorithm — mainline vocabulary for this product, and it recurs by nature.
+        "We fit a Gaussian mixture with EM. EM alternates between the E step and the M step until "
+        "the log likelihood converges.",
+        # "la": `ls -la`, a la carte, the LA region.
+        "The a la carte pricing page and the LA region both went down, so we failed over to us-east.",
+        # "vi": the editor.
+        "I opened the config in vi, fixed the port, and closed vi before restarting the worker.",
+        # "du": disk usage.
+        "Run du -h on the mount, then du -sh per shard to find the hot partition.",
+        # "lieu": "in lieu of" cannot recur, but it only needs one companion — here a cited surname.
+        "We cache the embedding in lieu of recomputing it, following Cho et al.",
+    ],
+)
+def test_english_technical_prose_is_never_read_as_vietnamese(answer):
+    # The inverse of R-23, and the more dangerous direction because it fails silently: a false
+    # "Vietnamese" verdict drops english_delivery from an English answer (ADR 0007's activation is
+    # deterministic, so nothing downstream notices) and makes require_vietnamese a no-op in vn mode.
+    # Every one of these cleared both gates against the shipped list; re-adding the single word each
+    # is named for turns that one case red again, so no removal here can be undone unnoticed.
+    assert answer_is_english(answer)
+
+
+def test_english_delivery_still_activates_on_an_answer_about_the_em_algorithm():
+    # The activation half of the case above, asserted where the damage actually lands: a mixed
+    # Session must still grade delivery on a pure-English answer.
+    rubric = rubric_with_delivery(
+        _RUBRIC,
+        "mixed",
+        "We fit a Gaussian mixture with EM. EM alternates between the E step and the M step until "
+        "the log likelihood converges.",
+    )
+    assert "english_delivery" in rubric.active
+
+
+def test_hyphenated_and_underscored_compounds_are_one_token():
+    # "bi" earns its place only because the tokenizer stops at the joiner. Split on it and this
+    # sentence donates three phantom hits — "bi" twice from the compounds, "va" from the identifier,
+    # 3/18 = 0.167 — convicting plainly English prose on vocabulary that never stands alone.
     assert answer_is_english(
-        "We ship an a la carte feature flag and a va_scores column, but this whole explanation is plain English prose."
+        "We train a bi-directional LSTM over bi-gram features and log a va_scores column per epoch."
+    )
+
+
+def test_a_single_stray_function_word_never_flips_english():
+    # Pins _VN_WORD_MIN_HITS. One genuine hit ("cho" — Kyunghyun Cho, the GRU paper) at 1/11 = 0.091
+    # is already past the density floor, so the hit count is the only thing holding this English.
+    # The residual English collisions left in the list are all of this shape: at most one per answer.
+    assert answer_is_english("Cho et al. introduced the GRU, which drops one LSTM gate.")
+
+
+def test_sparse_function_words_never_flip_long_english():
+    # Pins _VN_WORD_RATIO_THRESHOLD. Two genuine hits ("cho", "va" as the Virginia region) satisfy
+    # the hit count outright, so only the density floor (2/28 = 0.071 < 0.08) keeps this English —
+    # a long English answer must not be convicted by two incidental tokens.
+    assert answer_is_english(
+        "Cho et al. published the GRU in 2014, and after we moved the encoder into our VA region "
+        "the tail latency held, so the two-gate variant stayed in production."
     )
 
 
 def test_toneless_code_switched_vietnamese_stays_vietnamese():
-    # The toneless twin of the case above: Vietnamese grammar carrying English jargon, typed the way
-    # the target users actually type. The diacriticked version short-circuits on the letter ratio and
-    # never reaches this branch.
+    # The toneless twin of test_code_switched_vietnamese_stays_vietnamese: Vietnamese grammar
+    # carrying English jargon, typed the way the target users actually type. The diacriticked version
+    # short-circuits on the letter ratio and never reaches this branch.
     assert not answer_is_english(
         "Minh se dung read-through cache, neu miss thi fallback ve database, va set TTL khoang 5 phut cho hot key."
     )
@@ -102,6 +166,33 @@ def test_nfd_composed_vietnamese_is_still_detected():
 
     text = "Bias là khi mô hình sai, còn variance là khi nó thay đổi nhiều."
     assert not answer_is_english(unicodedata.normalize("NFD", text))
+
+
+def test_function_word_gate_changes_no_bench_case(monkeypatch):
+    """The calibration corpus classifies identically with and without the function-word signal.
+
+    This is the standing substitute for a `coach bench` run on every change to the word list. The
+    detector decides english_delivery activation, so a flipped bench case would change what the
+    judge is asked to score and would put the change under ADR 0009's gate; measured on the shipped
+    corpus, the second signal touches zero of them (every bench answer is either diacriticked
+    Vietnamese, caught by the letter ratio, or English that never reaches two hits). Pinning that
+    here makes the gate a deterministic CI fact instead of a stochastic, ~207k-token judgement call.
+
+    If this ever goes red, the word list has started moving bench cases — do NOT relax the assert:
+    the change needs a real bench run and the repo owner's decision.
+    """
+    from interview_coach.bench import load_bench_data
+
+    cases = load_bench_data().cases
+    assert cases, "the bench corpus must not be empty or this test asserts nothing"
+    with_gate = {c.case_id: (answer_is_english(c.answer), answer_is_english(c.question)) for c in cases}
+
+    # Emptying the word list leaves exactly the letter-ratio signal — a real disable, not a re-
+    # implementation of the branch that could drift away from the code it is meant to mirror.
+    monkeypatch.setattr(language, "_VIETNAMESE_FUNCTION_WORDS", frozenset())
+    ratio_only = {c.case_id: (answer_is_english(c.answer), answer_is_english(c.question)) for c in cases}
+
+    assert with_gate == ratio_only
 
 
 # --- delivery activation (the weight-0 mechanic, ADR 0007) ----------------------------------------

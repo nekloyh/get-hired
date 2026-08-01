@@ -49,24 +49,42 @@ _VIETNAMESE_CHARS = frozenset(
 # tone marks. 3% of alphabetic characters is comfortably between the two.
 _VIETNAMESE_RATIO_THRESHOLD = 0.03
 
-# The target users often type Vietnamese WITHOUT diacritics (the fast-typing style this product's
-# own question bank documents), which carries zero Vietnamese-specific letters — so a second
-# deterministic signal catches it: high-frequency Vietnamese function words in their unaccented
-# form. Every entry is curated to not be an English word ("rat", "bang", "con", "do", "an", "the"
-# are deliberately absent), so English prose scores ~0 hits while even short unaccented Vietnamese
-# saturates. Requiring BOTH a minimum hit count and a token ratio keeps a lone loanword ("la")
-# from flipping an English answer.
+# The target users often type Vietnamese WITHOUT diacritics ("khong dau" — the fast-typing style
+# this product's own question bank documents), which carries zero Vietnamese-specific letters, so a
+# second deterministic signal catches it: high-frequency Vietnamese function words in their
+# unaccented form.
+#
+# The list is NOT disjoint from English, and cannot be: unaccented Vietnamese syllables are two to
+# five letters and something always collides. What every entry IS curated against is *recurrence in
+# English technical prose* — a token that can appear twice in one English answer defeats the
+# min-hit gate by itself, and then english_delivery silently stops activating (ADR 0007) on a
+# perfectly English answer. That is why "em" (the EM algorithm; an em dash), "la" (`ls -la`, a la
+# carte, the LA region), "vi" (the editor) and "du" (`du -sh`) are absent — each was measured taking
+# an ordinary English answer over both gates on its own — and "lieu" with them, since "in lieu of"
+# needs only one companion hit. What remains is either a non-word in English ("khong", "duoc",
+# "hoac", ...) or an incidental that appears at most once in a technical answer: "dung" and "nay"
+# are dictionary words no technical answer uses, "cho" is a surname (Cho et al., the GRU paper),
+# "va" a US state code. Those survive on the gates rather than on curation — BOTH a minimum hit
+# count AND a token-density floor must clear, so one stray token can never flip an English answer.
+# fmt: off
 _VIETNAMESE_FUNCTION_WORDS = frozenset(
     {
         "khong", "duoc", "nhung", "khi", "neu", "hoac", "cua", "chua", "moi",
-        "nen", "nao", "vao", "cung", "minh", "vay", "toi", "la", "em", "anh",
+        "nen", "nao", "vao", "cung", "minh", "vay", "toi", "va", "bi", "anh",
         "gi", "khac", "voi", "cho", "nay", "trong", "truoc", "sau", "giua",
         "cach", "dung", "hieu", "biet", "phai", "nhieu", "theo", "hinh",
-        "giai", "thich", "vi", "du", "lieu",
+        "giai", "thich",
     }
 )
+# fmt: on
 _VN_WORD_MIN_HITS = 2
 _VN_WORD_RATIO_THRESHOLD = 0.08
+
+# A hyphen- or underscore-joined compound is ONE token. Splitting on the joiner manufactures
+# function-word hits out of English technical vocabulary that never stands alone: "bi-gram" and
+# "bi-directional" would each donate a bare "bi", "va_scores" a bare "va" — two hits from one
+# English sentence, exactly the recurrence the curation above is meant to exclude.
+_TOKEN_PATTERN = re.compile(r"[^\W\d_]+(?:[-_][^\W\d_]+)*")
 
 # Fenced blocks and inline code spans are language-neutral: a Vietnamese answer that pastes a long
 # Python snippet must not read as English because the code diluted the prose ratio.
@@ -87,7 +105,7 @@ def answer_is_english(text: str) -> bool:
     vietnamese = sum(1 for ch in alpha if ch in _VIETNAMESE_CHARS)
     if vietnamese / len(alpha) > _VIETNAMESE_RATIO_THRESHOLD:
         return False
-    tokens = re.findall(r"[^\W\d_]+", prose)
+    tokens = _TOKEN_PATTERN.findall(prose)
     hits = sum(1 for token in tokens if token in _VIETNAMESE_FUNCTION_WORDS)
     if tokens and hits >= _VN_WORD_MIN_HITS and hits / len(tokens) >= _VN_WORD_RATIO_THRESHOLD:
         return False

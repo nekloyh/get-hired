@@ -482,3 +482,33 @@ def test_vn_mode_follow_up_validator_accepts_toneless_vietnamese():
     with pytest.raises(ValueError, match="Vietnamese-language"):
         for validate in validators:
             validate(english)
+
+
+def test_render_seed_question_keeps_a_toneless_vietnamese_rendering(make_client):
+    # The third production consumer of the detector (require_vietnamese inside render_seed_question).
+    # Nothing exercised it directly, and the one microloop test that reaches it only drives the
+    # rejection path — the accepting path, the one R-23 breaks, was untested. If a toneless rendering
+    # reads as English the validator rejects it, the retry is spent, and the vn Session degrades to
+    # asking the candidate the English original: a silent de-Vietnamization of the seed question.
+    from interview_coach.interviewer import render_seed_question
+
+    toneless = "Neu model cua ban bi overfit thi ban se lam gi de giam variance?"
+    client, fake = make_client([json.dumps({"question": toneless})])
+
+    assert render_seed_question(client, "How do you reduce variance in an overfit model?", "vn") == toneless
+    assert fake.call_count == 1  # accepted first time — no validator retry was needed
+
+
+def test_render_seed_question_degrades_when_the_model_keeps_answering_in_english(make_client):
+    # The other half: require_vietnamese must still bite, or a vn Session would happily ask the
+    # English text back — the microloop covers this end-to-end, but nothing pinned it at the unit
+    # the fix touches. Exhausting the retry degrades to the English original rather than crashing the
+    # question (ADR 0005 — a rendering-quality failure is not a failed turn).
+    from interview_coach.interviewer import render_seed_question
+
+    english = json.dumps({"question": "How do you reduce variance in an overfit model?"})
+    client, fake = make_client([english, english])
+
+    original = "How do you reduce variance in an overfit model?"
+    assert render_seed_question(client, original, "vn") == original
+    assert fake.call_count == 2  # one attempt plus the single retry
