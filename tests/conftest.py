@@ -7,6 +7,7 @@ retry/validation logic in ``chat_json`` is exercised end-to-end against canned m
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -14,12 +15,37 @@ from interview_coach import telemetry
 from interview_coach.config import ProviderSettings, Settings
 from interview_coach.llm import GroqClient, LLMRouter, MimoClient
 
+# At conftest import, not in a fixture, and deliberately: `interview_coach.web_api` runs
+# `guard_single_worker()` at module scope, and that import happens during *collection* — an autouse
+# fixture runs far too late. A developer with WEB_CONCURRENCY exported for some other project would
+# otherwise get "Interrupted: 1 error during collection" and zero of the tests, from a variable that
+# has nothing to do with this repo. The guard's real call site is still pinned, in a subprocess with
+# WEB_CONCURRENCY set explicitly (tests/test_web_api.py).
+os.environ.pop("WEB_CONCURRENCY", None)
+
 
 @pytest.fixture(autouse=True)
 def _reset_telemetry():
     """Noise counters are process-global; every test starts from a clean slate."""
     telemetry.reset()
     yield
+
+
+@pytest.fixture(autouse=True)
+def _restore_coach_log_file():
+    """`_cmd_api` writes COACH_LOG_FILE into os.environ on purpose, so a test cannot just delenv it.
+
+    ``monkeypatch.delenv(..., raising=False)`` records no undo when the variable was absent, so the
+    value a CLI test causes to be *created* survives into every later test in the session — where it
+    would attach a file handler pointing at a deleted tmp_path.
+    """
+    saved = os.environ.get("COACH_LOG_FILE")
+    os.environ.pop("COACH_LOG_FILE", None)
+    yield
+    if saved is None:
+        os.environ.pop("COACH_LOG_FILE", None)
+    else:
+        os.environ["COACH_LOG_FILE"] = saved
 
 
 class _FakeFunction:

@@ -96,7 +96,8 @@ def _harness_result(score: float, *, expected_min: float = 1.0, expected_max: fl
         ),
         evaluation=Evaluation(
             dimensions={
-                dim: DimensionScore(score=round(score), evidence="no evidence") for dim in QUESTION.rubric.active
+                dim: DimensionScore(score=round(score), evidence="no evidence")
+                for dim in QUESTION.rubric.active
             },
             weighted_score=score,
             confidence=0.8,
@@ -175,7 +176,10 @@ def test_run_session_graph_prints_live_skill_state_updates(make_client, capsys):
         [
             json.dumps(
                 {
-                    "dimensions": {dim: {"score": 5, "evidence": "no evidence"} for dim in DIMENSIONS},
+                    "dimensions": {
+                        dim: {"score": 5, "evidence": "no evidence"}
+                        for dim in DIMENSIONS
+                    },
                     "weighted_score": 5.0,
                     "confidence": 0.8,
                     "follow_up_recommended": False,
@@ -306,7 +310,9 @@ def test_session_refuses_to_restart_over_inflight_checkpoint(tmp_path, monkeypat
     monkeypatch.setattr(cli, "build_client", lambda settings: DemoLLMClient())
     monkeypatch.setattr(cli, "resumable_session_state", lambda graph, session_id: {"status": "active"})
 
-    rc = cli.main(["session", "--scripted", "--session-id", "busy", "--checkpoint-db", str(tmp_path / "c.sqlite")])
+    rc = cli.main(
+        ["session", "--scripted", "--session-id", "busy", "--checkpoint-db", str(tmp_path / "c.sqlite")]
+    )
 
     assert rc == 2
     assert "already in progress" in capsys.readouterr().err
@@ -452,18 +458,18 @@ def test_coach_api_refuses_to_start_under_web_concurrency(monkeypatch, uvicorn_s
     assert "WEB_CONCURRENCY" in capsys.readouterr().err
 
 
-def test_coach_api_starts_normally_with_no_worker_config(monkeypatch, uvicorn_spy):
-    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
-
+def test_coach_api_starts_normally_with_no_worker_config(uvicorn_spy):
+    # WEB_CONCURRENCY and COACH_LOG_FILE are cleared for every test by conftest, precisely because
+    # `monkeypatch.delenv` cannot undo a variable the code under test creates.
     assert cli.main(["api"]) == 0
     assert len(uvicorn_spy) == 1
 
 
-def test_log_file_flag_reaches_the_serving_process(monkeypatch, uvicorn_spy, tmp_path):
+def test_log_file_flag_reaches_the_serving_process(uvicorn_spy, tmp_path):
     # `--reload` serves from a spawned subprocess that never runs `_cmd_api`; the environment is the
     # only channel that crosses that boundary, so the flag has to be exported before uvicorn starts.
-    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
-    monkeypatch.delenv("COACH_LOG_FILE", raising=False)
+    # That this env var is *read* — and that a record lands in the file — is pinned end-to-end by
+    # `test_the_log_file_env_var_is_actually_read_by_the_serving_process` in tests/test_web_api.py.
     log_file = tmp_path / "api.log"
 
     assert cli.main(["api", "--log-file", str(log_file)]) == 0

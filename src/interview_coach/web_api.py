@@ -309,18 +309,31 @@ def _validate_auth_settings(settings: Settings) -> None:
 
 
 def _requested_workers(env: Mapping[str, str], argv: Sequence[str]) -> tuple[int, str] | None:
-    """The worker count someone asked for, and which channel asked, or None when nobody did.
+    """The worker count that will actually take effect, and which channel set it, or None.
 
-    A value that is not an integer is uvicorn's own error to report — raising ``ValueError`` on a
+    Resolution mirrors uvicorn's exactly, because a guard that reads the command line differently
+    from the launcher is worse than no guard: it both misses and misfires. uvicorn's ``--workers``
+    is a plain click option (no ``multiple=True``), so a repeated flag keeps the **last** value —
+    stopping at the first occurrence let ``--workers 1 --workers 4`` start four processes silently,
+    and refused ``--workers 4 --workers 1`` with advice the operator had already taken. And
+    ``Config`` consults ``WEB_CONCURRENCY`` only ``if workers is None``, so any explicit flag —
+    including a typo uvicorn is about to reject — shadows the environment.
+
+    A value that is not an integer is uvicorn's own error to report; raising ``ValueError`` on a
     typo would be a worse failure than the one this guard exists to prevent.
     """
+    flagged: str | None = None
     for index, token in enumerate(argv):
-        raw = token[len("--workers=") :] if token.startswith("--workers=") else None
-        if raw is None and token == "--workers" and index + 1 < len(argv):
-            raw = argv[index + 1]
-        if raw is not None:
-            with suppress(ValueError):
-                return int(raw), "--workers"
+        if token.startswith("--workers="):
+            flagged = token[len("--workers=") :]
+        elif token == "--workers" and index + 1 < len(argv):
+            flagged = argv[index + 1]
+    if flagged is not None:
+        with suppress(ValueError):
+            return int(flagged), "--workers"
+        # Unparseable, but still explicit — and click rejects it before ``Config`` ever reads the
+        # environment. Falling through would refuse the run over a variable that is not in play.
+        return None
     with suppress(ValueError, KeyError):
         return int(env["WEB_CONCURRENCY"]), "WEB_CONCURRENCY"
     return None
@@ -330,11 +343,15 @@ def guard_single_worker(env: Mapping[str, str] | None = None, argv: Sequence[str
     """Refuse to serve from more than one process, before a socket is bound or a worker forked.
 
     Called at module import rather than only from ``coach api`` because the CLI is not the only way
-    in: ``uvicorn interview_coach.web_api:app --workers 4`` and a gunicorn ``--workers`` never touch
-    it. At import time uvicorn is still in ``config.load_app()``, which runs *before* ``bind_socket``
-    and before ``Multiprocess(...)`` — so raising here kills the launcher rather than half-starting a
-    fleet. ``WEB_CONCURRENCY`` is checked because it is the route nobody types: compose feeds `.env`
-    into the container wholesale and uvicorn resolves the variable itself.
+    in: ``uvicorn interview_coach.web_api:app --workers 4`` never touches it. Under uvicorn, import
+    time is early enough — the launcher is still in ``config.load_app()``, which runs *before*
+    ``bind_socket()`` and before ``Multiprocess(...)``, so raising here kills it rather than
+    half-starting a fleet. That "before the port" property is uvicorn's, not universal: gunicorn's
+    default ``preload_app=False`` binds and logs ``Listening at:`` before it forks and imports, so
+    the guard would only fire inside the children. gunicorn is not a dependency and not in the image,
+    so that is a documented limit rather than a case to engineer for. ``WEB_CONCURRENCY`` is checked
+    because it is the route nobody types: compose feeds `.env` into the container wholesale and
+    uvicorn resolves the variable itself.
 
     A hard failure, not a degrade. ADR 0005's degrade stance protects skill evidence from
     infrastructure noise; this fires before any Session exists, so there is no evidence to protect
@@ -537,8 +554,9 @@ def create_app(
         runtime = RuntimeSession(session_id=session_id, mode="pending", emit=emit)
         sender = asyncio.create_task(_send_events(websocket, outgoing))
         api_state.runtimes[session_id] = runtime
-        # %r, not %s: the id is a client-supplied URL path segment that Starlette percent-decodes, so
-        # a newline in it would forge log lines — the same untrusted-input care `export_path` takes.
+        # %r, not %s — and the same for every other Session-id record in this module: the id is a
+        # client-supplied URL path segment that Starlette percent-decodes, so `%0A` in it would forge
+        # whole log lines. Same untrusted-input care `export_path` takes with the filesystem.
         logger.info("Session %r socket connected", session_id)
         try:
             while True:
@@ -803,10 +821,10 @@ def _run_session_thread(
         # not an infrastructure failure — a distinct control-flow branch. The supervisor re-raises it
         # past the per-question failure-isolation net, so the in-flight question is never recorded as a
         # zero-evidence `failed` and the checkpoint stays resumable. Report it, don't score anything.
-        logger.info("Session %s cancelled by Candidate intent: %s", runtime.session_id, err)
+        logger.info("Session %r cancelled by Candidate intent: %s", runtime.session_id, err)
         runtime.emit({"type": "session_error", "error": f"Session cancelled: {err}"})
     except Exception as err:  # noqa: BLE001 - API boundary converts graph/provider failures to events
-        logger.exception("Session %s failed", runtime.session_id)
+        logger.exception("Session %r failed", runtime.session_id)
         runtime.emit({"type": "session_error", "error": f"{type(err).__name__}: {err}"})
 
 
@@ -833,7 +851,7 @@ def _session_language_mode(
         values: Mapping[str, Any] = raw.get("channel_values") or {}
         return str(values.get("language_mode") or DEFAULT_LANGUAGE_MODE)
     except Exception:
-        logger.warning("could not read language_mode for resumed Session %s", session_id, exc_info=True)
+        logger.warning("could not read language_mode for resumed Session %r", session_id, exc_info=True)
         return DEFAULT_LANGUAGE_MODE
 
 
@@ -847,7 +865,7 @@ def _persist_export(api_state: WebApiState, session_id: str, final_state: dict[s
     try:
         export_session_markdown(final_state, export_path(api_state.exports_dir, session_id))
     except OSError:
-        logger.exception("could not persist the Markdown export for Session %s", session_id)
+        logger.exception("could not persist the Markdown export for Session %r", session_id)
 
 
 def _stream_graph(
