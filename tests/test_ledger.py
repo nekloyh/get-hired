@@ -269,19 +269,20 @@ def test_staged_bytes_are_fsynced_before_the_name_is_published(tmp_path, monkeyp
     # entry can reach disk before the data does, so an unsynced publish lets a container restart
     # expose `ledger.json` as a name pointing at zero bytes — every Candidate in it cold-started by a
     # crash that this module's whole point is to survive. No in-process test can pull the power cord,
-    # so the ceiling here is the fd: `st_ino` proves the sync landed on *the* staged file (not some
-    # unrelated descriptor) and the call ordering proves it landed *before* the name went live.
+    # but the fd at sync time carries the whole guarantee: `st_ino` proves the sync landed on *the*
+    # staged file (not some unrelated descriptor), `st_size` proves that file actually held the
+    # ledger, and the call ordering proves both were true *before* the name went live.
     path = tmp_path / "ledger.json"
     real_fsync, real_replace = os.fsync, os.replace
-    synced_inodes: list[int] = []
+    synced: list[os.stat_result] = []
     syncs_before_publish: list[int] = []
 
     def spy_fsync(fd):
-        synced_inodes.append(os.fstat(fd).st_ino)
+        synced.append(os.fstat(fd))
         return real_fsync(fd)
 
     def spy_replace(src, dst, *args, **kwargs):
-        syncs_before_publish.append(len(synced_inodes))
+        syncs_before_publish.append(len(synced))
         return real_replace(src, dst, *args, **kwargs)
 
     monkeypatch.setattr(os, "fsync", spy_fsync)
@@ -291,7 +292,13 @@ def test_staged_bytes_are_fsynced_before_the_name_is_published(tmp_path, monkeyp
     assert syncs_before_publish == [1]  # exactly one sync, and it completed before publication
     # Rename preserves the inode, so this is the staged file that became the ledger — the bytes now
     # reachable under the published name are the bytes that were forced to disk.
-    assert path.stat().st_ino == synced_inodes[0]
+    assert path.stat().st_ino == synced[0].st_ino
+    # ...and there *were* bytes. `flush()` sitting next to `fsync()` reads as redundant to anyone who
+    # does not know Python buffers separately from the kernel, so deleting it is the plausible next
+    # edit — and it still fsyncs the right inode, just an empty one, publishing a full-sized name over
+    # zero durable bytes. Asserting the size at sync time is what separates "fsync was called" from
+    # the durability it is called for. `> 0` keeps that from passing on two empty files.
+    assert synced[0].st_size == path.stat().st_size > 0
 
 
 def test_a_write_that_dies_mid_flight_leaves_no_tempfile_behind(tmp_path, monkeypatch, caplog):
@@ -376,11 +383,13 @@ def test_published_ledger_is_owner_only(tmp_path):
 
 
 def test_publish_survives_a_mount_boundary_around_the_state_dir(tmp_path, monkeypatch, caplog):
-    # The deployed ledger lives on the Docker /state volume, which is a different filesystem from the
-    # image. os.replace is only atomic within one filesystem and raises EXDEV across a boundary, so a
-    # tempfile staged under the system temp dir would publish fine on a dev laptop and fail on every
-    # save in production. This emulates the kernel's rule — rename across directories that are not
-    # siblings is EXDEV — so staging anywhere but next to the target loses the record outright.
+    # The deployed ledger lives on the Docker /state volume, a different filesystem from the image,
+    # and os.replace raises EXDEV across a filesystem boundary — so a tempfile staged under the system
+    # temp dir loses every save in production. A test cannot mount a second filesystem, so this fake is
+    # deliberately *stricter* than the kernel rather than a model of it: it refuses any non-sibling
+    # rename, where the kernel refuses only cross-filesystem ones (measured — os.replace between two
+    # non-sibling directories on one filesystem succeeds). Stricter is the safe direction, refusing a
+    # superset of what the kernel refuses, so a staging choice that passes here cannot meet EXDEV.
     path = tmp_path / "ledger.json"
     real_replace = os.replace
 
