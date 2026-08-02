@@ -34,15 +34,7 @@ ENGLISH_DELIVERY_WEIGHT = 1.0
 # and all tone-marked vowels (both bare-vowel tones like "à" and stacked forms like "ậ"). Shared
 # accented letters (é, à, ô, ...) do appear in European loanwords, so detection is by *ratio*, not
 # presence — see :func:`answer_is_english`.
-_VIETNAMESE_CHARS = frozenset(
-    "ăâđêôơư"
-    "àáảãạằắẳẵặầấẩẫậ"
-    "èéẻẽẹềếểễệ"
-    "ìíỉĩị"
-    "òóỏõọồốổỗộờớởỡợ"
-    "ùúủũụừứửữự"
-    "ỳýỷỹỵ"
-)
+_VIETNAMESE_CHARS = frozenset("ăâđêôơưàáảãạằắẳẵặầấẩẫậèéẻẽẹềếểễệìíỉĩịòóỏõọồốổỗộờớởỡợùúủũụừứửữựỳýỷỹỵ")
 
 # An English answer quoting one Vietnamese term (e.g. "từ ghép" in an answer about segmentation)
 # stays English; a code-switched Vietnamese answer full of English jargon is still saturated with
@@ -52,19 +44,79 @@ _VIETNAMESE_RATIO_THRESHOLD = 0.03
 # The target users often type Vietnamese WITHOUT diacritics (the fast-typing style this product's
 # own question bank documents), which carries zero Vietnamese-specific letters — so a second
 # deterministic signal catches it: high-frequency Vietnamese function words in their unaccented
-# form. Every entry is curated to not be an English word ("rat", "bang", "con", "do", "an", "the"
-# are deliberately absent), so English prose scores ~0 hits while even short unaccented Vietnamese
-# saturates. Requiring BOTH a minimum hit count and a token ratio keeps a lone loanword ("la")
-# from flipping an English answer.
+# form.
+#
+# This list is NOT collision-free with English, and an earlier version of this comment claimed it
+# was. Unaccented Vietnamese is only ~29 letters wide, so its commonest function words keep landing
+# on English words, commands and surnames — measured on this repo's own English prose and on
+# hand-built adversarial prose: "la" (a la carte), "du" (du -sh), "cho" (Cho et al., who proposed
+# the GRU), "minh"/"anh" (given names), "toi". The two that had to go were "vi" (the editor — 15 of
+# this repo's 2,216 English sentences) and "em" (the EM algorithm, em dashes, em units), because
+# both are mainline vocabulary for an ML interview coach specifically.
+#
+# What makes the rest survivable is counting DISTINCT matched words rather than occurrences. Every
+# English false positive we could construct is one word repeated — "the BI layer … the BI team",
+# "Cho et al. … Cho later", "a bi encoder … the bi encoder" — which contributes 1 and cannot clear
+# a minimum of 2 on its own. Genuine unaccented Vietnamese reaches 2+ *different* function words in
+# a single clause. Occurrence counting scores those identically; distinct counting separates them,
+# and it is worth 7 of the 9 points this rule gained (measured, `test_language.py`'s corpus).
 _VIETNAMESE_FUNCTION_WORDS = frozenset(
     {
-        "khong", "duoc", "nhung", "khi", "neu", "hoac", "cua", "chua", "moi",
-        "nen", "nao", "vao", "cung", "minh", "vay", "toi", "la", "em", "anh",
-        "gi", "khac", "voi", "cho", "nay", "trong", "truoc", "sau", "giua",
-        "cach", "dung", "hieu", "biet", "phai", "nhieu", "theo", "hinh",
-        "giai", "thich", "vi", "du", "lieu",
+        "khong",
+        "duoc",
+        "nhung",
+        "khi",
+        "neu",
+        "hoac",
+        "cua",
+        "chua",
+        "moi",
+        "nen",
+        "nao",
+        "vao",
+        "cung",
+        "minh",
+        "vay",
+        "toi",
+        "la",
+        "anh",
+        "gi",
+        "khac",
+        "voi",
+        "cho",
+        "nay",
+        "trong",
+        "truoc",
+        "sau",
+        "giua",
+        "cach",
+        "dung",
+        "hieu",
+        "biet",
+        "phai",
+        "nhieu",
+        "theo",
+        "hinh",
+        "giai",
+        "thich",
+        "du",
+        "lieu",
+        # Added with the distinct-count rule: high-frequency, and none is an English word. "va" and
+        # "bi" are the two the issue's own acceptance criteria named — without them the motivating
+        # answer ("Model bi overfit tren tap train … va early stopping") reaches only one function
+        # word and reads as English.
+        "tren",
+        "ve",
+        "cac",
+        "nhu",
+        "thi",
+        "mot",
+        "hon",
+        "va",
+        "bi",
     }
 )
+# Both gates apply to the count of DISTINCT matched words — see the note above.
 _VN_WORD_MIN_HITS = 2
 _VN_WORD_RATIO_THRESHOLD = 0.08
 
@@ -79,6 +131,11 @@ def answer_is_english(text: str) -> bool:
     Two signals over the prose (code blocks stripped first): the ratio of Vietnamese-specific
     letters, and the density of unaccented Vietnamese function words — either marks the text as
     Vietnamese. Empty or symbol-only text is not English: there is no delivery to score.
+
+    The second signal counts DISTINCT function words, not occurrences: an English answer that says
+    "BI" four times is one collision repeated, while Vietnamese reaches several different function
+    words in a clause. See the note above the word list for what that buys and why the list is not
+    collision-free.
     """
     prose = unicodedata.normalize("NFC", _CODE_PATTERN.sub(" ", text)).lower()
     alpha = [ch for ch in prose if ch.isalpha()]
@@ -87,8 +144,11 @@ def answer_is_english(text: str) -> bool:
     vietnamese = sum(1 for ch in alpha if ch in _VIETNAMESE_CHARS)
     if vietnamese / len(alpha) > _VIETNAMESE_RATIO_THRESHOLD:
         return False
-    tokens = re.findall(r"[^\W\d_]+", prose)
-    hits = sum(1 for token in tokens if token in _VIETNAMESE_FUNCTION_WORDS)
+    # `[^\W\d]` keeps the underscore INSIDE a token, so `va_scores` and `bi_encoder` stay one word
+    # each. Splitting on it manufactured `va` and `bi` out of ordinary snake_case identifiers, which
+    # an English answer about retrieval writes constantly — two phantom hits is enough to flip it.
+    tokens = re.findall(r"[^\W\d]+", prose)
+    hits = len({token for token in tokens if token in _VIETNAMESE_FUNCTION_WORDS})
     if tokens and hits >= _VN_WORD_MIN_HITS and hits / len(tokens) >= _VN_WORD_RATIO_THRESHOLD:
         return False
     return True
@@ -114,11 +174,7 @@ def rubric_with_delivery(rubric: Rubric, language_mode: str, answer: str) -> Rub
     and a ``vn`` Session never activates the dimension at all (issue 0024 acceptance criterion).
     Question packs never carry the dimension themselves; it is injected here, per answer.
     """
-    active = (
-        language_mode != "vn"
-        and len(answer.split()) >= _MIN_DELIVERY_WORDS
-        and answer_is_english(answer)
-    )
+    active = language_mode != "vn" and len(answer.split()) >= _MIN_DELIVERY_WORDS and answer_is_english(answer)
     currently = rubric.weights.get("english_delivery", 0.0) > 0
     if active == currently:
         return rubric
