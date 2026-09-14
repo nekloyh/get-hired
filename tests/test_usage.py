@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import UTC, datetime
 
 import pytest
@@ -32,6 +33,7 @@ from interview_coach.usage import (
     record_quota_exhausted,
     record_usage,
     remaining_today,
+    reserve_questions,
     session_baseline,
     session_budget_guard,
     session_lifetime_spend,
@@ -947,3 +949,27 @@ def test_the_call_gate_remembers_a_good_path_but_re_probes_a_bad_one(tmp_path, m
     ledger.rmdir()
 
     assert usage.accounting_gate() is None
+
+
+# --- AUDIT §3.2 row 3: the question-cap check and the reservation are one atomic step -------------
+
+
+def test_two_simultaneous_starts_cannot_both_pass_the_question_cap(tmp_path, monkeypatch):
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(tmp_path / "ledger.jsonl"))
+    monkeypatch.setenv("COACH_DAILY_QUESTION_CAP", "3")
+    barrier = threading.Barrier(2)
+    outcomes: list[str | None] = []
+
+    def reserve() -> None:
+        barrier.wait()
+        outcomes.append(reserve_questions("id-1", questions=3))
+
+    threads = [threading.Thread(target=reserve) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert outcomes.count(None) == 1, outcomes
+    assert sum("COACH_DAILY_QUESTION_CAP" in (reason or "") for reason in outcomes) == 1
+    assert questions_today("id-1") == 3

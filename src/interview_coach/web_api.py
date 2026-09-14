@@ -60,8 +60,7 @@ from .usage import (
     begin_session_run,
     clear_run_rails_for_resume,
     daily_reset_hint,
-    question_cap_reason,
-    record_questions,
+    reserve_questions,
     session_budget_guard,
     session_scope,
     start_refusal_reason,
@@ -72,6 +71,19 @@ logger = logging.getLogger(__name__)
 
 SessionMode = Literal["auto", "demo", "live"]
 
+# Input bounds (AUDIT §3.1): one client must not be able to grow memory or prompt cost without limit.
+MAX_ANSWER_CHARS = 20_000
+MAX_ELAPSED_SECONDS_CEILING = 4 * 3600.0
+ANSWER_QUEUE_MAXSIZE = 8
+
+# How long a reconnect waits for the previous run's thread to leave an in-flight provider call. Covers
+# one timed-out call plus a retry (LLM_TIMEOUT_SECONDS 60 x 2); a full 4-attempt retry storm can run
+# ~4 minutes, in which case the client is told to retry rather than the wait growing to match.
+STALE_RUNTIME_JOIN_SECONDS = 120.0
+
+# Completed states kept in RAM; the export endpoint falls back to the Markdown `_persist_export` wrote.
+MAX_COMPLETED_SESSIONS_IN_MEMORY = 64
+
 
 class StartSessionPayload(BaseModel):
     type: Literal["start_session"]
@@ -81,7 +93,7 @@ class StartSessionPayload(BaseModel):
     claimed_skills: dict[str, float] = Field(default_factory=dict)
     candidate_id: str = ""  # cross-session Skill ledger id (0023); empty = one-shot cold start
     max_questions: int = Field(DEFAULT_MAX_QUESTIONS, ge=1, le=10)
-    max_elapsed_seconds: float = Field(DEFAULT_MAX_ELAPSED_SECONDS, gt=0)
+    max_elapsed_seconds: float = Field(DEFAULT_MAX_ELAPSED_SECONDS, gt=0, le=MAX_ELAPSED_SECONDS_CEILING)
     language_mode: Literal["en", "vn", "mixed"] = "en"  # issue 0024, ADR 0007
 
 
@@ -92,7 +104,7 @@ class ResumeSessionPayload(BaseModel):
 
 class CandidateAnswerPayload(BaseModel):
     type: Literal["candidate_answer"]
-    answer: str
+    answer: str = Field(max_length=MAX_ANSWER_CHARS)
 
 
 class CancelSessionPayload(BaseModel):
@@ -261,21 +273,42 @@ class EventEmitter:
             pass
 
 
+def _bounded_answers() -> queue.Queue[Any]:
+    return queue.Queue(maxsize=ANSWER_QUEUE_MAXSIZE)
+
+
 @dataclass
 class RuntimeSession:
     session_id: str
     mode: str
     emit: EventEmitter
-    answers: queue.Queue[Any] = field(default_factory=queue.Queue)
+    answers: queue.Queue[Any] = field(default_factory=_bounded_answers)
     cancelled: threading.Event = field(default_factory=threading.Event)
     thread: threading.Thread | None = None
+    socket_closed: bool = False
+    # Set under the state lock by the thread's own finally — unlike `is_alive()`, it cannot read
+    # True for a thread that has already released the registration.
+    run_finished: bool = False
 
     def reset_run_state(self) -> None:
         # A single socket can run start -> cancel -> start again. Without a fresh queue and event the
         # second run inherits a permanently-set cancelled flag (aborts instantly) and a stale sentinel
         # left in the queue (consumed as the first answer). Reset before each run.
-        self.answers = queue.Queue()
+        self.answers = _bounded_answers()
         self.cancelled = threading.Event()
+        self.run_finished = False
+
+    @property
+    def run_in_flight(self) -> bool:
+        return self.thread is not None and not self.run_finished
+
+    def cancel(self) -> None:
+        # A cancel supersedes queued answers: drain so the sentinel can never be lost to a full queue.
+        self.cancelled.set()
+        with suppress(queue.Empty):
+            while True:
+                self.answers.get_nowait()
+        self.answers.put_nowait(_CANCEL)
 
     def start(self, target, *args: Any) -> None:
         self.thread = threading.Thread(target=target, args=args, daemon=True)
@@ -290,6 +323,10 @@ class WebApiState:
     exports_dir: str = DEFAULT_EXPORTS_DIR
     completed_sessions: dict[str, dict[str, Any]] = field(default_factory=dict)
     runtimes: dict[str, RuntimeSession] = field(default_factory=dict)
+    # Session ids with a reconnect currently waiting for the previous run's thread: one waiter per id.
+    waiting: set[str] = field(default_factory=set)
+    # Guards every read/write of `runtimes`, `waiting`, and the eviction in `completed_sessions`.
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 def export_path(exports_dir: str | Path, session_id: str) -> Path:
@@ -557,19 +594,16 @@ def create_app(
             logger.warning("rejected WebSocket connection: missing or invalid auth frame")
             await websocket.close(code=WS_1008_POLICY_VIOLATION)
             return
-        # Defined behavior for two tabs on one session_id: reject the second so two graphs can't run
-        # concurrently against one checkpoint thread. One live socket per Session id.
-        if session_id in api_state.runtimes:
-            await websocket.send_json(
-                {"type": "session_error", "error": "This Session id already has an active connection."}
-            )
-            await websocket.close()
-            return
         outgoing: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         emit = EventEmitter(asyncio.get_running_loop(), outgoing)
         runtime = RuntimeSession(session_id=session_id, mode="pending", emit=emit)
+        # One live socket per Session id, and one graph per checkpoint thread: a second tab is
+        # refused, and a reconnect waits for the previous run's thread before it may resume.
+        if (refusal := await _claim_session_id(api_state, session_id, runtime)) is not None:
+            await websocket.send_json({"type": "session_error", "error": refusal})
+            await websocket.close()
+            return
         sender = asyncio.create_task(_send_events(websocket, outgoing))
-        api_state.runtimes[session_id] = runtime
         # %r, not %s — and the same for every other Session-id record in this module: the id is a
         # client-supplied URL path segment that Starlette percent-decodes, so `%0A` in it would forge
         # whole log lines. Same untrusted-input care `export_path` takes with the filesystem.
@@ -613,22 +647,33 @@ def create_app(
                     # always sends one works against gated and open servers alike.
                     continue
                 elif isinstance(payload, CandidateAnswerPayload):
-                    runtime.answers.put(payload.answer)
+                    try:
+                        runtime.answers.put_nowait(payload.answer)
+                    except queue.Full:
+                        emit(
+                            {
+                                "type": "session_error",
+                                "error": "Answer dropped: earlier answers are still being processed.",
+                            }
+                        )
                 else:
                     # Cancel is a control signal (ADR 0005): flag it and drop the sentinel so a blocked
                     # QueueCandidate.answer() raises CandidateIntent. _run_session_thread emits the
                     # terminal event; no "" is injected as a fake answer.
-                    runtime.cancelled.set()
-                    runtime.answers.put(_CANCEL)
+                    runtime.cancel()
         except WebSocketDisconnect:
-            runtime.cancelled.set()
-            runtime.answers.put(_CANCEL)
+            pass
         finally:
+            # Whatever ended this socket — disconnect, cancel, or a bug in the loop above — the run
+            # must be told, or a thread nobody feeds would hold the registration forever.
+            runtime.cancel()
             sender.cancel()
-            # Only drop the map entry if it is still ours — a rejected second connection must not evict
-            # the live one, and a stale run must not evict a newer registration.
-            if api_state.runtimes.get(session_id) is runtime:
-                api_state.runtimes.pop(session_id, None)
+            with api_state.lock:
+                runtime.socket_closed = True
+                # A thread still inside a provider call keeps the registration; it pops itself when
+                # it exits, so a reconnect on this id waits instead of starting a second graph.
+                if api_state.runtimes.get(session_id) is runtime and not runtime.run_in_flight:
+                    api_state.runtimes.pop(session_id, None)
 
     @app.get("/api/sessions/{session_id}/export.md", response_class=PlainTextResponse)
     def export_markdown(session_id: str, authorization: str = Header(default="")) -> str:
@@ -698,7 +743,19 @@ def _mount_static_ui(app: FastAPI, static_dir: str | Path) -> None:
 
 guard_single_worker()
 configure_session_logging(os.environ.get("COACH_LOG_FILE", ""))
-app = create_app()
+
+# `app` is built on first access, not at import: importing this module must not read `.env`, open
+# and sweep the checkpoint DB, or mount static files. `uvicorn interview_coach.web_api:app` still works.
+_lazy_app: FastAPI | None = None
+
+
+def __getattr__(name: str) -> Any:
+    global _lazy_app
+    if name != "app":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    if _lazy_app is None:
+        _lazy_app = create_app()
+    return _lazy_app
 
 
 async def _send_events(websocket: WebSocket, outgoing: asyncio.Queue[dict[str, Any]]) -> None:
@@ -707,7 +764,9 @@ async def _send_events(websocket: WebSocket, outgoing: asyncio.Queue[dict[str, A
         await websocket.send_json(event)
 
 
-def _parse_payload(raw: dict[str, Any]) -> ClientPayload:
+def _parse_payload(raw: Any) -> ClientPayload:
+    if not isinstance(raw, dict):
+        raise ValueError(f"expected a JSON object frame, got {type(raw).__name__}")
     payload_type = raw.get("type")
     model: type[BaseModel]
     if payload_type == "start_session":
@@ -774,8 +833,11 @@ def _run_session_thread(
         if metered and not resume:
             assert isinstance(payload, StartSessionPayload)
             identity = token_identity(api_state.settings.auth_token)
-            refusal = question_cap_reason(identity, questions=payload.max_questions) or start_refusal_reason(
-                provider, questions=payload.max_questions
+            # Budget rail first (read-only), then the cap: reserved at START, not at completion (a
+            # cap that only counts finished Sessions is bypassed by abandoning them), check+record in
+            # one locked step, and never consumed by a start the budget rail already refused.
+            refusal = start_refusal_reason(provider, questions=payload.max_questions) or reserve_questions(
+                identity, questions=payload.max_questions
             )
             if refusal is not None:
                 # No `session_started`: the Candidate must never watch an interview begin that
@@ -783,9 +845,6 @@ def _run_session_thread(
                 logger.warning("refused to start Session %r: %s", runtime.session_id, refusal)
                 runtime.emit({"type": "session_error", "error": refusal})
                 return
-            # Reserved at START, not at completion: a cap that only counts finished Sessions is
-            # bypassed by abandoning them.
-            record_questions(identity, payload.max_questions)
         if metered and resume:
             # The Candidate clicked resume. The per-run ceiling and the insufficient_quota latch
             # both hang on this run's own state, so nothing but this clears them — and a resume
@@ -876,9 +935,9 @@ def _run_session_thread(
             )
             final_state = _stream_graph(graph, initial_state, config, runtime, budget_stop=budget_stop)
         if final_state is not None:
-            api_state.completed_sessions[runtime.session_id] = final_state
             # Persist posteriors for a returning Candidate (0023); candidate_id rides in the state so a
-            # resumed Session saves too. save_posteriors no-ops on an empty id.
+            # resumed Session saves too. save_posteriors no-ops on an empty id. The Markdown is written
+            # BEFORE the state enters the bounded RAM cache, so an evicted id always has its file.
             if final_state.get("status") == SessionStatus.COMPLETE.value:
                 _persist_export(api_state, runtime.session_id, final_state)
                 save_posteriors(
@@ -887,6 +946,7 @@ def _run_session_thread(
                     skill_states_from_state(final_state),
                     now=time.time(),
                 )
+            _remember_completed(api_state, runtime.session_id, final_state)
             # Logged before the emit, not after: the emit is what hands control to the client, and a
             # record written afterwards races the browser (and the test) that is already reacting.
             logger.info("Session %r finished: status=%s", runtime.session_id, final_state.get("status"))
@@ -925,6 +985,63 @@ def _run_session_thread(
     except Exception as err:  # noqa: BLE001 - API boundary converts graph/provider failures to events
         logger.exception("Session %r failed", runtime.session_id)
         runtime.emit({"type": "session_error", "error": f"{type(err).__name__}: {err}"})
+    finally:
+        with api_state.lock:
+            runtime.run_finished = True
+            # The socket closed while this thread was still running: the registration was left for
+            # this thread to release, so a waiting reconnect can now proceed.
+            if runtime.socket_closed and api_state.runtimes.get(runtime.session_id) is runtime:
+                api_state.runtimes.pop(runtime.session_id, None)
+
+
+_ACTIVE_ELSEWHERE = "This Session id already has an active connection."
+_STILL_FINISHING = "The previous run of this Session is still finishing; retry in a moment."
+
+
+async def _claim_session_id(api_state: WebApiState, session_id: str, runtime: RuntimeSession) -> str | None:
+    """Register ``runtime`` for ``session_id``; returns the refusal message when the id is taken."""
+    with api_state.lock:
+        stale = api_state.runtimes.get(session_id)
+        if stale is None:
+            api_state.runtimes[session_id] = runtime
+            return None
+        if not stale.socket_closed:
+            return _ACTIVE_ELSEWHERE
+        if session_id in api_state.waiting:
+            # One waiter per id: a second reconnect must not pin another executor thread on the join.
+            return _STILL_FINISHING
+        api_state.waiting.add(session_id)
+    try:
+        if stale.thread is not None and stale.thread.is_alive():
+            # Closed socket, thread still winding down: cancellation is already signalled, so the only
+            # long wait is an in-flight provider call.
+            await asyncio.get_running_loop().run_in_executor(None, stale.thread.join, STALE_RUNTIME_JOIN_SECONDS)
+            if stale.thread.is_alive():
+                return _STILL_FINISHING
+        with api_state.lock:
+            current = api_state.runtimes.get(session_id)
+            if current is not None and current is not stale:
+                # Someone else took the id while we waited: refuse if their socket is open OR their
+                # run is still in flight — replacing either would put two graphs on one checkpoint.
+                if not current.socket_closed:
+                    return _ACTIVE_ELSEWHERE
+                if current.run_in_flight:
+                    return _STILL_FINISHING
+            api_state.runtimes[session_id] = runtime
+            return None
+    finally:
+        with api_state.lock:
+            api_state.waiting.discard(session_id)
+
+
+def _remember_completed(api_state: WebApiState, session_id: str, state: dict[str, Any]) -> None:
+    """Keep the newest completed states in RAM, evicting the oldest past the cap."""
+    with api_state.lock:
+        completed = api_state.completed_sessions
+        completed.pop(session_id, None)
+        completed[session_id] = state
+        while len(completed) > MAX_COMPLETED_SESSIONS_IN_MEMORY:
+            del completed[next(iter(completed))]
 
 
 def _checkpoint_values(api_state: WebApiState, session_id: str) -> Mapping[str, Any]:

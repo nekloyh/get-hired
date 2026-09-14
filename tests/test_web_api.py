@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 import subprocess
 import sys
+import threading
+import time
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.status import WS_1008_POLICY_VIOLATION
 from starlette.websockets import WebSocketDisconnect
@@ -18,6 +22,7 @@ from interview_coach import usage, web_api
 from interview_coach.config import Settings
 from interview_coach.demo_llm import DemoLLMClient
 from interview_coach.llm import RoleClients
+from interview_coach.microloop import CandidateInputUnavailable
 from interview_coach.web_api import (
     ResumeSessionPayload,
     configure_session_logging,
@@ -1780,3 +1785,318 @@ def test_a_suspended_web_session_can_actually_be_resumed(tmp_path, monkeypatch):
         resumed = _expect_question(ws)
 
     assert resumed["type"] == "question"
+
+
+# --- AUDIT §3.2 row 1: a reconnect must wait for the previous run's thread -----------------------
+
+
+class _BlockedRun:
+    """Run 1 asks its question, takes the answer, then sits in a "provider call" until released."""
+
+    def __init__(self, monkeypatch) -> None:
+        from interview_coach import supervisor
+
+        self.runs: list[float] = []
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        real_micro_loop = supervisor.run_micro_loop
+
+        def _gated(client, seed, candidate, *args, **kwargs):
+            self.runs.append(time.monotonic())
+            if len(self.runs) > 1:
+                return real_micro_loop(client, seed, candidate, *args, **kwargs)
+            candidate.answer(seed.question)
+            self.entered.set()
+            self.release.wait(timeout=30)
+            raise CandidateInputUnavailable("the abandoned provider call returned")
+
+        monkeypatch.setattr(supervisor, "run_micro_loop", _gated)
+
+
+def _drop_the_socket_mid_provider_call(client, blocked: _BlockedRun, session_id: str):
+    """Start, answer Q1, and close the socket while the graph thread is still inside the call."""
+    with client.websocket_connect(f"/api/sessions/{session_id}") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+        _receive_until(ws, "session_started")
+        _receive_until(ws, "question")
+        first_run = client.app.state.web_api.runtimes[session_id]
+        ws.send_json({"type": "candidate_answer", "answer": "An answer the Evaluator is still scoring."})
+        assert blocked.entered.wait(timeout=5), "the graph thread never took the answer"
+    return first_run
+
+
+def test_a_reconnect_waits_for_the_previous_runs_thread_before_resuming(tmp_path, monkeypatch):
+    # The daemon thread is inside a provider call when the socket drops; a reconnect + resume must
+    # not start a second graph on the same checkpoint thread while it is still there.
+    blocked = _BlockedRun(monkeypatch)
+    client = _test_client(tmp_path)
+    api_state = client.app.state.web_api
+    try:
+        first_run = _drop_the_socket_mid_provider_call(client, blocked, "reconnect")
+
+        with client.websocket_connect("/api/sessions/reconnect") as ws:
+            ws.send_json({"type": "resume_session", "mode": "demo"})
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                assert api_state.runtimes.get("reconnect") is first_run, "the stale run was evicted early"
+                assert len(blocked.runs) == 1, "a second graph started while the first was still running"
+                time.sleep(0.02)
+            blocked.release.set()
+            _receive_until(ws, "session_started")
+            _receive_until(ws, "question")
+            ws.send_json({"type": "candidate_answer", "answer": "A real answer about the bias-variance tradeoff."})
+            completed = _receive_until(ws, "session_completed")
+    finally:
+        blocked.release.set()
+
+    assert completed["state"]["status"] == "complete"
+    assert len(blocked.runs) == 2  # exactly one graph run per start/resume
+    assert first_run.thread is not None and not first_run.thread.is_alive()
+    assert api_state.runtimes == {}
+
+
+def test_a_reconnect_gives_up_on_a_run_that_will_not_finish(tmp_path, monkeypatch):
+    monkeypatch.setattr(web_api, "STALE_RUNTIME_JOIN_SECONDS", 0.05)
+    blocked = _BlockedRun(monkeypatch)
+    client = _test_client(tmp_path)
+    try:
+        _drop_the_socket_mid_provider_call(client, blocked, "stuck")
+
+        with client.websocket_connect("/api/sessions/stuck") as ws:
+            event = ws.receive_json()
+    finally:
+        blocked.release.set()
+
+    assert event["type"] == "session_error"
+    assert "still finishing" in event["error"]
+    assert len(blocked.runs) == 1
+
+
+def test_a_non_object_frame_is_a_session_error_not_a_wedged_session_id(tmp_path):
+    # `null`, a string or a list parses as JSON but is not a payload; it used to raise AttributeError
+    # out of the socket loop. With the registration now waiting on the thread, an escaped exception
+    # that never cancelled the run would have pinned the id for the life of the process.
+    client = _test_client(tmp_path)
+    api_state = client.app.state.web_api
+
+    with client.websocket_connect("/api/sessions/odd-frame") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+        _receive_until(ws, "session_started")
+        _receive_until(ws, "question")
+        ws.send_text("null")
+        error = _receive_until(ws, "session_error")
+        ws.send_json({"type": "candidate_answer", "answer": "A real answer about the bias-variance tradeoff."})
+        completed = _receive_until(ws, "session_completed")
+
+    assert "JSON object" in error["error"]
+    assert completed["state"]["status"] == "complete"
+    assert api_state.runtimes == {}
+
+
+def test_a_claim_that_finishes_waiting_never_overwrites_a_different_in_flight_run(tmp_path):
+    # A joins the stale run; meanwhile the stale run exits, B takes the id, and B's socket drops with
+    # B's thread still inside a provider call. A's re-check must refuse, not register over B.
+    import asyncio
+
+    api_state = _app(tmp_path).state.web_api
+    stale_done, b_done = threading.Event(), threading.Event()
+
+    def _runtime(name: str, gate: threading.Event) -> web_api.RuntimeSession:
+        runtime = web_api.RuntimeSession(session_id="x", mode="demo", emit=lambda event: None, socket_closed=True)
+        runtime.thread = threading.Thread(target=gate.wait, daemon=True)
+        runtime.thread.start()
+        return runtime
+
+    stale = _runtime("stale", stale_done)
+    b = _runtime("b", b_done)
+    a = web_api.RuntimeSession(session_id="x", mode="demo", emit=lambda event: None)
+
+    async def scenario():
+        api_state.runtimes["x"] = stale
+        claim = asyncio.create_task(web_api._claim_session_id(api_state, "x", a))
+        await asyncio.sleep(0.05)  # A is inside the join
+        assert "x" in api_state.waiting
+        with api_state.lock:
+            api_state.runtimes["x"] = b  # the stale run popped itself and B claimed the id
+        stale_done.set()
+        return await claim
+
+    try:
+        result = asyncio.run(scenario())
+    finally:
+        stale_done.set()
+        b_done.set()
+
+    assert result == web_api._STILL_FINISHING
+    assert api_state.runtimes["x"] is b
+    assert api_state.waiting == set()
+
+
+def test_only_one_reconnect_waits_on_a_stale_run_at_a_time(tmp_path):
+    import asyncio
+
+    api_state = _app(tmp_path).state.web_api
+    gate = threading.Event()
+    stale = web_api.RuntimeSession(session_id="y", mode="demo", emit=lambda event: None, socket_closed=True)
+    stale.thread = threading.Thread(target=gate.wait, daemon=True)
+    stale.thread.start()
+    first = web_api.RuntimeSession(session_id="y", mode="demo", emit=lambda event: None)
+    second = web_api.RuntimeSession(session_id="y", mode="demo", emit=lambda event: None)
+
+    async def scenario():
+        api_state.runtimes["y"] = stale
+        waiting = asyncio.create_task(web_api._claim_session_id(api_state, "y", first))
+        await asyncio.sleep(0.05)
+        refused = await web_api._claim_session_id(api_state, "y", second)
+        gate.set()
+        return refused, await waiting
+
+    try:
+        refused, granted = asyncio.run(scenario())
+    finally:
+        gate.set()
+
+    assert refused == web_api._STILL_FINISHING
+    assert granted is None
+    assert api_state.runtimes["y"] is first
+
+
+# --- AUDIT §3.1 row 3: bounded inputs --------------------------------------------------------------
+
+
+def test_an_oversize_answer_is_refused_as_a_session_error(tmp_path):
+    client = _test_client(tmp_path)
+
+    with client.websocket_connect("/api/sessions/oversize") as ws:
+        ws.send_json({"type": "candidate_answer", "answer": "x" * (web_api.MAX_ANSWER_CHARS + 1)})
+        event = ws.receive_json()
+
+    assert event["type"] == "session_error"
+    assert "at most" in event["error"]
+
+
+def test_an_oversize_time_budget_is_refused(tmp_path):
+    client = _test_client(tmp_path)
+
+    with client.websocket_connect("/api/sessions/too-long") as ws:
+        ws.send_json(
+            {"type": "start_session", "mode": "demo", "max_elapsed_seconds": web_api.MAX_ELAPSED_SECONDS_CEILING + 1}
+        )
+        event = ws.receive_json()
+
+    assert event["type"] == "session_error"
+    assert "less than or equal to" in event["error"]
+
+
+def test_answers_past_the_queue_bound_are_dropped_not_buffered(tmp_path, monkeypatch):
+    # The graph never consumes here, so a flood of answers must be refused past the bound, and the
+    # socket loop must still answer the next frame instead of blocking on a full queue.
+    from interview_coach import supervisor
+
+    release = threading.Event()
+
+    def _stuck(*args, **kwargs):
+        release.wait(timeout=30)
+        raise CandidateInputUnavailable("released")
+
+    monkeypatch.setattr(supervisor, "run_micro_loop", _stuck)
+    client = _test_client(tmp_path)
+    try:
+        with client.websocket_connect("/api/sessions/flood") as ws:
+            ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+            _receive_until(ws, "session_started")
+            for _ in range(web_api.ANSWER_QUEUE_MAXSIZE + 1):
+                ws.send_json({"type": "candidate_answer", "answer": "flood"})
+            ws.send_json({"type": "bogus"})
+            seen: list[dict] = []
+            for _ in range(40):
+                seen.append(ws.receive_json())
+                if seen[-1]["type"] == "session_error" and "unknown WebSocket payload type" in seen[-1]["error"]:
+                    break
+    finally:
+        release.set()
+
+    errors = [event["error"] for event in seen if event["type"] == "session_error"]
+    assert any("Answer dropped" in error for error in errors), errors
+    assert "unknown WebSocket payload type" in errors[-1]
+
+
+def test_a_cancel_is_never_dropped_by_a_full_answer_queue():
+    runtime = web_api.RuntimeSession(session_id="full", mode="demo", emit=lambda event: None)
+    for _ in range(web_api.ANSWER_QUEUE_MAXSIZE):
+        runtime.answers.put_nowait("queued")
+
+    runtime.cancel()
+
+    assert runtime.cancelled.is_set()
+    assert runtime.answers.get_nowait() is web_api._CANCEL
+    assert runtime.answers.empty()
+
+
+# --- AUDIT §3.2 row 7: completed Sessions are bounded in RAM --------------------------------------
+
+
+def test_completed_sessions_are_bounded_in_memory(tmp_path):
+    client = _test_client(tmp_path)
+    api_state = client.app.state.web_api
+    cap = web_api.MAX_COMPLETED_SESSIONS_IN_MEMORY
+
+    for index in range(cap + 1):
+        web_api._remember_completed(api_state, f"done-{index}", {"status": "complete"})
+
+    assert len(api_state.completed_sessions) == cap
+    assert "done-0" not in api_state.completed_sessions
+    assert {"done-1", f"done-{cap}"} <= set(api_state.completed_sessions)
+    # Evicted with nothing on disk: 404. Evicted but persisted: served from the file.
+    assert client.get("/api/sessions/done-0/export.md").status_code == 404
+    stored = export_path(api_state.exports_dir, "done-0")
+    stored.parent.mkdir(parents=True, exist_ok=True)
+    stored.write_text("# Interview Session: done-0\n", encoding="utf-8")
+    response = client.get("/api/sessions/done-0/export.md")
+    assert response.status_code == 200
+    assert response.text.startswith("# Interview Session: done-0")
+
+
+# --- AUDIT §3.2 row 4: importing the module has no app-construction side effects ------------------
+
+
+def test_importing_the_module_does_not_open_the_checkpoint_db(tmp_path):
+    # The guard and logging still run at import (their before-the-port property depends on it);
+    # building the app — reading .env, opening and sweeping the checkpoint SQLite — waits for `app`.
+    db = tmp_path / "checkpoints.sqlite"
+    script = (
+        "import os, sys\n"
+        "import interview_coach.web_api as web_api\n"
+        "print('after-import', os.path.exists(sys.argv[1]))\n"
+        "app = web_api.app\n"
+        "print('after-app', os.path.exists(sys.argv[1]), type(app).__name__)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(db)],
+        cwd=tmp_path,
+        env=_server_env(
+            COACH_CHECKPOINT_DB=str(db),
+            COACH_LEDGER_DB=str(tmp_path / "ledger.json"),
+            COACH_EXPORTS_DIR=str(tmp_path / "exports"),
+            COACH_STATIC_DIR="",
+        ),
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "after-import False" in proc.stdout, proc.stdout
+    assert "after-app True FastAPI" in proc.stdout, proc.stdout
+
+
+def test_the_app_attribute_is_built_once_and_lazily(tmp_path, monkeypatch):
+    monkeypatch.setattr(web_api, "_lazy_app", None)
+    monkeypatch.setattr(web_api, "create_app", lambda: _app(tmp_path))
+    module = importlib.import_module("interview_coach.web_api")
+
+    first = module.app
+
+    assert isinstance(first, FastAPI)
+    assert module.app is first
+    with pytest.raises(AttributeError, match="no_such_attribute"):
+        _ = module.no_such_attribute

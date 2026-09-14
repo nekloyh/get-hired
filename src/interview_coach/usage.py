@@ -877,9 +877,9 @@ def question_cap_reason(identity: str, *, questions: int, path: Path | None = No
     theatre, and the daily-budget and per-run rails already bound what they can spend by accident.
     When real accounts land (R-29) ``identity`` becomes per-user and this moves with them.
     """
-    # Checked here as well as in `start_refusal_reason`, because the web start path evaluates this
-    # rail FIRST (`question_cap_reason(...) or start_refusal_reason(...)`). A rail that counts rows
-    # before asking whether the file can be counted is a rail reading an unknown number (M0a / F1).
+    # Checked here as well as in `start_refusal_reason`, because `reserve_questions` is also called
+    # on its own (tests, future callers). A rail that counts rows before asking whether the file can
+    # be counted is a rail reading an unknown number (M0a / F1).
     if blocked := accounting_block_reason(path=path):
         return blocked
     cap = daily_question_cap()
@@ -891,6 +891,19 @@ def question_cap_reason(identity: str, *, questions: int, path: Path | None = No
         f"Session asks for {questions} more. {daily_reset_hint()} Raise COACH_DAILY_QUESTION_CAP to "
         "lift the cap."
     )
+
+
+# Check-and-record is one step: two simultaneous starts must not both read the pre-reservation count.
+_RESERVATION_LOCK = Lock()
+
+
+def reserve_questions(identity: str, *, questions: int, path: Path | None = None) -> str | None:
+    """Reserve ``questions`` against the daily cap atomically; returns the refusal reason, or None."""
+    with _RESERVATION_LOCK:
+        if reason := question_cap_reason(identity, questions=questions, path=path):
+            return reason
+        record_questions(identity, questions, path=path)
+        return None
 
 
 def budget_stop_reason(
