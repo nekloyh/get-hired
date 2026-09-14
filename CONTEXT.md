@@ -62,6 +62,14 @@ _Avoid_: quota error (that names the provider symptom, not the category), timeou
 Session history shown to the Candidate on presentation & planning surfaces — the dashboard, exports, Study-Plan narrative ("last time you struggled with backpressure"). Allowed by the ADR 0006 boundary; it must never enter the prompts of probing & judging agents (Evaluator, Interviewer, Supervisor), which is enforced by prompt-construction tests. Scoring memory remains decayed Beta priors only.
 _Avoid_: transcript RAG (the rejected mechanism), long-term memory (too broad — conflates the two sides of the boundary)
 
+**Skill ledger**:
+The per-Candidate JSON file of final Beta posteriors (`{candidate_id: {completed_at, skills: {skill: {alpha, beta}}}}`) that seeds a returning Candidate's decayed priors — `ledger.py`, `.skill-ledger.json`, `COACH_LEDGER_DB` / `--ledger-db`. It is scoring memory (ADR 0006), a latest snapshot per Candidate, not a history and not a record of spend.
+_Avoid_: ledger (unqualified — ambiguous with the usage ledger), priors file, memory DB
+
+**Usage ledger**:
+The append-only JSONL file of provider token spend and budget rows (token rows, `session_run`, `questions`, `quota_exhausted`/`quota_retry`) that every budget rail counts — `usage.py`, `logs/usage-ledger.jsonl`, `COACH_USAGE_LEDGER`, plus its `.unreconciled` sidecar. It records spend and the quota latch only; it holds no Skill evidence and no Session state.
+_Avoid_: ledger (unqualified), token log, cost log, `COACH_LEDGER_DB` (that is the Skill ledger)
+
 ## Relationships
 
 - A **Session** belongs to exactly one **Candidate**
