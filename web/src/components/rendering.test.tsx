@@ -29,7 +29,7 @@ describe('session alert', () => {
   it('renders a session error with the message and recovery actions', () => {
     render(
       <SessionAlert
-        error="LLM primary provider 'mimo' is not configured."
+        error="LLM primary provider 'openai' is not configured."
         onBackToSetup={() => {}}
         onReconnect={() => {}}
         status="error"

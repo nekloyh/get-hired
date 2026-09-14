@@ -321,7 +321,7 @@ def test_zero_drafts_surviving_to_gate_3_is_not_reported_as_success(make_client)
     run = run_forge(client, SKILL, 2, concepts=[_NOTE], existing_prompts=[])
     assert fake.call_count == 1  # the Writer call only — the expensive gate never ran
     assert all(o.rejection is not None for o in run.outcomes)
-    report = render_forge_report(run, provider="mimo", model="test-model", date="2026-07-11")
+    report = render_forge_report(run, provider="groq", model="test-model", date="2026-07-11")
     assert "no draft reached the admission gate; nothing was admitted" in report
     assert "admitted: 0/2" in report
 
@@ -346,7 +346,7 @@ def test_full_pipeline_orders_gates_cheap_to_expensive(make_client):
     gates = [o.rejection.gate if o.rejection else None for o in run.outcomes]
     assert gates == [GATE_CONTRACT, GATE_NOVELTY, None]
     assert run.outcomes[1].nearest_similarity == pytest.approx(1.0)
-    report = render_forge_report(run, provider="mimo", model="test-model", date="2026-07-11")
+    report = render_forge_report(run, provider="groq", model="test-model", date="2026-07-11")
     assert "- drafted: 3" in report
     assert "- gate 1 (contract): 3 -> 2" in report
     assert "- gate 2 (novelty): 2 -> 1" in report
@@ -391,7 +391,7 @@ def test_review_queue_round_trips_through_the_bank_validator(make_client, tmp_pa
     )
     run = run_forge(client, SKILL, 1, concepts=[_NOTE], existing_prompts=[])
     queue, report = write_forge_outputs(
-        run, queue_path=tmp_path / "review-queue-test.yaml", provider="mimo", model="test-model", date="2026-07-11"
+        run, queue_path=tmp_path / "review-queue-test.yaml", provider="groq", model="test-model", date="2026-07-11"
     )
     assert report.name == "review-queue-test-report.md"
     text = queue.read_text(encoding="utf-8")
@@ -417,7 +417,7 @@ def test_forge_never_touches_the_shipped_bank_files(make_client, tmp_path):
         [_draft_set_json(_draft_dict()), _answer_pair_json(), _eval_json(4.2, 4), _eval_json(2.0, 2)]
     )
     run = run_forge(client, SKILL, 1, concepts=[_NOTE], existing_prompts=[])
-    write_forge_outputs(run, queue_path=tmp_path / "q.yaml", provider="mimo", model="test-model", date="2026-07-11")
+    write_forge_outputs(run, queue_path=tmp_path / "q.yaml", provider="groq", model="test-model", date="2026-07-11")
     assert (bank_path.read_bytes(), concepts_path.read_bytes()) == before
 
 
@@ -434,7 +434,7 @@ def test_run_forge_rejects_out_of_budget_n(make_client):
 def _cli_settings() -> SimpleNamespace:
     return SimpleNamespace(
         configured=True,
-        primary_provider="mimo",
+        primary_provider="groq",
         primary_config=SimpleNamespace(model="test-model"),
     )
 

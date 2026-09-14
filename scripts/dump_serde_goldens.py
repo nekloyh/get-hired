@@ -63,7 +63,6 @@ class _PersonaTextClient(LLMClient):
         messages: Sequence[Message],
         *,
         response_format: ResponseFormat | None = None,
-        disable_thinking: bool = False,
     ) -> str:
         text = " ".join(m["content"] for m in messages)
         match = re.search(r"ability on this topic \(\w+\) is (\w+)", text)

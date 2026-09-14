@@ -49,7 +49,7 @@ class _RecordingClient(LLMClient):
         self.replies = list(replies or [])
         self.calls = 0
 
-    def chat(self, messages, *, response_format=None, disable_thinking=False) -> str:
+    def chat(self, messages, *, response_format=None) -> str:
         self.calls += 1
         return self.replies.pop(0) if self.replies else "{}"
 
@@ -103,9 +103,9 @@ def test_judge_override_stays_pinned_never_routed():
 
 
 def test_overridden_role_on_unconfigured_provider_fails_loudly():
-    # mimo has no key/base/model in _settings(): routing a role onto it must die at build time,
+    # zenmux has no key/model in _settings(): routing a role onto it must die at build time,
     # not resolve to a silent misroute mid-Session.
-    settings = _settings(role_planner_provider="mimo")
+    settings = _settings(role_planner_provider="zenmux")
     with pytest.raises(LLMConfigurationError, match="planner"):
         build_role_clients(settings)
 
@@ -269,7 +269,7 @@ def test_zenmux_serves_availability_roles():
     assert isinstance(roles.judge, OpenAIClient)
 
 
-@pytest.mark.parametrize("provider", ["zenmux", "groq", "mimo"])
+@pytest.mark.parametrize("provider", ["zenmux", "groq"])
 def test_the_judge_role_refuses_a_provider_with_no_bench_artifact(provider):
     # ADR 0009a: every score flows into the Beta state, the Supervisor's deviation calls and the
     # Study Plan, so an unmeasured judge produces numbers indistinguishable from measured ones.
@@ -278,9 +278,6 @@ def test_the_judge_role_refuses_a_provider_with_no_bench_artifact(provider):
         role_judge_provider=provider,
         zenmux_api_key="test",
         zenmux_model="auto",
-        mimo_api_key="test",
-        mimo_base_url="https://example.invalid/v1",
-        mimo_model="mimo-model",
     )
 
     with pytest.raises(ValueError, match="no green `coach bench` artifact"):
@@ -320,10 +317,10 @@ def test_an_unvalidated_judge_requires_an_explicit_opt_in():
 
 @pytest.mark.parametrize(
     ("primary", "expected"),
-    [("openai", "groq"), ("groq", "mimo"), ("mimo", "groq"), ("zenmux", "groq")],
+    [("openai", "groq"), ("groq", "openai"), ("zenmux", "groq")],
 )
 def test_adding_zenmux_does_not_change_any_existing_fallback(primary, expected):
-    # Zero-change rollout: zenmux sits last in the preference order, and one of the first three is
+    # Zero-change rollout: zenmux sits last in the preference order, and one of the first two is
     # always different from the primary, so no existing configuration resolves anywhere new.
     assert Settings(_env_file=None, primary_provider=primary).fallback_provider == expected
 

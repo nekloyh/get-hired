@@ -25,7 +25,7 @@ from openai import OpenAI
 from pydantic import BaseModel, ValidationError
 
 from . import telemetry
-from .config import ProviderName, ProviderSettings, RoleName, Settings
+from .config import PROVIDER_NAMES, ProviderName, ProviderSettings, RoleName, Settings
 from .usage import (
     AccountingUnavailable,
     ProviderQuotaExhausted,
@@ -227,7 +227,6 @@ class LLMClient(ABC):
         messages: Sequence[Message],
         *,
         response_format: ResponseFormat | None = None,
-        disable_thinking: bool = False,
     ) -> str:
         """Return raw assistant content for ``messages``."""
 
@@ -248,7 +247,6 @@ class LLMClient(ABC):
         *,
         validators: Sequence[Validator] = (),
         max_retries: int = 1,
-        disable_thinking: bool = False,
         json_schema: Mapping[str, Any] | None = None,
     ) -> T:
         """Get a schema-valid ``response_model`` from the model.
@@ -278,11 +276,7 @@ class LLMClient(ABC):
         for attempt in range(max_retries + 1):
             raw = ""
             try:
-                raw = self.chat(
-                    convo,
-                    response_format=response_format,
-                    disable_thinking=disable_thinking,
-                )
+                raw = self.chat(convo, response_format=response_format)
                 parsed = response_model.model_validate_json(_extract_json(raw))
                 for validate in validators:
                     validate(parsed)
@@ -338,7 +332,6 @@ class LLMClient(ABC):
         validators: Sequence[Validator] = (),
         tool_choice: Any = "auto",
         max_retries: int = 1,
-        disable_thinking: bool = True,
     ) -> T:
         """Run one native tool round-trip, then return a schema-valid ``response_model``.
 
@@ -413,7 +406,6 @@ class _OpenAICompatibleClient(LLMClient):
         response_format: ResponseFormat | None = None,
         tools: Sequence[ToolSpec] | None = None,
         tool_choice: Any = None,
-        disable_thinking: bool = False,
     ) -> Any:
         """Issue one completion and return the raw assistant message (content and/or tool_calls)."""
         kwargs: dict[str, Any] = {
@@ -427,8 +419,6 @@ class _OpenAICompatibleClient(LLMClient):
             kwargs["tools"] = list(tools)
             if tool_choice is not None:
                 kwargs["tool_choice"] = tool_choice
-        if extra_body := self._thinking_extra_body(disable_thinking):
-            kwargs["extra_body"] = extra_body
         # The last point at which this call can still be NOT made (M0a / F1). Every client here is a
         # metered one by construction — demo mode is a different class and never reaches this — so
         # "accounting is broken" and "make a paid call anyway" must not both be true. Checked per
@@ -516,9 +506,8 @@ class _OpenAICompatibleClient(LLMClient):
         messages: Sequence[Message],
         *,
         response_format: ResponseFormat | None = None,
-        disable_thinking: bool = False,
     ) -> str:
-        message = self._create(messages, response_format=response_format, disable_thinking=disable_thinking)
+        message = self._create(messages, response_format=response_format)
         content = self._extract_content(message)
         if not content.strip():
             raise EmptyCompletionError(f"{self.provider_name} returned empty content")
@@ -539,18 +528,12 @@ class _OpenAICompatibleClient(LLMClient):
         validators: Sequence[Validator] = (),
         tool_choice: Any = "auto",
         max_retries: int = 1,
-        disable_thinking: bool = True,
     ) -> T:
         if not self._supports_tools:
             raise ToolCallingUnsupported(f"{self.provider_name} has native tool-calling disabled")
 
         convo: list[Message] = list(messages)
-        first = self._create(
-            convo,
-            tools=tools,
-            tool_choice=tool_choice,
-            disable_thinking=disable_thinking,
-        )
+        first = self._create(convo, tools=tools, tool_choice=tool_choice)
         tool_calls = list(getattr(first, "tool_calls", None) or [])
         if not tool_calls:
             # Forced a tool call but the provider answered with prose — treat as unsupported so the
@@ -569,20 +552,10 @@ class _OpenAICompatibleClient(LLMClient):
 
         # The final answer reuses the exact structured-output contract (parse + validators + retry).
         convo.append({"role": "user", "content": final_instruction})
-        return self.chat_json(
-            convo,
-            response_model,
-            validators=validators,
-            max_retries=max_retries,
-            disable_thinking=disable_thinking,
-        )
+        return self.chat_json(convo, response_model, validators=validators, max_retries=max_retries)
 
     def _assistant_tool_message(self, message: Any, tool_calls: Sequence[Any]) -> Message:
-        """Rebuild the assistant turn for replay, carrying only content + tool_calls.
-
-        Crucially this never copies ``reasoning_content`` back into the history (ADR 0003): the
-        thinking quirk must not be replayed across a multi-turn tool conversation.
-        """
+        """Rebuild the assistant turn for replay, carrying only content + tool_calls (never provider extras)."""
         return {
             "role": "assistant",
             "content": message.content or "",
@@ -596,43 +569,14 @@ class _OpenAICompatibleClient(LLMClient):
             ],
         }
 
-    def _thinking_extra_body(self, disable_thinking: bool) -> dict[str, Any] | None:
-        return None
-
     def _extract_content(self, message: Any) -> str:
         return message.content or ""
-
-
-class MimoClient(_OpenAICompatibleClient):
-    """OpenAI-compatible client for MiMo.
-
-    The thinking-mode ``reasoning_content`` quirk is quarantined here, per ADR 0003: the answer is
-    read from ``message.content`` and ``reasoning_content`` is never fed to the JSON parser. Keeping
-    that handling inside this client is exactly what issue 0004 requires when the router lands.
-    """
-
-    provider_name: ProviderName = "mimo"
-    _supports_tools: bool = True
-
-    def _thinking_extra_body(self, disable_thinking: bool) -> dict[str, Any] | None:
-        if not disable_thinking:
-            return None
-        return {"thinking": {"type": "disabled"}}
-
-    def _extract_content(self, message: Any) -> str:
-        reasoning = getattr(message, "reasoning_content", None)
-        if reasoning is None and getattr(message, "model_extra", None):
-            reasoning = message.model_extra.get("reasoning_content")
-        if reasoning:
-            logger.debug("MiMo reasoning_content (%d chars) ignored for parsing", len(reasoning))
-        return super()._extract_content(message)
 
 
 class GroqClient(_OpenAICompatibleClient):
     """OpenAI-compatible client for Groq, with native function-calling enabled.
 
-    Groq is the 2026-06-03 cutover target and shares the same OpenAI-compatible tool-call path as
-    MiMo. The Interviewer remains the only caller of this API (ADR 0003).
+    The Interviewer remains the only caller of the tool-call API (ADR 0003).
     """
 
     provider_name: ProviderName = "groq"
@@ -649,7 +593,7 @@ class OpenAIClient(_OpenAICompatibleClient):
     provider_name: ProviderName = "openai"
     _supports_tools: bool = True
     # Live-probed on gpt-5.4-mini (2026-07-11): strict grammars accepted, including nested
-    # objects, arrays, and minimum/maximum bounds. Groq/MiMo stay opted out until verified;
+    # objects, arrays, and minimum/maximum bounds. Groq stays opted out until verified;
     # a per-model env override (<PROVIDER>_SUPPORTS_JSON_SCHEMA) can flip any of them.
     _default_supports_json_schema: bool = True
 
@@ -692,7 +636,11 @@ class LLMRouter(LLMClient):
         fallback_provider: ProviderName | None = None,
     ) -> None:
         self._primary_provider = primary_provider
-        self._fallback_provider: ProviderName = fallback_provider or ("groq" if primary_provider == "mimo" else "mimo")
+        self._fallback_provider: ProviderName = (
+            fallback_provider
+            if fallback_provider is not None
+            else next(name for name in PROVIDER_NAMES if name != primary_provider)
+        )
         self._clients = dict(clients)
         if self._primary_provider not in self._clients:
             raise LLMConfigurationError(f"primary provider {self._primary_provider!r} is not configured")
@@ -805,16 +753,11 @@ class LLMRouter(LLMClient):
         messages: Sequence[Message],
         *,
         response_format: ResponseFormat | None = None,
-        disable_thinking: bool = False,
     ) -> str:
         fallback = self._usable_fallback()
 
         def on_fallback(client: LLMClient) -> str:
-            return client.chat(
-                messages,
-                response_format=self._downgraded_format(response_format, client),
-                disable_thinking=disable_thinking,
-            )
+            return client.chat(messages, response_format=self._downgraded_format(response_format, client))
 
         if self._skip_primary_for(fallback):
             telemetry.incr(f"router.breaker_skip.{self._primary_provider}")
@@ -827,12 +770,7 @@ class LLMRouter(LLMClient):
 
         try:
             return self._call(
-                self._primary_provider,
-                lambda client: client.chat(
-                    messages,
-                    response_format=response_format,
-                    disable_thinking=disable_thinking,
-                ),
+                self._primary_provider, lambda client: client.chat(messages, response_format=response_format)
             )
         except Exception as err:
             if not is_provider_failure(err):
@@ -900,7 +838,6 @@ class LLMRouter(LLMClient):
 
 
 _CLIENT_CLASSES: dict[ProviderName, type[_OpenAICompatibleClient]] = {
-    "mimo": MimoClient,
     "groq": GroqClient,
     "openai": OpenAIClient,
     "zenmux": ZenMuxClient,

@@ -1,6 +1,6 @@
 """Live smoke for issue 0009's Diagnostic agent — hits the real configured provider.
 
-Unlike ``smoke_issue_0007.py`` (offline fakes), this exercises the *primary* Topic Plan path against
+This exercises the *primary* Topic Plan path against
 the real LLM to raise the audit value of the agent cutover: it proves the single-shot agent returns a
 schema-valid plan over the live provider, and shows how the agent's ordering/difficulty differs from
 the deterministic offline fallback for the same Candidate.

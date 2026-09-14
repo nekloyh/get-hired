@@ -75,7 +75,7 @@ def _followup(
 
 
 def _garbled_tool(name: str = "lookup_concpet") -> dict:
-    # A garbled tool name (transient MiMo glitch) that the Interviewer cannot execute.
+    # A garbled tool name (transient provider glitch) that the Interviewer cannot execute.
     return {
         "tool_calls": [
             {
@@ -492,7 +492,7 @@ def test_turn_records_the_llm_calls_it_cost(make_client):
     result = run_micro_loop(client, _seed([strong]), ScriptedCandidate([strong]))
 
     assert result.turns[0].trace.llm_calls == 1
-    assert result.turns[0].trace.llm_calls_by_provider == (("mimo", 1),)
+    assert result.turns[0].trace.llm_calls_by_provider == (("groq", 1),)
 
 
 def test_a_retried_judgment_costs_the_turn_more_than_one_call(make_client):

@@ -40,7 +40,7 @@ def spy_diagnose(monkeypatch):
 
 
 def _settings(*, configured: bool) -> SimpleNamespace:
-    return SimpleNamespace(configured=configured, primary_provider="mimo")
+    return SimpleNamespace(configured=configured, primary_provider="groq")
 
 
 def test_diagnose_uses_llm_agent_by_default_when_configured(monkeypatch, spy_diagnose):
@@ -476,7 +476,7 @@ class _ProviderDemoClient(DemoLLMClient):
     subject to the rail while still running a Session deterministically and offline.
     """
 
-    provider_name = "mimo"
+    provider_name = "groq"
 
 
 def _tmp_ledger(monkeypatch, tmp_path):
@@ -522,7 +522,7 @@ def test_session_refuses_to_start_into_a_spent_daily_budget(tmp_path, monkeypatc
     # _cmd_session makes this return 0 and spend a real Diagnostic call.
     _tmp_ledger(monkeypatch, tmp_path)
     monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "1000")
-    usage.record_usage("mimo", "test-model", prompt_tokens=900, completion_tokens=50)
+    usage.record_usage("groq", "test-model", prompt_tokens=900, completion_tokens=50)
     monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
     monkeypatch.setattr(cli, "build_client", lambda settings: _ProviderDemoClient())
 
@@ -632,7 +632,7 @@ def test_coach_usage_reconcile_replays_the_held_row(tmp_path, monkeypatch, capsy
     # merely cleared the flag would be "count the unrecorded call as zero" with a friendlier name.
     ledger = _tmp_ledger(monkeypatch, tmp_path)
     ledger.mkdir()
-    usage.record_usage("mimo", "test-model", prompt_tokens=100, completion_tokens=20)
+    usage.record_usage("groq", "test-model", prompt_tokens=100, completion_tokens=20)
     ledger.rmdir()  # the operator fixes the path first
 
     assert cli.main(["usage", "--reconcile"]) == 0
@@ -640,13 +640,13 @@ def test_coach_usage_reconcile_replays_the_held_row(tmp_path, monkeypatch, capsy
     captured = capsys.readouterr()
     assert "Reconciled 1 held ledger row(s)" in captured.out
     assert "ACCOUNTING:" not in captured.err
-    assert usage.usage_for_day()["mimo"]["total"] == 120
+    assert usage.usage_for_day()["groq"]["total"] == 120
 
 
 def test_reconcile_fails_loudly_while_the_path_is_still_broken(tmp_path, monkeypatch, capsys):
     ledger = _tmp_ledger(monkeypatch, tmp_path)
     ledger.mkdir()
-    usage.record_usage("mimo", "test-model", prompt_tokens=100, completion_tokens=20)
+    usage.record_usage("groq", "test-model", prompt_tokens=100, completion_tokens=20)
 
     assert cli.main(["usage", "--reconcile"]) == 2
 
@@ -690,7 +690,7 @@ def test_the_rail_counts_only_the_questions_actually_left(tmp_path, monkeypatch,
     # that can comfortably afford the rest of itself.
     class _Metered(_ProviderDemoClient):
         def chat_json(self, *args, **kwargs):
-            usage.record_usage("mimo", "test-model", prompt_tokens=500, completion_tokens=0)
+            usage.record_usage("groq", "test-model", prompt_tokens=500, completion_tokens=0)
             return super().chat_json(*args, **kwargs)
 
     _tmp_ledger(monkeypatch, tmp_path)
@@ -742,7 +742,7 @@ def test_budget_breach_suspends_and_never_records_a_failed_question(tmp_path, mo
 
     # The day is spent: resuming cannot fund the remaining questions.
     monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "10")
-    usage.record_usage("mimo", "test-model", prompt_tokens=10, completion_tokens=0)
+    usage.record_usage("groq", "test-model", prompt_tokens=10, completion_tokens=0)
 
     rc = cli.main(
         [
@@ -805,7 +805,7 @@ def test_session_ledger_rows_carry_the_session_id(tmp_path, monkeypatch):
 
     class _Recording(_ProviderDemoClient):
         def chat_json(self, *args, **kwargs):
-            usage.record_usage("mimo", "test-model", prompt_tokens=3, completion_tokens=1)
+            usage.record_usage("groq", "test-model", prompt_tokens=3, completion_tokens=1)
             return super().chat_json(*args, **kwargs)
 
     monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
@@ -835,8 +835,8 @@ def test_usage_command_shows_per_session_rows(tmp_path, monkeypatch, capsys):
     _tmp_ledger(monkeypatch, tmp_path)
     monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
     with usage.session_scope("interview-42"):
-        usage.record_usage("mimo", "test-model", prompt_tokens=1200, completion_tokens=300)
-    usage.record_usage("mimo", "test-model", prompt_tokens=40, completion_tokens=10)
+        usage.record_usage("groq", "test-model", prompt_tokens=1200, completion_tokens=300)
+    usage.record_usage("groq", "test-model", prompt_tokens=40, completion_tokens=10)
 
     assert cli.main(["usage"]) == 0
 
@@ -862,7 +862,7 @@ class _MeteredDemoClient(_ProviderDemoClient):
     tokens_per_call = 100
 
     def chat_json(self, *args, **kwargs):
-        usage.record_usage("mimo", "test-model", prompt_tokens=self.tokens_per_call, completion_tokens=0)
+        usage.record_usage("groq", "test-model", prompt_tokens=self.tokens_per_call, completion_tokens=0)
         return super().chat_json(*args, **kwargs)
 
 
@@ -928,7 +928,7 @@ def test_a_session_that_crosses_the_ceiling_on_its_last_call_keeps_its_evidence(
     class _PlannerHeavy(_ProviderDemoClient):
         def chat_json(self, messages, response_model, *args, **kwargs):
             cost = 10_000 if response_model.__name__ == "StudyPlanDraft" else 10
-            usage.record_usage("mimo", "test-model", prompt_tokens=cost, completion_tokens=0)
+            usage.record_usage("groq", "test-model", prompt_tokens=cost, completion_tokens=0)
             return super().chat_json(messages, response_model, *args, **kwargs)
 
     _tmp_ledger(monkeypatch, tmp_path)
@@ -1013,7 +1013,7 @@ def test_a_daily_exhaustion_suspend_says_the_wait_and_does_not_pretend_otherwise
     capsys.readouterr()
 
     monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "10")
-    usage.record_usage("mimo", "test-model", prompt_tokens=10, completion_tokens=0)
+    usage.record_usage("groq", "test-model", prompt_tokens=10, completion_tokens=0)
     rc = cli.main(
         ["session", "--resume", "--scripted", "--no-live", "--session-id", "dry", "--checkpoint-db", str(db_path)]
     )
@@ -1035,7 +1035,7 @@ def test_a_dead_quota_suspends_before_the_first_question(tmp_path, monkeypatch, 
     # nothing — verbatim the corruption the ADR's Why section describes.
     class _QuotaDead(_ProviderDemoClient):
         def chat_json(self, *args, **kwargs):
-            usage.record_quota_exhausted("mimo")  # what llm.py latches on a real RateLimitError
+            usage.record_quota_exhausted("groq")  # what llm.py latches on a real RateLimitError
             raise RuntimeError("Error code: 429 - insufficient_quota")
 
     _tmp_ledger(monkeypatch, tmp_path)
@@ -1068,7 +1068,7 @@ def test_a_dead_quota_mid_question_suspends_instead_of_cascading(tmp_path, monke
     def _quota_dies_on_the_second_question(*args, **kwargs):
         calls["n"] += 1
         if calls["n"] == 2:
-            raise ProviderQuotaExhausted("mimo daily quota exhausted (insufficient_quota)")
+            raise ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")
         return real_micro_loop(*args, **kwargs)
 
     monkeypatch.setattr(supervisor, "run_micro_loop", _quota_dies_on_the_second_question)
@@ -1101,7 +1101,7 @@ def test_a_dead_quota_on_the_diagnostic_offers_no_resume_because_nothing_was_che
     from interview_coach.usage import ProviderQuotaExhausted
 
     def _quota_dies_on_the_diagnostic(*args, **kwargs):
-        raise ProviderQuotaExhausted("mimo daily quota exhausted (insufficient_quota)")
+        raise ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")
 
     monkeypatch.setattr(cli, "diagnose_or_degrade", _quota_dies_on_the_diagnostic)
     _tmp_ledger(monkeypatch, tmp_path)
@@ -1126,7 +1126,7 @@ def test_diagnose_on_a_dead_quota_exits_2_with_the_reason_not_a_traceback(monkey
     from interview_coach.usage import ProviderQuotaExhausted
 
     def _quota_dies(*args, **kwargs):
-        raise ProviderQuotaExhausted("mimo daily quota exhausted (insufficient_quota)")
+        raise ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")
 
     monkeypatch.setattr(cli, "diagnose_or_degrade", _quota_dies)
     monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
@@ -1149,10 +1149,10 @@ def test_a_resume_retries_the_provider_once_and_re_suspends_if_it_is_still_dead(
     db_path = tmp_path / "retry.sqlite"
     _suspend_after_first_question(_MeteredDemoClient(), db_path, "retry")
     usage.begin_session_run("retry")
-    usage.record_quota_exhausted("mimo")
+    usage.record_quota_exhausted("groq")
     capsys.readouterr()
 
-    assert usage.quota_exhausted_today("mimo")
+    assert usage.quota_exhausted_today("groq")
     rc = cli.main(
         ["session", "--resume", "--scripted", "--no-live", "--session-id", "retry", "--checkpoint-db", str(db_path)]
     )
@@ -1160,8 +1160,8 @@ def test_a_resume_retries_the_provider_once_and_re_suspends_if_it_is_still_dead(
 
     # The provider is healthy again in this run, so the retry succeeds and the Session finishes.
     assert rc == 0
-    assert "retrying mimo after an insufficient_quota stop" in err
-    assert not usage.quota_exhausted_today("mimo")
+    assert "retrying groq after an insufficient_quota stop" in err
+    assert not usage.quota_exhausted_today("groq")
 
 
 def test_the_derived_ceiling_is_silent_on_a_worst_case_session_and_still_stops_a_runaway(tmp_path, monkeypatch, capsys):
@@ -1173,7 +1173,7 @@ def test_the_derived_ceiling_is_silent_on_a_worst_case_session_and_still_stops_a
     def brain(tokens_per_call):
         class _Billing(_ProviderDemoClient):
             def chat_json(self, *args, **kwargs):
-                usage.record_usage("mimo", "test-model", prompt_tokens=tokens_per_call, completion_tokens=0)
+                usage.record_usage("groq", "test-model", prompt_tokens=tokens_per_call, completion_tokens=0)
                 return super().chat_json(*args, **kwargs)
 
         return _Billing()

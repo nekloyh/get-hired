@@ -28,8 +28,7 @@ class _PersonaTextClient(LLMClient):
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def chat(self, messages: Sequence[Message], *, response_format: ResponseFormat | None = None,
-             disable_thinking: bool = False) -> str:
+    def chat(self, messages: Sequence[Message], *, response_format: ResponseFormat | None = None) -> str:
         text = " ".join(m["content"] for m in messages)
         self.calls.append(text)
         # The persona's true level appears as "ability on this topic (<skill>) is <level>".
@@ -48,8 +47,7 @@ class _SimJudge(LLMClient):
     def __init__(self, *, supervisor_action: str = "advance_plan") -> None:
         self.supervisor_action = supervisor_action
 
-    def chat(self, messages: Sequence[Message], *, response_format: ResponseFormat | None = None,
-             disable_thinking: bool = False) -> str:
+    def chat(self, messages: Sequence[Message], *, response_format: ResponseFormat | None = None) -> str:
         text = " ".join(m["content"] for m in messages)
         if "You are the Supervisor" in text:
             return json.dumps({"action": self.supervisor_action, "reasoning": "sim",

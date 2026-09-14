@@ -20,7 +20,7 @@ from interview_coach.llm import (
     LLMClient,
     LLMConfigurationError,
     LLMRouter,
-    MimoClient,
+    OpenAIClient,
     StructuredOutputError,
     ToolCallingUnsupported,
     build_client,
@@ -54,7 +54,7 @@ class _StaticClient(LLMClient):
     def supports_json_schema(self) -> bool:
         return self._supports_json_schema
 
-    def chat(self, messages, *, response_format=None, disable_thinking=False) -> str:
+    def chat(self, messages, *, response_format=None) -> str:
         self.calls += 1
         self.formats.append(response_format)
         return self.reply
@@ -65,7 +65,7 @@ class _FailingClient(LLMClient):
         self.exc = exc
         self.calls = 0
 
-    def chat(self, messages, *, response_format=None, disable_thinking=False) -> str:
+    def chat(self, messages, *, response_format=None) -> str:
         self.calls += 1
         raise self.exc
 
@@ -77,7 +77,7 @@ class _SwitchableClient(LLMClient):
         self.exc = exc
         self.calls = 0
 
-    def chat(self, messages, *, response_format=None, disable_thinking=False) -> str:
+    def chat(self, messages, *, response_format=None) -> str:
         self.calls += 1
         if self.exc is not None:
             raise self.exc
@@ -105,29 +105,12 @@ def test_raises_after_exhausting_retries(make_client):
     assert fake.call_count == 2  # max_retries=1 -> 2 attempts total
 
 
-def test_reasoning_content_is_ignored(make_client):
-    client, _ = make_client([('{"x": 3, "label": "y"}', "<long chain-of-thought>")])
-    out = client.chat_json([{"role": "user", "content": "go"}], Foo)
-    assert out.x == 3
-
-
-def test_mimo_can_disable_thinking_for_tool_loops(make_client):
-    client, fake = make_client(['{"x": 3, "label": "tool-loop"}'])
-    out = client.chat_json(
-        [{"role": "user", "content": "go"}],
-        Foo,
-        disable_thinking=True,
-    )
-    assert out.x == 3
-    assert fake.chat.completions.calls[0]["extra_body"] == {"thinking": {"type": "disabled"}}
-
-
-def test_mimo_and_groq_support_native_tool_calls(fake_openai_factory):
-    mimo_client = MimoClient(_provider("mimo"), client=fake_openai_factory([]))
+def test_groq_and_openai_support_native_tool_calls(fake_openai_factory):
     groq_client = GroqClient(_provider("groq"), client=fake_openai_factory([]))
+    openai_client = OpenAIClient(_provider("openai"), client=fake_openai_factory([]))
 
-    assert mimo_client.supports_tool_calls is True
     assert groq_client.supports_tool_calls is True
+    assert openai_client.supports_tool_calls is True
 
 
 def test_strips_code_fences(make_client):
@@ -163,14 +146,14 @@ def test_custom_validator_triggers_retry(make_client):
     assert fake.call_count == 2
 
 
-def test_same_prompt_parses_with_mimo_and_groq(fake_openai_factory):
+def test_same_prompt_parses_with_groq_and_openai(fake_openai_factory):
     prompt = [{"role": "user", "content": "Return the schema."}]
     reply = '{"x": 42, "label": "same-schema"}'
-    mimo_client = MimoClient(_provider("mimo"), client=fake_openai_factory([reply]))
     groq_client = GroqClient(_provider("groq"), client=fake_openai_factory([reply]))
+    openai_client = OpenAIClient(_provider("openai"), client=fake_openai_factory([reply]))
 
-    assert mimo_client.chat_json(prompt, Foo) == Foo(x=42, label="same-schema")
     assert groq_client.chat_json(prompt, Foo) == Foo(x=42, label="same-schema")
+    assert openai_client.chat_json(prompt, Foo) == Foo(x=42, label="same-schema")
 
 
 def test_primary_provider_env_switches_to_groq(monkeypatch):
@@ -200,15 +183,15 @@ def test_build_client_returns_router_for_selected_primary():
 
 
 def test_router_uses_selected_primary():
-    mimo = _StaticClient('{"x": 1, "label": "mimo"}')
+    openai = _StaticClient('{"x": 1, "label": "openai"}')
     groq = _StaticClient('{"x": 2, "label": "groq"}')
-    router = LLMRouter("groq", {"mimo": mimo, "groq": groq})
+    router = LLMRouter("groq", {"openai": openai, "groq": groq})
 
     out = router.chat_json([{"role": "user", "content": "go"}], Foo)
 
     assert out == Foo(x=2, label="groq")
     assert groq.calls == 1
-    assert mimo.calls == 0
+    assert openai.calls == 0
 
 
 def test_router_falls_back_on_primary_error():
@@ -216,7 +199,7 @@ def test_router_falls_back_on_primary_error():
     # (which this test used to pass) is now correctly treated as OUR bug, not the provider's.
     primary = _FailingClient(openai_sdk.APIConnectionError(request=_http_request()))
     fallback = _StaticClient('{"x": 3, "label": "fallback"}')
-    router = LLMRouter("mimo", {"mimo": primary, "groq": fallback})
+    router = LLMRouter("groq", {"groq": primary, "openai": fallback})
 
     out = router.chat_json([{"role": "user", "content": "go"}], Foo)
 
@@ -237,7 +220,7 @@ def test_every_call_is_counted_per_provider(make_client):
 
     total, per_provider = call_counts(before, telemetry.snapshot())
     assert total == 2
-    assert per_provider == (("mimo", 2),)
+    assert per_provider == (("groq", 2),)
 
 
 def test_retries_and_failures_are_counted_as_the_calls_they_are(make_client):
@@ -254,13 +237,13 @@ def test_retries_and_failures_are_counted_as_the_calls_they_are(make_client):
 
 
 def test_call_counts_ignores_unrelated_telemetry_movement():
-    before = {"llm.calls": 1, "llm.calls.mimo": 1, "sanitizer.whatever": 5}
-    after = {"llm.calls": 4, "llm.calls.mimo": 1, "llm.calls.groq": 2, "sanitizer.whatever": 9}
+    before = {"llm.calls": 1, "llm.calls.openai": 1, "sanitizer.whatever": 5}
+    after = {"llm.calls": 4, "llm.calls.openai": 1, "llm.calls.groq": 2, "sanitizer.whatever": 9}
 
     total, per_provider = call_counts(before, after)
 
     assert total == 3
-    assert per_provider == (("groq", 2),)  # mimo did not move, so it is not in this turn's split
+    assert per_provider == (("groq", 2),)  # openai did not move, so it is not in this turn's split
 
 
 def test_per_call_line_carries_provider_model_latency_tokens_and_outcome(make_client, caplog, tmp_path, monkeypatch):
@@ -276,7 +259,7 @@ def test_per_call_line_carries_provider_model_latency_tokens_and_outcome(make_cl
         client.chat([{"role": "user", "content": "go"}])
 
     line = next(m for m in caplog.messages if m.startswith(CALL_LOG_PREFIX))
-    assert "provider=mimo" in line
+    assert "provider=groq" in line
     assert "model=test-model" in line
     assert "prompt=11" in line
     assert "completion=7" in line
@@ -349,7 +332,7 @@ def _auth_error() -> Exception:
     [
         TypeError("chat() got an unexpected keyword argument"),
         ValueError("bad argument"),
-        LLMConfigurationError("mimo is not configured"),
+        LLMConfigurationError("groq is not configured"),
         StructuredOutputError("model never produced valid output"),
     ],
     ids=["type-error", "value-error", "misconfiguration", "structured-output"],
@@ -359,7 +342,7 @@ def test_router_propagates_non_provider_errors_without_failover(exc):
     # provider's tokens on the same broken call and return a plausible answer, hiding the defect.
     primary = _FailingClient(exc)
     fallback = _StaticClient('{"x": 3, "label": "fallback"}')
-    router = LLMRouter("mimo", {"mimo": primary, "groq": fallback})
+    router = LLMRouter("groq", {"groq": primary, "openai": fallback})
 
     with pytest.raises(type(exc)):
         router.chat([{"role": "user", "content": "go"}])
@@ -371,9 +354,9 @@ def test_router_propagates_non_provider_errors_without_failover(exc):
 def test_router_fails_over_on_empty_completion():
     # A provider that answers with nothing IS failing, so it stays failover-worthy — but it is now
     # a typed EmptyCompletionError rather than a bare ValueError the router cannot tell apart.
-    primary = _FailingClient(EmptyCompletionError("mimo returned empty content"))
+    primary = _FailingClient(EmptyCompletionError("groq returned empty content"))
     fallback = _StaticClient("recovered")
-    router = LLMRouter("mimo", {"mimo": primary, "groq": fallback})
+    router = LLMRouter("groq", {"groq": primary, "openai": fallback})
 
     assert router.chat([{"role": "user", "content": "go"}]) == "recovered"
     assert fallback.calls == 1
@@ -384,12 +367,12 @@ def test_three_auth_failures_open_the_breaker_and_stop_hitting_the_primary():
     # call, forever. After the threshold the router goes straight to the fallback.
     primary = _FailingClient(_auth_error())
     fallback = _StaticClient("fallback-answer")
-    router = LLMRouter("mimo", {"mimo": primary, "groq": fallback})
+    router = LLMRouter("groq", {"groq": primary, "openai": fallback})
 
     for _ in range(BREAKER_FAILURE_THRESHOLD):
         assert router.chat([{"role": "user", "content": "go"}]) == "fallback-answer"
     assert primary.calls == BREAKER_FAILURE_THRESHOLD
-    assert router.breaker_is_open("mimo")
+    assert router.breaker_is_open("groq")
 
     for _ in range(5):
         assert router.chat([{"role": "user", "content": "go"}]) == "fallback-answer"
@@ -404,25 +387,25 @@ def test_breaker_half_opens_after_cooldown_and_closes_on_a_successful_probe(monk
 
     primary = _SwitchableClient(_auth_error())
     fallback = _StaticClient("fallback-answer")
-    router = LLMRouter("mimo", {"mimo": primary, "groq": fallback})
+    router = LLMRouter("groq", {"groq": primary, "openai": fallback})
 
     for _ in range(BREAKER_FAILURE_THRESHOLD):
         router.chat([{"role": "user", "content": "go"}])
-    assert router.breaker_is_open("mimo")
+    assert router.breaker_is_open("groq")
 
     # Still cooling: the primary stays bypassed.
     clock["t"] += BREAKER_COOLDOWN_SECONDS - 1
     router.chat([{"role": "user", "content": "go"}])
     assert primary.calls == BREAKER_FAILURE_THRESHOLD
-    assert router.breaker_is_open("mimo")
+    assert router.breaker_is_open("groq")
 
     # Cooldown elapsed -> half-open. The provider has recovered, so the probe closes the breaker.
     clock["t"] += 2
-    assert not router.breaker_is_open("mimo")
+    assert not router.breaker_is_open("groq")
     primary.exc = None
     assert router.chat([{"role": "user", "content": "go"}]) == "primary-answer"
     assert primary.calls == BREAKER_FAILURE_THRESHOLD + 1
-    assert not router.breaker_is_open("mimo")
+    assert not router.breaker_is_open("groq")
 
     # Fully closed: traffic is back on the primary and the fallback is idle again.
     assert router.chat([{"role": "user", "content": "go"}]) == "primary-answer"
@@ -435,7 +418,7 @@ def test_failed_half_open_probe_re_opens_the_breaker_for_another_cooldown(monkey
     monkeypatch.setattr(llm_module, "_now", lambda: clock["t"])
 
     primary = _SwitchableClient(_auth_error())
-    router = LLMRouter("mimo", {"mimo": primary, "groq": _StaticClient("fallback-answer")})
+    router = LLMRouter("groq", {"groq": primary, "openai": _StaticClient("fallback-answer")})
     for _ in range(BREAKER_FAILURE_THRESHOLD):
         router.chat([{"role": "user", "content": "go"}])
 
@@ -443,7 +426,7 @@ def test_failed_half_open_probe_re_opens_the_breaker_for_another_cooldown(monkey
     router.chat([{"role": "user", "content": "go"}])  # probe, still dead
     probed = primary.calls
     assert probed == BREAKER_FAILURE_THRESHOLD + 1
-    assert router.breaker_is_open("mimo")
+    assert router.breaker_is_open("groq")
 
     clock["t"] += BREAKER_COOLDOWN_SECONDS - 1  # inside the NEW cooldown
     router.chat([{"role": "user", "content": "go"}])
@@ -453,7 +436,7 @@ def test_failed_half_open_probe_re_opens_the_breaker_for_another_cooldown(monkey
 def test_a_success_resets_the_failure_count_before_the_breaker_trips():
     # Intermittent blips must not accumulate into an open breaker across a healthy provider's life.
     primary = _SwitchableClient(openai_sdk.APIConnectionError(request=_http_request()))
-    router = LLMRouter("mimo", {"mimo": primary, "groq": _StaticClient("fallback-answer")})
+    router = LLMRouter("groq", {"groq": primary, "openai": _StaticClient("fallback-answer")})
 
     for _ in range(BREAKER_FAILURE_THRESHOLD - 1):
         router.chat([{"role": "user", "content": "go"}])
@@ -463,30 +446,30 @@ def test_a_success_resets_the_failure_count_before_the_breaker_trips():
     for _ in range(BREAKER_FAILURE_THRESHOLD - 1):
         router.chat([{"role": "user", "content": "go"}])
 
-    assert not router.breaker_is_open("mimo")
+    assert not router.breaker_is_open("groq")
 
 
 def test_our_own_bugs_never_push_a_provider_toward_the_breaker():
     primary = _FailingClient(TypeError("bad call site"))
-    router = LLMRouter("mimo", {"mimo": primary, "groq": _StaticClient("fallback-answer")})
+    router = LLMRouter("groq", {"groq": primary, "openai": _StaticClient("fallback-answer")})
 
     for _ in range(BREAKER_FAILURE_THRESHOLD + 2):
         with pytest.raises(TypeError):
             router.chat([{"role": "user", "content": "go"}])
 
-    assert not router.breaker_is_open("mimo")
+    assert not router.breaker_is_open("groq")
 
 
 def test_open_breaker_still_probes_the_primary_when_no_fallback_can_serve():
     # With nothing else able to answer there is nothing to save by skipping, and skipping would
     # guarantee the primary is never re-probed by real traffic. Availability wins over fail-fast.
     primary = _SwitchableClient(_auth_error())
-    router = LLMRouter("mimo", {"mimo": primary})
+    router = LLMRouter("groq", {"groq": primary})
 
     for _ in range(BREAKER_FAILURE_THRESHOLD):
         with pytest.raises(openai_sdk.AuthenticationError):
             router.chat([{"role": "user", "content": "go"}])
-    assert router.breaker_is_open("mimo")
+    assert router.breaker_is_open("groq")
 
     primary.exc = None
     assert router.chat([{"role": "user", "content": "go"}]) == "primary-answer"
@@ -497,14 +480,14 @@ def test_breaker_skip_downgrades_a_strict_grammar_the_fallback_cannot_enforce():
     # circuit-broken primary turns every structured call into a 400 on the fallback.
     primary = _FailingClient(_auth_error())
     fallback = _StaticClient("{}", supports_json_schema=False)
-    router = LLMRouter("mimo", {"mimo": primary, "groq": fallback})
+    router = LLMRouter("groq", {"groq": primary, "openai": fallback})
     schema = {"type": "json_schema", "json_schema": {"name": "foo", "schema": {}}}
 
     for _ in range(BREAKER_FAILURE_THRESHOLD):
         router.chat([{"role": "user", "content": "go"}], response_format=schema)
     router.chat([{"role": "user", "content": "go"}], response_format=schema)
 
-    assert router.breaker_is_open("mimo")
+    assert router.breaker_is_open("groq")
     assert fallback.formats[-1] == {"type": "json_object"}
 
 
@@ -521,7 +504,7 @@ class _ToolClient(LLMClient):
     def supports_tool_calls(self) -> bool:
         return True
 
-    def chat(self, messages, *, response_format=None, disable_thinking=False) -> str:
+    def chat(self, messages, *, response_format=None) -> str:
         return ""
 
     def chat_with_tools(self, messages, **kwargs):
@@ -541,8 +524,8 @@ def test_router_tool_decline_propagates_without_failover():
     # A declined/unsupported native tool call must fail loudly — failing over would hide exactly the
     # tool-call integration problem this path exists to surface.
     primary = _ToolClient(declines=True)
-    fallback = _ToolClient(result="groq")
-    router = LLMRouter("mimo", {"mimo": primary, "groq": fallback})
+    fallback = _ToolClient(result="fallback")
+    router = LLMRouter("groq", {"groq": primary, "openai": fallback})
 
     with pytest.raises(ToolCallingUnsupported):
         router.chat_with_tools([{"role": "user", "content": "go"}], **_tool_kwargs())
@@ -555,12 +538,12 @@ def test_router_tool_transport_error_fails_over():
     # A transport-level failure (timeout/5xx) is a real outage, so failover to a tool-capable
     # fallback is correct.
     primary = _ToolClient(error=openai_sdk.APITimeoutError(request=_http_request()))
-    fallback = _ToolClient(result="groq-result")
-    router = LLMRouter("mimo", {"mimo": primary, "groq": fallback})
+    fallback = _ToolClient(result="fallback-result")
+    router = LLMRouter("groq", {"groq": primary, "openai": fallback})
 
     out = router.chat_with_tools([{"role": "user", "content": "go"}], **_tool_kwargs())
 
-    assert out == "groq-result"
+    assert out == "fallback-result"
     assert primary.tool_calls == 1
     assert fallback.tool_calls == 1
 
@@ -582,21 +565,21 @@ def test_transport_backoff_retries_429_then_succeeds(monkeypatch, fake_openai_fa
     waits: list[float] = []
     monkeypatch.setattr(llm_module, "_sleep", waits.append)
     fake = fake_openai_factory([_rate_limited(), _rate_limited(), '{"x": 1, "label": "ok"}'])
-    client = MimoClient(_provider("mimo"), client=fake)
+    client = GroqClient(_provider("groq"), client=fake)
 
     out = client.chat_json([{"role": "user", "content": "go"}], Foo)
 
     assert out.x == 1
     assert fake.call_count == 3
     assert waits == [2.0, 5.0]  # the fixed schedule when the provider sends no Retry-After
-    assert telemetry.snapshot()["transport.backoff.mimo"] == 2
+    assert telemetry.snapshot()["transport.backoff.groq"] == 2
 
 
 def test_transport_backoff_honors_retry_after_header(monkeypatch, fake_openai_factory):
     waits: list[float] = []
     monkeypatch.setattr(llm_module, "_sleep", waits.append)
     fake = fake_openai_factory([_rate_limited(headers={"retry-after": "1"}), '{"x": 1, "label": "ok"}'])
-    client = MimoClient(_provider("mimo"), client=fake)
+    client = GroqClient(_provider("groq"), client=fake)
 
     client.chat_json([{"role": "user", "content": "go"}], Foo)
 
@@ -609,7 +592,7 @@ def test_insufficient_quota_fails_fast_without_backoff(monkeypatch, tmp_path, fa
     waits: list[float] = []
     monkeypatch.setattr(llm_module, "_sleep", waits.append)
     fake = fake_openai_factory([_rate_limited(message="You exceeded your current quota: insufficient_quota")])
-    client = MimoClient(_provider("mimo"), client=fake)
+    client = GroqClient(_provider("groq"), client=fake)
 
     # GH #119: a TYPED stop, not the SDK's RateLimitError — question_node re-raises it past its
     # failure-isolation net, so a dead quota suspends instead of recording a zero-evidence `failed`.
@@ -620,7 +603,7 @@ def test_insufficient_quota_fails_fast_without_backoff(monkeypatch, tmp_path, fa
     assert waits == []
     # ADR 0005's addendum calls insufficient_quota the DETECTION half of budget exhaustion; the latch
     # carries it to the session-behaviour half (R-25) across processes.
-    assert usage.quota_exhausted_today("mimo")
+    assert usage.quota_exhausted_today("groq")
     assert not usage.quota_exhausted_today("openai")  # per provider, never a global kill switch
     assert llm_module.is_provider_failure(ProviderQuotaExhausted("x"))  # routed roles still fail over
 
@@ -628,7 +611,7 @@ def test_insufficient_quota_fails_fast_without_backoff(monkeypatch, tmp_path, fa
 def test_transport_backoff_gives_up_after_bounded_attempts(monkeypatch, fake_openai_factory):
     monkeypatch.setattr(llm_module, "_sleep", lambda _wait: None)
     fake = fake_openai_factory([_rate_limited()])  # the fake repeats its last scripted reply
-    client = MimoClient(_provider("mimo"), client=fake)
+    client = GroqClient(_provider("groq"), client=fake)
 
     with pytest.raises(openai_sdk.RateLimitError):
         client.chat([{"role": "user", "content": "go"}])
@@ -642,13 +625,13 @@ def test_5xx_is_retried_but_4xx_is_not(monkeypatch, fake_openai_factory):
         "boom", response=httpx.Response(500, request=_http_request()), body=None
     )
     fake = fake_openai_factory([server_err, '{"x": 2, "label": "recovered"}'])
-    client = MimoClient(_provider("mimo"), client=fake)
+    client = GroqClient(_provider("groq"), client=fake)
     assert client.chat_json([{"role": "user", "content": "go"}], Foo).x == 2
     assert fake.call_count == 2
 
     bad_request = openai_sdk.BadRequestError("bad", response=httpx.Response(400, request=_http_request()), body=None)
     fake2 = fake_openai_factory([bad_request])
-    client2 = MimoClient(_provider("mimo"), client=fake2)
+    client2 = GroqClient(_provider("groq"), client=fake2)
     with pytest.raises(openai_sdk.BadRequestError):
         client2.chat([{"role": "user", "content": "go"}])
     assert fake2.call_count == 1
@@ -660,12 +643,12 @@ def test_usage_recorded_to_daily_ledger(monkeypatch, tmp_path, fake_openai_facto
     fake = fake_openai_factory(
         [{"content": '{"x": 1, "label": "ok"}', "usage": {"prompt_tokens": 100, "completion_tokens": 20}}]
     )
-    client = MimoClient(_provider("mimo"), client=fake)
+    client = GroqClient(_provider("groq"), client=fake)
 
     client.chat_json([{"role": "user", "content": "go"}], Foo)
 
     totals = usage_for_day()
-    assert totals["mimo"] == {"prompt": 100, "completion": 20, "total": 120, "calls": 1}
+    assert totals["groq"] == {"prompt": 100, "completion": 20, "total": 120, "calls": 1}
 
 
 # --- M0a / F1: the accounting gate at the provider call boundary ---------------------------------
@@ -699,10 +682,10 @@ def test_the_call_after_an_unrecordable_one_is_refused(monkeypatch, tmp_path, fa
     monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
     reply = {"content": '{"x": 1, "label": "ok"}', "usage": {"prompt_tokens": 100, "completion_tokens": 20}}
     fake = fake_openai_factory([reply, reply, reply])
-    client = MimoClient(_provider("mimo"), client=fake)
+    client = GroqClient(_provider("groq"), client=fake)
 
     client.chat_json([{"role": "user", "content": "one"}], Foo)
-    assert usage_for_day()["mimo"]["calls"] == 1
+    assert usage_for_day()["groq"]["calls"] == 1
 
     _break(ledger)
     client.chat_json([{"role": "user", "content": "two"}], Foo)  # billed; its row cannot be written
@@ -725,7 +708,7 @@ def test_an_unwritable_ledger_refuses_the_very_first_call(monkeypatch, tmp_path,
     """
     _unappendable_ledger(monkeypatch, tmp_path)
     fake = fake_openai_factory(['{"x": 1, "label": "ok"}'])
-    client = MimoClient(_provider("mimo"), client=fake)
+    client = GroqClient(_provider("groq"), client=fake)
 
     with pytest.raises(usage.AccountingUnavailable) as caught:
         client.chat_json([{"role": "user", "content": "go"}], Foo)
@@ -741,10 +724,10 @@ def test_a_refused_call_is_not_a_provider_failure(monkeypatch, tmp_path, fake_op
     provider's allowance, equally unrecorded, to work around our own inability to count.
     """
     _unappendable_ledger(monkeypatch, tmp_path)
-    primary = MimoClient(_provider("mimo"), client=fake_openai_factory(['{"x": 1, "label": "a"}']))
+    primary = GroqClient(_provider("groq"), client=fake_openai_factory(['{"x": 1, "label": "a"}']))
     fallback_fake = fake_openai_factory(['{"x": 2, "label": "b"}'])
-    fallback = GroqClient(_provider("groq"), client=fallback_fake)
-    router = LLMRouter("mimo", {"mimo": primary, "groq": fallback}, fallback_provider="groq")
+    fallback = OpenAIClient(_provider("openai"), client=fallback_fake)
+    router = LLMRouter("groq", {"groq": primary, "openai": fallback}, fallback_provider="openai")
 
     with pytest.raises(usage.AccountingUnavailable):
         router.chat_json([{"role": "user", "content": "go"}], Foo)
@@ -761,7 +744,7 @@ def test_the_gate_is_not_swallowed_by_the_structured_output_retry(monkeypatch, t
     """
     _unappendable_ledger(monkeypatch, tmp_path)
     fake = fake_openai_factory(['{"x": 1, "label": "ok"}'])
-    client = MimoClient(_provider("mimo"), client=fake)
+    client = GroqClient(_provider("groq"), client=fake)
 
     with pytest.raises(usage.AccountingUnavailable):
         client.chat_json([{"role": "user", "content": "go"}], Foo, max_retries=3)
@@ -775,7 +758,7 @@ def test_a_reconciled_ledger_lets_calls_through_again(monkeypatch, tmp_path, fak
     monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
     reply = {"content": '{"x": 1, "label": "ok"}', "usage": {"prompt_tokens": 100, "completion_tokens": 20}}
     fake = fake_openai_factory([reply, reply, reply])
-    client = MimoClient(_provider("mimo"), client=fake)
+    client = GroqClient(_provider("groq"), client=fake)
 
     _break(ledger)
     usage.reset_accounting_state()  # a process that starts with the path already broken
@@ -787,7 +770,7 @@ def test_a_reconciled_ledger_lets_calls_through_again(monkeypatch, tmp_path, fak
 
     client.chat_json([{"role": "user", "content": "allowed"}], Foo)
     assert fake.call_count == 1
-    assert usage_for_day()["mimo"] == {"prompt": 100, "completion": 20, "total": 120, "calls": 1}
+    assert usage_for_day()["groq"] == {"prompt": 100, "completion": 20, "total": 120, "calls": 1}
 
 
 def test_sdk_retries_disabled_so_backoff_is_singly_owned(monkeypatch):
@@ -806,8 +789,6 @@ def test_sdk_retries_disabled_so_backoff_is_singly_owned(monkeypatch):
 
 
 def _openai_client(fake):
-    from interview_coach.llm import OpenAIClient
-
     return OpenAIClient(_provider("openai"), client=fake)
 
 
@@ -834,7 +815,7 @@ def test_json_schema_sent_as_strict_grammar_on_supporting_client(fake_openai_fac
 
 def test_json_schema_ignored_on_unsupporting_client(fake_openai_factory):
     fake = fake_openai_factory(['{"x": 1, "label": "ok"}'])
-    client = MimoClient(_provider("mimo"), client=fake)  # MiMo: not verified, opted out
+    client = GroqClient(_provider("groq"), client=fake)  # Groq: not verified, opted out
 
     client.chat_json([{"role": "user", "content": "go"}], Foo, json_schema=TINY_SCHEMA)
 
@@ -842,9 +823,7 @@ def test_json_schema_ignored_on_unsupporting_client(fake_openai_factory):
 
 
 def test_router_downgrades_grammar_for_schema_less_fallback(monkeypatch, tmp_path, fake_openai_factory):
-    from interview_coach.llm import OpenAIClient
-
-    # Primary (openai, grammar-capable) dies; fallback (mimo) cannot enforce the grammar. The
+    # Primary (openai, grammar-capable) dies; fallback (groq) cannot enforce the grammar. The
     # failover must downgrade to json_object rather than turn an outage into a 400.
     # The tmp ledger keeps the quota latch this raise writes out of the repo's real one.
     monkeypatch.setenv("COACH_USAGE_LEDGER", str(tmp_path / "ledger.jsonl"))
@@ -854,9 +833,9 @@ def test_router_downgrades_grammar_for_schema_less_fallback(monkeypatch, tmp_pat
         "openai",
         {
             "openai": OpenAIClient(_provider("openai"), client=fake_primary),
-            "mimo": MimoClient(_provider("mimo"), client=fake_fallback),
+            "groq": GroqClient(_provider("groq"), client=fake_fallback),
         },
-        fallback_provider="mimo",
+        fallback_provider="groq",
     )
 
     out = router.chat_json([{"role": "user", "content": "go"}], Foo, json_schema=TINY_SCHEMA)
@@ -872,7 +851,7 @@ def test_408_and_409_stay_retryable_after_sdk_retries_disabled(monkeypatch, fake
     monkeypatch.setattr(llm_module, "_sleep", lambda _wait: None)
     timeout_408 = openai_sdk.APIStatusError("timeout", response=httpx.Response(408, request=_http_request()), body=None)
     fake = fake_openai_factory([timeout_408, '{"x": 4, "label": "recovered"}'])
-    client = MimoClient(_provider("mimo"), client=fake)
+    client = GroqClient(_provider("groq"), client=fake)
     assert client.chat_json([{"role": "user", "content": "go"}], Foo).x == 4
     assert fake.call_count == 2
 

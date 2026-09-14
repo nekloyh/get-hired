@@ -1,6 +1,6 @@
 """Replay the FROZEN concept-retrieval eval set and report hit@1 with a Wilson 95% CI (R-15, #70).
 
-Supersedes `scripts/review_issue_0008_chroma_retrieval.py` as the retrieval gate. That script
+Replaces the 2026-07-11 review script (since deleted) as the retrieval gate. That script
 rebuilt its eval from `questions.yaml` on every run, so the bank's growth silently moved the
 denominator (50 lookups at the 2026-07-11 audit, 59 at 184f5a2) and the labels could be — and were —
 edited upward by the agent reading the score. Here the eval set is a frozen file this script can only

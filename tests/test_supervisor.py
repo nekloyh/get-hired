@@ -334,7 +334,7 @@ def test_a_dead_quota_mid_session_suspends_and_resumes_without_a_failed_question
     def _quota_dies_on_the_second_question(*args, **kwargs):
         quota["calls"] += 1
         if quota["calls"] == 2 and quota["dead"]:
-            raise ProviderQuotaExhausted("mimo daily quota exhausted (insufficient_quota)")
+            raise ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")
         return base(*args, **kwargs)
 
     monkeypatch.setattr(supervisor, "run_micro_loop", _quota_dies_on_the_second_question)

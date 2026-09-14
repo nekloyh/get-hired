@@ -90,7 +90,7 @@ def _transcript() -> tuple[RecollectionTurn, ...]:
 
 
 def _settings() -> SimpleNamespace:
-    return SimpleNamespace(configured=True, primary_provider="mimo")
+    return SimpleNamespace(configured=True, primary_provider="groq")
 
 
 # --- end-to-end: recollection -> typed evidence -> ledger fusion (THE acceptance criterion) ------

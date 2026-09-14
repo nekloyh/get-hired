@@ -35,10 +35,7 @@ from interview_coach.web_api import (
 def _app(tmp_path):
     settings = Settings(
         _env_file=None,
-        primary_provider="mimo",
-        mimo_api_key="",
-        mimo_base_url="",
-        mimo_model="",
+        primary_provider="groq",
         groq_api_key="",
         groq_model="",
         concept_store="memory",
@@ -64,7 +61,7 @@ def test_health_reports_provider_config_and_demo_availability(tmp_path):
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "ok"
-    assert data["primary_provider"] == "mimo"
+    assert data["primary_provider"] == "groq"
     assert data["primary_configured"] is False
     assert data["demo_available"] is True
 
@@ -265,10 +262,7 @@ _TOKEN = "s3cret-shared-token"
 def _gated_client(tmp_path, *, token: str = _TOKEN, origins: str = ""):
     settings = Settings(
         _env_file=None,
-        primary_provider="mimo",
-        mimo_api_key="",
-        mimo_base_url="",
-        mimo_model="",
+        primary_provider="groq",
         groq_api_key="",
         groq_model="",
         auth_token=token,
@@ -625,10 +619,7 @@ def test_a_failed_disk_write_does_not_fail_the_session(tmp_path, monkeypatch):
 def _ui_client(tmp_path, *, static_dir):
     settings = Settings(
         _env_file=None,
-        primary_provider="mimo",
-        mimo_api_key="",
-        mimo_base_url="",
-        mimo_model="",
+        primary_provider="groq",
         groq_api_key="",
         groq_model="",
         concept_store="memory",
@@ -692,10 +683,7 @@ def test_state_paths_come_from_the_environment_when_not_passed(tmp_path):
     # R-11: a container points all three at one mounted volume without a code change.
     settings = Settings(
         _env_file=None,
-        primary_provider="mimo",
-        mimo_api_key="",
-        mimo_base_url="",
-        mimo_model="",
+        primary_provider="groq",
         groq_api_key="",
         groq_model="",
         checkpoint_db=str(tmp_path / "state" / "checkpoints.sqlite"),
@@ -714,10 +702,7 @@ def test_default_state_paths_are_unchanged(tmp_path):
     # Zero-change rollout for a local checkout: the historical CWD-relative names still apply.
     settings = Settings(
         _env_file=None,
-        primary_provider="mimo",
-        mimo_api_key="",
-        mimo_base_url="",
-        mimo_model="",
+        primary_provider="groq",
         groq_api_key="",
         groq_model="",
     )
@@ -788,10 +773,7 @@ def test_a_ttl_of_zero_disables_the_sweep(tmp_path):
     # The knob has to be able to turn the reaper off for a deployment that wants every checkpoint.
     settings = Settings(
         _env_file=None,
-        primary_provider="mimo",
-        mimo_api_key="",
-        mimo_base_url="",
-        mimo_model="",
+        primary_provider="groq",
         groq_api_key="",
         groq_model="",
         checkpoint_ttl_seconds=0,
@@ -862,10 +844,7 @@ def test_the_startup_sweep_actually_runs(tmp_path):
 
     settings = Settings(
         _env_file=None,
-        primary_provider="mimo",
-        mimo_api_key="",
-        mimo_base_url="",
-        mimo_model="",
+        primary_provider="groq",
         groq_api_key="",
         groq_model="",
         concept_store="memory",
@@ -1301,7 +1280,7 @@ def test_the_suite_never_writes_into_the_operators_own_log_file(tmp_path):
     # so `set -a; . .env` with the path `.env.example` documents turned `uv run pytest` into a suite
     # that reddened `test_the_log_file_is_bounded` (two RotatingFileHandlers on the process-global
     # logger) and, far worse, appended 1,939 lines into the operator's real server log, 415 of them
-    # counterfeit `llm-call provider=mimo ... outcome=ok` records. That is the trace ADR 0009
+    # counterfeit `llm-call ... model=test-model ... outcome=ok` records. That is the trace ADR 0009
     # addendum a reads to find a silent judge failover, so those are fabricated evidence. The
     # conftest pop is the fix, and only a subprocess can observe it: by the time any in-process test
     # runs, this process's collection is long over and the damage would already be done.
@@ -1332,7 +1311,7 @@ class _ProviderDemoClient(DemoLLMClient):
     every demo-mode test above untouched.
     """
 
-    provider_name = "mimo"
+    provider_name = "groq"
 
 
 class _MeteredDemoClient(_ProviderDemoClient):
@@ -1341,7 +1320,7 @@ class _MeteredDemoClient(_ProviderDemoClient):
     tokens_per_call = 100
 
     def chat_json(self, *args, **kwargs):
-        usage.record_usage("mimo", "test-model", prompt_tokens=self.tokens_per_call, completion_tokens=0)
+        usage.record_usage("groq", "test-model", prompt_tokens=self.tokens_per_call, completion_tokens=0)
         return super().chat_json(*args, **kwargs)
 
 
@@ -1361,10 +1340,10 @@ def _live_client(tmp_path, monkeypatch, *, token: str = "", brain=None):
     monkeypatch.setattr(web_api, "build_role_clients", lambda settings, client: RoleClients.single(client))
     settings = Settings(
         _env_file=None,
-        primary_provider="mimo",
-        mimo_api_key="test",
-        mimo_base_url="http://test",
-        mimo_model="test-model",
+        primary_provider="groq",
+        groq_api_key="test",
+        groq_base_url="http://test",
+        groq_model="test-model",
         auth_token=token,
         concept_store="memory",
     )
@@ -1397,7 +1376,7 @@ def test_live_session_refuses_to_start_when_the_day_is_spent(tmp_path, monkeypat
     # see an interview begin that cannot be paid for.
     client = _live_client(tmp_path, monkeypatch)
     monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "10")
-    usage.record_usage("mimo", "test-model", prompt_tokens=10, completion_tokens=0)
+    usage.record_usage("groq", "test-model", prompt_tokens=10, completion_tokens=0)
 
     with client.websocket_connect("/api/sessions/spent") as ws:
         _start_live(ws)
@@ -1622,7 +1601,7 @@ def test_a_dead_quota_mid_session_suspends_the_web_session(tmp_path, monkeypatch
     def _quota_dies_on_the_second_question(*args, **kwargs):
         calls["n"] += 1
         if calls["n"] == 2:
-            raise ProviderQuotaExhausted("mimo daily quota exhausted (insufficient_quota)")
+            raise ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")
         return real_micro_loop(*args, **kwargs)
 
     monkeypatch.setattr(supervisor, "run_micro_loop", _quota_dies_on_the_second_question)
@@ -1654,7 +1633,7 @@ def test_a_dead_quota_on_the_diagnostic_tells_the_web_candidate_to_start_over(tm
     from interview_coach.usage import ProviderQuotaExhausted
 
     def _quota_dies(*args, **kwargs):
-        raise ProviderQuotaExhausted("mimo daily quota exhausted (insufficient_quota)")
+        raise ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")
 
     monkeypatch.setattr(web_api, "diagnose_or_degrade", _quota_dies)
     client = _live_client(tmp_path, monkeypatch)
@@ -1679,16 +1658,16 @@ def test_a_refused_live_session_never_starts_the_interview(tmp_path, monkeypatch
     monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "10")
     monkeypatch.delenv("LLM_SESSION_TOKEN_BUDGET", raising=False)
     monkeypatch.delenv("COACH_DAILY_QUESTION_CAP", raising=False)
-    usage.record_usage("mimo", "test-model", prompt_tokens=10, completion_tokens=0)
+    usage.record_usage("groq", "test-model", prompt_tokens=10, completion_tokens=0)
     monkeypatch.setattr(web_api, "build_client", lambda settings: _ProviderDemoClient())
     monkeypatch.setattr(web_api, "build_role_clients", lambda settings, client: RoleClients.single(client))
 
     settings = Settings(
         _env_file=None,
-        primary_provider="mimo",
-        mimo_api_key="test",
-        mimo_base_url="http://test",
-        mimo_model="test-model",
+        primary_provider="groq",
+        groq_api_key="test",
+        groq_base_url="http://test",
+        groq_model="test-model",
         concept_store="memory",
     )
     api_state = web_api.WebApiState(

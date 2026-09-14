@@ -7,9 +7,8 @@ the micro-loop) but not the judgment that drives it.
 
 Slice 0007 gives this agent the project's only tool: ``lookup_concept``. The Interviewer performs a
 small ReAct loop: the model emits provider-level ``tool_calls``, Python executes the lookup, and the
-result is fed back as a ``tool`` turn before the model writes the grounded Follow-up. MiMo thinking
-mode is disabled so ``reasoning_content`` never has to be replayed through a multi-turn tool history
-(ADR 0003). A JSON tool-plan fallback exists only for non-native test/dummy clients.
+result is fed back as a ``tool`` turn before the model writes the grounded Follow-up (ADR 0003). A
+JSON tool-plan fallback exists only for non-native test/dummy clients.
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ logger = logging.getLogger(__name__)
 class UnknownToolCall(RuntimeError):
     """The model asked for a tool the Interviewer does not expose.
 
-    Usually a transient MiMo glitch (a garbled/misspelled tool name), not a genuine capability
+    Usually a provider's garbled tool name (a transient glitch), not a genuine capability
     failure — so it is retried once before the loop gives up, and it is deliberately distinct from
     :class:`ToolCallingUnsupported`.
     """
@@ -422,7 +421,6 @@ def _native_follow_up_attempt(
         ),
         tool_choice={"type": "function", "function": {"name": "lookup_concept"}},
         max_retries=1,
-        disable_thinking=True,
     )
     concept_miss = captured.get("concept_miss")
     if concept_miss is not None:
@@ -530,7 +528,6 @@ def _generate_follow_up_json(
         _build_tool_messages(original_question, answer, evaluation, skill),
         ConceptToolRequest,
         max_retries=1,
-        disable_thinking=True,
     )
     lookup_skill = skill or tool_request.skill
     lookup_language = _preferred_lookup_language(tool_request.language, lookup_skill, language_mode)
@@ -553,7 +550,6 @@ def _generate_follow_up_json(
         FollowUp,
         validators=_make_validators(original_question, lambda: lookup, language_mode),
         max_retries=1,
-        disable_thinking=True,
     )
     follow_up = follow_up.model_copy(
         update={
@@ -678,7 +674,6 @@ def render_seed_question(client: LLMClient, question: str, language_mode: str = 
             RenderedSeedQuestion,
             validators=[require_vietnamese],
             max_retries=1,
-            disable_thinking=True,
         )
     except StructuredOutputError as err:
         # Only a rendering-QUALITY failure degrades (the model couldn't produce valid Vietnamese

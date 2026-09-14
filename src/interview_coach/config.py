@@ -1,8 +1,6 @@
 """Runtime configuration, loaded from the environment / `.env`.
 
-Issue 0004 makes the MiMo -> Groq cutover a ``PRIMARY_PROVIDER`` switch. Both providers are
-OpenAI-compatible, but each has its own credentials/model so the cutover does not require editing
-agent code.
+``PRIMARY_PROVIDER`` selects the primary OpenAI-compatible provider; ``ROLE_*`` overrides route roles elsewhere.
 
 Per-role routing (ADR 0010, issue R-18): each agent role — ``judge``, ``interviewer``,
 ``supervisor``, ``diagnostic``, ``planner`` — may override its provider, model, and temperature via
@@ -18,7 +16,7 @@ from typing import Literal, get_args
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-type ProviderName = Literal["mimo", "groq", "openai", "zenmux"]
+type ProviderName = Literal["groq", "openai", "zenmux"]
 
 type RoleName = Literal["judge", "interviewer", "supervisor", "diagnostic", "planner"]
 
@@ -66,11 +64,7 @@ class Settings(BaseSettings):
         populate_by_name=True,
     )
 
-    primary_provider: ProviderName = Field("mimo", validation_alias="PRIMARY_PROVIDER")
-
-    mimo_api_key: str = Field("", validation_alias="MIMO_API_KEY")
-    mimo_base_url: str = Field("", validation_alias="MIMO_BASE_URL")
-    mimo_model: str = Field("", validation_alias="MIMO_MODEL")
+    primary_provider: ProviderName = Field("openai", validation_alias="PRIMARY_PROVIDER")
 
     groq_api_key: str = Field("", validation_alias="GROQ_API_KEY")
     groq_base_url: str = Field("https://api.groq.com/openai/v1", validation_alias="GROQ_BASE_URL")
@@ -88,7 +82,6 @@ class Settings(BaseSettings):
 
     # Per-provider capability override (per-model in effect — a provider entry binds one model).
     # None = defer to the client class's live-verified default.
-    mimo_supports_json_schema: bool | None = Field(None, validation_alias="MIMO_SUPPORTS_JSON_SCHEMA")
     groq_supports_json_schema: bool | None = Field(None, validation_alias="GROQ_SUPPORTS_JSON_SCHEMA")
     openai_supports_json_schema: bool | None = Field(None, validation_alias="OPENAI_SUPPORTS_JSON_SCHEMA")
     zenmux_supports_json_schema: bool | None = Field(None, validation_alias="ZENMUX_SUPPORTS_JSON_SCHEMA")
@@ -156,27 +149,19 @@ class Settings(BaseSettings):
 
     @property
     def fallback_provider(self) -> ProviderName:
-        """The first other provider in preference order is the fallback for this MVP router.
-
-        ``zenmux`` sits last on purpose: one of the first three is always different from the primary,
-        so appending it cannot change the fallback any existing configuration resolves to.
-        """
-        for candidate in ("groq", "mimo", "openai", "zenmux"):
-            if candidate != self.primary_provider:
-                return candidate
-        return "mimo"
+        """The first other provider in preference order; ``zenmux`` (an aggregator) is deliberately last."""
+        order: tuple[ProviderName, ...] = ("groq", "openai", "zenmux")
+        return next(candidate for candidate in order if candidate != self.primary_provider)
 
     def provider_config(self, provider: ProviderName) -> ProviderSettings:
         """Return the normalized config for ``provider``."""
         creds: dict[ProviderName, tuple[str, str, str]] = {
-            "mimo": (self.mimo_api_key, self.mimo_base_url, self.mimo_model),
             "groq": (self.groq_api_key, self.groq_base_url, self.groq_model),
             "openai": (self.openai_api_key, self.openai_base_url, self.openai_model),
             "zenmux": (self.zenmux_api_key, self.zenmux_base_url, self.zenmux_model),
         }
         api_key, base_url, model = creds[provider]
         json_schema_overrides: dict[ProviderName, bool | None] = {
-            "mimo": self.mimo_supports_json_schema,
             "groq": self.groq_supports_json_schema,
             "openai": self.openai_supports_json_schema,
             "zenmux": self.zenmux_supports_json_schema,

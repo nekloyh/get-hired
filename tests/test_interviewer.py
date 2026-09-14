@@ -150,24 +150,6 @@ def test_generate_follow_up_rejects_reasking_original_question(make_client):
     assert fake.call_count == 3
 
 
-def test_interviewer_disables_mimo_thinking_for_tool_loop(make_client):
-    client, fake = make_client([_tool_call_reply(), _followup_json()])
-
-    generate_follow_up(
-        client,
-        original_question="Why does L2 regularization reduce overfitting?",
-        answer="It makes weights smaller.",
-        evaluation=_weak_evaluation(),
-        skill="ml_fundamentals",
-        concept_store=_store(),
-    )
-
-    assert [call["extra_body"] for call in fake.chat.completions.calls] == [
-        {"thinking": {"type": "disabled"}},
-        {"thinking": {"type": "disabled"}},
-    ]
-
-
 def _tool_call_reply(
     query: str = "L2 penalty variance mechanism",
     skill: str | None = "ml_fundamentals",
@@ -217,7 +199,7 @@ def test_generate_follow_up_uses_native_tool_call(make_tool_client):
 
 
 def _garbled_tool_reply(name: str = "lookup_concpet") -> dict:
-    # A misspelled/garbled tool name — the transient MiMo glitch that used to crash the whole Session.
+    # A misspelled/garbled tool name — the transient provider glitch that used to crash the whole Session.
     return {
         "tool_calls": [
             {
@@ -349,12 +331,11 @@ class _JsonOnlyClient(LLMClient):
         self.replies = list(replies)
         self.calls: list[dict] = []
 
-    def chat(self, messages, *, response_format=None, disable_thinking=False) -> str:
+    def chat(self, messages, *, response_format=None) -> str:
         self.calls.append(
             {
                 "messages": messages,
                 "response_format": response_format,
-                "disable_thinking": disable_thinking,
             }
         )
         return self.replies[min(len(self.calls) - 1, len(self.replies) - 1)]
@@ -375,7 +356,6 @@ def test_json_tool_plan_fallback_is_only_for_non_native_clients():
 
     assert fu.concept_id == "l2"
     assert len(client.calls) == 2
-    assert all(call["disable_thinking"] is True for call in client.calls)
 
 
 @pytest.mark.live
