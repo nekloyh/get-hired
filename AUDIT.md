@@ -447,3 +447,37 @@ Commented-out code: none in `src/` (4 grep hits, all prose). The volume problem 
 ## Appendix — open trackers (`gh`, 2026-09-14)
 
 Open issues: #119 (quota → failed item, HIGH), #113 (replay carries no pack), #103/#96 (rubric anchors), #88/#87/#86/#85/#84/#83 (packs, voice spike, CV import, i18n, accounts, dashboard), #79/#72/#71 (eval), #60 (frontend redesign decision), #59 (blocker: onboarding ≤10 min truth-check). Open PRs: #104 (draft, anchors — "DO NOT MERGE"), #50 (frontend redesign, open since 2026-07-11). Last CI on `main`: 2026-08-04, green. ADR status: 0010 Accepted; 0011, 0014, and the 2026-07-19 addenda to 0001/0002 are **Proposed** (experiment-gated, not in code) — `docs/adr/0001-control-hierarchy.md:9`, `0002-bayesian-skill-state.md:11`, `0011:3`, `0014:3`.
+
+---
+
+## Execution log — branch `audit/stabilize-2026-09-14` (2026-09-14)
+
+The recommendation (Option A plus Option B's step 5 in part) was executed on a branch off `main`; nothing was pushed. Every gate was run locally after each commit.
+
+| Commit | What | Gates |
+|---|---|---|
+| `3ea1275` | Landed the 21 uncommitted M0a files and 4 untracked doc paths verbatim (Phase 6 item 1). | pytest 833 |
+| `a576501` | This report. | — |
+| `cf4e40e` | Web: `types.ts` synced with the wire format; panel verdict and evidence-degraded badge rendered; test fixture moved out of a `*.test` file (32 → 27 real tests); 4 missing CSS rules; tracked Vite/Playwright caches untracked and ignored. | eslint, tsc, vitest 27, vite build |
+| `4f8cdf3` | **GH #119**: `ProviderQuotaExhausted` raised by the provider client, re-raised past every failure-isolation net, turned into a suspend with a resume path by both drivers (and an honest "start again" when it died on the Diagnostic). `schema_version` on checkpoints and `_meta` on the Skill ledger. Demo commands deleted; stop-reason and study-plan helpers deduped; ledger loaders folded; silent eval-tooling catches now log; `harness_passed([])` is red. | pytest 840, ruff, mypy, goldens byte-identical |
+| `bd41425` | `docs/data-model.md` (every store, shape, writer, reader, retention, authority, versioning rule, duplications) and two glossary entries. | cites verified |
+| `9bc067d` | **Reconnect race** closed (registration lives until the thread exits; reconnect joins the stale thread, one waiter per id, never overwrites an in-flight run); answer ≤ 20k chars, `max_elapsed_seconds` ≤ 4 h, answers queue bounded to 8 with a visible drop; `completed_sessions` bounded to 64 (export persisted first); `usage.reserve_questions` makes the cap check+record atomic and runs after the read-only budget rail; `web_api.app` built lazily so importing the module no longer reads `.env` or sweeps the checkpoint DB. | pytest 853, ruff, mypy, web/usage subset stable ×2 |
+| `3f19c99` | MiMo provider and `disable_thinking` removed; `primary_provider` defaults to `openai`; test fake provider is Groq; two superseded scripts deleted; README/.env.example cleaned. | pytest 848 (853 − 5 MiMo-only tests), goldens byte-identical, vitest 27 |
+
+Outside git: the 51 fabricated `mimo/test-model` rows were removed from `logs/usage-ledger.jsonl` (backup at `logs/usage-ledger.jsonl.bak-2026-09-14`); the Docker image was built from `9bc067d` via `git archive` (402 MB, lazy `app` resolves inside the container with the UI mounted) and then deleted — §1.6's UNKNOWN is closed.
+
+### Corrections to this report found while executing it
+
+1. §3.4 listed `_generate_follow_up_json` as fake-only. **Wrong**: demo mode (`DemoLLMClient` has no `chat_with_tools`) uses it. Kept.
+2. §3.4 listed `TranscriptItem.to_dict` as having no caller. It has test callers (`tests/test_session_serde.py:35, 40`) and no production caller. Kept.
+3. §2.2 row 1 cited `web_api.py:838` for the resume stream; the call was `_stream_graph`. Row 3 attributed the `quota_exhausted` write to `usage.py:287-331`; the writer is `llm.py`. Row 5 implied Chroma is live in the container; the image installs without `--extra rag`, so `auto` resolves to `memory` there. `docs/data-model.md` has the corrected cites.
+4. §3.2 row 2's prediction that the pre-fix Session would show `question_count == 2` was off: the characterization test observed `3` (the Session ran to its cap after the fabricated `failed` item). The defect itself was as described.
+5. §3.8 reported the ledger pollution as historical and mitigated; the mitigation lived only in the uncommitted conftest, which is now committed, and the rows are purged.
+
+### Left for the user — not done, and why
+
+- **`.env`** still holds `MIMO_*`/`GROQ_*` keys and no `COACH_AUTH_TOKEN` (Phase 6 item 9). Editing a secrets file was not assumed to be in scope.
+- **GitHub**: nothing pushed; #119 not closed; PR #104 (draft) and #50 untouched. Push the branch, open a PR, let CI run on it, then close #119 from the PR.
+- **Historical docs** (`docs/issues/*`, `docs/audits/*`, `docs/adr/*`, `docs/reference/*`, `CLAUDE.md`) keep their MiMo, `coach interview`/`coach evaluate`, and deleted-script mentions on purpose; a docs sweep is a separate decision.
+- **Untested by design**: an exception escaping the socket loop after the parser guard is cancelled by the `finally` (code-reviewed) but not unit-tested, because the test client delivers pending frames lazily and the crash cannot be observed deterministically. `STALE_RUNTIME_JOIN_SECONDS` (120 s) is shorter than a full 4-attempt retry storm (~4 min); in that window a reconnect is told to retry.
+- **Follow-ups worth a ticket**: `pytest-timeout` (a regression in the bounded-queue path would hang a receive loop instead of failing); Option B step 2 (split `web_api.py`) and step 3 (SQLite read path for the usage ledger, which every rail still re-parses per call) were not started; `ruff format` would reflow 19 pre-existing test files.
