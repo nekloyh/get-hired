@@ -55,9 +55,11 @@ from .supervisor import (
 )
 from .usage import (
     AccountingUnavailable,
+    ProviderQuotaExhausted,
     SessionBudgetSuspended,
     begin_session_run,
     clear_run_rails_for_resume,
+    daily_reset_hint,
     question_cap_reason,
     record_questions,
     session_budget_guard,
@@ -895,6 +897,17 @@ def _run_session_thread(
         # The checkpoint is durable, so the UI's resume picks it up once the budget allows.
         logger.warning("Session %r suspended on a budget rail: %s", runtime.session_id, err)
         runtime.emit({"type": "session_error", "error": f"Session suspended: {err}"})
+    except ProviderQuotaExhausted as err:
+        # GH #119: the daily quota died mid-Session. Same structural reason as the branch above —
+        # nothing completed, so nothing is persisted as complete; the checkpoint stays resumable.
+        logger.warning("Session %r suspended on a dead provider quota: %s", runtime.session_id, err)
+        # A quota that dies on the Diagnostic leaves no checkpoint; offering a resume would be a stall.
+        next_step = (
+            "Resuming re-tries the provider once."
+            if _checkpoint_values(api_state, runtime.session_id)
+            else "Nothing was checkpointed yet; start a new Session after the reset."
+        )
+        runtime.emit({"type": "session_error", "error": f"Session suspended: {err} {daily_reset_hint()} {next_step}"})
     except AccountingUnavailable as err:
         # M0a / F1: a metered call was refused because usage accounting is broken or unreconciled.
         # Its own branch for the same structural reason as the one above — nothing completed, so

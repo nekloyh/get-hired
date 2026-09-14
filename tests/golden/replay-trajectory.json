@@ -7,6 +7,7 @@
     "max_questions": 3,
     "next_skill": null,
     "question_count": 3,
+    "schema_version": 1,
     "session_id": "alice-traj",
     "skill_metadata": {
       "deep_learning": {

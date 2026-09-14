@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 
 from .llm import LLMClient, Message, Validator
 from .skill import SkillState
-from .usage import AccountingUnavailable
+from .usage import AccountingUnavailable, ProviderQuotaExhausted
 
 logger = logging.getLogger(__name__)
 
@@ -197,10 +197,7 @@ def diagnose(
     """
     criticality = role_criticality(profile.target_role, profile.target_companies)
     means = _initial_mastery_means(profile, ledger_priors)
-    priors = {
-        skill: _seed_prior(skill, means[skill], criticality[skill])
-        for skill in SKILLS
-    }
+    priors = {skill: _seed_prior(skill, means[skill], criticality[skill]) for skill in SKILLS}
     if client is None:
         plan = tuple(_topic_plan_entry(skill, priors[skill], means[skill]) for skill in _ordered_skills(priors))
         source = TopicPlanSource.DETERMINISTIC
@@ -232,10 +229,10 @@ def diagnose_or_degrade(
     """
     try:
         return diagnose(profile, client, ledger_priors=ledger_priors)
-    except AccountingUnavailable:
-        # M0a / F1: not a provider failure to degrade around. Degrading here would start a Session
-        # whose every subsequent call is refused anyway, and would report a broken ledger as a
-        # deterministic Topic Plan — a stop the operator can act on, disguised as a fallback.
+    except (AccountingUnavailable, ProviderQuotaExhausted):
+        # M0a / F1 and GH #119: not failures to degrade around. Degrading would start a Session
+        # whose every subsequent call is refused or dead anyway, and would report a broken ledger or
+        # a spent quota as a deterministic Topic Plan — a stop the operator can act on, disguised.
         raise
     except Exception as err:  # noqa: BLE001 — pre-graph call site; degrade instead of crash (ADR 0005)
         if client is None:
@@ -289,10 +286,7 @@ def _build_diagnostic_messages(
     profile: CandidateProfile,
     priors: Mapping[str, SeededSkillPrior],
 ) -> list[Message]:
-    claims = "\n".join(
-        f"- {skill}: {score:g}/5"
-        for skill, score in sorted(profile.claimed_skills.items())
-    ) or "- none"
+    claims = "\n".join(f"- {skill}: {score:g}/5" for skill, score in sorted(profile.claimed_skills.items())) or "- none"
     prior_lines = "\n".join(
         (
             f"- {skill}: mastery={prior.state.mastery:.3f}, "

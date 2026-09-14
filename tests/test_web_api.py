@@ -1315,6 +1315,8 @@ def test_the_suite_never_writes_into_the_operators_own_log_file(tmp_path):
 
     assert proc.returncode == 0, proc.stdout[-4000:]
     assert not log_file.exists(), f"collection wrote to COACH_LOG_FILE:\n{log_file.read_text(encoding='utf-8')[:2000]}"
+
+
 # --- R-25: the free-tier budget rail on the web surface ------------------------------------------
 
 
@@ -1601,6 +1603,66 @@ def test_a_mid_session_breach_suspends_instead_of_completing(tmp_path, monkeypat
     web_errors = [r for r in caplog.records if r.levelno >= logging.ERROR and r.name == "interview_coach.web_api"]
     assert web_errors == []
     assert any("suspended on a budget rail" in r.getMessage() for r in caplog.records)
+
+
+def test_a_dead_quota_mid_session_suspends_the_web_session(tmp_path, monkeypatch):
+    # GH #119 on the web surface: the typed quota stop propagates out of the graph and lands in its
+    # own branch — a session_error saying "suspended", never session_completed, nothing persisted.
+    from interview_coach import supervisor
+    from interview_coach.usage import ProviderQuotaExhausted
+
+    real_micro_loop = supervisor.run_micro_loop
+    calls = {"n": 0}
+
+    def _quota_dies_on_the_second_question(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise ProviderQuotaExhausted("mimo daily quota exhausted (insufficient_quota)")
+        return real_micro_loop(*args, **kwargs)
+
+    monkeypatch.setattr(supervisor, "run_micro_loop", _quota_dies_on_the_second_question)
+    client = _live_client(tmp_path, monkeypatch)
+
+    seen: list[dict] = []
+    with client.websocket_connect("/api/sessions/quota-dead") as ws:
+        _start_live(ws, max_questions=2)
+        assert ws.receive_json()["type"] == "session_started"
+        _expect_question(ws)
+        ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+        for _ in range(40):
+            seen.append(ws.receive_json())
+            if seen[-1]["type"] in {"session_error", "session_completed", "question"}:
+                break
+
+    event = seen[-1]
+    assert event["type"] == "session_error", f"the quota stop did not suspend after Q1: {event}"
+    assert "suspended" in event["error"].lower()
+    assert "insufficient_quota" in event["error"]
+    assert not [item for item in seen if item["type"] == "session_completed"]
+    assert client.app.state.web_api.completed_sessions == {}
+    assert client.get("/api/sessions/quota-dead/export.md").status_code == 404
+
+
+def test_a_dead_quota_on_the_diagnostic_tells_the_web_candidate_to_start_over(tmp_path, monkeypatch):
+    # Same first-call-of-the-day case on the web surface: no checkpoint exists, so the message must
+    # not promise that "Resume" re-tries anything.
+    from interview_coach.usage import ProviderQuotaExhausted
+
+    def _quota_dies(*args, **kwargs):
+        raise ProviderQuotaExhausted("mimo daily quota exhausted (insufficient_quota)")
+
+    monkeypatch.setattr(web_api, "diagnose_or_degrade", _quota_dies)
+    client = _live_client(tmp_path, monkeypatch)
+
+    with client.websocket_connect("/api/sessions/quota-diag") as ws:
+        _start_live(ws, max_questions=1)
+        event = ws.receive_json()
+
+    assert event["type"] == "session_error", event
+    assert "suspended" in event["error"].lower()
+    assert "Nothing was checkpointed yet" in event["error"]
+    assert "Resuming" not in event["error"]
+    assert client.app.state.web_api.completed_sessions == {}
 
 
 def test_a_refused_live_session_never_starts_the_interview(tmp_path, monkeypatch):

@@ -138,6 +138,19 @@ class StopReason(StrEnum):
     FAILED = "failed"
 
 
+_DISPLAY_STOP_REASONS = {
+    StopReason.SAFETY_CAP.value: "unresolved_by_safety_cap",
+    StopReason.FOLLOW_UP_UNAVAILABLE.value: "degraded_follow_up_unavailable",
+    StopReason.FAILED.value: "failed_recorded_and_skipped",
+}
+
+
+def display_stop_reason(stop_reason: object) -> str:
+    """Human-facing label for a stop reason (CLI summary and Markdown export share it)."""
+    text = "" if stop_reason is None else str(stop_reason)
+    return _DISPLAY_STOP_REASONS.get(text, text)
+
+
 @dataclass(frozen=True)
 class TurnTrace:
     """Debug trace for the agent decisions attached to one micro-loop turn.

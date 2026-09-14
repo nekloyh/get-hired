@@ -26,7 +26,7 @@ from interview_coach.llm import (
     build_client,
     call_counts,
 )
-from interview_coach.usage import usage_for_day
+from interview_coach.usage import ProviderQuotaExhausted, usage_for_day
 
 
 class Foo(BaseModel):
@@ -611,17 +611,18 @@ def test_insufficient_quota_fails_fast_without_backoff(monkeypatch, tmp_path, fa
     fake = fake_openai_factory([_rate_limited(message="You exceeded your current quota: insufficient_quota")])
     client = MimoClient(_provider("mimo"), client=fake)
 
-    with pytest.raises(openai_sdk.RateLimitError):
+    # GH #119: a TYPED stop, not the SDK's RateLimitError — question_node re-raises it past its
+    # failure-isolation net, so a dead quota suspends instead of recording a zero-evidence `failed`.
+    with pytest.raises(ProviderQuotaExhausted, match="insufficient_quota"):
         client.chat([{"role": "user", "content": "go"}])
 
     assert fake.call_count == 1
     assert waits == []
-    # ADR 0005's addendum calls insufficient_quota the DETECTION half of budget exhaustion; this
-    # latch is what carries it to the session-behaviour half (R-25). Without it the exception is
-    # swallowed by question_node's failure-isolation net and the fact is lost, so the Session
-    # cascades into zero-evidence `failed` questions and exits 0.
+    # ADR 0005's addendum calls insufficient_quota the DETECTION half of budget exhaustion; the latch
+    # carries it to the session-behaviour half (R-25) across processes.
     assert usage.quota_exhausted_today("mimo")
     assert not usage.quota_exhausted_today("openai")  # per provider, never a global kill switch
+    assert llm_module.is_provider_failure(ProviderQuotaExhausted("x"))  # routed roles still fail over
 
 
 def test_transport_backoff_gives_up_after_bounded_attempts(monkeypatch, fake_openai_factory):

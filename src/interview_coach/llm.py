@@ -26,7 +26,13 @@ from pydantic import BaseModel, ValidationError
 
 from . import telemetry
 from .config import ProviderName, ProviderSettings, RoleName, Settings
-from .usage import AccountingUnavailable, accounting_gate, record_quota_exhausted, record_usage
+from .usage import (
+    AccountingUnavailable,
+    ProviderQuotaExhausted,
+    accounting_gate,
+    record_quota_exhausted,
+    record_usage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -133,9 +139,10 @@ def is_provider_failure(err: BaseException) -> bool:
     from a bad call site, an :class:`LLMConfigurationError` from a half-configured provider, a
     :class:`StructuredOutputError` the model earned. Those used to be indistinguishable from an
     outage, so a code bug would silently spend a second provider's tokens and return *something* —
-    hiding the defect behind a plausible answer. They now propagate.
+    hiding the defect behind a plausible answer. They now propagate. A dead quota is the provider
+    failing too: routed roles fail over and the breaker counts it; the pinned judge propagates it.
     """
-    return isinstance(err, (openai.APIError, EmptyCompletionError))
+    return isinstance(err, (openai.APIError, EmptyCompletionError, ProviderQuotaExhausted))
 
 
 # Per-provider circuit breaker (R-09). A provider that failed this many times in a row is not going
@@ -446,14 +453,12 @@ class _OpenAICompatibleClient(LLMClient):
                         self.provider_name,
                         "logs/usage-ledger.jsonl",
                     )
-                    # ADR 0005's addendum names insufficient_quota as the DETECTION half of budget
-                    # exhaustion and GH #80 as the session-behaviour half. Latching it here is what
-                    # joins them: this exception is about to be swallowed by question_node's
-                    # failure-isolation net, so the fact that the quota is dead has to outlive it —
-                    # otherwise the Session cascades into zero-evidence `failed` questions and exits
-                    # 0 with a Study Plan built from nothing.
+                    # ADR 0005: the latch outlives this process (the start gate reads it); the typed
+                    # raise is what question_node re-raises instead of recording a `failed` (GH #119).
                     record_quota_exhausted(self.provider_name)
-                    raise
+                    raise ProviderQuotaExhausted(
+                        f"{self.provider_name} daily quota exhausted (insufficient_quota)"
+                    ) from err
                 if not will_retry:
                     raise
                 wait = _retry_wait(err, attempt)

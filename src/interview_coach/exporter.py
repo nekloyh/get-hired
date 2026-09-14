@@ -6,19 +6,9 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from .microloop import display_stop_reason
 from .session_serde import decision_records, sorted_skill_states, transcript_items
 from .skill import SkillState
-
-
-def _display_stop_reason(stop_reason: Any) -> str:
-    text = "" if stop_reason is None else str(stop_reason)
-    if text == "safety_cap":
-        return "unresolved_by_safety_cap"
-    if text == "follow_up_unavailable":
-        return "degraded_follow_up_unavailable"
-    if text == "failed":
-        return "failed_recorded_and_skipped"
-    return text
 
 
 def export_session_markdown(session_state: Mapping[str, Any], path: str | Path) -> Path:
@@ -108,7 +98,7 @@ def _append_transcript(lines: list[str], session_state: Mapping[str, Any]) -> No
         if item.stop_reason == "failed":
             lines.append(
                 f"**Question failed and was skipped** — `{_md(item.error or 'unknown error')}`; "
-                f"stop: `{_md(_display_stop_reason(item.stop_reason))}`."
+                f"stop: `{_md(display_stop_reason(item.stop_reason))}`."
             )
         else:
             score_label = "Kept score" if item.stop_reason == "safety_cap" else "Resolved score"
@@ -116,7 +106,7 @@ def _append_transcript(lines: list[str], session_state: Mapping[str, Any]) -> No
                 f"{score_label}: **{item.resolved_weighted_score:.2f}/5**; "
                 f"confidence: **{item.resolved_confidence:.2f}**; "
                 f"evidence weight: **{item.evidence_weight:.2f}**; "
-                f"stop: `{_md(_display_stop_reason(item.stop_reason))}`."
+                f"stop: `{_md(display_stop_reason(item.stop_reason))}`."
             )
         lines.append("")
         for turn_n, turn in enumerate(item.turns, start=1):

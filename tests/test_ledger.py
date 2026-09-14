@@ -15,6 +15,7 @@ from interview_coach.diagnostic import CandidateProfile, diagnose
 from interview_coach.evaluator import Evaluation
 from interview_coach.ledger import (
     LEDGER_HALF_LIFE_DAYS,
+    LEDGER_SCHEMA_VERSION,
     SECONDS_PER_DAY,
     decay_beta,
     load_priors,
@@ -232,9 +233,23 @@ def test_concurrent_saves_for_different_candidates_both_persist(tmp_path, monkey
 
     # Both new records AND the pre-existing one survive the merge — losing "carol" would mean the
     # winning writer had merged into a stale read.
-    assert sorted(json.loads(path.read_text(encoding="utf-8"))) == ["alice", "bob", "carol"]
+    candidates = [key for key in json.loads(path.read_text(encoding="utf-8")) if key != "_meta"]
+    assert sorted(candidates) == ["alice", "bob", "carol"]
     assert load_priors(path, "alice", now=0.0).raw_mastery["mlops"] == pytest.approx(0.9)
     assert load_priors(path, "bob", now=0.0).raw_mastery["mlops"] == pytest.approx(2.0 / 3.0)
+
+
+def test_the_ledger_carries_a_schema_version_that_is_never_read_as_a_candidate(tmp_path):
+    path = tmp_path / "ledger.json"
+    save_posteriors(path, "alice", {"mlops": SkillState("mlops", alpha=8.0, beta=2.0)}, now=0.0)
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["_meta"] == {"schema_version": LEDGER_SCHEMA_VERSION}
+    assert load_priors(path, "alice", now=0.0).raw_mastery["mlops"] == pytest.approx(0.8)
+    assert load_states(path, "alice", now=0.0)["mlops"].alpha == pytest.approx(8.0)
+    # The meta record is not a Candidate: asking for it is a cold start, not a crash.
+    assert load_priors(path, "_meta", now=0.0) is None
+    assert load_states(path, "_meta", now=0.0) is None
 
 
 def test_failed_publish_keeps_the_old_ledger_and_leaves_no_temp_file(tmp_path, monkeypatch, caplog):

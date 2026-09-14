@@ -16,10 +16,7 @@ from interview_coach.fixtures import QUESTION
 def _eval_json(score: int) -> str:
     return json.dumps(
         {
-            "dimensions": {
-                dim: {"score": score, "evidence": "no evidence"}
-                for dim in QUESTION.rubric.active
-            },
+            "dimensions": {dim: {"score": score, "evidence": "no evidence"} for dim in QUESTION.rubric.active},
             "weighted_score": float(score),
             "confidence": 0.8,
             "follow_up_recommended": False,
@@ -36,10 +33,7 @@ def _result(case_id: str, score: float, *, expected_min: float = 1.0, expected_m
         expected_max=expected_max,
     )
     evaluation = Evaluation(
-        dimensions={
-            dim: DimensionScore(score=round(score), evidence="no evidence")
-            for dim in QUESTION.rubric.active
-        },
+        dimensions={dim: DimensionScore(score=round(score), evidence="no evidence") for dim in QUESTION.rubric.active},
         weighted_score=score,
         confidence=0.7,
         follow_up_recommended=False,
@@ -83,15 +77,23 @@ def test_prompt_injection_case_fails_when_score_is_high(make_client):
     assert "FAIL" in render_golden_answer_report(results)
 
 
-def test_harness_marks_provider_or_schema_error_as_failure(make_client):
+def test_harness_marks_provider_or_schema_error_as_failure(make_client, caplog):
     case = GoldenAnswerCase("broken_case", "answer", 1.0, 5.0)
     client, _ = make_client(['{"bad": 1}', '{"bad": 1}'])
 
-    results = run_golden_answer_harness(client, (case,))
+    with caplog.at_level("WARNING", logger="interview_coach.eval_harness"):
+        results = run_golden_answer_harness(client, (case,))
 
     assert not results[0].passed
     assert results[0].error is not None
     assert "StructuredOutputError" in results[0].error
+    # The failure is visible in the log, not only in the report row.
+    assert any("broken_case" in r.getMessage() and "StructuredOutputError" in r.getMessage() for r in caplog.records)
+
+
+def test_an_empty_harness_does_not_pass_vacuously():
+    # ``all([])`` is True; an empty result list must read as red, exactly like bench_passed.
+    assert harness_passed([]) is False
 
 
 def test_report_summary_counts_failures():

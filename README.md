@@ -187,10 +187,7 @@ fallback. **The validated judge is `openai` / `gpt-5.4-mini`** — the configura
 ## Run
 
 ```bash
-uv run python -m interview_coach                          # run the micro-loop over the seed questions
-uv run python -m interview_coach interview --max-turns 6  # raise the per-question safety cap
-uv run python -m interview_coach interview --concept-store chroma --concept-persist-dir .chroma
-uv run python -m interview_coach evaluate --answer weak   # slices 0001–0002: evaluate one fixture answer
+uv run python -m interview_coach                          # prints the subcommand help and exits 2
 uv run python -m interview_coach diagnose --target-role "machine learning engineer" --claim mlops=4             # LLM agent when configured, else deterministic
 uv run python -m interview_coach diagnose --offline --target-role "machine learning engineer" --claim mlops=4   # force the deterministic offline path
 uv run python -m interview_coach session --max-questions 3 --export-markdown exports/session.md                 # interactive Candidate answers
@@ -317,8 +314,7 @@ cd web && npm run test:e2e  # optional: requires the backend API running and Pla
 - `src/interview_coach/fixtures.py` — the slice-0001 hard-coded question + strong/weak fixture answers.
 - `src/interview_coach/skill.py` — the Beta-distributed `SkillState` (`mastery`/`confidence` from
   α/β) and its pure-Python updater `apply_evaluation()`. No LLM by design (ADR 0002).
-- `src/interview_coach/cli.py` — `interview` runs the micro-loop over the seed questions; `evaluate`
-  runs the slices 0001–0002 demo (judgment → before→after Skill state); `session` is the live
-  terminal UI; `api` runs the web backend; `eval-harness` runs the Evaluator regression checks.
+- `src/interview_coach/cli.py` — `session` is the live terminal UI; `api` runs the web backend;
+  `eval-harness` runs the Evaluator regression checks.
 - `web/` — Vite React + TypeScript local UI with typed WebSocket events, setup controls, interview
   workspace, live Skill/Topic Plan sidebars, final report, unit tests, and a Playwright demo-flow spec.

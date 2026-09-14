@@ -13,6 +13,7 @@ run needs a live provider.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib import resources
@@ -25,6 +26,8 @@ from .evaluator import Evaluation, evaluate
 from .language import validate_language_mode
 from .llm import LLMClient
 from .rubric import Rubric
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -185,6 +188,7 @@ def _evaluate_case(client: LLMClient, case: BenchCase) -> tuple[Evaluation | Non
     try:
         evaluation = evaluate(client, case.question, case.answer, case.rubric, language_mode=case.language_mode)
     except Exception as err:  # noqa: BLE001 - the bench reports provider/schema failures as cases
+        logger.warning("bench case %s errored (%s: %s)", case.case_id, type(err).__name__, err)
         return None, f"{type(err).__name__}: {err}"
     return evaluation, None
 

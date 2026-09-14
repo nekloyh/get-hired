@@ -20,9 +20,8 @@ from interview_coach.diagnostic import CandidateProfile, DiagnosticResult, Topic
 from interview_coach.eval_harness import GoldenAnswerCase, GoldenAnswerResult
 from interview_coach.evaluator import DimensionScore, Evaluation
 from interview_coach.fixtures import QUESTION
-from interview_coach.microloop import DEFAULT_MAX_TURNS, MicroLoopResult, StopReason, Turn
+from interview_coach.microloop import DEFAULT_MAX_TURNS
 from interview_coach.rubric import DIMENSIONS
-from interview_coach.skill import SkillState
 from interview_coach.supervisor import build_session_graph, initial_session_state, session_config
 
 
@@ -84,7 +83,16 @@ def test_diagnose_offline_flag_forces_deterministic_even_when_configured(monkeyp
 def test_required_llm_command_still_errors_when_unconfigured(monkeypatch):
     monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=False))
 
-    assert cli.main(["evaluate"]) == 2
+    assert cli.main(["eval-harness"]) == 2
+
+
+def test_bare_coach_prints_help_and_exits_2(capsys):
+    # The slice demos that used to run on a bare `coach` are gone; nothing runs by default.
+    assert cli.main([]) == 2
+
+    err = capsys.readouterr().err
+    assert "usage:" in err
+    assert "session" in err
 
 
 def _harness_result(score: float, *, expected_min: float = 1.0, expected_max: float = 5.0) -> GoldenAnswerResult:
@@ -403,35 +411,6 @@ def test_cmd_session_resume_resets_clock_via_cli(tmp_path, monkeypatch, capsys):
     assert "stop_reason: max_elapsed_seconds" not in output  # the clock was reset; no stale force-complete
 
 
-def test_cli_prints_follow_up_unavailable_as_degrade(capsys):
-    ev = Evaluation(
-        dimensions={"correctness": DimensionScore(score=2, evidence="no evidence")},
-        weighted_score=2.0,
-        confidence=0.8,
-        follow_up_recommended=True,
-        follow_up_rationale="needs a probe",
-    )
-    result = MicroLoopResult(
-        skill="ml_fundamentals",
-        turns=(
-            Turn(
-                question="Explain L2 regularization.",
-                answer="It makes weights smaller.",
-                evaluation=ev,
-                is_follow_up=False,
-            ),
-        ),
-        stop_reason=StopReason.FOLLOW_UP_UNAVAILABLE,
-        skill_state=SkillState.neutral("ml_fundamentals"),
-    )
-
-    cli._print_micro_loop(result)
-
-    output = capsys.readouterr().out
-    assert "degraded because a Follow-up was unavailable" in output
-    assert "halted by SAFETY CAP" not in output
-
-
 # --- R-12: `coach api` refuses to fork workers ---------------------------------------------------
 
 
@@ -483,6 +462,8 @@ def test_the_exported_log_file_does_not_outlive_the_test_that_exported_it():
     # tmp_path pytest deletes on the way out. conftest's autouse teardown is what sweeps it, and
     # deleting that fixture left the whole suite green until this assertion existed.
     assert "COACH_LOG_FILE" not in os.environ
+
+
 # --- R-25: the free-tier budget rail on the CLI surface ------------------------------------------
 
 
@@ -613,8 +594,17 @@ def test_session_refuses_to_start_when_the_ledger_cannot_be_written(tmp_path, mo
     monkeypatch.setattr(cli, "diagnose_or_degrade", _never)
 
     rc = cli.main(
-        ["session", "--scripted", "--no-live", "--max-questions", "1", "--session-id", "no-ledger",
-         "--checkpoint-db", str(tmp_path / "c.sqlite")]
+        [
+            "session",
+            "--scripted",
+            "--no-live",
+            "--max-questions",
+            "1",
+            "--session-id",
+            "no-ledger",
+            "--checkpoint-db",
+            str(tmp_path / "c.sqlite"),
+        ]
     )
 
     err = capsys.readouterr().err
@@ -1066,34 +1056,88 @@ def test_a_dead_quota_suspends_before_the_first_question(tmp_path, monkeypatch, 
 
 
 def test_a_dead_quota_mid_question_suspends_instead_of_cascading(tmp_path, monkeypatch, capsys):
-    # The harder half: the quota dies once the graph is already running, so the exception DOES land
-    # in question_node's `except Exception` net and one `failed` question is unavoidable without
-    # editing supervisor.py. What the latch buys is that it stops there — one, not one per remaining
-    # question, and exit 2 with no Study Plan instead of exit 0 with a fabricated one.
-    class _QuotaAfterDiagnostic(_ProviderDemoClient):
-        calls = 0
+    # GH #119: the quota dies once the graph is already running. The typed stop must propagate past
+    # question_node's net — no zero-evidence `failed` item, no advance — and the CLI suspends with
+    # the resume command instead of printing a "(complete)" summary built on nothing.
+    from interview_coach import supervisor
+    from interview_coach.usage import ProviderQuotaExhausted
 
-        def chat_json(self, *args, **kwargs):
-            type(self).calls += 1
-            if type(self).calls > 1:
-                usage.record_quota_exhausted("mimo")
-                raise RuntimeError("Error code: 429 - insufficient_quota")
-            return super().chat_json(*args, **kwargs)
+    real_micro_loop = supervisor.run_micro_loop
+    calls = {"n": 0}
 
+    def _quota_dies_on_the_second_question(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise ProviderQuotaExhausted("mimo daily quota exhausted (insufficient_quota)")
+        return real_micro_loop(*args, **kwargs)
+
+    monkeypatch.setattr(supervisor, "run_micro_loop", _quota_dies_on_the_second_question)
     _tmp_ledger(monkeypatch, tmp_path)
     monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
-    monkeypatch.setattr(cli, "build_client", lambda settings: _QuotaAfterDiagnostic())
+    monkeypatch.setattr(cli, "build_client", lambda settings: _ProviderDemoClient())
     db_path = tmp_path / "mid-quota.sqlite"
 
     rc = cli.main(_session_argv("mid-quota", db_path, questions="3"))
+    out, err = capsys.readouterr()
+
+    assert rc == 2
+    assert "SESSION SUSPENDED" in err
+    assert "insufficient_quota" in err
+    assert "--resume" in err
+    assert "SESSION mid-quota (complete)" not in out
+    state = _checkpoint_state("mid-quota", db_path)
+    assert [item["stop_reason"] for item in state["transcript"]] == ["resolved"]
+    assert state["question_count"] == 1
+    assert state["status"] == "active"
+    assert not state.get("study_plan")
+
+
+def test_a_dead_quota_on_the_diagnostic_offers_no_resume_because_nothing_was_checkpointed(
+    tmp_path, monkeypatch, capsys
+):
+    # The first call of the day is the one the start gate cannot predict: the latch is written by the
+    # call that dies. Dying on the Diagnostic leaves no graph checkpoint, so the suspend banner must
+    # not point at `--resume` (that path answers with an unknown-id error).
+    from interview_coach.usage import ProviderQuotaExhausted
+
+    def _quota_dies_on_the_diagnostic(*args, **kwargs):
+        raise ProviderQuotaExhausted("mimo daily quota exhausted (insufficient_quota)")
+
+    monkeypatch.setattr(cli, "diagnose_or_degrade", _quota_dies_on_the_diagnostic)
+    _tmp_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: _ProviderDemoClient())
+    db_path = tmp_path / "diag-quota.sqlite"
+
+    rc = cli.main(_session_argv("diag-quota", db_path))
+    out, err = capsys.readouterr()
+
+    assert rc == 2
+    assert "SESSION SUSPENDED" in err
+    assert "Nothing was checkpointed yet" in err
+    assert "--resume" not in err
+    assert _checkpoint_state("diag-quota", db_path) is None
+    assert "SESSION diag-quota" not in out
+
+
+def test_diagnose_on_a_dead_quota_exits_2_with_the_reason_not_a_traceback(monkeypatch, capsys):
+    # `diagnose_or_degrade` re-raises the typed stop (it must not disguise a dead quota as a
+    # deterministic plan), so the dispatcher owns the exit for every non-session command.
+    from interview_coach.usage import ProviderQuotaExhausted
+
+    def _quota_dies(*args, **kwargs):
+        raise ProviderQuotaExhausted("mimo daily quota exhausted (insufficient_quota)")
+
+    monkeypatch.setattr(cli, "diagnose_or_degrade", _quota_dies)
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: object())
+
+    rc = cli.main(["diagnose", "--target-role", "machine learning engineer"])
     err = capsys.readouterr().err
 
     assert rc == 2
     assert "insufficient_quota" in err
-    state = _checkpoint_state("mid-quota", db_path)
-    assert [item["stop_reason"] for item in state["transcript"]] == ["failed"]
-    assert state["status"] != "complete"
-    assert not state.get("study_plan")
+    assert "resets at 00:00 UTC" in err
 
 
 def test_a_resume_retries_the_provider_once_and_re_suspends_if_it_is_still_dead(tmp_path, monkeypatch, capsys):

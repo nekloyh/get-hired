@@ -254,9 +254,7 @@ def test_novelty_threshold_boundary():
 
 def test_novelty_gate_accepts_a_custom_similarity_fn():
     # The embedding seam: any callable scoring [0, 1] can replace the Jaccard default.
-    rejection, nearest, similarity = novelty_gate(
-        "anything", ["unrelated"], similarity_fn=lambda a, b: 0.99
-    )
+    rejection, nearest, similarity = novelty_gate("anything", ["unrelated"], similarity_fn=lambda a, b: 0.99)
     assert rejection is not None and rejection.gate == GATE_NOVELTY
     assert similarity == pytest.approx(0.99)
 
@@ -311,7 +309,7 @@ def test_admission_gate_turns_answer_generation_failure_into_rejection(make_clie
 
 def test_zero_drafts_surviving_to_gate_3_is_not_reported_as_success(make_client):
     # Both drafts die at gate 1 → gate 3 must spend nothing and the report must say so explicitly
-    # (harness_passed([]) is vacuously True; the report guard is the defense).
+    # (admission_gate never calls harness_passed, so the report guard is the defense).
     client, fake = make_client(
         [
             _draft_set_json(
@@ -402,9 +400,7 @@ def test_review_queue_round_trips_through_the_bank_validator(make_client, tmp_pa
     assert set(data) == {SKILL}
     seen: set[str] = set()
     for i, raw in enumerate(data[SKILL]):
-        parsed = validate_question(
-            raw, skill=SKILL, concept_ids={_NOTE.id}, seen_questions=seen, where=f"queue[{i}]"
-        )
+        parsed = validate_question(raw, skill=SKILL, concept_ids={_NOTE.id}, seen_questions=seen, where=f"queue[{i}]")
         assert isinstance(parsed, SeedQuestion)
         # answers[0] is the admitted strong answer per the bank contract (answers[0] answers the seed)
         assert parsed.answers[0].startswith("Weight decay penalizes")
@@ -421,9 +417,7 @@ def test_forge_never_touches_the_shipped_bank_files(make_client, tmp_path):
         [_draft_set_json(_draft_dict()), _answer_pair_json(), _eval_json(4.2, 4), _eval_json(2.0, 2)]
     )
     run = run_forge(client, SKILL, 1, concepts=[_NOTE], existing_prompts=[])
-    write_forge_outputs(
-        run, queue_path=tmp_path / "q.yaml", provider="mimo", model="test-model", date="2026-07-11"
-    )
+    write_forge_outputs(run, queue_path=tmp_path / "q.yaml", provider="mimo", model="test-model", date="2026-07-11")
     assert (bank_path.read_bytes(), concepts_path.read_bytes()) == before
 
 

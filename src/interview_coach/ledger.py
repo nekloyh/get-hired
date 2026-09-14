@@ -12,8 +12,8 @@ evidence bar (ADR 0002 — role never moves the mean, and the seeded prior stays
 direct evidence dominates within an answer or two).
 
 Storage is a single JSON file mapping ``candidate_id -> {completed_at, skills: {skill: {alpha, beta}}}``
-— diff-friendly and hand-inspectable. A missing or corrupt ledger degrades to cold start with a
-logged warning; it never crashes a Session.
+plus a ``_meta: {schema_version}`` key — diff-friendly and hand-inspectable. A missing or corrupt
+ledger degrades to cold start with a logged warning; it never crashes a Session.
 """
 
 from __future__ import annotations
@@ -34,6 +34,8 @@ from .skill import NEUTRAL_ALPHA, NEUTRAL_BETA, SkillState
 logger = logging.getLogger(__name__)
 
 SECONDS_PER_DAY = 86_400.0
+# Written under the top-level ``_meta`` key; candidate records are every other key.
+LEDGER_SCHEMA_VERSION = 1
 
 # Half-life of carried evidence, in days: after this long a Skill's pseudo-count mass above the neutral
 # prior has decayed by half, so a returning Candidate's edge fades over ~a month of absence. Chosen so
@@ -85,11 +87,13 @@ class LedgerPriors:
     days_elapsed: float
 
 
-def load_priors(path: str | Path, candidate_id: str, *, now: float) -> LedgerPriors | None:
-    """Load a Candidate's carried priors, or ``None`` for a first-ever/absent/corrupt ledger.
+def _load_candidate(
+    path: str | Path, candidate_id: str, now: float
+) -> tuple[float, dict[str, tuple[float, float]]] | None:
+    """Read and validate one Candidate's record: ``(days_elapsed, {skill: (alpha, beta)})`` or ``None``.
 
-    Never raises: a missing file is a normal cold start; a corrupt or malformed ledger logs a warning
-    and degrades to cold start rather than crashing the Session.
+    Never raises: a missing file or unknown Candidate is a normal cold start; a corrupt, malformed or
+    non-finite ledger logs a warning and degrades to cold start rather than crashing the Session.
     """
     if not candidate_id:
         return None
@@ -101,82 +105,61 @@ def load_priors(path: str | Path, candidate_id: str, *, now: float) -> LedgerPri
         logger.warning("Skill ledger unreadable at %s (%s); starting cold.", path, err)
         return None
     try:
-        data = json.loads(raw)
-        entry = data[candidate_id]
+        entry = json.loads(raw)[candidate_id]
         completed_at = float(entry["completed_at"])
         if not math.isfinite(completed_at):
             raise ValueError("non-finite completed_at")
-        skills = entry["skills"]
-        raw_mastery: dict[str, float] = {}
-        seed_means: dict[str, float] = {}
         days_elapsed = max(0.0, (now - completed_at) / SECONDS_PER_DAY)
-        for skill, params in skills.items():
-            alpha = float(params["alpha"])
-            beta = float(params["beta"])
+        params: dict[str, tuple[float, float]] = {}
+        for skill, raw_params in entry["skills"].items():
+            alpha = float(raw_params["alpha"])
+            beta = float(raw_params["beta"])
             # json.loads accepts NaN/Infinity, and every comparison against NaN is False, so the
-            # positivity check alone would let a non-finite param through into NaN seed priors —
-            # exactly the outcome this module promises is impossible. Reject non-finite explicitly.
+            # positivity check alone would let a non-finite param through. Reject it explicitly.
             if not (math.isfinite(alpha) and math.isfinite(beta)) or alpha <= 0 or beta <= 0:
                 raise ValueError(f"invalid Beta params for {skill!r} (must be finite and positive)")
-            raw_mastery[skill] = alpha / (alpha + beta)
-            d_alpha, d_beta = decay_beta(alpha, beta, days_elapsed)
-            seed_means[skill] = d_alpha / (d_alpha + d_beta)
+            params[skill] = (alpha, beta)
     except KeyError:
         # File exists but has no record for this Candidate — a normal first-ever Session for them.
         return None
     except (ValueError, TypeError, json.JSONDecodeError) as err:
         logger.warning("Skill ledger for %r is malformed (%s); starting cold.", candidate_id, err)
         return None
-    if not seed_means:
+    return (days_elapsed, params) if params else None
+
+
+def load_priors(path: str | Path, candidate_id: str, *, now: float) -> LedgerPriors | None:
+    """Load a Candidate's carried priors, or ``None`` for a first-ever/absent/corrupt ledger."""
+    loaded = _load_candidate(path, candidate_id, now)
+    if loaded is None:
         return None
+    days_elapsed, params = loaded
+    raw_mastery: dict[str, float] = {}
+    seed_means: dict[str, float] = {}
+    for skill, (alpha, beta) in params.items():
+        raw_mastery[skill] = alpha / (alpha + beta)
+        d_alpha, d_beta = decay_beta(alpha, beta, days_elapsed)
+        seed_means[skill] = d_alpha / (d_alpha + d_beta)
     return LedgerPriors(raw_mastery=raw_mastery, seed_means=seed_means, days_elapsed=days_elapsed)
 
 
 def load_states(path: str | Path, candidate_id: str, *, now: float) -> dict[str, SkillState] | None:
-    """Load a Candidate's per-Skill Beta posteriors, decayed to ``now`` (issue 0026).
+    """Load a Candidate's full decayed Beta params as SkillStates (issue 0026), or ``None``.
 
-    Unlike :func:`load_priors` — which deliberately exposes only *means* for the Diagnostic prior
-    seam — this rehydrates full :class:`SkillState` objects so reconstructed post-mortem evidence
+    Unlike :func:`load_priors` this keeps both parameters, so reconstructed post-mortem evidence
     can be fused through the sanctioned ``observe()`` seam. Decay is applied HERE, before any caller
     observes new evidence: ``save_posteriors`` stamps a fresh ``completed_at`` for the whole record,
     so saving un-decayed params back would silently un-decay stale evidence.
-
-    Never raises: missing/unknown/corrupt/non-finite ledgers degrade to ``None`` (cold start) with
-    the same discipline as :func:`load_priors`.
     """
-    if not candidate_id:
+    loaded = _load_candidate(path, candidate_id, now)
+    if loaded is None:
         return None
-    try:
-        raw = Path(path).read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None
-    except OSError as err:
-        logger.warning("Skill ledger unreadable at %s (%s); starting cold.", path, err)
-        return None
-    try:
-        data = json.loads(raw)
-        entry = data[candidate_id]
-        completed_at = float(entry["completed_at"])
-        if not math.isfinite(completed_at):
-            raise ValueError("non-finite completed_at")
-        days_elapsed = max(0.0, (now - completed_at) / SECONDS_PER_DAY)
-        states: dict[str, SkillState] = {}
-        for skill, params in entry["skills"].items():
-            alpha = float(params["alpha"])
-            beta = float(params["beta"])
-            # Same explicit non-finite rejection as load_priors: json.loads accepts NaN/Infinity and
-            # NaN defeats every comparison, so the positivity check alone is not enough.
-            if not (math.isfinite(alpha) and math.isfinite(beta)) or alpha <= 0 or beta <= 0:
-                raise ValueError(f"invalid Beta params for {skill!r} (must be finite and positive)")
-            d_alpha, d_beta = decay_beta(alpha, beta, days_elapsed)
-            states[skill] = SkillState(skill=skill, alpha=d_alpha, beta=d_beta)
-    except KeyError:
-        # File exists but has no record for this Candidate — a normal first-ever post-mortem for them.
-        return None
-    except (ValueError, TypeError, json.JSONDecodeError) as err:
-        logger.warning("Skill ledger for %r is malformed (%s); starting cold.", candidate_id, err)
-        return None
-    return states or None
+    days_elapsed, params = loaded
+    states: dict[str, SkillState] = {}
+    for skill, (alpha, beta) in params.items():
+        d_alpha, d_beta = decay_beta(alpha, beta, days_elapsed)
+        states[skill] = SkillState(skill=skill, alpha=d_alpha, beta=d_beta)
+    return states
 
 
 def save_posteriors(
@@ -207,12 +190,10 @@ def save_posteriors(
                     data = loaded
         except (OSError, json.JSONDecodeError) as err:
             logger.warning("Skill ledger at %s unreadable before save (%s); overwriting.", path, err)
+        data["_meta"] = {"schema_version": LEDGER_SCHEMA_VERSION}
         data[candidate_id] = {
             "completed_at": now,
-            "skills": {
-                skill: {"alpha": state.alpha, "beta": state.beta}
-                for skill, state in skill_states.items()
-            },
+            "skills": {skill: {"alpha": state.alpha, "beta": state.beta} for skill, state in skill_states.items()},
         }
         tmp_path: Path | None = None
         try:

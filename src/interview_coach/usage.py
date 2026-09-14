@@ -249,6 +249,14 @@ class AccountingUnavailable(RuntimeError):
     """
 
 
+class ProviderQuotaExhausted(RuntimeError):
+    """The provider's terminal ``insufficient_quota`` (GH #119, ADR 0005's third category).
+
+    Re-raised past every failure-isolation net exactly like :class:`AccountingUnavailable`: a dead
+    quota says nothing about the Candidate. The drivers turn it into a suspend with a resume path.
+    """
+
+
 # Which Session (if any) the calls on this thread belong to. A ContextVar rather than a parameter
 # threaded through every agent: ``record_usage`` is called from deep inside the provider clients,
 # and langgraph runs sync nodes in a copied context, so a scope entered by the driver is visible in

@@ -320,6 +320,62 @@ def test_an_accounting_refusal_is_not_recorded_as_a_failed_question(make_client,
     assert fake.call_count == 0
 
 
+def test_a_dead_quota_mid_session_suspends_and_resumes_without_a_failed_question(tmp_path, make_client, monkeypatch):
+    # GH #119 (ADR 0005's third category). insufficient_quota inside a question used to land in
+    # question_node's `except Exception` net: one zero-evidence `failed` item, question_count + 1.
+    # It must propagate like AccountingUnavailable, leave the checkpoint at the last resolved
+    # question, and let a plain resume pick the same question back up.
+    from interview_coach import supervisor
+    from interview_coach.usage import ProviderQuotaExhausted
+
+    base = _fake_micro_loop(4.0)
+    quota = {"dead": True, "calls": 0}
+
+    def _quota_dies_on_the_second_question(*args, **kwargs):
+        quota["calls"] += 1
+        if quota["calls"] == 2 and quota["dead"]:
+            raise ProviderQuotaExhausted("mimo daily quota exhausted (insufficient_quota)")
+        return base(*args, **kwargs)
+
+    monkeypatch.setattr(supervisor, "run_micro_loop", _quota_dies_on_the_second_question)
+    client, _ = make_client(
+        [
+            _decision("advance_plan", "Need the next planned Skill."),
+            _decision("advance_plan", "Need the next planned Skill."),
+            _plan("mlops", "system_design", "vietnamese_nlp"),
+        ]
+    )
+    session_id = "quota-mid-session"
+    config = session_config(session_id)
+    state = initial_session_state(session_id, _diagnostic(), max_questions=3, started_at=0)
+    second_skill = state["topic_plan"][1]["skill"]
+    prior_of_second_skill = dict(state["skill_states"][second_skill])
+
+    with SqliteSaver.from_conn_string(str(tmp_path / "quota.sqlite")) as checkpointer:
+        graph = build_session_graph(client, checkpointer=checkpointer, now=lambda: 1)
+        raised: list[BaseException] = []
+        try:
+            for _ in graph.stream(state, config, stream_mode="values"):
+                pass
+        except ProviderQuotaExhausted as err:
+            raised.append(err)
+        checkpoint = graph.get_state(config).values
+
+        assert checkpoint["question_count"] == 1
+        assert [item["stop_reason"] for item in checkpoint["transcript"]] == ["resolved"]
+        assert checkpoint["skill_states"][second_skill] == prior_of_second_skill
+        assert checkpoint["status"] == SessionStatus.ACTIVE.value
+        assert raised, "the quota stop was swallowed by question_node's failure-isolation net"
+
+        quota["dead"] = False
+        final = list(graph.stream(None, config, stream_mode="values"))[-1]
+
+    assert final["status"] == SessionStatus.COMPLETE.value
+    assert len(final["transcript"]) == 3
+    assert final["transcript"][1]["skill"] == second_skill
+    assert StopReason.FAILED.value not in {item["stop_reason"] for item in final["transcript"]}
+
+
 def test_supervisor_degrades_on_transport_error_at_decision_node(make_client, monkeypatch):
     # Issue 0020: a provider/transport error at the Supervisor's decision node (the only otherwise
     # unguarded macro-loop LLM call) must degrade to the deterministic plan-following decision, not
@@ -804,15 +860,13 @@ def test_skip_ahead_to_an_explicit_index_moves_the_pointer_and_the_skill():
     assert result["stop_reason"] is None
 
 
-def test_skip_ahead_without_a_target_jumps_two_entries():
-    # The documented default: skipping "over already-satisfied plan entries" means current + 2, not
-    # current + 1 (which would just be advance_plan).
+def test_skip_ahead_without_a_target_is_a_bug_not_a_silent_default():
+    # The validator already rejects a target-less skip_ahead and the fallback never emits one, so
+    # reaching here means a caller bypassed both — say so instead of inventing an index.
     state = _plan_state(["ml_fundamentals", "deep_learning", "mlops", "system_design"])
 
-    result = _apply(state, "skip_ahead")
-
-    assert result["current_plan_index"] == 2
-    assert result["next_skill"] == "mlops"
+    with pytest.raises(ValueError, match="skip_ahead requires target_plan_index"):
+        _apply(state, "skip_ahead")
 
 
 def test_skip_ahead_off_the_end_of_the_plan_completes_the_session():

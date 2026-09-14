@@ -14,12 +14,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypedDict, cast
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
-from typing_extensions import TypedDict
 
 from .concepts import ConceptStore
 from .diagnostic import SKILLS, DiagnosticResult
@@ -50,12 +49,14 @@ from .session_serde import (
 )
 from .skill import SkillState
 from .study_planner import plan_study
-from .usage import AccountingUnavailable
+from .usage import AccountingUnavailable, ProviderQuotaExhausted
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_QUESTIONS = 5
 DEFAULT_MAX_ELAPSED_SECONDS = 30 * 60
+# Stamped into every new checkpoint; readers tolerate its absence (pre-stamp checkpoints).
+SESSION_SCHEMA_VERSION = 1
 
 
 class SessionStatus(StrEnum):
@@ -72,6 +73,7 @@ class SupervisorAction(StrEnum):
 
 
 class SessionState(TypedDict, total=False):
+    schema_version: int  # SESSION_SCHEMA_VERSION; absent in pre-stamp checkpoints — never subscript it
     session_id: str
     topic_plan: list[dict[str, Any]]
     skill_states: dict[str, dict[str, float | str]]
@@ -158,6 +160,7 @@ def initial_session_state(
     language_mode = validate_language_mode(language_mode)
     topic_plan = [asdict(entry) for entry in diagnostic.topic_plan]
     state: SessionState = {
+        "schema_version": SESSION_SCHEMA_VERSION,
         "session_id": session_id,
         "topic_plan": topic_plan,
         "skill_states": {skill: prior.state.to_dict() for skill, prior in diagnostic.priors.items()},
@@ -275,12 +278,11 @@ def build_session_graph(
             # never be recorded as a zero-evidence `failed` question. The CLI turns it into exit code 2;
             # the web layer converts it into a session_error event.
             raise
-        except AccountingUnavailable:
-            # M0a / F1: a call refused because usage accounting is broken or unreconciled. Same
-            # shape and same reason as the branch above — the refusal is a fact about OUR
-            # bookkeeping, not evidence about the Candidate, so the net below turning it into a
-            # zero-evidence `failed` question would be the fake-evidence corruption ADR 0005
-            # forbids. The drivers convert it into a visible stop with a reconcile instruction.
+        except (AccountingUnavailable, ProviderQuotaExhausted):
+            # M0a / F1 and GH #119: a refused call (broken accounting) or a dead daily quota is a
+            # fact about our bookkeeping or the provider, not evidence about the Candidate — the net
+            # below would turn either into the zero-evidence `failed` question ADR 0005 forbids.
+            # The drivers convert them into a visible stop with a reconcile/resume instruction.
             raise
         except Exception as err:  # noqa: BLE001 — one bad question must not abort the Session (slice 0014)
             # A failure inside a single question (a malformed Evaluator output that survived its retry,
@@ -390,6 +392,10 @@ def decide_next_move(
             err,
         )
         return fallback
+    except ProviderQuotaExhausted:
+        # GH #119: the resolved question is already checkpointed, so suspending here is safe; a
+        # deterministic fallback would only walk the Session into the next dead call.
+        raise
     except Exception as err:  # noqa: BLE001 — the only otherwise-unguarded macro-loop LLM call site
         # A provider/transport failure (timeout, HTTP error after fallback exhaustion) is an
         # infrastructure failure, not schema-invalid output. Per ADR 0005 the Supervisor degrades to
@@ -441,7 +447,9 @@ def _apply_supervisor_decision(
     elif decision.action is SupervisorAction.EXTRA_QUESTION:
         next_skill = _last_probed_skill(state) or next_skill
     elif decision.action is SupervisorAction.SKIP_AHEAD:
-        next_index = decision.target_plan_index if decision.target_plan_index is not None else current_index + 2
+        if decision.target_plan_index is None:
+            raise ValueError("skip_ahead requires target_plan_index")
+        next_index = decision.target_plan_index
         next_skill = plan[next_index]["skill"] if next_index < len(plan) else None
         if next_skill is None:
             status = SessionStatus.COMPLETE.value
@@ -686,9 +694,6 @@ def _load_skill_state(state: SessionState, skill: str) -> SkillState:
 def skill_states_from_state(state: Mapping[str, Any]) -> dict[str, SkillState]:
     """Rehydrate every persisted Skill posterior — used to write the cross-session ledger (0023)."""
     return skill_states_from_mapping(state)
-
-
-
 
 
 def _skill_state_summary(state: SessionState) -> str:

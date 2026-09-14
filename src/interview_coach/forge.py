@@ -41,12 +41,13 @@ from .seeds import QUESTION_BANK, SeedQuestion
 logger = logging.getLogger(__name__)
 
 # Hard cap on --n. Gate 3 spends ~2 answer-generation + 2 evaluate() calls per surviving draft (and
-# each evaluate() is 1–4 chat calls worst case: retry, self-critique, evidence degrade), while the
-# LLM stack has NO rate-limit/backoff logic anywhere — batch size is the only free-tier budget rail.
+# each evaluate() is 1–4 chat calls worst case: retry, panel, evidence degrade). llm.py backs off
+# 429s/5xx, but backoff cannot refund a finite daily allowance — batch size is the budget rail.
 MAX_DRAFTS = 10
 
 # Gate 2 near-duplicate threshold on token-set Jaccard similarity (same ASCII tokenizer as
-# concepts.InMemoryConceptStore). Measured over the shipped corpus (42 bank + 20 FPT-pack prompts),
+# concepts.InMemoryConceptStore). Measured over the 2026-07 corpus (42 bank + 20 FPT-pack prompts;
+# the bank holds 45 today),
 # the most similar pair of *distinct* questions scores 0.478 while a verbatim copy scores 1.0 —
 # 0.6 sits above every legitimate pair with margin yet still catches light rephrasings. Calibrated
 # for Jaccard only: an embedding ``similarity_fn`` needs its own threshold (BGE cosine of unrelated
@@ -293,36 +294,6 @@ def jaccard_similarity(a: str, b: str) -> float:
     return len(ta & tb) / len(ta | tb)
 
 
-def build_embedding_similarity(model_name: str | None = None) -> SimilarityFn:
-    """Optional embedding-based gate-2 ranker (cosine over BGE-small), for the ``rag`` extras.
-
-    Mirrors ``ChromaConceptStore.create``'s deferred-import pattern so a bare install fails loudly
-    only when this path is actually requested; the pipeline default stays the offline Jaccard.
-    Callers wiring this into :func:`run_forge` must also pass a cosine-calibrated
-    ``novelty_threshold`` — the Jaccard default of 0.6 is far too low for BGE cosine scores.
-    """
-    try:
-        import chromadb  # noqa: F401 — presence check: the rag extra ships both packages together
-        from chromadb.utils import embedding_functions
-    except ImportError as err:
-        raise RuntimeError(
-            "embedding novelty detection requires optional packages: chromadb and sentence-transformers"
-        ) from err
-
-    from .concepts import BGE_SMALL_EN
-
-    embed = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model_name or BGE_SMALL_EN)
-
-    def similarity(a: str, b: str) -> float:
-        va, vb = embed([a, b])
-        dot = sum(x * y for x, y in zip(va, vb, strict=True))
-        norm_a = sum(x * x for x in va) ** 0.5
-        norm_b = sum(y * y for y in vb) ** 0.5
-        return dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
-
-    return similarity
-
-
 def novelty_gate(
     question: str,
     corpus: Sequence[str],
@@ -416,6 +387,13 @@ def admission_gate(client: LLMClient, question: SeedQuestion) -> AdmissionOutcom
     try:
         pair = generate_answer_pair(client, question)
     except Exception as err:  # noqa: BLE001 — errors-as-results at the expensive provider-facing gate
+        logger.warning(
+            "forge admission: answer generation failed for %s draft %r (%s: %s)",
+            question.skill,
+            question.question[:60],
+            type(err).__name__,
+            err,
+        )
         return AdmissionOutcome(
             rejection=GateRejection(
                 gate=GATE_ADMISSION,
@@ -440,8 +418,8 @@ def admission_gate(client: LLMClient, question: SeedQuestion) -> AdmissionOutcom
             rubric=question.rubric,
         ),
     )
-    # Exactly two cases are always submitted, so harness_passed's missing empty-guard (all([]) is
-    # True) cannot bite here; the zero-drafts-reach-gate-3 case is guarded in the run report.
+    # Exactly two cases are always submitted; the zero-drafts-reach-gate-3 case is guarded in the
+    # run report.
     strong_result, weak_result = run_golden_answer_harness(client, cases)
     failures = [_admission_failure(r) for r in (strong_result, weak_result) if not r.passed]
     return AdmissionOutcome(
@@ -554,18 +532,13 @@ def render_forge_report(run: ForgeRun, *, provider: str, model: str, date: str) 
     counts = gate_yield(run)
     # ``all([]) is True``-style vacuous success must not creep in: when nothing reached gate 3,
     # the admission line says so explicitly instead of reading like a clean pass.
-    admission_note = (
-        " — no draft reached the admission gate; nothing was admitted"
-        if counts[GATE_NOVELTY] == 0
-        else ""
-    )
+    admission_note = " — no draft reached the admission gate; nothing was admitted" if counts[GATE_NOVELTY] == 0 else ""
     lines = [
         f"# Question Forge run — {run.skill}",
         "",
         f"- Date: {date}",
         f"- Judge provider: {provider} — model: {model}",
-        "  (the configured primary; a mid-run provider failover silently swaps the judge — check "
-        "WARNING logs before trusting borderline admissions)",
+        "  (the pinned judge role — it bypasses the router, so no mid-run failover can swap it; ADR 0009 addendum a)",
         f"- Requested drafts: {run.requested}",
         f"- Admission bands: strong {STRONG_BAND[0]:.1f}-{STRONG_BAND[1]:.1f} / "
         f"weak {WEAK_BAND[0]:.1f}-{WEAK_BAND[1]:.1f}",
@@ -586,18 +559,14 @@ def render_forge_report(run: ForgeRun, *, provider: str, model: str, date: str) 
     for i, outcome in enumerate(run.outcomes, start=1):
         details: list[str] = []
         if outcome.nearest_similarity is not None and outcome.nearest_question is not None:
-            details.append(
-                f"nearest: {_excerpt(outcome.nearest_question, 40)} (sim {outcome.nearest_similarity:.2f})"
-            )
+            details.append(f"nearest: {_excerpt(outcome.nearest_question, 40)} (sim {outcome.nearest_similarity:.2f})")
         if outcome.strong_score is not None:
             details.append(f"strong {outcome.strong_score:.2f}")
         if outcome.weak_score is not None:
             details.append(f"weak {outcome.weak_score:.2f}")
         verdict = "ADMITTED" if outcome.admitted else "rejected"
         gate = "-" if outcome.rejection is None else outcome.rejection.gate
-        lines.append(
-            f"| {i} | {_excerpt(outcome.draft.question)} | {verdict} | {gate} | {'; '.join(details) or '-'} |"
-        )
+        lines.append(f"| {i} | {_excerpt(outcome.draft.question)} | {verdict} | {gate} | {'; '.join(details) or '-'} |")
     lines += ["", "## Rejection attribution", ""]
     rejected = [(i, o) for i, o in enumerate(run.outcomes, start=1) if o.rejection is not None]
     if rejected:
