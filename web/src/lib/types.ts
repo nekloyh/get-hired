@@ -53,19 +53,46 @@ export type SkillState = {
   beta: number
 }
 
+export type PanelOpinion = {
+  recommended_score: number
+  argument: string
+  key_evidence: string
+}
+
+export type PanelTrace = {
+  triggers: string[]
+  skeptic: PanelOpinion
+  advocate: PanelOpinion
+  initial_score: number
+  initial_confidence: number
+  disagreement: number
+}
+
+export type TrustTrace = {
+  pre_guard_confidence: number
+  unverifiable_fraction: number
+  divergence: number
+  noise_events: string[]
+  panel_suppressed: boolean
+}
+
 export type Evaluation = {
   dimensions: Record<string, { score: number; evidence: string }>
   weighted_score: number
   confidence: number
   follow_up_recommended: boolean
   follow_up_rationale: string
+  evidence_degraded?: boolean
   delivery_fixes?: string[]
+  // Legacy: only pre-2026-07-11 checkpoints carry it; current escalations write `panel`.
   self_critique?: {
     triggers: string[]
     first_confidence: number
     second_confidence: number
     kept_pass: string
   } | null
+  panel?: PanelTrace | null
+  trust?: TrustTrace | null
 }
 
 export type TranscriptTurn = {
@@ -81,11 +108,13 @@ export type TranscriptTurn = {
 export type TranscriptItem = {
   skill: string
   plan_index: number
-  stop_reason: string
+  stop_reason: string | null
   resolved_weighted_score: number
   resolved_confidence: number
-  skill_state: SkillState
+  evidence_weight?: number
+  skill_state: SkillState | null
   turns: TranscriptTurn[]
+  error?: string
 }
 
 export type StudyResource = {
@@ -127,6 +156,7 @@ export type SupervisorDecision = {
   reasoning: string
   target_skill?: string | null
   target_plan_index?: number | null
+  will_probe_skill?: string | null
   after_question: number
   from_plan_index: number
   to_plan_index: number
@@ -141,6 +171,7 @@ export type TopicPlanEntry = {
 }
 
 export type SessionState = {
+  schema_version?: number
   session_id: string
   topic_plan: TopicPlanEntry[]
   skill_states: Record<string, SkillState>
@@ -149,12 +180,16 @@ export type SessionState = {
   next_skill?: string | null
   question_count: number
   max_questions: number
+  max_elapsed_seconds?: number
+  started_at?: number
   status: string
   stop_reason?: string | null
   transcript: TranscriptItem[]
   supervisor_decisions: SupervisorDecision[]
   study_plan?: StudyPlan | null
   study_plan_error?: string | null
+  candidate_id?: string
+  ledger_prior_mastery?: Record<string, number>
   language_mode?: LanguageMode
 }
 

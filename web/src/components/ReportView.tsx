@@ -2,7 +2,7 @@ import { CalendarDays, Download, ExternalLink, FileText, Trophy } from 'lucide-r
 import { useState } from 'react'
 import { fetchExportMarkdown } from '../lib/api'
 import { pct } from '../lib/skillMetrics'
-import type { SessionState } from '../lib/types'
+import type { PanelTrace, SessionState } from '../lib/types'
 
 export function ReportView({ state }: { state: SessionState | null }) {
   const [exportError, setExportError] = useState<string | null>(null)
@@ -130,6 +130,12 @@ export function ReportView({ state }: { state: SessionState | null }) {
                     </span>
                   ))}
                 </div>
+                {turn.evaluation.evidence_degraded ? (
+                  <span className="evidence-badge">citations unverifiable — confidence capped</span>
+                ) : null}
+                {turn.evaluation.panel ? (
+                  <CommitteeVerdict panel={turn.evaluation.panel} verdict={turn.evaluation.weighted_score} />
+                ) : null}
                 {turn.evaluation.delivery_fixes?.length ? (
                   <div className="delivery-fixes">
                     <strong>English delivery fixes</strong>
@@ -147,5 +153,22 @@ export function ReportView({ state }: { state: SessionState | null }) {
         ))}
       </div>
     </section>
+  )
+}
+
+/** The Panel Verdict the export already prints (issue 0027): who advised what, and how split they were. */
+function CommitteeVerdict({ panel, verdict }: { panel: PanelTrace; verdict: number }) {
+  return (
+    <div className="panel-verdict" aria-label="Committee verdict">
+      <strong>Committee verdict</strong>
+      <span>Escalated on {panel.triggers.join(', ')}</span>
+      <span>
+        First pass {panel.initial_score.toFixed(2)}/5 → verdict {verdict.toFixed(2)}/5 · disagreement{' '}
+        {panel.disagreement.toFixed(2)} points
+      </span>
+      <span>
+        Skeptic {panel.skeptic.recommended_score}/5 · Advocate {panel.advocate.recommended_score}/5
+      </span>
+    </div>
   )
 }

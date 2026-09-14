@@ -16,6 +16,8 @@ env/
 .ruff_cache/
 .mypy_cache/
 node_modules/
+web/.vite/
+web/test-results/
 
 # Secrets / config
 .env
@@ -40,6 +42,4 @@ data/exports/
 # OS
 .DS_Store
 
-# Claude Code local state (agent worktrees, local settings)
-.claude/
 deploy/nginx/certs/

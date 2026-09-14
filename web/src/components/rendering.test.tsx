@@ -4,7 +4,7 @@ import { ReportView } from './ReportView'
 import { SessionAlert } from './SessionAlert'
 import { SkillBars } from './SkillBars'
 import { TopicPlan } from './TopicPlan'
-import { stateFixture } from '../lib/sessionReducer.test'
+import { stateFixture, withEvaluation } from '../test/fixtures'
 
 describe('Skill and progress rendering', () => {
   it('renders mastery, confidence context, and role criticality', () => {
@@ -69,5 +69,32 @@ describe('report rendering', () => {
     expect(screen.getByText(/Q1 mlops/)).toBeInTheDocument()
     expect(screen.getByText('correctness:')).toBeInTheDocument()
     expect(screen.getByText('Enough evidence for demo.')).toBeInTheDocument()
+    expect(screen.queryByText(/citations unverifiable/)).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Committee verdict')).not.toBeInTheDocument()
+  })
+
+  it('badges an evidence-degraded evaluation (issue 0033)', () => {
+    render(<ReportView state={withEvaluation({ evidence_degraded: true })} />)
+
+    expect(screen.getByText('citations unverifiable — confidence capped')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Committee verdict')).not.toBeInTheDocument()
+  })
+
+  it('renders the Committee verdict when the evaluation carries a panel trace (issue 0027)', () => {
+    const panel = {
+      triggers: ['low_confidence', 'divergence'],
+      skeptic: { recommended_score: 2, argument: 'Thin on rollback.', key_evidence: 'rollback risk' },
+      advocate: { recommended_score: 4, argument: 'Names delayed labels.', key_evidence: 'delayed labels' },
+      initial_score: 2.5,
+      initial_confidence: 0.4,
+      disagreement: 2,
+    }
+    render(<ReportView state={withEvaluation({ panel, weighted_score: 3.5 })} />)
+
+    const block = screen.getByLabelText('Committee verdict')
+    expect(block).toHaveTextContent('Escalated on low_confidence, divergence')
+    expect(block).toHaveTextContent('First pass 2.50/5 → verdict 3.50/5 · disagreement 2.00 points')
+    expect(block).toHaveTextContent('Skeptic 2/5 · Advocate 4/5')
+    expect(screen.queryByText(/citations unverifiable/)).not.toBeInTheDocument()
   })
 })

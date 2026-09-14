@@ -5,7 +5,7 @@ import type { Health } from './types'
 // A production build is served BY the backend (or by nginx in front of it), so it defaults to
 // same-origin — which is what lets one image run behind any hostname, and makes `wss://` follow
 // `https://` without configuration. `VITE_API_URL` still overrides both (the reconnect e2e uses it).
-export const API_BASE =
+const API_BASE =
   import.meta.env.VITE_API_URL ?? (import.meta.env.DEV ? 'http://127.0.0.1:8000' : window.location.origin)
 
 // Read per call, never captured at module load: the token is entered at runtime (see authToken.ts),
@@ -40,7 +40,7 @@ export async function fetchExportMarkdown(sessionId: string): Promise<string> {
 }
 
 /** Turn an export failure into something the Candidate can act on rather than a bare status code. */
-export function exportFailureMessage(status: number): string {
+function exportFailureMessage(status: number): string {
   if (status === 401) return 'Export refused: the access token is missing or wrong. Re-enter it in Setup.'
   if (status === 404) return 'The server has no completed Session under this id.'
   return `Export failed (HTTP ${status}).`
@@ -54,6 +54,6 @@ export function sessionWebSocketUrl(sessionId: string): string {
   return url.toString()
 }
 
-export function exportMarkdownUrl(sessionId: string): string {
+function exportMarkdownUrl(sessionId: string): string {
   return `${API_BASE}/api/sessions/${encodeURIComponent(sessionId)}/export.md`
 }
