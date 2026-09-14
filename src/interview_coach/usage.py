@@ -23,7 +23,21 @@ to be present":
 * ``questions``   — a product-cap reservation against a token identity
 * ``quota_exhausted`` / ``quota_retry`` — the provider's terminal ``insufficient_quota``, latched
 
-Recording must NEVER take down a live call — a lost ledger line is noise, a crashed judgment is not.
+M0a / F1 corrects the half of that sentence that was wrong. Recording still must never take down
+the call *in flight* — a crashed judgment is worse than a late ledger line — but a lost ledger line
+is **not** noise: it is spend nobody can see, and the day counter that every rail above reads then
+silently under-counts. So a failed write no longer returns quietly. It latches an **accounting
+fault**, and while one is unresolved every metered call is refused. Two conditions, deliberately
+distinguished, because their honest remedies differ:
+
+* **before any call** — the ledger path is unwritable (:func:`check_ledger_writable`). Nothing has
+  been spent unaccounted; fixing the path clears it with no bookkeeping to repair.
+* **after a billed call** — the provider answered, we were charged, and the token row would not
+  write (:func:`record_usage`). The day's spend is now *undetermined*, which is not the same as
+  zero. The unwritten row is parked in a sidecar next to the ledger and the condition stays
+  **unreconciled** until ``coach usage --reconcile`` replays it, so the tokens are folded back in
+  rather than forgiven.
+
 Days are UTC, matching the provider's daily reset.
 """
 
@@ -38,6 +52,7 @@ from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -61,6 +76,18 @@ DEFAULT_DAILY_TOKEN_BUDGET = 2_500_000
 
 def ledger_path() -> Path:
     return Path(os.environ.get("COACH_USAGE_LEDGER", str(DEFAULT_LEDGER_PATH)))
+
+
+# The unwritten rows live beside the ledger they could not join, under the ledger's own name plus
+# this suffix — so an operator who knows where the ledger is already knows where the fault is, and a
+# `docker cp` or a volume backup of the state directory carries both or neither.
+LEDGER_FAULT_SUFFIX = ".unreconciled"
+
+
+def ledger_fault_path(path: Path | None = None) -> Path:
+    """Where an accounting fault parks the rows the ledger refused."""
+    target = path or ledger_path()
+    return target.with_name(target.name + LEDGER_FAULT_SUFFIX)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -209,6 +236,19 @@ class SessionBudgetSuspended(RuntimeError):
     """
 
 
+class AccountingUnavailable(RuntimeError):
+    """Usage accounting is not in a state where another metered call may be made (M0a / F1).
+
+    Raised at the provider call boundary — the last point at which a call can still be *not made* —
+    and, unlike an ordinary provider failure, re-raised past ``question_node``'s
+    failure-isolation net. Same reasoning as ``CandidateIntent`` and the budget rail (ADR 0005): a
+    refusal to spend says nothing about the Candidate, so recording it as a zero-evidence ``failed``
+    question would manufacture exactly the fake evidence that ADR forbids. ``RuntimeError`` rather
+    than a ``ValueError``: ``chat_json`` retries ``(ValidationError, ValueError)``, and a gate that
+    the caller retries three times is not a gate.
+    """
+
+
 # Which Session (if any) the calls on this thread belong to. A ContextVar rather than a parameter
 # threaded through every agent: ``record_usage`` is called from deep inside the provider clients,
 # and langgraph runs sync nodes in a copied context, so a scope entered by the driver is visible in
@@ -238,7 +278,12 @@ def record_usage(
     completion_tokens: int,
     path: Path | None = None,
 ) -> None:
-    """Append one call's token usage to the ledger. Swallows IO errors by design."""
+    """Append one call's token usage to the ledger.
+
+    Never raises: the provider has already answered and the caller is mid-judgment. A write that
+    fails here latches an **unreconciled** accounting fault instead — the call was billed, so the
+    day's spend is now undetermined, and the next metered call is refused rather than made blind.
+    """
     entry: dict[str, object] = {
         "ts": _now_ts(),
         "provider": provider,
@@ -286,14 +331,297 @@ def clear_quota_exhausted(provider: str, *, path: Path | None = None) -> None:
     _append({"ts": _now_ts(), "kind": "quota_retry", "provider": provider}, path)
 
 
+# --- accounting health (M0a / F1) ---------------------------------------------------------------
+#
+# The rails above are arithmetic over the ledger. Arithmetic over a file that is not being written
+# is not conservative — it reads as "spent nothing", which is the most permissive answer there is.
+# In the stock container that was not hypothetical: the default ledger path resolves to /app/logs,
+# /app is root:root 755, the process is uid 10001, so every `mkdir` failed, every row was dropped
+# with a warning, and every rail happily reported a full budget for as long as the deployment ran.
+#
+# So a failed write latches, and a latch blocks metered work. The latch is BOTH in-process (free to
+# check on the hot path, and correct even when nothing at all can be written) and on disk beside the
+# ledger (so it survives the process, which is the only way a CLI — one process per invocation —
+# could remember it at all).
+
+_FAULT_LOCK = Lock()
+# Faults raised by THIS process, each with whether its sidecar row made it to disk. Kept even after
+# a successful flush so a reader never has to choose between two sources of truth mid-write.
+_FAULTS: list[dict[str, Any]] = []
+# Ledger paths whose writability has been proven in this process. Only successes are remembered: a
+# failure must be re-probed, or an operator who fixes the path would still be refused until restart.
+_PROVEN_WRITABLE: set[str] = set()
+
+
+def _write_row(entry: Mapping[str, object], target: Path) -> None:
+    """Append one JSONL row, raising ``OSError`` — the one place that actually touches the ledger."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(dict(entry)) + "\n")
+
+
+def _flush_faults(target: Path) -> None:
+    """Best-effort: park every not-yet-parked fault in the sidecar beside ``target``."""
+    sidecar = ledger_fault_path(target)
+    with _FAULT_LOCK:
+        pending = [fault for fault in _FAULTS if not fault["parked"]]
+    for fault in pending:
+        try:
+            _write_row(fault["record"], sidecar)
+        except OSError as err:
+            # Expected whenever the ledger is unwritable because its *directory* is: the sidecar
+            # lives in that same directory. The in-process latch still blocks this process, and the
+            # writability probe still blocks the next one — see `accounting_block_reason`.
+            logger.error(
+                "accounting fault could not be parked in %s (%s: %s); it is held in memory only and "
+                "will be lost if this process exits",
+                sidecar,
+                type(err).__name__,
+                err,
+            )
+            return
+        with _FAULT_LOCK:
+            fault["parked"] = True
+
+
+def _latch_fault(entry: Mapping[str, object], err: OSError, target: Path) -> None:
+    """Record that a ledger row could not be written, and refuse metered work until it is resolved."""
+    # A token row is the only kind written AFTER the provider has been paid. Every other kind is
+    # bookkeeping we can replay for free, so only this one leaves the day's spend undetermined.
+    billed = "prompt_tokens" in entry
+    record: dict[str, Any] = {
+        "ts": _now_ts(),
+        "kind": "accounting_fault",
+        "row": str(entry.get("kind", "tokens")),
+        "billed": billed,
+        "ledger": str(target),
+        "error": f"{type(err).__name__}: {err}",
+        "entry": dict(entry),
+    }
+    with _FAULT_LOCK:
+        _FAULTS.append({"record": record, "parked": False})
+    logger.error(
+        "usage ledger write FAILED (%s: %s) for a %s row at %s — %s. Metered calls are refused "
+        "until this is reconciled (`coach usage --reconcile`).",
+        type(err).__name__,
+        err,
+        record["row"],
+        target,
+        "the call was already billed, so the day's spend is now UNDETERMINED" if billed else "no spend is unaccounted",
+    )
+    _flush_faults(target)
+
+
 def _append(entry: dict[str, object], path: Path | None) -> None:
+    """Append one ledger row. Never raises; a failure latches an accounting fault instead."""
+    target = path or ledger_path()
+    try:
+        _write_row(entry, target)
+    except OSError as err:
+        _latch_fault(entry, err, target)
+
+
+def _parked_faults(target: Path) -> list[dict[str, Any]]:
+    """Every unresolved fault: the sidecar's rows, plus anything this process could not park."""
+    faults: list[dict[str, Any]] = []
+    sidecar = ledger_fault_path(target)
+    try:
+        text = sidecar.read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+    for line in text.splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            faults.append(row)
+    with _FAULT_LOCK:
+        faults.extend(fault["record"] for fault in _FAULTS if not fault["parked"])
+    return faults
+
+
+def accounting_fault(*, path: Path | None = None) -> str | None:
+    """The unresolved accounting condition blocking metered work, or None.
+
+    Cheap enough for the per-call gate: one ``stat``-shaped read of a file that does not exist on
+    any healthy deployment. It reports only *latched* faults — a write that already failed — never
+    the writability of the path, which :func:`check_ledger_writable` owns.
+    """
+    target = path or ledger_path()
+    faults = _parked_faults(target)
+    if not faults:
+        return None
+    # Retry parking now: the fault may have been raised while the directory was unwritable and
+    # survived only in memory. Once it is on disk it outlives this process, which is the difference
+    # between a remembered fault and a forgotten one.
+    _flush_faults(target)
+    billed = [fault for fault in faults if fault.get("billed")]
+    if billed:
+        tokens = 0
+        for fault in billed:
+            row = fault.get("entry")
+            if isinstance(row, dict):
+                try:
+                    tokens += int(row.get("prompt_tokens", 0)) + int(row.get("completion_tokens", 0))
+                except (TypeError, ValueError):
+                    continue
+        return (
+            f"Usage accounting is UNRECONCILED: {len(billed)} provider call(s) were billed but could "
+            f"not be recorded in the token ledger at {target} (~{tokens:,} token(s) held in "
+            f"{ledger_fault_path(target)}). Until they are folded back in, every budget rail here "
+            f"under-counts the day, so metered calls are refused rather than made against a number "
+            f"we know is wrong — an unrecorded call is not a free one. Make the ledger path writable, "
+            f"then run `coach usage --reconcile` to replay the held rows and clear this."
+        )
+    return (
+        f"Usage accounting is degraded: {len(faults)} ledger row(s) could not be written to {target} "
+        f"and are held in {ledger_fault_path(target)}. No provider call is unaccounted for — the held "
+        f"rows are budget bookkeeping — but the rails read an incomplete ledger until they are "
+        f"replayed. Make the ledger path writable, then run `coach usage --reconcile`."
+    )
+
+
+def check_ledger_writable(*, path: Path | None = None) -> str | None:
+    """Why the ledger cannot be written, or None. The check that runs BEFORE anything is spent.
+
+    Distinct from :func:`accounting_fault` on purpose, and the distinction is the whole point of
+    this slice: this condition means no metered call has been made under it, so there is no spend to
+    reconcile — fixing the path is the entire remedy. Probing by opening the file in append mode
+    rather than by ``os.access``: the mode bits are not the question, "will the next append work" is.
+    """
     target = path or ledger_path()
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        with target.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
+        with target.open("a", encoding="utf-8"):
+            pass
+        # Read too, not only append: every rail above COUNTS this file, so a ledger we can write and
+        # cannot read still leaves the day's spend unknown. The append above has just created it, so
+        # on a healthy path this always succeeds.
+        with target.open("r", encoding="utf-8"):
+            pass
     except OSError as err:
-        logger.warning("usage ledger write failed (%s); dropping entry %s", err, entry)
+        return (
+            f"Usage accounting is unavailable: the token ledger at {target} cannot be written "
+            f"({type(err).__name__}: {err}). Every metered call is refused while this holds, because "
+            f"a call nobody records is spend nobody can see. Nothing is unaccounted for yet — no "
+            f"metered call has been made under this condition. Point COACH_USAGE_LEDGER at a writable "
+            f"path (in the container that means the state volume, e.g. /app/state/usage-ledger.jsonl) "
+            f"or grant the running user (uid 10001 in this image) write access to it."
+        )
+    return None
+
+
+def accounting_block_reason(*, path: Path | None = None) -> str | None:
+    """The single gate every rail shares: an unresolved fault first, then the path itself.
+
+    Fault first because it is the stronger statement — a path that is writable *again* does not
+    un-spend the call whose row never landed.
+    """
+    return accounting_fault(path=path) or check_ledger_writable(path=path)
+
+
+def accounting_gate(*, path: Path | None = None) -> str | None:
+    """The gate at the provider call boundary, cheap after the first call in a process.
+
+    A latched fault is always checked. The writability probe runs once per ledger path per process
+    and only its SUCCESS is remembered: a failure is re-probed every call, which costs nothing on a
+    path that is already refusing work, and means an operator who fixes the path is unblocked
+    without a restart. The one-per-process probe is what closes the gap the start rails leave — the
+    bench, the forge and any other direct caller never pass through ``start_refusal_reason``, and
+    without it their FIRST call would be billed before the missing row latched anything.
+    """
+    if fault := accounting_fault(path=path):
+        return fault
+    target = path or ledger_path()
+    key = str(target)
+    if key in _PROVEN_WRITABLE:
+        return None
+    reason = check_ledger_writable(path=target)
+    if reason is None:
+        _PROVEN_WRITABLE.add(key)
+    return reason
+
+
+def reconcile_accounting(*, path: Path | None = None) -> str:
+    """Replay every held row into the ledger and clear the fault. Raises ``OSError`` if it cannot.
+
+    Reconciliation replays rather than forgives: the held rows carry the token counts the provider
+    actually charged, so folding them back in restores the true day total. Treating them as zero —
+    which is what "just clear the flag" would do — is the one outcome this slice exists to prevent.
+    """
+    target = path or ledger_path()
+    faults = _parked_faults(target)
+    if not faults:
+        return "No accounting fault to reconcile."
+    replayed = 0
+    tokens = 0
+    unreplayed: list[dict[str, Any]] = []
+    failure: OSError | None = None
+    for fault in faults:
+        row = fault.get("entry")
+        if not isinstance(row, dict):
+            # A fault whose row could not be parked and whose process has since exited: we know a
+            # call went unrecorded but not what it cost. Said out loud below rather than rounded to 0.
+            continue
+        if failure is not None:
+            unreplayed.append(fault)
+            continue
+        try:
+            _write_row(row, target)
+        except OSError as err:
+            # Stop at the first failure and keep the rest held. Carrying on would only lose more
+            # rows, and leaving an already-replayed row in the sidecar would double-count it on the
+            # next attempt — over-counting a day's spend is safer than losing it, but it is still wrong.
+            failure = err
+            unreplayed.append(fault)
+            continue
+        replayed += 1
+        try:
+            tokens += int(row.get("prompt_tokens", 0)) + int(row.get("completion_tokens", 0))
+        except (TypeError, ValueError):
+            pass
+    lost = len(faults) - replayed - len(unreplayed)
+    _rewrite_fault_sidecar(target, unreplayed)
+    _PROVEN_WRITABLE.discard(str(target))
+    if failure is not None:
+        raise failure
+    note = f"Reconciled {replayed} held ledger row(s) into {target} (~{tokens:,} token(s) restored)."
+    if lost:
+        note += f" {lost} fault(s) carried no replayable row; that spend stays unknown, not zero."
+    return note
+
+
+def _rewrite_fault_sidecar(target: Path, faults: list[dict[str, Any]]) -> None:
+    """Leave exactly ``faults`` held, and drop the in-process copies now accounted for either way."""
+    sidecar = ledger_fault_path(target)
+    with _FAULT_LOCK:
+        _FAULTS.clear()
+    if not faults:
+        sidecar.unlink(missing_ok=True)
+        return
+    body = "".join(json.dumps(fault) + "\n" for fault in faults)
+    try:
+        sidecar.write_text(body, encoding="utf-8")
+    except OSError as err:
+        # The sidecar is where the unreplayed rows live, so failing to rewrite it is the one case
+        # that can lose them. Loud, and re-latched in memory so this process still refuses to spend.
+        logger.error(
+            "could not rewrite %s (%s: %s); %d held row(s) are in memory only",
+            sidecar,
+            type(err).__name__,
+            err,
+            len(faults),
+        )
+        with _FAULT_LOCK:
+            _FAULTS.extend({"record": fault, "parked": False} for fault in faults)
+
+
+def reset_accounting_state() -> None:
+    """Forget this process's latched faults and writability probes (test isolation only)."""
+    with _FAULT_LOCK:
+        _FAULTS.clear()
+    _PROVEN_WRITABLE.clear()
 
 
 def _all_rows(path: Path | None) -> Iterator[dict]:
@@ -301,7 +629,16 @@ def _all_rows(path: Path | None) -> Iterator[dict]:
     target = path or ledger_path()
     if not target.exists():
         return
-    for line in target.read_text(encoding="utf-8").splitlines():
+    try:
+        text = target.read_text(encoding="utf-8")
+    except OSError as err:
+        # A ledger that cannot be READ is as broken as one that cannot be written, and it must not
+        # take a rail down with a traceback. Returning nothing here would read as "spent nothing",
+        # so this is never the last line of defence: `check_ledger_writable` probes the read too,
+        # and every rail checks it before counting anything.
+        logger.error("usage ledger at %s could not be read (%s: %s)", target, type(err).__name__, err)
+        return
+    for line in text.splitlines():
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
@@ -500,6 +837,11 @@ def daily_reset_hint(now: datetime | None = None) -> str:
 
 def start_refusal_reason(provider: str, *, questions: int, path: Path | None = None) -> str | None:
     """Why a fresh Session must not start, or None. Checked BEFORE the first token is spent."""
+    # Accounting first: every rail below is arithmetic over the ledger, so a ledger that is not
+    # being written makes them all answer "plenty left" — the most permissive answer, from the least
+    # reliable input. A start gate that reads a broken counter is not a gate (M0a / F1).
+    if blocked := accounting_block_reason(path=path):
+        return blocked
     if quota_exhausted_today(provider, path=path):
         return (
             f"The {provider} account is out of quota — the provider returned insufficient_quota and "
@@ -527,6 +869,11 @@ def question_cap_reason(identity: str, *, questions: int, path: Path | None = No
     theatre, and the daily-budget and per-run rails already bound what they can spend by accident.
     When real accounts land (R-29) ``identity`` becomes per-user and this moves with them.
     """
+    # Checked here as well as in `start_refusal_reason`, because the web start path evaluates this
+    # rail FIRST (`question_cap_reason(...) or start_refusal_reason(...)`). A rail that counts rows
+    # before asking whether the file can be counted is a rail reading an unknown number (M0a / F1).
+    if blocked := accounting_block_reason(path=path):
+        return blocked
     cap = daily_question_cap()
     already = questions_today(identity, path=path)
     if already + questions <= cap:
@@ -560,6 +907,12 @@ def budget_stop_reason(
         # unwinds before saving Beta posteriors (ADR 0006), printing the summary, or writing the
         # export — a plain abort of a Session that produced real evidence, reported as a suspend.
         return None
+    # Same precedence as the start gate, and for the same reason: the two rails below both read the
+    # ledger. Placed AFTER the completion check on purpose — at COMPLETE the only spend left is one
+    # Study Plan call, which the call-boundary gate refuses on its own (the planner node degrades),
+    # so suspending here would throw away a whole interview's evidence to save a call already saved.
+    if blocked := accounting_block_reason(path=path):
+        return blocked
     if quota_exhausted_today(provider, path=path):
         return (
             f"The {provider} account is out of quota (the provider returned insufficient_quota, "

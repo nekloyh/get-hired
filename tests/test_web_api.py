@@ -1418,6 +1418,72 @@ def test_a_funded_live_session_still_starts(tmp_path, monkeypatch):
     assert set(usage.sessions_for_day()) == {"funded"}
 
 
+# --- M0a / F1: accounting health on the web surface ----------------------------------------------
+
+
+def _break_the_ledger(tmp_path):
+    """Replace the ledger with a directory: appends fail, the sidecar beside it still writes."""
+    ledger = tmp_path / "usage-ledger.jsonl"
+    ledger.unlink(missing_ok=True)
+    ledger.mkdir(exist_ok=True)
+    return ledger
+
+
+def test_a_live_session_refuses_to_start_when_the_ledger_cannot_be_written(tmp_path, monkeypatch):
+    # AC 3 on the web surface. Same shape as the spent-budget refusal above — session_error, no
+    # session_started — but for the opposite reason: there the ledger said "no budget left", here it
+    # says nothing at all, and an unwritten ledger reads to every rail as a FULL budget. The
+    # Candidate must not watch an interview begin whose cost nobody can count.
+    client = _live_client(tmp_path, monkeypatch, brain=_MeteredDemoClient)
+    _break_the_ledger(tmp_path)
+
+    with client.websocket_connect("/api/sessions/no-ledger") as ws:
+        _start_live(ws)
+        event = ws.receive_json()
+
+    assert event["type"] == "session_error"
+    assert "Usage accounting is unavailable" in event["error"]
+    assert "COACH_USAGE_LEDGER" in event["error"]  # the remedy, not just the refusal
+    assert "00:00 UTC" not in event["error"]  # waiting for the daily reset fixes nothing here
+
+
+def test_a_running_session_suspends_when_a_billed_call_cannot_be_recorded(tmp_path, monkeypatch):
+    # AC 4 on the web surface. The Session starts healthy, the ledger breaks under it, and the very
+    # next node boundary suspends with the unreconciled condition rather than quietly interviewing
+    # on against a spend total that stopped moving. Nothing is persisted as complete.
+    client = _live_client(tmp_path, monkeypatch, brain=_MeteredDemoClient)
+
+    with client.websocket_connect("/api/sessions/mid-run") as ws:
+        _start_live(ws, max_questions=3)
+        assert ws.receive_json()["type"] == "session_started"
+        _expect_question(ws)
+        _break_the_ledger(tmp_path)
+        ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+        event = _receive_until_any(ws, {"session_error", "session_completed"})
+
+    assert event["type"] == "session_error"
+    assert "UNRECONCILED" in event["error"]
+    assert "--reconcile" in event["error"]
+
+
+def test_demo_mode_runs_even_with_an_unwritable_ledger(tmp_path, monkeypatch):
+    # Demo mode spends nobody's allowance, so it has nothing to account for and must stay usable
+    # while accounting is broken — that is what keeps a misconfigured deployment demonstrable
+    # instead of dead. Same exemption predicate as the budget rails, checked against a new rail.
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(tmp_path / "usage-ledger.jsonl"))
+    _break_the_ledger(tmp_path)
+    client = _test_client(tmp_path)
+
+    with client.websocket_connect("/api/sessions/demo-no-ledger") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+        assert ws.receive_json()["type"] == "session_started"
+        _expect_question(ws)
+        ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+        completed = _receive_until(ws, "session_completed")
+
+    assert completed["state"]["status"] == "complete"
+
+
 def test_demo_mode_is_exempt_from_every_budget_rail(tmp_path, monkeypatch):
     # THE exemption predicate on the web surface. Demo mode carries no provider identity, so it
     # spends nobody's allowance and no rail may fire on it — not the daily gate, not the product

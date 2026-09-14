@@ -667,6 +667,128 @@ def test_usage_recorded_to_daily_ledger(monkeypatch, tmp_path, fake_openai_facto
     assert totals["mimo"] == {"prompt": 100, "completion": 20, "total": 120, "calls": 1}
 
 
+# --- M0a / F1: the accounting gate at the provider call boundary ---------------------------------
+
+
+def _unappendable_ledger(monkeypatch, tmp_path):
+    """A ledger path that cannot be appended to, in a directory that can still hold its sidecar."""
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.mkdir()
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
+    return ledger
+
+
+def _break(ledger):
+    """Make an already-healthy ledger unappendable, the way a live deployment loses one."""
+    ledger.unlink(missing_ok=True)
+    ledger.mkdir()
+
+
+def test_the_call_after_an_unrecordable_one_is_refused(monkeypatch, tmp_path, fake_openai_factory):
+    """AC 4: a billed call whose usage row would not write stops the NEXT call from happening.
+
+    The three-call shape is the only honest one for the POST-call fault. A path that is already
+    broken is refused before anything is spent (the test below), so the interesting case is the one
+    a running deployment actually hits: the ledger was fine, we asked, we were billed, and only then
+    did the write fail. The second call cannot be un-billed — what this pins is that there is no
+    third one, because a system that keeps spending after it has lost count is spending an amount
+    nobody can state. The old `logger.warning(...); return` made exactly that third call.
+    """
+    ledger = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
+    reply = {"content": '{"x": 1, "label": "ok"}', "usage": {"prompt_tokens": 100, "completion_tokens": 20}}
+    fake = fake_openai_factory([reply, reply, reply])
+    client = MimoClient(_provider("mimo"), client=fake)
+
+    client.chat_json([{"role": "user", "content": "one"}], Foo)
+    assert usage_for_day()["mimo"]["calls"] == 1
+
+    _break(ledger)
+    client.chat_json([{"role": "user", "content": "two"}], Foo)  # billed; its row cannot be written
+    assert fake.call_count == 2
+
+    with pytest.raises(usage.AccountingUnavailable) as caught:
+        client.chat_json([{"role": "user", "content": "three"}], Foo)
+
+    assert fake.call_count == 2  # the provider was never asked a third time
+    assert "UNRECONCILED" in str(caught.value)
+    assert "~120 token(s)" in str(caught.value)  # the spend it cannot account for, stated
+
+
+def test_an_unwritable_ledger_refuses_the_very_first_call(monkeypatch, tmp_path, fake_openai_factory):
+    """AC 3: nothing is billed at all — the gate runs before the request, not after the response.
+
+    Load-bearing for every caller that does NOT pass through `start_refusal_reason`: the bench, the
+    forge, and any one-off command. Without the probe here their first call would be spent before
+    the missing row had anything to latch.
+    """
+    _unappendable_ledger(monkeypatch, tmp_path)
+    fake = fake_openai_factory(['{"x": 1, "label": "ok"}'])
+    client = MimoClient(_provider("mimo"), client=fake)
+
+    with pytest.raises(usage.AccountingUnavailable) as caught:
+        client.chat_json([{"role": "user", "content": "go"}], Foo)
+
+    assert fake.call_count == 0
+    assert "Nothing is unaccounted for yet" in str(caught.value)
+
+
+def test_a_refused_call_is_not_a_provider_failure(monkeypatch, tmp_path, fake_openai_factory):
+    """Our bookkeeping is broken, not the provider's service — so no failover, no breaker trip.
+
+    Failing over here would be the worst possible reading of the fault: it would spend a SECOND
+    provider's allowance, equally unrecorded, to work around our own inability to count.
+    """
+    _unappendable_ledger(monkeypatch, tmp_path)
+    primary = MimoClient(_provider("mimo"), client=fake_openai_factory(['{"x": 1, "label": "a"}']))
+    fallback_fake = fake_openai_factory(['{"x": 2, "label": "b"}'])
+    fallback = GroqClient(_provider("groq"), client=fallback_fake)
+    router = LLMRouter("mimo", {"mimo": primary, "groq": fallback}, fallback_provider="groq")
+
+    with pytest.raises(usage.AccountingUnavailable):
+        router.chat_json([{"role": "user", "content": "go"}], Foo)
+
+    assert fallback_fake.call_count == 0
+    assert not llm_module.is_provider_failure(usage.AccountingUnavailable("x"))
+
+
+def test_the_gate_is_not_swallowed_by_the_structured_output_retry(monkeypatch, tmp_path, fake_openai_factory):
+    """`chat_json` retries `(ValidationError, ValueError)`; a gate the caller retries is not a gate.
+
+    Pinned because the obvious exception base for "cannot do this" is ValueError, and choosing it
+    would have turned one refusal into three silent re-attempts at the same closed door.
+    """
+    _unappendable_ledger(monkeypatch, tmp_path)
+    fake = fake_openai_factory(['{"x": 1, "label": "ok"}'])
+    client = MimoClient(_provider("mimo"), client=fake)
+
+    with pytest.raises(usage.AccountingUnavailable):
+        client.chat_json([{"role": "user", "content": "go"}], Foo, max_retries=3)
+
+    assert fake.call_count == 0
+
+
+def test_a_reconciled_ledger_lets_calls_through_again(monkeypatch, tmp_path, fake_openai_factory):
+    """The gate has to open again, or "refuse metered work" is just an outage with better wording."""
+    ledger = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
+    reply = {"content": '{"x": 1, "label": "ok"}', "usage": {"prompt_tokens": 100, "completion_tokens": 20}}
+    fake = fake_openai_factory([reply, reply, reply])
+    client = MimoClient(_provider("mimo"), client=fake)
+
+    _break(ledger)
+    usage.reset_accounting_state()  # a process that starts with the path already broken
+    with pytest.raises(usage.AccountingUnavailable):
+        client.chat_json([{"role": "user", "content": "refused"}], Foo)
+
+    ledger.rmdir()
+    usage.reconcile_accounting()
+
+    client.chat_json([{"role": "user", "content": "allowed"}], Foo)
+    assert fake.call_count == 1
+    assert usage_for_day()["mimo"] == {"prompt": 100, "completion": 20, "total": 120, "calls": 1}
+
+
 def test_sdk_retries_disabled_so_backoff_is_singly_owned(monkeypatch):
     captured: dict = {}
 

@@ -4,6 +4,9 @@ A multi-agent system that runs an adaptive mock technical interview. Built prima
 agentic patterns** — see `CLAUDE.md` for the authoritative design and `CONTEXT.md` for the domain
 glossary.
 
+Development sequencing and acceptance gates live in **[the implementation plan](docs/issues/README.md)**.
+It links the existing slices and separates personal/trusted-pilot milestones from public-launch requirements.
+
 ## Quickstart (live) — clone to a real interview in ~10 minutes
 
 You need [uv](https://docs.astral.sh/uv/), Node 18+, and **one OpenAI API key**. Nothing else: no

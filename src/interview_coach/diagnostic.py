@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from .llm import LLMClient, Message, Validator
 from .skill import SkillState
+from .usage import AccountingUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -231,6 +232,11 @@ def diagnose_or_degrade(
     """
     try:
         return diagnose(profile, client, ledger_priors=ledger_priors)
+    except AccountingUnavailable:
+        # M0a / F1: not a provider failure to degrade around. Degrading here would start a Session
+        # whose every subsequent call is refused anyway, and would report a broken ledger as a
+        # deterministic Topic Plan — a stop the operator can act on, disguised as a fallback.
+        raise
     except Exception as err:  # noqa: BLE001 — pre-graph call site; degrade instead of crash (ADR 0005)
         if client is None:
             raise

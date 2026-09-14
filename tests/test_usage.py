@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 
+import pytest
+
 from interview_coach import telemetry, usage
 from interview_coach.usage import (
     DEFAULT_DAILY_QUESTION_CAP,
@@ -108,13 +110,6 @@ def test_a_half_written_token_row_is_skipped_whole(tmp_path, monkeypatch):
 
     assert usage_for_day() == {}
     assert sessions_for_day() == {}
-
-
-def test_record_usage_never_raises_on_io_failure(tmp_path):
-    # A ledger line lost to IO is noise; a crashed live judgment is not.
-    unwritable = tmp_path / "dir-as-file"
-    unwritable.write_text("occupied", encoding="utf-8")
-    record_usage("openai", "m", prompt_tokens=1, completion_tokens=1, path=unwritable / "ledger.jsonl")
 
 
 def test_missing_ledger_is_empty(tmp_path, monkeypatch):
@@ -721,3 +716,234 @@ def test_telemetry_incr_snapshot_delta_reset():
     assert telemetry.delta(after, after) == {}
     telemetry.reset()
     assert telemetry.snapshot() == {}
+
+
+# --- M0a / F1: accounting health ------------------------------------------------------------------
+#
+# The rails above are arithmetic over the ledger file. Every test in this section exists because
+# arithmetic over a file nobody is writing reads as "spent nothing" — the most permissive answer
+# there is, from the least reliable input. Two fault shapes, deliberately kept apart:
+#
+#   ledger path is a DIRECTORY  -> the ledger cannot be appended, its sidecar (a sibling file) can.
+#                                  This is the realistic container shape: writes fail, the directory
+#                                  around them does not.
+#   ledger parent is a FILE     -> neither the ledger nor the sidecar can be written. The worst case,
+#                                  pinned separately because it is the one the latch cannot outlive.
+
+
+def _broken_ledger(tmp_path, monkeypatch):
+    """A ledger path that cannot be appended to, in a directory that can still hold the sidecar."""
+    ledger = tmp_path / "usage-ledger.jsonl"
+    ledger.mkdir()
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
+    return ledger
+
+
+def test_a_healthy_ledger_blocks_nothing(tmp_path, monkeypatch):
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(tmp_path / "usage-ledger.jsonl"))
+    assert usage.check_ledger_writable() is None
+    assert usage.accounting_fault() is None
+    assert usage.accounting_block_reason() is None
+    assert usage.accounting_gate() is None
+
+
+def test_the_probe_creates_the_ledger_rather_than_asserting_the_mode_bits(tmp_path, monkeypatch):
+    # `os.access` answers a question about permissions; the rail's question is "will the next append
+    # work", which only an append answers. Creating the file is the honest side effect of asking.
+    ledger = tmp_path / "nested" / "usage-ledger.jsonl"
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
+    assert usage.check_ledger_writable() is None
+    assert ledger.exists()
+    assert ledger.read_text(encoding="utf-8") == ""
+
+
+def test_an_unwritable_path_blocks_before_anything_is_spent(tmp_path, monkeypatch):
+    # AC 3. The pre-call half: the condition is visible, it names the remedy, and it says out loud
+    # that nothing is unaccounted for — which is the whole reason it is a different state from the
+    # post-call one below.
+    _broken_ledger(tmp_path, monkeypatch)
+
+    reason = usage.check_ledger_writable()
+    assert reason is not None
+    assert "cannot be written" in reason
+    assert "COACH_USAGE_LEDGER" in reason
+    assert "Nothing is unaccounted for yet" in reason
+    # ...and it reaches both rails, so neither surface can start or continue a metered Session.
+    assert usage.start_refusal_reason("openai", questions=1) == reason
+    assert _stop(questions_left=1) == reason
+
+
+def test_the_start_gate_refuses_an_unwritable_ledger_before_the_quota_and_budget_rails(tmp_path, monkeypatch):
+    # Precedence matters: with the ledger broken, `remaining_today` reports a FULL budget, so the
+    # two rails below would both wave the Session through on a number they cannot know.
+    _broken_ledger(tmp_path, monkeypatch)
+    monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "1")  # would refuse on its own, with other wording
+
+    refusal = usage.start_refusal_reason("openai", questions=1)
+    assert refusal is not None
+    assert "Usage accounting is unavailable" in refusal
+    assert "00:00 UTC" not in refusal  # not a scarcity story; waiting for the reset fixes nothing
+
+
+def test_a_running_session_suspends_on_an_unwritable_ledger(tmp_path, monkeypatch):
+    _broken_ledger(tmp_path, monkeypatch)
+    guard = session_budget_guard("s", "openai", max_turns=4, complete_status="complete")
+
+    reason = guard({"max_questions": 3, "question_count": 1, "status": "active"})
+    assert reason is not None
+    assert "Usage accounting is unavailable" in reason
+
+
+def test_a_completed_session_is_not_suspended_by_a_broken_ledger(tmp_path, monkeypatch):
+    # The same carve-out the budget rail already has, and for a stronger reason here: at COMPLETE the
+    # only spend left is one Study Plan call, which the call-boundary gate refuses on its own. Firing
+    # here would discard a whole interview's evidence to prevent a call already prevented.
+    _broken_ledger(tmp_path, monkeypatch)
+    guard = session_budget_guard("s", "openai", max_turns=4, complete_status="complete")
+
+    assert guard({"max_questions": 3, "question_count": 3, "status": "complete"}) is None
+
+
+def test_a_billed_call_whose_row_cannot_be_written_is_never_counted_as_zero(tmp_path, monkeypatch):
+    # AC 4, the core of this slice. The provider answered and charged us; only the bookkeeping
+    # failed. The tokens are parked, the condition says UNRECONCILED, and it names what it holds.
+    ledger = _broken_ledger(tmp_path, monkeypatch)
+
+    record_usage("openai", "gpt-5.4-mini", prompt_tokens=1000, completion_tokens=200)  # must not raise
+
+    fault = usage.accounting_fault()
+    assert fault is not None
+    assert "UNRECONCILED" in fault
+    assert "1 provider call" in fault
+    assert "~1,200 token(s)" in fault  # the spend is stated, not rounded away
+    parked = usage.ledger_fault_path(ledger)
+    assert parked.exists()
+    held = json.loads(parked.read_text(encoding="utf-8").splitlines()[0])
+    assert held["billed"] is True
+    assert held["entry"]["prompt_tokens"] == 1000
+
+
+def test_a_bookkeeping_row_that_cannot_be_written_says_no_spend_is_unaccounted(tmp_path, monkeypatch):
+    # The other side of the pre/post distinction. A `questions` reservation is written BEFORE any
+    # call, so losing it costs a rail its input but leaves nothing unpaid-for. Blocked all the same —
+    # the rails are reading an incomplete ledger — but never described as unreconciled spend.
+    _broken_ledger(tmp_path, monkeypatch)
+
+    record_questions("identity", 3)
+
+    fault = usage.accounting_fault()
+    assert fault is not None
+    assert "UNRECONCILED" not in fault
+    assert "No provider call is unaccounted for" in fault
+
+
+def test_a_latched_fault_outlives_the_process_that_raised_it(tmp_path, monkeypatch):
+    # The CLI is one process per invocation, so an in-memory latch alone would forget every fault
+    # between commands. `reset_accounting_state` is exactly what a fresh process starts from.
+    _broken_ledger(tmp_path, monkeypatch)
+    record_usage("openai", "gpt-5.4-mini", prompt_tokens=10, completion_tokens=5)
+
+    usage.reset_accounting_state()
+
+    assert "UNRECONCILED" in (usage.accounting_fault() or "")
+
+
+def test_repairing_the_path_does_not_by_itself_forgive_the_unrecorded_call(tmp_path, monkeypatch):
+    # A writable path is not a reconciled ledger: the row whose write failed is still missing, so the
+    # day total is still wrong. Clearing on repair alone would be "treat the unknown spend as zero"
+    # with extra steps.
+    ledger = _broken_ledger(tmp_path, monkeypatch)
+    record_usage("openai", "gpt-5.4-mini", prompt_tokens=1000, completion_tokens=200)
+
+    ledger.rmdir()  # the operator fixes the path
+
+    assert usage.check_ledger_writable() is None
+    assert "UNRECONCILED" in (usage.accounting_block_reason() or "")
+
+
+def test_reconcile_replays_the_held_row_instead_of_forgiving_it(tmp_path, monkeypatch):
+    ledger = _broken_ledger(tmp_path, monkeypatch)
+    record_usage("openai", "gpt-5.4-mini", prompt_tokens=1000, completion_tokens=200)
+    ledger.rmdir()
+
+    note = usage.reconcile_accounting()
+
+    assert "Reconciled 1 held ledger row(s)" in note
+    assert usage.accounting_block_reason() is None
+    assert not usage.ledger_fault_path(ledger).exists()
+    # The point of replaying rather than clearing: the day's total is right again afterwards.
+    assert usage_for_day()["openai"]["total"] == 1200
+
+
+def test_a_failed_reconcile_neither_loses_the_held_row_nor_replays_it_twice(tmp_path, monkeypatch):
+    # Running --reconcile before fixing the path is the obvious operator mistake, so the failed
+    # attempt must be a no-op: the row stays held, and the reconcile that eventually succeeds counts
+    # it exactly once. Losing it would forgive real spend; replaying it twice would invent spend.
+    ledger = _broken_ledger(tmp_path, monkeypatch)
+    record_usage("openai", "gpt-5.4-mini", prompt_tokens=100, completion_tokens=20)
+
+    with pytest.raises(OSError):
+        usage.reconcile_accounting()
+
+    assert "UNRECONCILED" in (usage.accounting_fault() or "")
+    assert usage.ledger_fault_path(ledger).exists()
+
+    ledger.rmdir()
+    usage.reconcile_accounting()
+
+    assert usage.usage_for_day()["openai"] == {"prompt": 100, "completion": 20, "total": 120, "calls": 1}
+    assert usage.accounting_block_reason() is None
+
+
+def test_reconcile_says_so_when_a_fault_carries_no_replayable_row(tmp_path, monkeypatch):
+    # The residual this design cannot repair: a fault raised when even the sidecar was unwritable,
+    # whose process has since exited. We know a call went unrecorded but not what it cost — and the
+    # one thing that must never happen is calling that zero.
+    ledger = tmp_path / "usage-ledger.jsonl"
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
+    usage.ledger_fault_path(ledger).write_text(
+        json.dumps({"ts": utc_date() + "T00:00:00+00:00", "kind": "accounting_fault", "billed": True}) + "\n",
+        encoding="utf-8",
+    )
+
+    note = usage.reconcile_accounting()
+
+    assert "stays unknown, not zero" in note
+    assert usage.accounting_block_reason() is None
+
+
+def test_a_fault_that_cannot_even_be_parked_still_blocks_this_process(tmp_path, monkeypatch):
+    # Worst case: the ledger's whole directory is unusable, so the sidecar fails too. The in-process
+    # latch is the only thing left — and it is enough, because the path is still unwritable, so the
+    # pre-call probe blocks the NEXT process on its own.
+    occupied = tmp_path / "not-a-directory"
+    occupied.write_text("occupied", encoding="utf-8")
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(occupied / "usage-ledger.jsonl"))
+
+    record_usage("openai", "gpt-5.4-mini", prompt_tokens=10, completion_tokens=5)
+
+    assert "UNRECONCILED" in (usage.accounting_fault() or "")
+    usage.reset_accounting_state()  # a fresh process: the fault itself is gone...
+    assert usage.accounting_fault() is None
+    assert usage.accounting_block_reason() is not None  # ...but metered work is still refused
+
+
+def test_record_usage_never_raises_on_io_failure(tmp_path):
+    # Unchanged invariant: a ledger write happens mid-judgment, after the provider has answered, so
+    # it must not be the thing that crashes the judgment. What changed is what happens next — the
+    # loss is latched and blocks the following call instead of being written off as noise.
+    unwritable = tmp_path / "dir-as-file"
+    unwritable.write_text("occupied", encoding="utf-8")
+    record_usage("openai", "m", prompt_tokens=1, completion_tokens=1, path=unwritable / "ledger.jsonl")
+    assert usage.accounting_fault(path=unwritable / "ledger.jsonl") is not None
+
+
+def test_the_call_gate_remembers_a_good_path_but_re_probes_a_bad_one(tmp_path, monkeypatch):
+    # Memoizing a failure would leave an operator who fixes the path refused until they restart the
+    # server — the one remedy a Candidate on the web cannot apply.
+    ledger = _broken_ledger(tmp_path, monkeypatch)
+    assert usage.accounting_gate() is not None
+
+    ledger.rmdir()
+
+    assert usage.accounting_gate() is None

@@ -6,7 +6,7 @@ This file tells any agent or contributor where the authoritative design lives, s
 
 1. **`/CONTEXT.md`** — domain glossary. Use these exact terms (Candidate, Session, Interviewer, Evaluator, Supervisor, Micro-loop, Macro-loop, Skill, Topic Plan, Role criticality, Follow-up, Self-critique, Derived confidence, Budget exhaustion, Coaching memory).
 2. **`/docs/adr/`** — the binding architectural decisions (0001–0014). **These win over everything else.** Sections and files marked `Status: Proposed` are experiment-gated hypotheses — do NOT implement from them until their status is Accepted; everything else (including addenda dated 2026-07-19) is binding now.
-3. **`/docs/issues/`** — the build plan as vertical slices (0001–0037). Slice status lives in the doc's `## Status` section; live work status lives in GitHub Issues (the remediation backlog R-01→R-33 maps to GH #56–#88, `R-NN = #(55+NN)`).
+3. **[`/docs/issues/README.md`](docs/issues/README.md)** — the canonical milestone order, dependencies, and quality gates (updated 2026-09-13). **`/docs/issues/`** holds the build plan as vertical slices (0001–0037). Slice status lives in the doc's `## Status` section; live work status lives in GitHub Issues (the remediation backlog R-01→R-33 maps to GH #56–#88, `R-NN = #(55+NN)`).
 
 ## Reference — background only, do NOT implement from these
 
@@ -17,7 +17,7 @@ These are optimized for shipping fast / recruiter signal. That is **not** this p
 
 ## For Implementers
 
-Start with the issue drafts in `/docs/issues/`. Each is a thin vertical slice with acceptance criteria. The critical path to a running multi-question session (**0001 → 0002 → 0005 → {0006, 0007, 0009} → 0010**) is complete; current work is the remediation backlog (GH #56–#88, waves Now/Next/Later).
+Start with the issue drafts in `/docs/issues/`. Each is a thin vertical slice with acceptance criteria. The critical path to a running multi-question session (**0001 → 0002 → 0005 → {0006, 0007, 0009} → 0010**) is complete; current sequencing is the [quality-gated implementation plan](docs/issues/README.md), which reconciles the older remediation waves with the remaining code gaps. Reuse the existing GitHub trackers; accounts are a public-launch gate, not a prerequisite for the trusted-pilot dashboard.
 
 ### Where the ADRs override the MVP docs (common traps)
 
@@ -39,7 +39,7 @@ The old blanket list ("multi-judge consensus, modern RAG, cross-session memory, 
 - **Multi-judge consensus** — *reshaped, not deferred.* Debate-as-score-corrector was measured worthless on this judge (verdict moved 0.00 in 10 forced escalations); cheap multi-vote as an **uncertainty** signal is `ADR 0011` (Proposed, gated E4/E5). Do not build score-averaging consensus.
 - **Modern RAG (HyDE / hybrid / rerank)** — *deferral reaffirmed with data:* the toy store scores 47/50 vs embedders' 46–47/50 at current shelf size; the Skill filter does the work. Upgrade triggers are recorded in R-13 (GH #68); revisit when taxonomy-as-data (`ADR 0014`) changes the shelf.
 - **Cross-session transcript memory** — *split:* scoring memory stays decayed priors (`ADR 0006`, unchanged); **coaching memory** on presentation/planning surfaces is allowed by the 0006 addendum and consumed by slice 0035 (GH #83).
-- **Observability** — *split:* the minimal per-call LLM trace **landed** (R-26/GH #81) — every provider call logs `llm-call provider= model= ms= prompt= completion= outcome=`, and `TurnTrace.llm_calls_by_provider` puts the per-turn provider split in the export, which is what makes a silent judge failover visible after the fact. The *dashboard* remains Later (R-28/GH #83).
+- **Observability** — *split:* the minimal per-call LLM trace **landed** (R-26/GH #81) — every provider call logs `llm-call provider= model= ms= prompt= completion= outcome=`, and `TurnTrace.llm_calls_by_provider` puts the per-turn provider split in the export, which is what makes a silent judge failover visible after the fact. Session/turn/role attribution is the M2 continuation; the Candidate progress dashboard (R-28/GH #83) moves to M3 in the [implementation plan](docs/issues/README.md). A separate operations dashboard remains deferred.
 
 ## Provider note
 

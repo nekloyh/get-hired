@@ -54,6 +54,7 @@ from .supervisor import (
     skill_states_from_state,
 )
 from .usage import (
+    AccountingUnavailable,
     SessionBudgetSuspended,
     begin_session_run,
     clear_run_rails_for_resume,
@@ -894,6 +895,13 @@ def _run_session_thread(
         # The checkpoint is durable, so the UI's resume picks it up once the budget allows.
         logger.warning("Session %r suspended on a budget rail: %s", runtime.session_id, err)
         runtime.emit({"type": "session_error", "error": f"Session suspended: {err}"})
+    except AccountingUnavailable as err:
+        # M0a / F1: a metered call was refused because usage accounting is broken or unreconciled.
+        # Its own branch for the same structural reason as the one above — nothing completed, so
+        # nothing may be persisted as complete — but a different remedy, which the Candidate-facing
+        # text has to carry honestly: this one waits on an operator, not on 00:00 UTC.
+        logger.error("Session %r stopped on an accounting fault: %s", runtime.session_id, err)
+        runtime.emit({"type": "session_error", "error": f"Session stopped: {err}"})
     except CandidateIntent as err:
         # ADR 0005 / issue 0017: the Candidate asked to stop (web cancel/disconnect). This is intent,
         # not an infrastructure failure — a distinct control-flow branch. The supervisor re-raises it

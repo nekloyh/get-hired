@@ -87,6 +87,7 @@ The `coach-state` volume holds everything that must outlive the process:
 | `/app/state/session-checkpoints.sqlite` | LangGraph checkpoints | Every in-flight interview; resume stops working |
 | `/app/state/exports/` | Completed-Session Markdown (R-08) | Every report not already downloaded |
 | `/app/state/skill-ledger.json` | Cross-session Beta priors | Returning Candidates cold-start again |
+| `/app/state/usage-ledger.jsonl` | The token ledger — i.e. the free-tier budget balance | The day's spend resets to zero and every budget rail over-reports |
 
 A `docker restart` mid-question is recoverable: the browser shows *Connection lost*, **Reconnect**
 resumes from the checkpoint, and the pending question is re-emitted. This is verified from a real
@@ -123,9 +124,32 @@ Scaling past one host means R-29 (Postgres checkpointer + real accounts), not mo
 
 ```bash
 docker compose logs -f app          # session lifecycle + the per-call `llm-call` trace
-docker compose exec app coach usage # today's token spend against the daily budget
+docker compose exec app coach usage # today's token spend + the accounting health line
+docker compose exec app coach usage --reconcile  # replay rows a failed ledger write parked
 docker compose up -d --build        # redeploy; the state volume is untouched
 ```
+
+`coach usage` leads with an **ACCOUNTING:** line whenever the token ledger cannot be written or is
+holding rows a failed write could not land. Take it seriously: every number that command prints —
+and every budget rail in the app — is arithmetic over `/app/state/usage-ledger.jsonl`, so a ledger
+nobody can write reads as a *full* budget rather than an unknown one. That is not theoretical: until
+M0a the image left `COACH_USAGE_LEDGER` at its repo-anchored default, which resolves to
+`/app/logs/usage-ledger.jsonl` inside the container, and `/app` is `root:root` 755 while the process
+is uid 10001 — so every append failed, every token row was dropped with a warning, and the
+deployment reported a pristine 2,500,000-token allowance for as long as it ran.
+
+Two conditions, with different remedies, and the message says which:
+
+- **unavailable** — the path cannot be written. Nothing is unaccounted for, because metered calls
+  are refused while it holds; point `COACH_USAGE_LEDGER` at the state volume and it clears itself.
+- **UNRECONCILED** — a provider call was billed and its usage row would not write. The day's spend
+  is now *undetermined*, which is not zero. The unwritten rows are parked in
+  `/app/state/usage-ledger.jsonl.unreconciled`; fix the path, then
+  `docker compose exec app coach usage --reconcile` replays them into the ledger and clears it.
+
+Either way metered work stops and demo mode keeps working, so a misconfigured deployment is
+demonstrable rather than dead. Suspended Sessions keep their resolved questions in the checkpoint
+and record nothing as `failed` (ADR 0005).
 
 The `llm-call provider=… model=… ms=… outcome=…` line (R-26) is the one that makes a silent judge
 failover visible after the fact. If you ever see the judge role on a provider it is not pinned to,
@@ -173,3 +197,27 @@ Every claim above was executed against real containers on 2026-07-27:
 - `docker compose config` with that same `COACH_LOG_FILE=logs/coach-api.log` in `.env` →
   `COACH_LOG_FILE: /app/state/logs/coach-api.log`: the `environment:` block overrides `env_file`.
 - gunicorn is **not** verified and not covered — see §6.
+
+The usage-accounting path (M0a / F1) was executed on 2026-09-13 against the real image, as uid
+10001, on disposable volumes. Fakes are limited to the HTTP transport: the real `OpenAIClient`, its
+real call path and the real `record_usage` run, so no paid API is contacted. Full report and
+commands: [`docs/audits/m0a-usage-ledger-2026-09-13.md`](audits/m0a-usage-ledger-2026-09-13.md).
+
+- **The defect, reproduced:** pre-fix `usage.py`/`llm.py` mounted over the image with
+  `COACH_USAGE_LEDGER` unset → 3 fake metered calls made, **0** ledger rows,
+  `remaining_today = 2,500,000`, exit 0, three `usage ledger write failed … dropping entry`
+  warnings. `mkdir /app/logs` as uid 10001 → `PermissionError`.
+- **Fixed image, stock config:** one fake metered call → exactly one row in
+  `/app/state/usage-ledger.jsonl`, balance 2,500,000 → 2,499,880.
+- **Survives restart and container replacement:** 5 calls / 600 tokens, then `docker restart`, then
+  `docker rm` + a fresh container from the image on the same volume → same 600 tokens both times.
+- **Unwritable path:** `/app/logs/usage-ledger.jsonl` (the old default) → `AccountingUnavailable`,
+  **zero** provider calls made, `coach session` refuses with exit 2 and names the remedy.
+- **Failure after a billed call:** ledger replaced by a directory mid-run → the billed call's row is
+  parked in `usage-ledger.jsonl.unreconciled`, the next call is refused, repairing the path alone
+  does **not** clear it, and `--reconcile` replays the 120 tokens back into the ledger.
+- **Unchanged:** the daily-budget start rail still refuses with its own wording, and a demo Session
+  completes with no provider configured *and* a deliberately unwritable ledger.
+- `docker compose config` with `COACH_USAGE_LEDGER=logs/usage-ledger.jsonl` in `.env` →
+  `/app/state/usage-ledger.jsonl`: the `environment:` block overrides `env_file`, and the container
+  reads the winning value.

@@ -294,6 +294,32 @@ def test_candidate_intent_aborts_session_and_is_not_recorded_as_failed(make_clie
     assert fake.call_count == 0
 
 
+def test_an_accounting_refusal_is_not_recorded_as_a_failed_question(make_client, monkeypatch):
+    # M0a / F1, the same rule ADR 0005 states for Candidate intent and for budget exhaustion: a stop
+    # that is a fact about OUR bookkeeping must never be written down as evidence about the
+    # Candidate. Without the typed re-raise this lands in question_node's `except Exception` net and
+    # becomes a zero-evidence `failed` item — and then the Session ADVANCES, so a broken ledger does
+    # not merely stop the interview, it manufactures a transcript of failures and a Study Plan built
+    # on them. The contrast is deliberate: test_question_failure_is_isolated_and_session_continues
+    # asserts the opposite outcome for a RuntimeError, which is genuine infrastructure noise.
+    from interview_coach import supervisor
+    from interview_coach.usage import AccountingUnavailable
+
+    def _refusing_micro_loop(*args, **kwargs):
+        raise AccountingUnavailable("Usage accounting is UNRECONCILED: 1 provider call(s) were billed")
+
+    monkeypatch.setattr(supervisor, "run_micro_loop", _refusing_micro_loop)
+    client, fake = make_client([_plan("mlops", "system_design", "vietnamese_nlp")])
+    state = initial_session_state("accounting-stop-session", _diagnostic(), max_questions=3, started_at=0)
+    graph = build_session_graph(client, now=lambda: 1)
+
+    with pytest.raises(AccountingUnavailable):
+        graph.invoke(state, session_config("accounting-stop-session"))
+
+    # Nothing advanced: no transcript item, no Supervisor decision call, no Study Plan.
+    assert fake.call_count == 0
+
+
 def test_supervisor_degrades_on_transport_error_at_decision_node(make_client, monkeypatch):
     # Issue 0020: a provider/transport error at the Supervisor's decision node (the only otherwise
     # unguarded macro-loop LLM call) must degrade to the deterministic plan-following decision, not

@@ -11,7 +11,7 @@ import os
 
 import pytest
 
-from interview_coach import telemetry
+from interview_coach import telemetry, usage
 from interview_coach.config import ProviderSettings, Settings
 from interview_coach.llm import GroqClient, LLMRouter, MimoClient
 
@@ -43,6 +43,27 @@ def _reset_telemetry():
     """Noise counters are process-global; every test starts from a clean slate."""
     telemetry.reset()
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_usage_ledger(tmp_path_factory, monkeypatch):
+    """Point every test at its own token ledger, and forget any accounting fault it latched.
+
+    Two separate reasons, both process-global state:
+
+    * ``COACH_USAGE_LEDGER`` was unset for most of the suite, so any fixture scripting a ``usage``
+      block appended into the operator's real ``logs/usage-ledger.jsonl`` — 51 ``mimo/test-model``
+      rows were counted there in the 2026-09-02 baseline. That ledger is the input to every budget
+      rail; fabricated rows in it are fabricated evidence about spend. Tests that want a specific
+      path still set their own, which wins (an autouse fixture runs before the test body).
+    * M0a's accounting latch lives in module globals by design — it has to work when nothing at all
+      can be written — so a test that deliberately breaks the ledger would otherwise refuse metered
+      calls for every test that follows it.
+    """
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(tmp_path_factory.mktemp("ledger") / "usage-ledger.jsonl"))
+    usage.reset_accounting_state()
+    yield
+    usage.reset_accounting_state()
 
 
 @pytest.fixture(autouse=True)

@@ -26,7 +26,7 @@ from pydantic import BaseModel, ValidationError
 
 from . import telemetry
 from .config import ProviderName, ProviderSettings, RoleName, Settings
-from .usage import record_quota_exhausted, record_usage
+from .usage import AccountingUnavailable, accounting_gate, record_quota_exhausted, record_usage
 
 logger = logging.getLogger(__name__)
 
@@ -422,6 +422,13 @@ class _OpenAICompatibleClient(LLMClient):
                 kwargs["tool_choice"] = tool_choice
         if extra_body := self._thinking_extra_body(disable_thinking):
             kwargs["extra_body"] = extra_body
+        # The last point at which this call can still be NOT made (M0a / F1). Every client here is a
+        # metered one by construction — demo mode is a different class and never reaches this — so
+        # "accounting is broken" and "make a paid call anyway" must not both be true. Checked per
+        # call rather than per Session because a fault can latch mid-question, and the whole promise
+        # is that the call after the unrecorded one does not happen.
+        if blocked := accounting_gate():
+            raise AccountingUnavailable(blocked)
         for attempt in range(_TRANSPORT_ATTEMPTS):
             started = _now()
             try:

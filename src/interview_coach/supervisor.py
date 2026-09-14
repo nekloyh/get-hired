@@ -50,6 +50,7 @@ from .session_serde import (
 )
 from .skill import SkillState
 from .study_planner import plan_study
+from .usage import AccountingUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +274,13 @@ def build_session_graph(
             # failure — it must propagate *past* the failure-isolation net below and abort the Session,
             # never be recorded as a zero-evidence `failed` question. The CLI turns it into exit code 2;
             # the web layer converts it into a session_error event.
+            raise
+        except AccountingUnavailable:
+            # M0a / F1: a call refused because usage accounting is broken or unreconciled. Same
+            # shape and same reason as the branch above — the refusal is a fact about OUR
+            # bookkeeping, not evidence about the Candidate, so the net below turning it into a
+            # zero-evidence `failed` question would be the fake-evidence corruption ADR 0005
+            # forbids. The drivers convert it into a visible stop with a reconcile instruction.
             raise
         except Exception as err:  # noqa: BLE001 — one bad question must not abort the Session (slice 0014)
             # A failure inside a single question (a malformed Evaluator output that survived its retry,

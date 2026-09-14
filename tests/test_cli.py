@@ -595,6 +595,76 @@ def test_session_starts_when_the_day_can_fund_it(tmp_path, monkeypatch, capsys):
     assert "00:00 UTC" not in capsys.readouterr().err
 
 
+# --- M0a / F1: accounting health on the CLI surface ----------------------------------------------
+
+
+def test_session_refuses_to_start_when_the_ledger_cannot_be_written(tmp_path, monkeypatch, capsys):
+    # AC 3. The same gate shape as the spent-budget refusal above, for the opposite input: there the
+    # ledger said "nothing left", here it says nothing at all — which every rail reads as a FULL
+    # budget. Refused before the Diagnostic, so not one token is spent under a broken counter.
+    ledger = _tmp_ledger(monkeypatch, tmp_path)
+    ledger.mkdir()  # appends now fail; the directory around it still holds the fault sidecar
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: _ProviderDemoClient())
+
+    def _never(*args, **kwargs):
+        raise AssertionError("the accounting gate must refuse BEFORE any token is spent")
+
+    monkeypatch.setattr(cli, "diagnose_or_degrade", _never)
+
+    rc = cli.main(
+        ["session", "--scripted", "--no-live", "--max-questions", "1", "--session-id", "no-ledger",
+         "--checkpoint-db", str(tmp_path / "c.sqlite")]
+    )
+
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "Usage accounting is unavailable" in err
+    assert "COACH_USAGE_LEDGER" in err  # the remedy is named
+    assert "00:00 UTC" not in err  # this is not scarcity; the daily reset fixes nothing
+
+
+def test_coach_usage_leads_with_the_accounting_condition(tmp_path, monkeypatch, capsys):
+    # `coach usage` prints numbers derived entirely from this file. A reader who is not told the
+    # file is broken reads a full budget off an empty ledger — which is how the container shipped.
+    ledger = _tmp_ledger(monkeypatch, tmp_path)
+    ledger.mkdir()
+
+    assert cli.main(["usage"]) == 0
+
+    captured = capsys.readouterr()
+    assert "ACCOUNTING:" in captured.err
+    assert "Usage accounting is unavailable" in captured.err
+
+
+def test_coach_usage_reconcile_replays_the_held_row(tmp_path, monkeypatch, capsys):
+    # The operator-facing half of AC 4: the held tokens go back INTO the ledger. Reconciliation that
+    # merely cleared the flag would be "count the unrecorded call as zero" with a friendlier name.
+    ledger = _tmp_ledger(monkeypatch, tmp_path)
+    ledger.mkdir()
+    usage.record_usage("mimo", "test-model", prompt_tokens=100, completion_tokens=20)
+    ledger.rmdir()  # the operator fixes the path first
+
+    assert cli.main(["usage", "--reconcile"]) == 0
+
+    captured = capsys.readouterr()
+    assert "Reconciled 1 held ledger row(s)" in captured.out
+    assert "ACCOUNTING:" not in captured.err
+    assert usage.usage_for_day()["mimo"]["total"] == 120
+
+
+def test_reconcile_fails_loudly_while_the_path_is_still_broken(tmp_path, monkeypatch, capsys):
+    ledger = _tmp_ledger(monkeypatch, tmp_path)
+    ledger.mkdir()
+    usage.record_usage("mimo", "test-model", prompt_tokens=100, completion_tokens=20)
+
+    assert cli.main(["usage", "--reconcile"]) == 2
+
+    err = capsys.readouterr().err
+    assert "Could not reconcile" in err
+    assert usage.accounting_block_reason() is not None  # still refusing metered work
+
+
 def test_demo_mode_is_exempt_from_every_budget_rail(tmp_path, monkeypatch, capsys):
     # THE exemption predicate. DemoLLMClient carries no provider identity, so it spends nobody's
     # allowance and every rail must be inert for it — that is what keeps demo mode free and the rest

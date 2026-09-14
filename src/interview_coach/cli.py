@@ -96,12 +96,16 @@ from .supervisor import (
 from .ui import render_skill_state_rows
 from .usage import (
     WORST_CASE_TOKENS_PER_CALL,
+    AccountingUnavailable,
     SessionBudgetSuspended,
+    accounting_block_reason,
     begin_session_run,
     clear_run_rails_for_resume,
     daily_question_cap,
     daily_token_budget,
     estimated_session_tokens,
+    ledger_path,
+    reconcile_accounting,
     remaining_today,
     session_budget_guard,
     session_scope,
@@ -402,7 +406,10 @@ def _run_session_graph(
         # before the suspend banner — it IS in the checkpoint, and a suspend that looks like it ate
         # the last answer is indistinguishable from a crash.
         if budget_stop is not None and (reason := budget_stop(final)):
-            print(f"\n=== SESSION SUSPENDED (budget) ===\n{reason}", file=sys.stderr)
+            # The banner names no cause: this one rail now carries two of them (budget exhaustion
+            # and a broken usage ledger), and the reason below states which. Labelling an accounting
+            # fault "(budget)" would send the operator to wait for 00:00 UTC for a file permission.
+            print(f"\n=== SESSION SUSPENDED ===\n{reason}", file=sys.stderr)
             raise SessionBudgetSuspended(reason)
     if final is None:
         raise RuntimeError("Session graph produced no final state")
@@ -601,6 +608,18 @@ def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
             print(
                 f"Resume it with: coach session --resume --session-id {args.session_id} "
                 f"--checkpoint-db {args.checkpoint_db}",
+                file=sys.stderr,
+            )
+            return 2
+        except AccountingUnavailable as err:
+            # M0a / F1: a call was refused because usage accounting is broken. Not intent, and not
+            # the per-question failure net's business — the questions resolved so far are in the
+            # checkpoint and nothing was recorded as `failed`. The remedy is bookkeeping, not time,
+            # so the resume line is printed under the reason rather than instead of it.
+            print(f"\n=== SESSION STOPPED (accounting) ===\n{err}", file=sys.stderr)
+            print(
+                f"Once accounting is healthy, resume it with: coach session --resume --session-id "
+                f"{args.session_id} --checkpoint-db {args.checkpoint_db}",
                 file=sys.stderr,
             )
             return 2
@@ -814,9 +833,29 @@ def _cmd_bench(client: ClientArg, args: argparse.Namespace) -> int:
 
 def _cmd_usage(client: ClientArg, args: argparse.Namespace) -> int:
     """Today's client-side token ledger — the daily free-tier budget is invisible to the API."""
+    ledger = ledger_path()
+    if getattr(args, "reconcile", False):
+        # M0a / F1: replay the rows a failed write parked, then clear the fault. Explicitly an
+        # operator action: the rail refuses metered work until someone has looked, precisely because
+        # the alternative — clearing itself — is indistinguishable from counting the lost spend as 0.
+        try:
+            print(reconcile_accounting())
+        except OSError as err:
+            print(
+                f"Could not reconcile: {type(err).__name__}: {err}. The ledger at {ledger} is still "
+                f"not writable, so the held rows stay held and metered calls stay refused.",
+                file=sys.stderr,
+            )
+            return 2
+    # Printed before the totals, not after: every number below is arithmetic over this file, so a
+    # reader who does not know the file is broken would read a full budget off an empty ledger.
+    if blocked := accounting_block_reason():
+        print(f"ACCOUNTING: {blocked}\n", file=sys.stderr)
+    else:
+        print(f"Accounting healthy (ledger: {ledger}).")
     totals = usage_for_day()
     if not totals:
-        print("No recorded usage today (ledger: logs/usage-ledger.jsonl).")
+        print(f"No recorded usage today (ledger: {ledger}).")
     for provider, stats in sorted(totals.items()):
         print(
             f"{provider}: {stats['total']:,} tokens across {stats['calls']} call(s) "
@@ -1232,6 +1271,14 @@ def main(argv: list[str] | None = None) -> int:
     harness_parser.set_defaults(func=_cmd_eval_harness, requires_llm=True)
 
     usage_parser = sub.add_parser("usage", help="Show today's token spend per provider (client-side daily ledger)")
+    usage_parser.add_argument(
+        "--reconcile",
+        action="store_true",
+        help=(
+            "Replay the ledger rows a failed write parked beside the ledger, then clear the "
+            "accounting fault that is refusing metered calls (M0a). Fix the path first."
+        ),
+    )
     usage_parser.set_defaults(func=_cmd_usage, requires_llm=False)
 
     bench_parser = sub.add_parser("bench", help="Issue 0022: bilingual Judge calibration bench")

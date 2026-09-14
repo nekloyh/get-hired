@@ -51,11 +51,18 @@ RUN mkdir -p /app/state /app/state/exports \
     && chown -R coach:coach /app/state
 USER coach
 
+# COACH_USAGE_LEDGER is set here, not only in compose, and it is load-bearing (M0a / F1). Its
+# default is repo-anchored — /app/logs/usage-ledger.jsonl in this image — and /app is root:root 755
+# while the process is uid 10001, so every append failed and every token row was dropped. Accounting
+# now refuses metered calls rather than dropping rows, which would turn a `docker run` of this image
+# into a deployment that cannot interview at all. The value belongs on the state volume for the
+# second reason too: the ledger IS the budget balance, so it must survive container replacement.
 ENV PATH="/app/.venv/bin:$PATH" \
     COACH_STATIC_DIR=/app/web/dist \
     COACH_CHECKPOINT_DB=/app/state/session-checkpoints.sqlite \
     COACH_LEDGER_DB=/app/state/skill-ledger.json \
-    COACH_EXPORTS_DIR=/app/state/exports
+    COACH_EXPORTS_DIR=/app/state/exports \
+    COACH_USAGE_LEDGER=/app/state/usage-ledger.jsonl
 
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
