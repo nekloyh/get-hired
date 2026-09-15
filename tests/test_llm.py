@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from types import SimpleNamespace
 
 import httpx
@@ -492,6 +493,55 @@ def test_breaker_skip_downgrades_a_strict_grammar_the_fallback_cannot_enforce():
 
     assert router.breaker_is_open("groq")
     assert fallback.formats[-1] == {"type": "json_object"}
+
+
+def _dead_router() -> tuple[LLMRouter, _FailingClient]:
+    primary = _FailingClient(_auth_error())
+    return LLMRouter("groq", {"groq": primary, "openai": _StaticClient("fallback-answer")}), primary
+
+
+def test_the_breaker_protects_the_next_sessions_router_too():
+    # NEW-08: a router is built per Session, so per-instance breaker state protected exactly one
+    # Session — the next one re-discovered the same dead provider at full retry cost
+    # (BREAKER_FAILURE_THRESHOLD x _TRANSPORT_ATTEMPTS HTTP attempts), forever, which is the opposite
+    # of what this module's docstring promises.
+    router_a, primary_a = _dead_router()
+    for _ in range(BREAKER_FAILURE_THRESHOLD):
+        assert router_a.chat([{"role": "user", "content": "go"}]) == "fallback-answer"
+    assert primary_a.calls == BREAKER_FAILURE_THRESHOLD
+    assert router_a.breaker_is_open("groq")
+
+    router_b, primary_b = _dead_router()
+
+    assert router_b.breaker_is_open("groq")
+    assert router_b.chat([{"role": "user", "content": "go"}]) == "fallback-answer"
+    assert primary_b.calls == 0  # Session B pays nothing to re-learn the outage
+
+
+def test_a_concurrent_sessions_router_sees_the_breaker_its_sibling_opened():
+    # One daemon thread per Session (web_api), each holding its own router object.
+    opened = threading.Barrier(2)
+    observed: dict[str, int] = {}
+    router_b, primary_b = _dead_router()
+
+    def session_a() -> None:
+        router_a, _ = _dead_router()
+        for _ in range(BREAKER_FAILURE_THRESHOLD):
+            router_a.chat([{"role": "user", "content": "go"}])
+        opened.wait(timeout=5)
+
+    def session_b() -> None:
+        opened.wait(timeout=5)
+        router_b.chat([{"role": "user", "content": "go"}])
+        observed["primary_calls"] = primary_b.calls
+
+    threads = [threading.Thread(target=session_a), threading.Thread(target=session_b)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert observed == {"primary_calls": 0}
 
 
 class _ToolClient(LLMClient):

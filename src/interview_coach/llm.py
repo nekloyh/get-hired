@@ -18,6 +18,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any, TypeVar
 
 import openai
@@ -172,15 +173,35 @@ BREAKER_COOLDOWN_SECONDS = 60.0
 
 @dataclass
 class _Breaker:
-    """One provider's consecutive-failure state.
-
-    Deliberately unlocked: the rest of this codebase's shared counters (telemetry, the usage ledger)
-    are unsynchronised too, and the worst a torn update can do here is miscount a single failure —
-    which delays or advances an open by one call and self-corrects on the next success.
-    """
+    """One provider's consecutive-failure state."""
 
     failures: int = 0
     opened_at: float | None = None
+
+
+# PROCESS-level, not per-router (NEW-08). A router is built per Session and runs inside that
+# Session's own thread, so per-instance state protected exactly one Session: the next one re-paid the
+# whole discovery cost — BREAKER_FAILURE_THRESHOLD failures, each up to `_TRANSPORT_ATTEMPTS` HTTP
+# attempts — against a provider already known to be dead. Hoisting it is what makes this module's
+# own promise ("stops costing a wasted round-trip on every call") true.
+#
+# Shared by every Session thread, so it is lock-guarded. Unlike telemetry's counters — which QA-03
+# had to scope PER-Session because sharing them let one Candidate's provider hiccup cap another
+# Candidate's confidence — nothing here is evidence: it is a routing hint about a provider's
+# liveness, which genuinely IS process-wide, it is not a noise event, and the worst a stale entry can
+# do is send one call to the configured fallback for up to one cooldown.
+#
+# Keyed by provider NAME, not (provider, base_url): one process holds one base_url per provider (the
+# router's clients all come from a single `<P>_BASE_URL`), and ROLE_* overrides become PINNED clients
+# that bypass the router and never touch a breaker at all.
+_BREAKER_LOCK = Lock()
+_BREAKERS: dict[ProviderName, _Breaker] = {}
+
+
+def reset_breakers() -> None:
+    """Forget every provider's breaker state (test isolation only)."""
+    with _BREAKER_LOCK:
+        _BREAKERS.clear()
 
 
 # --- per-call trace (R-26) ----------------------------------------------------------------------
@@ -692,7 +713,6 @@ class LLMRouter(LLMClient):
         self._clients = dict(clients)
         if self._primary_provider not in self._clients:
             raise LLMConfigurationError(f"primary provider {self._primary_provider!r} is not configured")
-        self._breakers: dict[ProviderName, _Breaker] = {}
 
     # --- circuit breaker ------------------------------------------------------------------------
 
@@ -704,37 +724,45 @@ class LLMRouter(LLMClient):
         (:meth:`_record_success` / :meth:`_record_failure`) then closes or re-opens the breaker, so
         only one probe per cooldown window ever reaches a provider that is still down.
         """
-        breaker = self._breakers.get(provider)
-        if breaker is None or breaker.opened_at is None:
+        with _BREAKER_LOCK:
+            breaker = _BREAKERS.get(provider)
+            opened_at = None if breaker is None else breaker.opened_at
+        if opened_at is None:
             return False
-        return (_now() - breaker.opened_at) < BREAKER_COOLDOWN_SECONDS
+        return (_now() - opened_at) < BREAKER_COOLDOWN_SECONDS
 
     def _record_success(self, provider: ProviderName) -> None:
-        breaker = self._breakers.get(provider)
-        if breaker is None or (breaker.failures == 0 and breaker.opened_at is None):
-            return
-        if breaker.opened_at is not None:
+        with _BREAKER_LOCK:
+            breaker = _BREAKERS.get(provider)
+            if breaker is None or (breaker.failures == 0 and breaker.opened_at is None):
+                return
+            closing = breaker.opened_at is not None
+            breaker.failures = 0
+            breaker.opened_at = None
+        # Outside the lock: a logging handler must never run while it is held.
+        if closing:
             telemetry.incr(f"router.breaker_close.{provider}")
             logger.info("provider %s answered again; closing its circuit breaker", provider)
-        breaker.failures = 0
-        breaker.opened_at = None
 
     def _record_failure(self, provider: ProviderName) -> None:
-        breaker = self._breakers.setdefault(provider, _Breaker())
-        breaker.failures += 1
-        if breaker.failures < BREAKER_FAILURE_THRESHOLD:
-            return
-        already_open = breaker.opened_at is not None
-        # Re-stamped on every failure at or past the threshold, so a failed half-open probe starts a
-        # fresh cooldown instead of letting every subsequent call through.
-        breaker.opened_at = _now()
+        with _BREAKER_LOCK:
+            breaker = _BREAKERS.setdefault(provider, _Breaker())
+            breaker.failures += 1
+            if breaker.failures < BREAKER_FAILURE_THRESHOLD:
+                return
+            already_open = breaker.opened_at is not None
+            # Re-stamped on every failure at or past the threshold, so a failed half-open probe
+            # starts a fresh cooldown instead of letting every subsequent call through.
+            breaker.opened_at = _now()
+            failures = breaker.failures
+        # Outside the lock: a logging handler must never run while it is held.
         if not already_open:
             telemetry.incr(f"router.breaker_open.{provider}")
             logger.warning(
                 "provider %s failed %d consecutive times; opening its circuit breaker for %.0fs "
                 "(calls route straight to the fallback until a probe succeeds)",
                 provider,
-                breaker.failures,
+                failures,
                 BREAKER_COOLDOWN_SECONDS,
             )
 

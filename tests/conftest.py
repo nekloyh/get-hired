@@ -13,7 +13,7 @@ import pytest
 
 from interview_coach import telemetry, usage
 from interview_coach.config import ProviderSettings, Settings
-from interview_coach.llm import GroqClient, LLMRouter
+from interview_coach.llm import GroqClient, LLMRouter, reset_breakers
 
 # At conftest import, not in a fixture, and deliberately: `interview_coach.web_api` runs BOTH of its
 # module-scope environment readers — `guard_single_worker()` and `configure_session_logging(...)` —
@@ -43,6 +43,20 @@ def _reset_telemetry():
     """Noise counters are process-global; every test starts from a clean slate."""
     telemetry.reset()
     yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_breakers():
+    """Provider circuit-breaker state is process-global now; every test starts from a clean slate.
+
+    Reset on BOTH sides, unlike `_reset_telemetry`: the breaker tests monkeypatch `llm._now` to a
+    fake clock, so a leaked `opened_at` of 500.0 is compared against real `time.monotonic()`
+    afterwards — which reads as expired on a long-lived box and as open on a freshly booted one.
+    That is a failure whose outcome depends on machine uptime, not just on test order.
+    """
+    reset_breakers()
+    yield
+    reset_breakers()
 
 
 @pytest.fixture(autouse=True)
