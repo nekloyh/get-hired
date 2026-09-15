@@ -5,6 +5,9 @@ export type AppSession = {
   sessionId: string
   mode: string
   currentQuestion: string
+  // NEW-01: the turn the pending question belongs to. Sent back with the answer so the server can
+  // refuse one that answers a different turn; null whenever nothing is answerable.
+  currentTurnId: number | null
   messages: ChatMessage[]
   state: SessionState | null
   error: string | null
@@ -15,6 +18,7 @@ export const initialSession: AppSession = {
   sessionId: '',
   mode: 'auto',
   currentQuestion: '',
+  currentTurnId: null,
   messages: [],
   state: null,
   error: null,
@@ -38,6 +42,7 @@ export function reduceSessionEvent(session: AppSession, event: SessionEvent): Ap
       ...session,
       status: 'active',
       currentQuestion: event.question,
+      currentTurnId: event.turn_id,
       messages: [...session.messages, interviewerMessage(event.question)],
     }
   }
@@ -53,6 +58,7 @@ export function reduceSessionEvent(session: AppSession, event: SessionEvent): Ap
       ...session,
       status: 'complete',
       currentQuestion: '',
+  currentTurnId: null,
       state: event.state,
       messages: [...session.messages, systemMessage('Session completed.')],
     }
@@ -62,6 +68,7 @@ export function reduceSessionEvent(session: AppSession, event: SessionEvent): Ap
     status: 'error',
     // Clear the pending question so the composer disables — sending into a failed socket would throw.
     currentQuestion: '',
+  currentTurnId: null,
     error: event.error,
     messages: [...session.messages, systemMessage(event.error)],
   }
@@ -79,6 +86,7 @@ export function reduceConnectionClosed(session: AppSession): AppSession {
     ...session,
     status: 'disconnected',
     currentQuestion: '',
+  currentTurnId: null,
     messages: [
       ...session.messages,
       systemMessage('Connection to the interviewer was lost. Reconnect to resume where you left off.'),
@@ -91,6 +99,7 @@ export function addCandidateAnswer(session: AppSession, answer: string): AppSess
     ...session,
     status: 'evaluating',
     currentQuestion: '',
+  currentTurnId: null,
     messages: [...session.messages, candidateMessage(answer)],
   }
 }

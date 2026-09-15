@@ -40,6 +40,20 @@ describe('setup validation', () => {
 })
 
 describe('session event reducer', () => {
+  it('binds the pending turn id and releases it once answered', () => {
+    // NEW-01: the id the server minted with the question rides back with the answer, and stops being
+    // sendable the moment the question stops being answerable — otherwise a stale id could re-arm a
+    // turn the server has already closed.
+    const asked = reduceSessionEvent(initialSession, {
+      type: 'question',
+      question: 'Explain drift monitoring.',
+      turn_id: 7,
+    })
+    expect(asked.currentTurnId).toBe(7)
+    expect(addCandidateAnswer(asked, 'Track input distributions.').currentTurnId).toBeNull()
+    expect(reduceConnectionClosed(asked).currentTurnId).toBeNull()
+  })
+
   it('adds interviewer and candidate chat messages around a question', () => {
     const started = reduceSessionEvent(initialSession, {
       type: 'session_started',
@@ -47,7 +61,7 @@ describe('session event reducer', () => {
       mode: 'demo',
       resumed: false,
     })
-    const asked = reduceSessionEvent(started, { type: 'question', question: 'Explain drift monitoring.' })
+    const asked = reduceSessionEvent(started, { type: 'question', question: 'Explain drift monitoring.', turn_id: 1 })
     const answered = addCandidateAnswer(asked, 'Track input distributions and delayed labels.')
 
     expect(answered.status).toBe('evaluating')
@@ -73,7 +87,7 @@ describe('connection lifecycle', () => {
       mode: 'demo',
       resumed: false,
     })
-    const asked = reduceSessionEvent(started, { type: 'question', question: 'Explain drift monitoring.' })
+    const asked = reduceSessionEvent(started, { type: 'question', question: 'Explain drift monitoring.', turn_id: 1 })
 
     const dropped = reduceConnectionClosed(asked)
 

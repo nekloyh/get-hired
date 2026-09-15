@@ -160,8 +160,9 @@ export function App() {
     const socket = socketRef.current
     // Never send into a stale/closed socket: a CLOSED socket silently discards the payload (the
     // answer is lost) yet the optimistic state flip would hide the disconnected/error banner (0016).
-    if (!answer || !canAnswer || !socket || socket.readyState !== WebSocket.OPEN) return
-    socket.send(JSON.stringify({ type: 'candidate_answer', answer }))
+    if (!answer || !canAnswer || session.currentTurnId === null || !socket || socket.readyState !== WebSocket.OPEN)
+      return
+    socket.send(JSON.stringify({ type: 'candidate_answer', answer, turn_id: session.currentTurnId }))
     setSession((current) => addCandidateAnswer(current, answer))
     setDraft('')
   }

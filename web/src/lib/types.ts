@@ -195,7 +195,7 @@ export type SessionState = {
 
 export type SessionEvent =
   | { type: 'session_started'; session_id: string; mode: string; resumed: boolean }
-  | { type: 'question'; question: string }
+  | { type: 'question'; question: string; turn_id: number }
   | { type: 'state_update'; state: SessionState }
   | { type: 'session_completed'; state: SessionState }
   | { type: 'session_error'; error: string }

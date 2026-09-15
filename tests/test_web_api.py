@@ -191,6 +191,68 @@ def test_resume_after_cancel_preserves_the_in_flight_question(tmp_path):
     assert state["transcript"][0]["turns"][0]["answer"].startswith("A real answer")
 
 
+# --- NEW-01: an answer is bound to the turn it answers -------------------------------------------
+
+
+def test_an_answer_is_bound_to_the_turn_it_answers(tmp_path):
+    # NEW-01 / ADR 0005. The queue used to be a bare FIFO, so a second answer sent while only the
+    # first question was pending was held and consumed by the NEXT question — the answer typed for
+    # Q1 became `deep_learning` evidence, and the Session completed with no error at all, with the
+    # shifted scores written to the Skill ledger.
+    client = _test_client(tmp_path)
+
+    with client.websocket_connect("/api/sessions/queue-jump") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 2})
+        first = _receive_until(ws, "question")
+        assert isinstance(first.get("turn_id"), int), f"the question frame carries no turn id: {first}"
+        ws.send_json(
+            {"type": "candidate_answer", "answer": "REAL: bias and variance trade off.", "turn_id": first["turn_id"]}
+        )
+        ws.send_json(
+            {"type": "candidate_answer", "answer": "STOLEN: typed for the first question.", "turn_id": first["turn_id"]}
+        )
+        refusal = _receive_until(ws, "session_error", limit=40)
+        assert "does not answer" in refusal["error"]
+        # The queue-jump is refused, so Q2 is now genuinely unanswered — answer it properly, which
+        # is also the proof the refusal did not wedge the Session.
+        second = _receive_until(ws, "question", limit=40)
+        assert second["turn_id"] != first["turn_id"]
+        ws.send_json(
+            {
+                "type": "candidate_answer",
+                "answer": "REAL: an answer for the second question.",
+                "turn_id": second["turn_id"],
+            }
+        )
+        completed = _receive_until(ws, "session_completed", limit=60)
+
+    answers = [turn["answer"] for item in completed["state"]["transcript"] for turn in item["turns"]]
+    assert not any(answer.startswith("STOLEN") for answer in answers), answers
+    assert any(answer.startswith("REAL: an answer for the second") for answer in answers), answers
+
+
+def test_an_id_less_client_still_cannot_answer_a_question_nobody_asked(tmp_path):
+    # The binding is enforced server-side, not by the client's UI state: a bundle that sends no
+    # turn_id at all (an old tab after a mid-Session deploy, curl, anything) is still refused when it
+    # answers a turn nothing is waiting on. That is what makes this a fix rather than a convention.
+    client = _test_client(tmp_path)
+
+    with client.websocket_connect("/api/sessions/queue-jump-legacy") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 2})
+        first_turn_id = _receive_until(ws, "question")["turn_id"]
+        ws.send_json({"type": "candidate_answer", "answer": "REAL: bias and variance trade off."})
+        ws.send_json({"type": "candidate_answer", "answer": "STOLEN: typed for the first question."})
+        refusal = _receive_until(ws, "session_error", limit=40)
+        assert "does not answer" in refusal["error"]
+        second = _receive_until(ws, "question", limit=40)
+        ws.send_json({"type": "candidate_answer", "answer": "REAL: an answer for the second question."})
+        completed = _receive_until(ws, "session_completed", limit=60)
+
+    answers = [turn["answer"] for item in completed["state"]["transcript"] for turn in item["turns"]]
+    assert not any(answer.startswith("STOLEN") for answer in answers), answers
+    assert second["turn_id"] > first_turn_id
+
+
 def test_start_cancel_start_on_one_socket_clears_stale_state(tmp_path):
     # Without a per-run reset the second start inherits a set cancelled flag and a stale sentinel and
     # aborts instantly. A fresh run must reach a real question again.
@@ -2088,9 +2150,13 @@ def test_a_free_text_candidate_id_is_refused_before_a_session_starts(tmp_path, b
     assert not (tmp_path / "ledger.json").exists()
 
 
-def test_answers_past_the_queue_bound_are_dropped_not_buffered(tmp_path, monkeypatch):
-    # The graph never consumes here, so a flood of answers must be refused past the bound, and the
-    # socket loop must still answer the next frame instead of blocking on a full queue.
+def test_a_flood_of_answers_with_no_pending_question_is_refused_not_buffered(tmp_path, monkeypatch):
+    # The graph never consumes here — `run_micro_loop` is stubbed, so no QueueCandidate is ever built
+    # and no question frame is ever emitted. Since NEW-01 that means nothing is pending, so every one
+    # of these frames is refused at the binding rather than buffered against the queue bound, and the
+    # socket loop must still answer the next frame instead of blocking. The bound itself is now a
+    # backstop, pinned directly by `test_a_cancel_is_never_dropped_by_a_full_answer_queue`, which
+    # fills the queue by hand.
     from interview_coach import supervisor
 
     release = threading.Event()
@@ -2117,7 +2183,7 @@ def test_answers_past_the_queue_bound_are_dropped_not_buffered(tmp_path, monkeyp
         release.set()
 
     errors = [event["error"] for event in seen if event["type"] == "session_error"]
-    assert any("Answer dropped" in error for error in errors), errors
+    assert len([e for e in errors if "does not answer" in e]) == web_api.ANSWER_QUEUE_MAXSIZE + 1, errors
     assert "unknown WebSocket payload type" in errors[-1]
 
 

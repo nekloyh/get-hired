@@ -112,6 +112,10 @@ class ResumeSessionPayload(BaseModel):
 class CandidateAnswerPayload(BaseModel):
     type: Literal["candidate_answer"]
     answer: str = Field(max_length=MAX_ANSWER_CHARS)
+    # NEW-01: which turn this answers. Optional on the wire because the *server* enforces the
+    # binding (see the handler): an old bundle that omits it is still refused when it answers a turn
+    # nobody is waiting on, so absence is a missing convenience, not a bypass.
+    turn_id: int | None = None
 
 
 class CancelSessionPayload(BaseModel):
@@ -246,13 +250,18 @@ class QueueCandidate:
         emit: EventEmitter,
         answers: queue.Queue[Any],
         cancelled: threading.Event,
+        begin_turn: Callable[[], int],
     ) -> None:
         self._emit = emit
         self._answers = answers
         self._cancelled = cancelled
+        self._begin_turn = begin_turn
 
     def answer(self, question: str) -> str:
-        self._emit({"type": "question", "question": question})
+        # Arm the binding BEFORE the frame leaves: the client cannot answer a question it has not
+        # received, so set-then-emit is what makes "an answer arrived with nothing pending" mean
+        # exactly that, with no window in which a legitimate answer would be refused.
+        self._emit({"type": "question", "question": question, "turn_id": self._begin_turn()})
         while True:
             if self._cancelled.is_set():
                 raise CandidateInputUnavailable("Session was cancelled while waiting for a Candidate answer.")
@@ -296,6 +305,17 @@ class RuntimeSession:
     # Set under the state lock by the thread's own finally — unlike `is_alive()`, it cannot read
     # True for a thread that has already released the registration.
     run_finished: bool = False
+    # NEW-01. `turn_seq` counts up for the life of the socket and is deliberately NOT reset per run:
+    # restarting it would let an answer still in flight from a cancelled run match a turn of the run
+    # that replaced it. `awaiting_turn_id` is the one turn the graph thread is blocked on; None means
+    # nothing is pending, and every answer that arrives then is refused rather than buffered.
+    turn_seq: int = 0
+    awaiting_turn_id: int | None = None
+
+    def begin_turn(self) -> int:
+        self.turn_seq += 1
+        self.awaiting_turn_id = self.turn_seq
+        return self.turn_seq
 
     def reset_run_state(self) -> None:
         # A single socket can run start -> cancel -> start again. Without a fresh queue and event the
@@ -304,6 +324,7 @@ class RuntimeSession:
         self.answers = _bounded_answers()
         self.cancelled = threading.Event()
         self.run_finished = False
+        self.awaiting_turn_id = None
 
     @property
     def run_in_flight(self) -> bool:
@@ -312,6 +333,7 @@ class RuntimeSession:
     def cancel(self) -> None:
         # A cancel supersedes queued answers: drain so the sentinel can never be lost to a full queue.
         self.cancelled.set()
+        self.awaiting_turn_id = None  # a cancel closes the turn; a late answer is not evidence
         with suppress(queue.Empty):
             while True:
                 self.answers.get_nowait()
@@ -654,6 +676,19 @@ def create_app(
                     # always sends one works against gated and open servers alike.
                     continue
                 elif isinstance(payload, CandidateAnswerPayload):
+                    # NEW-01 / ADR 0005: an answer is evidence about ONE turn, and the server decides
+                    # which. Without this the queue is a bare FIFO, so a second answer sent while one
+                    # question is pending shifts every later question's evidence onto the wrong
+                    # prompt — silently, with no error, all the way into the Skill ledger.
+                    expected = runtime.awaiting_turn_id
+                    if expected is None or (payload.turn_id is not None and payload.turn_id != expected):
+                        emit(
+                            {
+                                "type": "session_error",
+                                "error": "Answer refused: it does not answer the pending question.",
+                            }
+                        )
+                        continue
                     try:
                         runtime.answers.put_nowait(payload.answer)
                     except queue.Full:
@@ -663,6 +698,8 @@ def create_app(
                                 "error": "Answer dropped: earlier answers are still being processed.",
                             }
                         )
+                    else:
+                        runtime.awaiting_turn_id = None
                 else:
                     # Cancel is a control signal (ADR 0005): flag it and drop the sentinel so a blocked
                     # QueueCandidate.answer() raises CandidateIntent. _run_session_thread emits the
@@ -940,7 +977,9 @@ def _run_session_thread(
                 checkpointer=checkpointer,
                 concept_store=concept_store,
                 resource_store=resource_store,
-                candidate_factory=lambda seed: QueueCandidate(runtime.emit, runtime.answers, runtime.cancelled),
+                candidate_factory=lambda seed: QueueCandidate(
+                    runtime.emit, runtime.answers, runtime.cancelled, runtime.begin_turn
+                ),
             )
             config = session_config(runtime.session_id)
             initial_state = None
