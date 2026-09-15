@@ -46,7 +46,13 @@ LEDGER_SCHEMA_VERSION = 1
 # line. Note it refuses diacritics, so a Vietnamese name is an invalid KEY — the field is an id, and
 # the UI says so; widening to Unicode letters re-opens the log-forging and hand-editability
 # arguments and should be a deliberate decision, not a loosening to make a test pass.
-SAFE_CANDIDATE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+# The leading `_` is reserved for this module's own keys (`_meta`), so a Candidate id can never
+# collide with one — NEW-28: `_meta` matched the old rule, so a Candidate using it persisted and
+# warm-started correctly and was then silently destroyed by the next Candidate's save. The whole
+# prefix rather than the one literal, because the next metadata key would reopen it. It must stay a
+# CHARACTER CLASS: web_api feeds this pattern straight into a pydantic `Field(pattern=...)` and
+# pydantic's rust-regex engine has no look-around, so a negative lookahead fails at import.
+SAFE_CANDIDATE_ID = re.compile(r"[A-Za-z0-9-][A-Za-z0-9_-]{0,63}")
 
 
 def is_safe_candidate_id(candidate_id: str) -> bool:
@@ -148,7 +154,7 @@ def _load_candidate(
         raw = Path(path).read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
-    except OSError as err:
+    except (OSError, UnicodeDecodeError) as err:
         logger.warning("Skill ledger unreadable at %s (%s); starting cold.", path, err)
         return None
     try:
@@ -242,7 +248,12 @@ def save_posteriors(
                 loaded = json.loads(target.read_text(encoding="utf-8"))
                 if isinstance(loaded, dict):
                     data = loaded
-        except (OSError, json.JSONDecodeError) as err:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as err:
+            # UnicodeDecodeError is a ValueError, not an OSError, so it used to walk out of a
+            # function whose docstring promises it never raises. NOTE this inherits the existing
+            # "unreadable -> overwrite" policy: one corrupt byte discards every other Candidate's
+            # record. That is the pre-existing policy for malformed JSON and is deliberately not
+            # changed here; quarantine-instead-of-overwrite deserves its own finding.
             logger.warning("Skill ledger at %s unreadable before save (%s); overwriting.", path, err)
         if not _ledger_version_is_supported(data, target):
             return  # never downgrade a ledger a newer build wrote

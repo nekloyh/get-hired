@@ -20,6 +20,7 @@ from interview_coach.ledger import (
     LEDGER_SCHEMA_VERSION,
     SECONDS_PER_DAY,
     decay_beta,
+    is_safe_candidate_id,
     load_priors,
     load_states,
     save_posteriors,
@@ -255,6 +256,41 @@ def _merge_and_park(path: str, read_flag, release) -> None:
 
     Path.read_text = parked
     save_posteriors(target, "alice", {"mlops": SkillState("mlops", alpha=9.0, beta=1.0)}, now=0.0)
+
+
+def test_a_candidate_id_cannot_collide_with_the_ledgers_own_metadata_key(tmp_path):
+    # NEW-28: `_meta` matched the id rule, so a Candidate (or a harness) using it persisted and
+    # warm-started correctly — and then the next Candidate to finish overwrote data["_meta"] with the
+    # schema marker and destroyed that record silently. The whole `_` prefix is reserved rather than
+    # the one literal, because the next metadata key would reopen it, and because the rule has to
+    # stay a character class: web_api feeds SAFE_CANDIDATE_ID.pattern straight into a pydantic
+    # Field(pattern=...), and pydantic's rust-regex engine has no look-around at all.
+    assert not is_safe_candidate_id("_meta")
+    assert not is_safe_candidate_id("_anything")
+    assert is_safe_candidate_id("alice") and is_safe_candidate_id("a-b_c") and is_safe_candidate_id("a" * 64)
+
+    path = tmp_path / "ledger.json"
+    save_posteriors(path, "_meta", {"mlops": SkillState("mlops", alpha=8.0, beta=2.0)}, now=0.0)
+
+    assert not path.exists()  # refused at the ledger too, not merely at the boundary
+
+
+def test_a_ledger_that_is_not_valid_utf8_degrades_instead_of_aborting_the_session(tmp_path, caplog):
+    # NEW-29: both loaders promise they never raise, and UnicodeDecodeError is a ValueError, not an
+    # OSError, so it walked straight out of the guard. A ledger that acquires invalid UTF-8 from
+    # outside the writer — volume corruption, a restore by another tool, a hand edit — then aborted
+    # the next Session start on a file that is supposed to degrade to "no priors".
+    path = tmp_path / "ledger.json"
+    path.write_bytes(b'{"alice": {"completed_at": 0.0, "skills": {}}}\xff\xfe')
+
+    with caplog.at_level(logging.WARNING, logger="interview_coach.ledger"):
+        assert load_priors(path, "alice", now=0.0) is None
+        assert load_states(path, "alice", now=0.0) is None
+        # The writer must survive it too, or a finished Session dies on its memory write.
+        save_posteriors(path, "bob", {"mlops": SkillState("mlops", alpha=2.0, beta=1.0)}, now=0.0)
+
+    assert "unreadable" in caplog.text
+    assert json.loads(path.read_text(encoding="utf-8"))["bob"]["skills"]["mlops"]["alpha"] == 2.0
 
 
 def test_a_ledger_from_a_newer_build_is_neither_read_nor_overwritten(tmp_path, caplog):
