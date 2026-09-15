@@ -118,67 +118,43 @@ interview in progress. It is read-only in the UI; use **New session** to start a
 
 ## Status
 
-**Slice 0027 — Panel Verdict: cost-gated committee debrief.** When the Evaluator's own signals say
-a score is shaky — the deterministic escalation triggers from slice 0006 (confidence < 0.5, or the
-weighted-score cross-check tripping) — the judgment now escalates to a committee instead of a lone
-re-read: a **Skeptic** and an **Advocate** each argue the exchange citing the candidate's actual
-words, then the Evaluator re-evaluates having read both and that verdict is kept (the panel
-advises, the Evaluator decides — ADR 0001). Committee disagreement replaces judge confidence as
-the evidence weight on escalated questions, so a verdict the committee split on moves the Beta
-posterior less, and the Markdown export gains a **committee packet** — triggers, first pass →
-verdict, disagreement, and both scorecards. The triggers are the entire cost gate: a confident
-first pass pays zero extra calls. The 29-case calibration bench is green and a forced-escalation
-experiment records what the debate actually buys on this judge
-(`docs/audits/calibration-bench-2026-07-11-panel-verdict.md`).
+**`v0.1.0-pilot` (2026-09-15).** M-0 and M-1 of the [implementation plan](docs/issues/README.md) are
+complete: the Session is bounded, its spend is accounted for, and the stack deploys behind nginx/TLS.
+The whole path has been driven through a real compose stack — HTTP→HTTPS, `wss://` through the proxy,
+a restart mid-question, a teardown and restore — and what that run found is in
+[`MILESTONE-REPORT.md`](MILESTONE-REPORT.md) §5.
 
-Earlier slice: **0024 — bilingual VN/EN interview mode (ADR 0007).** A Session now carries an explicit
-`language_mode` (`en` | `vn` | `mixed`), chosen with `coach session --language ...` or the web
-setup control and threaded through the Session state into every prompt-bearing agent: the
-Interviewer renders bank questions and generates Follow-ups in the Session's language (a
-deterministic validator holds `vn` follow-ups to actual Vietnamese), the Evaluator is instructed
-per mode, the Study Planner writes vn/mixed plans in Vietnamese, and the export records the mode.
-English communication quality is scored in a dedicated `english_delivery` rubric dimension that is
-activated deterministically per answer (a Vietnamese-character detector — never the judge's call),
-excluded from `weighted_score` so the Beta skill posterior stays technical-only, and weak delivery
-must come with ≥3 concrete phrase-level fixes. The calibration bench gained four mixed-mode cases —
-including a broken-English/strong-content disentanglement proof — and stays green
-(`docs/audits/calibration-bench-2026-07-11-bilingual-mode.md`).
+**Before anyone but you uses it, work through [`docs/pilot-runbook.md`](docs/pilot-runbook.md).** It
+is a pre-flight gate, and one of its lines is a Groq key rotation that only you can tick.
 
-Earlier slices: **0010–0012 — persisted Sessions, Study Planner, React UI/API, and Evaluator harness.**
-`coach session` still runs/resumes a multi-question interactive Session through LangGraph +
-`SqliteSaver` in the terminal. The local web MVP is now a Vite React + TypeScript app backed by
-`coach api`, a thin FastAPI/WebSocket layer over the same Python Session graph. The backend uses live
-LLMs when configured and has an explicit demo-only deterministic client for UI review without
-credentials. `--scripted` runs the built-in fixture Candidate for demos/tests. `--export-markdown`
-writes the full Session transcript, evaluations, Supervisor decisions, and Study Plan as a portfolio
-artifact; the web API also exposes completed Session Markdown at `/api/sessions/{session_id}/export.md`.
-`coach eval-harness` runs held-out golden answers through the Evaluator and exits non-zero when score
-ranges regress.
+### What runs today
 
-Earlier slices: **0006–0009** added Self-critique, RAG Follow-ups, and Diagnostic priors.
-Low-confidence Evaluator judgments get exactly one Self-critique pass. The Interviewer is the only
-tool-using agent: Follow-up generation first calls `lookup_concept`, then asks a grounded question
-using the retrieved note. The concept store can run
-in-memory for tests/demos or against a Chroma `concepts` collection using `BAAI/bge-small-en-v1.5`.
-The Diagnostic reads the Candidate profile and produces a Topic Plan plus weak Beta priors with
-prior-only correlations and Role criticality metadata. The single-shot LLM agent is the primary
-Topic Plan path whenever a provider is configured; a deterministic ordering is the offline fallback.
-`DiagnosticResult.topic_plan_source` records which path ran (`llm` | `deterministic`).
+A Session is a Diagnostic (profile → Topic Plan + weak Beta priors), then a Supervisor macro-loop
+executing that plan over LangGraph with SQLite checkpoints, then a micro-loop per question:
+Interviewer asks → Candidate answers → Evaluator scores and flags a Follow-up → the Interviewer aims
+one at the gap using the `lookup_concept` tool → repeat until the Evaluator stops or the cap trips.
+The Evaluator is the only component that judges (ADR 0001). When its own deterministic triggers say a
+score is shaky, the judgment escalates to a Skeptic/Advocate **Panel** and the Evaluator re-decides
+having read both; committee disagreement, not judge confidence, becomes the evidence weight. Skill
+state is a decayed Beta posterior per Skill (ADR 0002, ADR 0006), never a running average. A Session
+ends with a two-week Study Plan and a Markdown export of the whole thing.
 
-Earlier slices: **0004–0005** added the provider router + within-question micro-loop. LLM calls go
-through an
-`LLMRouter`: `PRIMARY_PROVIDER=openai|groq|zenmux` selects the primary OpenAI-compatible provider and falls
-back to the other configured provider on primary call failure. The judgment path is also a loop that
-owns one question end-to-end (ADR 0001): the **Interviewer** asks → the fixture **Candidate** answers
-→ the **Evaluator** scores the turn and flags `follow_up_recommended` → if a **Follow-up** is flagged
-and the safety cap is not hit, the Interviewer generates one targeting the gap and we repeat →
-otherwise stop and keep the last score, then update the **Skill** state (slice 0002). The Evaluator's
-flag is the stop logic; the cap is only a guardrail, logged distinctly when it trips.
+EN/VN/mixed is first-class (ADR 0007): the mode is Session state, a deterministic detector — never
+the judge — decides when English delivery is scored, and that dimension stays out of `weighted_score`
+so the skill posterior is technical-only.
 
-Earlier slices: **0001** evaluate one answer → typed `Evaluation`; **0002** Beta-distributed Skill
-state updated from the score (pure Python, no LLM — ADR 0002); **0003** a deterministic
-`weighted_score` cross-check that lowers `confidence` on divergence. The Supervisor macro-loop is the
-next major orchestration slice.
+Interfaces: `coach session` in the terminal, `coach api` + a Vite/React app in the browser, and a
+Docker image with an nginx/TLS compose stack.
+
+### What is not true yet
+
+| | |
+|---|---|
+| The judge calibration gate is **red at 34/35** | a known EN/VN split on two dimensions with a gap in their 1–5 scale ([#96](https://github.com/nekloyh/get-hired/issues/96)). Scores are for practice, not for comparing people |
+| One shared token, no accounts | anyone with it can read or overwrite anyone's Skill history by typing their Candidate id ([#84](https://github.com/nekloyh/get-hired/issues/84)) |
+| Resume is per **question**, not per turn | a crash costs the question in flight, not the interview |
+| The Skill ledger keeps one snapshot per Candidate | there is no history to chart yet ([#127](https://github.com/nekloyh/get-hired/issues/127)) |
+| Self-critique is dormant | its low-confidence trigger never fires on the current judge; the Panel above is what replaced it. `SelfCritiqueTrace` is a leftover type with no producer ([#129](https://github.com/nekloyh/get-hired/issues/129)) |
 
 ## Setup
 
@@ -282,6 +258,13 @@ decision-level regression testing. Together they are the two halves of the eval 
 ## Test
 
 ```bash
+./scripts/gate.sh         # everything CI runs, one verdict per line, one GATE: OK at the end
+./scripts/gate.sh --all   # ...plus the image build, compose validation and the browser specs
+```
+
+Or one at a time:
+
+```bash
 uv run pytest             # offline/unit tests only (no credentials needed)
 uv run pytest -m live     # explicitly hit the real provider (needs .env configured)
 uv sync --extra rag && uv run pytest -m rag  # optional Chroma/BGE integration
@@ -297,8 +280,8 @@ cd web && npm run test:e2e  # optional: requires the backend API running and Pla
   `LLMRouter`: structured output + one self-correcting retry, primary-provider selection, and typed
   failover with a per-provider circuit breaker.
 - `src/interview_coach/evaluator.py` — the `Evaluation` schema + `evaluate()`, plus the slice-0003
-  `weighted_score` cross-check and slice-0006 Self-critique. The Evaluator is the *only* component
-  that judges (ADR 0001).
+  `weighted_score` cross-check and the deterministic triggers that escalate a shaky judgment to the
+  Panel. The Evaluator is the *only* component that judges (ADR 0001).
 - `src/interview_coach/interviewer.py` — the Interviewer: `generate_follow_up()` aims one Follow-up at
   the gap the Evaluator flagged using the `lookup_concept` tool. It never scores.
 - `src/interview_coach/concepts.py` — seed concept notes, the `lookup_concept` tool interface,
