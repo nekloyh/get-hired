@@ -775,6 +775,28 @@ def test_a_just_finished_session_is_still_resumable(tmp_path):
         assert _receive_until(ws, "session_completed", limit=40)["state"]["status"] == "complete"
 
 
+def test_resuming_a_swept_session_id_is_refused_before_the_graph_runs(tmp_path):
+    # The complement of the test above, and the reason the sweep needs one: localStorage keeps a
+    # Session id forever while checkpoints expire on a 7-day TTL, so a Candidate returning after the
+    # sweep clicks the UI's own "Reconnect & Resume" on an id that no longer has a checkpoint.
+    # Before this the graph was streamed anyway and langgraph answered with
+    # `session_error: EmptyInputError: Received no input for __start__` — after a `session_started`
+    # that claimed `resumed: true`, so the UI had already said "Session resumed from checkpoint."
+    # The CLI has refused this since 0019; the web must agree, and must refuse BEFORE session_started.
+    # `receive_json()` rather than `_receive_until` is the assertion: the first frame on the socket
+    # has to be the refusal.
+    client = _test_client(tmp_path)
+
+    with client.websocket_connect("/api/sessions/swept-away") as ws:
+        ws.send_json({"type": "resume_session", "mode": "demo"})
+        first = ws.receive_json()
+
+        assert first["type"] == "session_error", f"first event was {first!r}"
+        assert "No saved Session found" in first["error"]
+        assert "swept-away" in first["error"]
+        assert "EmptyInputError" not in first["error"]
+
+
 def test_an_unreadable_timestamp_is_left_alone_rather_than_guessed(tmp_path):
     from langgraph.checkpoint.sqlite import SqliteSaver
 

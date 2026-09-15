@@ -835,6 +835,20 @@ def _run_session_thread(
         provider = provider_label(roles.judge)
         metered = provider != UNKNOWN_PROVIDER
         checkpoint_values = _checkpoint_values(api_state, runtime.session_id) if resume else {}
+        if resume and not checkpoint_values:
+            # The CLI's --resume guard, ported (issue 0019). With nothing checkpointed,
+            # graph.stream(None, ...) answers with langgraph's EmptyInputError, which reached the
+            # Candidate as `session_error: EmptyInputError: Received no input for __start__`. Not an
+            # edge case: the browser keeps one Session id in localStorage forever while checkpoints
+            # expire on COACH_CHECKPOINT_TTL_SECONDS (7 days), so a Candidate returning after the
+            # sweep clicks the UI's own "Reconnect & Resume" and is hard-stuck on a message about
+            # `__start__`. Refused ABOVE the resume budget-rail clearing, which writes to the usage
+            # ledger, and BEFORE `session_started` — the reducer appends "Session resumed from
+            # checkpoint." on that frame, so emitting it here tells the Candidate their progress was
+            # restored and then hands them the error.
+            logger.warning("refused to resume Session %r: no checkpoint", runtime.session_id)
+            runtime.emit({"type": "session_error", "error": _unknown_session_message(runtime.session_id)})
+            return
         max_questions = (
             int(checkpoint_values.get("max_questions", DEFAULT_MAX_QUESTIONS))
             if resume
@@ -1056,6 +1070,19 @@ def _remember_completed(api_state: WebApiState, session_id: str, state: dict[str
         completed[session_id] = state
         while len(completed) > MAX_COMPLETED_SESSIONS_IN_MEMORY:
             del completed[next(iter(completed))]
+
+
+def _unknown_session_message(session_id: str) -> str:
+    """The web's half of the CLI's unknown-``--resume``-id refusal, in the same opening words (0019).
+
+    Deliberately NOT the CLI string verbatim: ``--session-id`` is meaningless in a browser, and the
+    CLI's hint lists every thread_id in the checkpoint DB plus the DB's path — one Candidate's socket
+    must never be handed the ids of everyone else's Sessions.
+    """
+    return (
+        f"No saved Session found for {session_id!r}. It was never started here, or its checkpoint "
+        "has expired. Start a new Session from Setup — there is nothing to resume."
+    )
 
 
 def _checkpoint_values(api_state: WebApiState, session_id: str) -> Mapping[str, Any]:
