@@ -34,6 +34,7 @@ from interview_coach.usage import (
     questions_today,
     quota_exhausted_today,
     record_questions,
+    record_questions_released,
     record_quota_exhausted,
     record_usage,
     remaining_today,
@@ -1250,3 +1251,32 @@ def test_a_second_process_cannot_pass_the_cap_the_first_is_already_taking(tmp_pa
     assert questions_today("id-1") == 10  # the cap holds across the process boundary
     assert child_outcome.read_text(encoding="utf-8") == ""  # the child won the race and reserved
     assert outcomes and "COACH_DAILY_QUESTION_CAP" in (outcomes[0] or "")  # this process was refused
+
+
+def test_a_released_reservation_gives_the_cap_back_without_rewriting_a_row(tmp_path, monkeypatch):
+    # QA-08's ledger half. The ledger is append-only, so a refund is a compensating ROW of its own
+    # kind — the same shape `quota_retry` already uses to answer `quota_exhausted` — never a mutation
+    # and never a negative count smuggled onto a reservation row, which a torn line would be
+    # indistinguishable from.
+    ledger = _ledger(tmp_path, monkeypatch)
+    monkeypatch.setenv("COACH_DAILY_QUESTION_CAP", "10")
+
+    assert reserve_questions("id-1", questions=10) is None
+    assert questions_today("id-1") == 10
+    assert question_cap_reason("id-1", questions=1) is not None  # the cap really is full
+
+    record_questions_released("id-1", 7, session="s-1")
+
+    assert questions_today("id-1") == 3
+    assert question_cap_reason("id-1", questions=7) is None
+    assert questions_today("id-2") == 0  # per identity, like the reservation it answers
+    rows = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+    assert [row["kind"] for row in rows] == ["questions", "questions_released"]
+    assert rows[0]["questions"] == 10  # the reservation row is untouched
+    # A fifth row kind in the same file, and it must be as invisible to the token readers as the four
+    # before it — a refund read as spend would corrupt the budget rail it sits next to.
+    assert usage_for_day() == {}
+    assert sessions_for_day() == {}
+    # A release with no reservation behind it is floored at 0, never banked against the next start.
+    record_questions_released("id-2", 5)
+    assert questions_today("id-2") == 0

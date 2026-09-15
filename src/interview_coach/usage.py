@@ -321,6 +321,31 @@ def record_questions(identity: str, questions: int, *, path: Path | None = None)
     )
 
 
+def record_questions_released(
+    identity: str, questions: int, *, session: str = "", path: Path | None = None
+) -> None:
+    """Hand ``questions`` back to ``identity``'s daily cap — the compensating row for a reservation.
+
+    A compensating ROW of its own kind, not a mutation and not a negative count on a ``questions``
+    row: the ledger is append-only, and every other undo in it already works this way —
+    ``quota_retry`` answers ``quota_exhausted``, a new ``session_run`` baseline answers the previous
+    one, and both are resolved by scanning in write order. A negated value would also be
+    indistinguishable from a corrupt reservation in a torn line. It is invisible to every token
+    reader for the same reason a reservation is: it carries no token fields at all.
+    """
+    entry: dict[str, object] = {
+        "ts": _now_ts(),
+        "kind": "questions_released",
+        "identity": identity,
+        "questions": int(questions),
+    }
+    if session:
+        # Not read by any rail — it is what makes a stray or doubled release traceable in a file
+        # people paste into bug reports.
+        entry["session"] = session
+    _append(entry, path)
+
+
 def record_quota_exhausted(provider: str, *, path: Path | None = None) -> None:
     """Latch ``provider``'s terminal ``insufficient_quota`` (ADR 0005's detection half, PR #89).
 
@@ -918,16 +943,24 @@ def quota_exhausted_today(provider: str, *, day: str | None = None, path: Path |
 
 
 def questions_today(identity: str, *, day: str | None = None, path: Path | None = None) -> int:
-    """Questions ``identity`` has reserved today against the product cap."""
+    """Questions ``identity`` still holds against the product cap today: reserved minus released.
+
+    A run that ends without asking what it reserved gives the remainder back (web_api's
+    ``_release_unused_questions``), so this measures OUTSTANDING reservations rather than every
+    reservation ever taken. Never negative: a release only ever answers a reservation, and if one is
+    ever written without its pair, 0 is the honest floor rather than a credit against the next start.
+    """
     total = 0
     for entry in _rows_for_day(day or utc_date(), path):
-        if entry.get("kind") != "questions" or str(entry.get("identity", "")) != identity:
+        kind = entry.get("kind")
+        if kind not in {"questions", "questions_released"} or str(entry.get("identity", "")) != identity:
             continue
         try:
-            total += int(entry["questions"])
+            count = int(entry["questions"])
         except (KeyError, TypeError, ValueError):
             continue
-    return total
+        total += -count if kind == "questions_released" else count
+    return max(0, total)
 
 
 def remaining_today(provider: str = "openai", *, path: Path | None = None) -> int:

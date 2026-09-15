@@ -60,6 +60,7 @@ from .usage import (
     begin_session_run,
     clear_run_rails_for_resume,
     daily_reset_hint,
+    record_questions_released,
     reserve_questions,
     session_budget_guard,
     session_scope,
@@ -815,6 +816,9 @@ def _run_session_thread(
     payload: StartSessionPayload | ResumeSessionPayload,
     resume: bool,
 ) -> None:
+    # QA-08: what this run took off the daily question cap, so the `finally` can hand back what it
+    # can never ask. Declared outside the `try`, because the first statement inside it can raise.
+    reservation: tuple[str, int] | None = None
     try:
         # QA-01: a fresh start on an id that already has a checkpoint restarts the graph over it AND
         # overwrites exports/<id>.md, which the export endpoint can never get back — it reads RAM,
@@ -849,6 +853,18 @@ def _run_session_thread(
             logger.warning("refused to resume Session %r: no checkpoint", runtime.session_id)
             runtime.emit({"type": "session_error", "error": _unknown_session_message(runtime.session_id)})
             return
+        # QA-08: built HERE, before the cap reservation below, because building it is what rejects an
+        # unknown Skill claim. Reserving first let 48 malformed frames at max_questions=10 fill a
+        # 480-question cap for the whole UTC day at zero provider cost, and a client that crashes
+        # between the two did the same by accident.
+        profile: CandidateProfile | None = None
+        if not resume:
+            assert isinstance(payload, StartSessionPayload)
+            profile = CandidateProfile(
+                target_role=payload.target_role,
+                target_companies=tuple(payload.target_companies),
+                claimed_skills=payload.claimed_skills,
+            )
         max_questions = (
             int(checkpoint_values.get("max_questions", DEFAULT_MAX_QUESTIONS))
             if resume
@@ -869,6 +885,7 @@ def _run_session_thread(
                 logger.warning("refused to start Session %r: %s", runtime.session_id, refusal)
                 runtime.emit({"type": "session_error", "error": refusal})
                 return
+            reservation = (identity, payload.max_questions)
         if metered and resume:
             # The Candidate clicked resume. The per-run ceiling and the insufficient_quota latch
             # both hang on this run's own state, so nothing but this clears them — and a resume
@@ -929,11 +946,7 @@ def _run_session_thread(
                     # until the Candidate asks for a new one, so without a baseline the rail would
                     # charge each new interview for every interview that came before it.
                     begin_session_run(runtime.session_id)
-                profile = CandidateProfile(
-                    target_role=payload.target_role,
-                    target_companies=tuple(payload.target_companies),
-                    claimed_skills=payload.claimed_skills,
-                )
+                assert profile is not None  # built above, before the cap reservation (QA-08)
                 carried = load_priors(api_state.ledger_db, payload.candidate_id, now=time.time())
                 diagnostic = diagnose_or_degrade(
                     profile,
@@ -1010,6 +1023,9 @@ def _run_session_thread(
         logger.exception("Session %r failed", runtime.session_id)
         runtime.emit({"type": "session_error", "error": f"{type(err).__name__}: {err}"})
     finally:
+        # Outside the state lock on purpose: this reads the checkpoint DB and appends to the ledger,
+        # and `_claim_session_id` and the socket handler are both blocked while that lock is held.
+        _release_unused_questions(api_state, runtime, reservation)
         with api_state.lock:
             runtime.run_finished = True
             # The socket closed while this thread was still running: the registration was left for
@@ -1070,6 +1086,39 @@ def _remember_completed(api_state: WebApiState, session_id: str, state: dict[str
         completed[session_id] = state
         while len(completed) > MAX_COMPLETED_SESSIONS_IN_MEMORY:
             del completed[next(iter(completed))]
+
+
+def _release_unused_questions(
+    api_state: WebApiState, runtime: RuntimeSession, reservation: tuple[str, int] | None
+) -> None:
+    """Hand back the questions this run reserved and can never ask (QA-08).
+
+    Only a run that can never come back for them. A cancelled or SUSPENDED Session keeps a resumable
+    checkpoint and a resume does not re-reserve — ``reserve_questions`` is on the ``not resume``
+    branch — so releasing there would hand the resumed run its remaining questions off the books, and
+    it would reopen the bypass the up-front reservation exists to close: a cap that only counts
+    finished Sessions is beaten by abandoning them.
+
+    So exactly two cases release. Nothing checkpointed at all: the run died before the graph wrote a
+    thing (an invalid payload, a store that would not build, a quota that died on the Diagnostic) and
+    the Candidate has already been told to start a new Session, not to resume this one. COMPLETE: the
+    interview is over, and a question the Supervisor ended early on is never going to be asked.
+    """
+    if reservation is None:
+        return
+    identity, reserved = reservation
+    try:
+        values = _checkpoint_values(api_state, runtime.session_id)
+        if not values:
+            unused = reserved
+        elif str(values.get("status", "")) == SessionStatus.COMPLETE.value:
+            unused = reserved - int(values.get("question_count", 0))
+        else:
+            return  # resumable: the reservation is still owed to this Session
+        if unused > 0:
+            record_questions_released(identity, unused, session=runtime.session_id)
+    except Exception:  # noqa: BLE001 - a refund must never mask the run's own outcome, or wedge the id
+        logger.warning("could not release the question reservation for %r", runtime.session_id, exc_info=True)
 
 
 def _unknown_session_message(session_id: str) -> str:

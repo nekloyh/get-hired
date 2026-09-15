@@ -1587,6 +1587,47 @@ def test_resuming_a_live_session_does_not_recharge_the_question_cap(tmp_path, mo
     assert usage.questions_today(usage.token_identity("")) == 1
 
 
+def test_a_semantically_invalid_start_never_consumes_the_daily_question_cap(tmp_path, monkeypatch):
+    # QA-08. `claimed_skills` is validated by CandidateProfile, which the start handler used to build
+    # long AFTER it took the cap reservation — so a frame that dies before any provider call had
+    # already appended `questions: 10`. 48 of them filled a 480-question cap for the whole UTC day at
+    # zero provider cost, and a client that crashes in that window did the same by accident.
+    client = _live_client(tmp_path, monkeypatch)
+    monkeypatch.setenv("COACH_DAILY_QUESTION_CAP", "20")
+
+    for n in range(3):
+        with client.websocket_connect(f"/api/sessions/junk-{n}") as ws:
+            _start_live(ws, max_questions=10, claimed_skills={"not_a_real_skill": 3})
+            event = _receive_until(ws, "session_error")
+        # The third frame must still be rejected for being nonsense, not for a cap two frames of
+        # nonsense filled.
+        assert "unknown Skill claim" in event["error"], event
+
+    assert usage.questions_today(usage.token_identity("")) == 0
+
+
+def test_a_start_that_dies_before_anything_is_checkpointed_gives_the_questions_back(tmp_path, monkeypatch):
+    # The other half of QA-08: reordering only covers the payloads we can validate up front. A start
+    # that reserves 10 and then dies with NOTHING checkpointed can never be resumed to ask them, so
+    # holding them locks the identity out for the UTC day at zero provider cost — the same denial of
+    # service reached by a crash instead of a malformed frame. `build_resource_store` stands in for
+    # any failure between the reservation and the first checkpoint write.
+    def _explode(*args, **kwargs):
+        raise RuntimeError("store exploded")
+
+    client = _live_client(tmp_path, monkeypatch)
+    monkeypatch.setenv("COACH_DAILY_QUESTION_CAP", "10")
+    monkeypatch.setattr(web_api, "build_resource_store", _explode)
+
+    with client.websocket_connect("/api/sessions/crashed") as ws:
+        _start_live(ws, max_questions=10)
+        event = _receive_until(ws, "session_error")
+
+    assert "RuntimeError" in event["error"], event
+    assert web_api._checkpoint_values(client.app.state.web_api, "crashed") == {}  # nothing to resume
+    assert usage.questions_today(usage.token_identity("")) == 0
+
+
 def test_a_mid_session_breach_suspends_instead_of_completing(tmp_path, monkeypatch, caplog):
     # AC (c) on the web surface: a visible session_error, no session_completed — never a
     # `failed`-and-advance (ADR 0005) and never a silent stall.
