@@ -316,6 +316,13 @@ def _inflight_session_message(session_id: str) -> str:
     )
 
 
+def _completed_session_message(session_id: str) -> str:
+    return (
+        f"A Session with id {session_id!r} has already finished. Choose a different --session-id, or "
+        "pass --resume to re-open its report — starting fresh would overwrite it."
+    )
+
+
 def _print_resume_recap(state: Mapping[str, Any]) -> None:
     """Compact recap of what a resumed Session already resolved, instead of replaying history."""
     transcript = state.get("transcript", [])
@@ -445,9 +452,16 @@ def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
                 )
             else:
                 existing = resumable_session_state(graph, args.session_id)
-                if existing is not None and existing.get("status") != SessionStatus.COMPLETE.value:
-                    # Don't silently restart over an in-flight Session on the same id (0019).
-                    print(_inflight_session_message(args.session_id), file=sys.stderr)
+                if existing is not None:
+                    # Don't silently restart over a Session on this id (0019) — in-flight OR
+                    # finished. QA-01: a completed checkpoint is an interview whose report a fresh
+                    # start would overwrite, so it is refused too, with its own remedy.
+                    print(
+                        _completed_session_message(args.session_id)
+                        if existing.get("status") == SessionStatus.COMPLETE.value
+                        else _inflight_session_message(args.session_id),
+                        file=sys.stderr,
+                    )
                     return 2
                 profile = CandidateProfile(
                     target_role=args.target_role,

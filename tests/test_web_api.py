@@ -560,6 +560,24 @@ def test_the_export_lands_in_the_configured_directory(tmp_path):
     assert (tmp_path / "exports" / "on-disk.md").read_text(encoding="utf-8").startswith("# Interview Session:")
 
 
+def test_a_fresh_start_over_an_existing_checkpoint_is_refused(tmp_path):
+    # QA-01: the browser keeps ONE Session id in localStorage and the id field is readOnly, so a
+    # returning Candidate pressing Start lands on yesterday's id. Without a guard the graph restarts
+    # over the checkpoint and _persist_export overwrites exports/<id>.md — and the export endpoint
+    # reads RAM then that file, never the checkpoint, so the report is simply gone.
+    client = _test_client(tmp_path)
+    _complete_a_demo_session(client, "returning")
+    first_export = client.get("/api/sessions/returning/export.md").text
+
+    with client.websocket_connect("/api/sessions/returning") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+        event = _receive_until_any(ws, {"session_started", "session_error"})
+
+    assert event["type"] == "session_error", f"a fresh start restarted over a saved Session: {event}"
+    assert "resume" in event["error"].lower()  # the refusal has to name the remedy the UI can perform
+    assert client.get("/api/sessions/returning/export.md").text == first_export
+
+
 def test_an_unknown_session_is_still_a_404_after_the_disk_fallback(tmp_path):
     assert _test_client(tmp_path).get("/api/sessions/never-existed/export.md").status_code == 404
 
@@ -1713,12 +1731,20 @@ def test_the_web_rail_counts_only_the_questions_actually_left(tmp_path, monkeypa
 
 
 def test_a_new_interview_on_the_same_browser_id_is_not_suspended(tmp_path, monkeypatch):
-    # web/src/lib/sessionId.ts persists ONE id per browser, and connect(false) — the fresh-start
-    # path — reuses it verbatim. While the rail measured the id, the next brand-new interview never
-    # received a question at all, and each bricked attempt still burned a real Diagnostic call.
+    # web/src/lib/sessionId.ts persists ONE id per browser. While the rail measured the id, the next
+    # brand-new interview never received a question at all, and each bricked attempt still burned a
+    # real Diagnostic call.
+    # Since QA-01 a fresh start is refused while a checkpoint for the id still exists, so the way an
+    # id comes back round is the startup TTL sweep (COACH_CHECKPOINT_TTL_SECONDS, 7 days by default)
+    # dropping the thread — while the usage ledger, which has no TTL, keeps every row. That is the
+    # shape reproduced here: the checkpoint is swept between interviews, the spend is not.
     client = _live_client(tmp_path, monkeypatch, brain=_MeteredDemoClient)
 
+    def sweep_checkpoints() -> None:
+        (tmp_path / "checkpoints.sqlite").unlink(missing_ok=True)
+
     def one_interview(expect: str) -> dict:
+        sweep_checkpoints()
         with client.websocket_connect("/api/sessions/same-browser") as ws:
             _start_live(ws, max_questions=1)
             assert ws.receive_json()["type"] == "session_started"

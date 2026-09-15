@@ -816,6 +816,16 @@ def _run_session_thread(
     resume: bool,
 ) -> None:
     try:
+        # QA-01: a fresh start on an id that already has a checkpoint restarts the graph over it AND
+        # overwrites exports/<id>.md, which the export endpoint can never get back — it reads RAM,
+        # then that file, never the checkpoint. The browser keeps ONE id in localStorage
+        # (web/src/lib/sessionId.ts) and renders it read-only, so a returning Candidate pressing
+        # Start is exactly this case, not an edge case. Refuse it before anything is built or spent;
+        # resuming and rotating the id are both one click away.
+        if not resume and _checkpoint_values(api_state, runtime.session_id):
+            logger.warning("refused a fresh start on Session %r: it already has a checkpoint", runtime.session_id)
+            runtime.emit({"type": "session_error", "error": _ALREADY_CHECKPOINTED})
+            return
         client = _client_for_mode(runtime.mode, api_state.settings)
         # ADR 0010: demo mode's client is not a router, so the bundle collapses to single-client
         # semantics; live mode pins the judge and applies any ROLE_* overrides.
@@ -996,6 +1006,10 @@ def _run_session_thread(
 
 _ACTIVE_ELSEWHERE = "This Session id already has an active connection."
 _STILL_FINISHING = "The previous run of this Session is still finishing; retry in a moment."
+_ALREADY_CHECKPOINTED = (
+    "This Session id already has saved progress. Resume it to continue where you left off, or use "
+    '"New session" to get a fresh id — starting over here would overwrite the saved report.'
+)
 
 
 async def _claim_session_id(api_state: WebApiState, session_id: str, runtime: RuntimeSession) -> str | None:

@@ -359,8 +359,11 @@ def test_session_rejects_unknown_language_flag(tmp_path, capsys):
     assert "--language" in capsys.readouterr().err
 
 
-def test_session_starts_fresh_when_prior_checkpoint_is_complete(tmp_path, monkeypatch, capsys):
-    # The in-flight guard is scoped to non-complete Sessions: a completed checkpoint may be started over.
+def test_session_refuses_to_restart_over_a_completed_checkpoint(tmp_path, monkeypatch, capsys):
+    # QA-01, and a deliberate inversion of what this test used to pin. The in-flight guard was scoped
+    # to non-complete Sessions, so a FINISHED interview on the same id was silently restarted over
+    # and its export overwritten. `--session-id` defaults to one constant, so that was the default
+    # CLI path, not an edge case.
     from interview_coach.demo_llm import DemoLLMClient
 
     monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
@@ -381,8 +384,10 @@ def test_session_starts_fresh_when_prior_checkpoint_is_complete(tmp_path, monkey
         ]
     )
 
-    assert rc == 0
-    assert "already in progress" not in capsys.readouterr().err
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "has already finished" in err
+    assert "--resume" in err
 
 
 def test_cmd_session_resume_resets_clock_via_cli(tmp_path, monkeypatch, capsys):
@@ -901,6 +906,14 @@ def test_every_interview_on_a_reused_session_id_gets_its_own_budget(tmp_path, mo
     monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
     monkeypatch.setattr(cli, "build_client", lambda settings: _MeteredDemoClient())
 
+    # Since QA-01 a fresh start over an existing checkpoint is refused, so the way one id runs a
+    # second interview is the checkpoint being gone — the server's 7-day TTL sweep, an operator
+    # clearing the db, a fresh container on an empty volume — while the usage ledger, which has no
+    # TTL, keeps every row. That is the shape reproduced here: the checkpoint db is dropped between
+    # runs, the spend is not.
+    def sweep_checkpoints() -> None:
+        db_path.unlink(missing_ok=True)
+
     # Run 1 with the rail effectively off, to measure what one of these Sessions actually costs.
     monkeypatch.setenv("LLM_SESSION_TOKEN_BUDGET", "10000000")
     assert cli.main(_session_argv("local-session", db_path)) == 0
@@ -910,7 +923,9 @@ def test_every_interview_on_a_reused_session_id_gets_its_own_budget(tmp_path, mo
     # Now size the rail at 2.5x one Session: comfortably more than any single run needs, and
     # comfortably LESS than three of them summed.
     monkeypatch.setenv("LLM_SESSION_TOKEN_BUDGET", str(int(one_session * 2.5)))
+    sweep_checkpoints()
     assert cli.main(_session_argv("local-session", db_path)) == 0
+    sweep_checkpoints()
     assert cli.main(_session_argv("local-session", db_path)) == 0
 
     out, err = capsys.readouterr()
