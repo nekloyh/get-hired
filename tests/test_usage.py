@@ -1162,6 +1162,7 @@ def test_a_sidecar_that_is_not_valid_utf8_does_not_crash_the_call_gate(tmp_path,
     assert reason is not None
     assert "UNRECONCILED" in reason
 
+
 def _held_in_memory(tmp_path):
     """Latch a billed fault the sidecar could not take, then make its directory usable again.
 
@@ -1308,7 +1309,6 @@ def test_two_simultaneous_starts_cannot_both_pass_the_question_cap(tmp_path, mon
     assert outcomes.count(None) == 1, outcomes
     assert sum("COACH_DAILY_QUESTION_CAP" in (reason or "") for reason in outcomes) == 1
     assert questions_today("id-1") == 3
-
 
 
 def _reserve_and_park(read_flag, release, outcome: str) -> None:

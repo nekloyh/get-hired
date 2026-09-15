@@ -808,10 +808,7 @@ def _cmd_bench(client: ClientArg, args: argparse.Namespace) -> int:
         work=f"a {k}-sweep calibration bench",
         needed=needed,
         allow_overspend=args.ignore_budget,
-        hint=(
-            " Pass --ignore-budget to spend it deliberately (that cannot override a broken ledger "
-            "or a dead quota)."
-        ),
+        hint=(" Pass --ignore-budget to spend it deliberately (that cannot override a broken ledger or a dead quota)."),
     ):
         # Refused, not warned (NEW-10): the warning let a `--k 3` sweep drain the day under a live
         # Session. Exit 2 is neither the gate's green (0) nor its red (1), and NO report is written,

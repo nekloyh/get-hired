@@ -174,9 +174,7 @@ def test_weak_answer_triggers_follow_up_then_resolves(make_client):
 
 def test_question_resolves_to_the_last_score(make_client):
     # The kept score is the LAST turn's (4), not the first weak one (2) — "keep the last score".
-    client, _ = make_client(
-        [_eval(2, follow_up=True), _tool(), _followup(), _eval(4, follow_up=False)]
-    )
+    client, _ = make_client([_eval(2, follow_up=True), _tool(), _followup(), _eval(4, follow_up=False)])
     seed = _seed(["a weak answer missing the mechanism", "a better answer naming the mechanism"])
     result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers))
     assert result.resolved_evaluation is result.turns[-1].evaluation
@@ -186,9 +184,7 @@ def test_question_resolves_to_the_last_score(make_client):
 def test_safety_cap_halts_pathological_loop_and_logs_a_guardrail_trip(make_client, caplog):
     # The Evaluator never stops flagging; the cap must halt the loop and log it as a guardrail trip
     # that is distinct from a normal resolution.
-    client, fake = make_client(
-        [_eval(2, follow_up=True), _tool(), _followup(), _eval(2, follow_up=True)]
-    )
+    client, fake = make_client([_eval(2, follow_up=True), _tool(), _followup(), _eval(2, follow_up=True)])
     seed = _seed(["the first answer stays weak throughout", "the second answer stays weak throughout"])
     with caplog.at_level(logging.INFO, logger="interview_coach.microloop"):
         result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers), max_turns=2)
@@ -234,8 +230,12 @@ def test_micro_loop_does_not_override_evaluator_follow_up_decision(make_client):
     client, fake = make_client(
         [
             _eval(3, follow_up=True),  # seed: a real gap -> probe once
-            _tool(), _followup(), _eval(5, follow_up=True, confidence=0.9),  # FU1: strong + confident
-            _tool(), _followup(), _eval(5, follow_up=True, confidence=0.9),  # FU2 -> cap
+            _tool(),
+            _followup(),
+            _eval(5, follow_up=True, confidence=0.9),  # FU1: strong + confident
+            _tool(),
+            _followup(),
+            _eval(5, follow_up=True, confidence=0.9),  # FU2 -> cap
         ]
     )
     seed = _seed(
@@ -260,7 +260,8 @@ def test_strong_seed_follow_up_still_runs_until_evaluator_resolves(make_client):
     client, fake = make_client(
         [
             _eval(5, follow_up=True, confidence=0.9),  # strong seed, but Evaluator still wants to probe
-            _tool(), _followup(),
+            _tool(),
+            _followup(),
             _eval(5, follow_up=False, confidence=0.9),  # the follow-up answer resolves naturally
         ]
     )
@@ -274,9 +275,7 @@ def test_strong_seed_follow_up_still_runs_until_evaluator_resolves(make_client):
 
 def test_weak_follow_up_reaches_cap_when_evaluator_keeps_flagging(make_client):
     # A weak follow-up answer is unresolved evidence, so the loop keeps probing to the cap.
-    client, _ = make_client(
-        [_eval(2, follow_up=True), _tool(), _followup(), _eval(2, follow_up=True, confidence=0.9)]
-    )
+    client, _ = make_client([_eval(2, follow_up=True), _tool(), _followup(), _eval(2, follow_up=True, confidence=0.9)])
     seed = _seed(["a weak answer missing the mechanism", "an answer that is still weak"])
     result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers), max_turns=2)
 
@@ -362,9 +361,7 @@ def test_vn_mode_renders_the_seed_question_and_never_scores_delivery(make_client
     # Reply 1: the Vietnamese rendering of the seed question; reply 2: the technical-only evaluation.
     client, fake = make_client([_VN_RENDERED, _eval_technical_only(4, follow_up=False)])
     seed = _seed([_VN_ANSWER])
-    result = run_micro_loop(
-        client, seed, ScriptedCandidate(seed.answers), language_mode="vn"
-    )
+    result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers), language_mode="vn")
     assert result.turns[0].question == "Hãy giải thích trade-off giữa bias và variance."
     assert "english_delivery" not in result.turns[0].evaluation.dimensions  # no phantom scores
     assert fake.call_count == 2
@@ -409,16 +406,12 @@ def test_mixed_mode_scores_delivery_only_on_english_answers(make_client):
         ["The model overfits when it memorizes noise.", _VN_ANSWER],
         question="Explain overfitting.",
     )
-    result = run_micro_loop(
-        client, seed, ScriptedCandidate(seed.answers), language_mode="mixed"
-    )
+    result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers), language_mode="mixed")
     first, second = result.turns
     assert "english_delivery" in first.evaluation.dimensions
     assert "english_delivery" not in second.evaluation.dimensions
     # the follow-up generation was told to code-switch (the block rides in the tool-loop user turn)
-    follow_up_messages = " ".join(
-        str(m.get("content")) for m in fake.chat.completions.calls[3]["messages"]
-    )
+    follow_up_messages = " ".join(str(m.get("content")) for m in fake.chat.completions.calls[3]["messages"])
     assert "SESSION LANGUAGE MODE: mixed" in follow_up_messages
 
 
@@ -455,9 +448,7 @@ def test_live_vn_mode_renders_the_question_in_vietnamese():
     seed = _seed(
         ["Bias là khi mô hình sai có hệ thống, còn variance là khi nó dao động mạnh theo dữ liệu train."],
     )
-    result = run_micro_loop(
-        client, seed, ScriptedCandidate(seed.answers), max_turns=1, language_mode="vn"
-    )
+    result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers), max_turns=1, language_mode="vn")
     assert not answer_is_english(result.turns[0].question)  # actually asked in Vietnamese
     assert "english_delivery" not in result.turns[0].evaluation.dimensions
 

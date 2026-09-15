@@ -17,6 +17,10 @@ jobs:
       # image build, where Dockerfile:37 uses --frozen. This job now fails on that drift instead.
       - run: uv sync --locked --dev
       - run: uv run ruff check
+      # `ruff check` and `ruff format` are different tools: the linter never reflows code, so
+      # formatting drifted on 26 of 71 files while the lint gate stayed green (#131). Checked,
+      # not applied — CI must report drift, not rewrite the contributor's commit.
+      - run: uv run ruff format --check
       - run: uv run mypy
       - run: uv run pytest -q
 

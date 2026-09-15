@@ -206,7 +206,6 @@ def _receive_both(ws, first_type: str, second_type: str, *, limit: int = 60) -> 
     raise AssertionError(f"did not receive both {first_type!r} and {second_type!r}; got {sorted(found)}")
 
 
-
 def test_an_answer_is_bound_to_the_turn_it_answers(tmp_path):
     # NEW-01 / ADR 0005. The queue used to be a bare FIFO, so a second answer sent while only the
     # first question was pending was held and consumed by the NEXT question — the answer typed for
@@ -264,9 +263,7 @@ def test_an_id_less_answer_is_refused_outright(tmp_path):
         assert "does not answer" in refusal["error"]
 
         # The Session is not wedged: the same question still accepts a properly bound answer.
-        ws.send_json(
-            {"type": "candidate_answer", "answer": "REAL: bias and variance.", "turn_id": first["turn_id"]}
-        )
+        ws.send_json({"type": "candidate_answer", "answer": "REAL: bias and variance.", "turn_id": first["turn_id"]})
         second = _receive_until(ws, "question", limit=40)
         ws.send_json(
             {

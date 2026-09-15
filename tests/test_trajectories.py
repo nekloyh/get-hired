@@ -25,10 +25,7 @@ def _diagnostic():
 
 def _eval(score: int) -> str:
     payload = {
-        "dimensions": {
-            dim: {"score": score, "evidence": "no evidence"}
-            for dim in DIMENSIONS
-        },
+        "dimensions": {dim: {"score": score, "evidence": "no evidence"} for dim in DIMENSIONS},
         "weighted_score": float(score),
         "confidence": 0.8,
         "follow_up_recommended": False,

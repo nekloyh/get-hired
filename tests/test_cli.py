@@ -1379,8 +1379,14 @@ def test_resume_refuses_a_session_that_already_finished(tmp_path, monkeypatch, c
 
     rc = cli.main(
         [
-            "session", "--resume", "--scripted", "--no-live",
-            "--session-id", "finished", "--checkpoint-db", str(db_path),
+            "session",
+            "--resume",
+            "--scripted",
+            "--no-live",
+            "--session-id",
+            "finished",
+            "--checkpoint-db",
+            str(db_path),
         ]
     )
     out, err = capsys.readouterr()
@@ -1416,8 +1422,14 @@ def test_a_second_driver_is_refused_while_another_process_holds_the_session(tmp_
     try:
         rc = cli.main(
             [
-                "session", "--resume", "--scripted", "--no-live",
-                "--session-id", "shared", "--checkpoint-db", str(db_path),
+                "session",
+                "--resume",
+                "--scripted",
+                "--no-live",
+                "--session-id",
+                "shared",
+                "--checkpoint-db",
+                str(db_path),
             ]
         )
     finally:

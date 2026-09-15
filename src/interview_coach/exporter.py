@@ -261,8 +261,7 @@ def _append_study_plan(lines: list[str], plan: Any) -> None:
             f"[{_md(resource.get('title'))}]({resource.get('url')})" for resource in item.get("resources", [])
         )
         lines.append(
-            f"| {item.get('day')} | {_md_inline(item.get('focus'))} | {resources} | "
-            f"{_md_inline(item.get('outcome'))} |"
+            f"| {item.get('day')} | {_md_inline(item.get('focus'))} | {resources} | {_md_inline(item.get('outcome'))} |"
         )
     lines.append("")
     lines.append("### Milestones")

@@ -59,6 +59,7 @@ def is_safe_candidate_id(candidate_id: str) -> bool:
     """Whether ``candidate_id`` may be used as a Skill ledger key."""
     return bool(SAFE_CANDIDATE_ID.fullmatch(candidate_id))
 
+
 # Half-life of carried evidence, in days: after this long a Skill's pseudo-count mass above the neutral
 # prior has decayed by half, so a returning Candidate's edge fades over ~a month of absence. Chosen so
 # a next-day return keeps almost all of last Session's signal while a months-later return is nearly a

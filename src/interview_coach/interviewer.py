@@ -364,9 +364,7 @@ def _lookup_with_widening(
     except LookupError:
         if language is None:
             raise
-        logger.info(
-            "no %r-language note on shelf %r; widening the lookup to any language", language, skill
-        )
+        logger.info("no %r-language note on shelf %r; widening the lookup to any language", language, skill)
         return lookup_concept(store, query, skill=skill, language=None), None
 
 
@@ -616,8 +614,7 @@ def generate_follow_up(
         # turn already holds a valid score, so the question must resolve on it rather than crash
         # into a zero-evidence FAILED record (slice 0014 / ADR 0005 — infrastructure degrades).
         raise FollowUpUnavailable(
-            f"follow-up generation exhausted its retries ({err}); resolving the question without "
-            "a follow-up"
+            f"follow-up generation exhausted its retries ({err}); resolving the question without a follow-up"
         ) from err
 
 

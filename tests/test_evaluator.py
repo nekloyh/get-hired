@@ -126,10 +126,7 @@ def test_non_contiguous_evidence_rejected_then_corrected(make_client):
     bad = _good_dimensions()
     bad["correctness"] = {
         "score": 5,
-        "evidence": (
-            "Bias is error from overly simple assumptions. "
-            "L2 shrinks weights to reduce variance"
-        ),
+        "evidence": ("Bias is error from overly simple assumptions. L2 shrinks weights to reduce variance"),
     }
 
     client, fake = make_client([_eval_json(bad), _eval_json(_good_dimensions())])
@@ -147,10 +144,7 @@ def test_evidence_retry_prompt_includes_candidate_answer_and_contiguous_rule(mak
     bad = _good_dimensions()
     bad["correctness"] = {
         "score": 5,
-        "evidence": (
-            "Bias is error from overly simple assumptions. "
-            "L2 shrinks weights to reduce variance"
-        ),
+        "evidence": ("Bias is error from overly simple assumptions. L2 shrinks weights to reduce variance"),
     }
 
     client, fake = make_client([_eval_json(bad), _eval_json(_good_dimensions())])
@@ -554,15 +548,11 @@ def test_degrade_pass_is_reserved_for_evidence_failures(make_client):
 
 # --- english_delivery + language_mode (issue 0024, ADR 0007) --------------------------------------
 
-_DELIVERY_RUBRIC = Rubric(
-    weights={**QUESTION.rubric.weights, "english_delivery": 1.0}
-)
+_DELIVERY_RUBRIC = Rubric(weights={**QUESTION.rubric.weights, "english_delivery": 1.0})
 
 
 def _delivery_dimensions(delivery_score: int) -> dict:
-    return _good_dimensions() | {
-        "english_delivery": {"score": delivery_score, "evidence": "no evidence"}
-    }
+    return _good_dimensions() | {"english_delivery": {"score": delivery_score, "evidence": "no evidence"}}
 
 
 def test_system_prompt_separates_english_delivery_from_weighted_score():
@@ -610,9 +600,7 @@ def test_strong_delivery_needs_no_fixes(make_client):
 def test_stray_delivery_fixes_on_inactive_dimension_are_dropped_without_a_retry(make_client):
     # Seen live: the judge volunteers delivery advice on cases where english_delivery is not scored.
     # Structural noise is folded deterministically — no phantom advice, no burned retry.
-    stray = json.dumps(
-        json.loads(_eval_json(_good_dimensions())) | {"delivery_fixes": ["a", "b", "c"]}
-    )
+    stray = json.dumps(json.loads(_eval_json(_good_dimensions())) | {"delivery_fixes": ["a", "b", "c"]})
     client, fake = make_client([stray])
     ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
     assert ev.delivery_fixes == ()
@@ -928,7 +916,10 @@ def test_panel_budget_exhausted_keeps_guarded_first_pass(make_client):
     client, fake = make_client([_eval_json(_good_dimensions(), confidence=0.2)])
 
     ev = evaluate(
-        client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric,
+        client,
+        QUESTION.question,
+        STRONG_ANSWER,
+        QUESTION.rubric,
         panel_budget=PanelBudget(remaining=0),
     )
 
@@ -966,16 +957,12 @@ def test_panel_budget_allows_one_escalation_then_stops(make_client):
     from interview_coach.evaluator import PanelBudget
 
     low = _eval_json(_good_dimensions(), confidence=0.2)
-    opinion = json.dumps(
-        {"recommended_score": 4.0, "argument": "Committee voice.", "key_evidence": "learning curves"}
-    )
+    opinion = json.dumps({"recommended_score": 4.0, "argument": "Committee voice.", "key_evidence": "learning curves"})
     verdict = _eval_json(_good_dimensions(), confidence=0.9)
     client, fake = make_client([low, opinion, opinion, verdict])
     budget = PanelBudget(remaining=1)
 
-    ev = evaluate(
-        client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric, panel_budget=budget
-    )
+    ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric, panel_budget=budget)
 
     assert ev.panel is not None
     assert fake.call_count == 4  # first pass + skeptic + advocate + verdict
@@ -1048,9 +1035,7 @@ def test_panel_verdict_inherits_first_pass_noise(make_client):
     # the verdict parses cleanly. The kept verdict must still carry (and be capped by) the FIRST
     # pass's noise — otherwise every escalated case reads as a clean parse in the shadow data.
     low = _eval_json(_good_dimensions(), confidence=0.2)
-    opinion = json.dumps(
-        {"recommended_score": 4.0, "argument": "Committee voice.", "key_evidence": "learning curves"}
-    )
+    opinion = json.dumps({"recommended_score": 4.0, "argument": "Committee voice.", "key_evidence": "learning curves"})
     clean_verdict = _eval_json(_good_dimensions(), confidence=0.9)
     client, fake = make_client(["not json", low, opinion, opinion, clean_verdict])
 

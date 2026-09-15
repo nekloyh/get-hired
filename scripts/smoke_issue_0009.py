@@ -61,8 +61,7 @@ def main() -> int:
     settings = load_settings()
     if not settings.configured:
         print(
-            f"SKIP: primary provider {settings.primary_provider!r} not configured "
-            "(set up .env to run the live smoke).",
+            f"SKIP: primary provider {settings.primary_provider!r} not configured (set up .env to run the live smoke).",
             file=sys.stderr,
         )
         return 0

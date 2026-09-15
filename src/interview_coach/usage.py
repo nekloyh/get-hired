@@ -385,9 +385,7 @@ def record_questions(identity: str, questions: int, *, path: Path | None = None)
     )
 
 
-def record_questions_released(
-    identity: str, questions: int, *, session: str = "", path: Path | None = None
-) -> None:
+def record_questions_released(identity: str, questions: int, *, session: str = "", path: Path | None = None) -> None:
     """Hand ``questions`` back to ``identity``'s daily cap — the compensating row for a reservation.
 
     A compensating ROW of its own kind, not a mutation and not a negative count on a ``questions``
@@ -640,9 +638,7 @@ def _parked_faults(target: Path) -> list[dict[str, Any]]:
             # A torn last line is a parked row whose write was cut short: unparseable, but evidence
             # that something WAS parked. Skipping it is the same forgiveness as above, one row at a
             # time, so it becomes a fault carrying no replayable row instead.
-            logger.error(
-                "a row in %s could not be parsed (%s); it is held as unknown spend, not dropped", sidecar, err
-            )
+            logger.error("a row in %s could not be parsed (%s); it is held as unknown spend, not dropped", sidecar, err)
             faults.append(_unreadable_fault(target, sidecar, f"{type(err).__name__}: {err}", whole_file=False))
             continue
         if isinstance(row, dict):
@@ -1143,9 +1139,7 @@ def start_refusal_reason(provider: str, *, questions: int, path: Path | None = N
     )
 
 
-def metered_command_refusal_reason(
-    provider: str, *, work: str, needed: int, path: Path | None = None
-) -> str | None:
+def metered_command_refusal_reason(provider: str, *, work: str, needed: int, path: Path | None = None) -> str | None:
     """Why a metered CLI batch command must not start, or None. Checked BEFORE the first token.
 
     ``start_refusal_reason`` is sized in questions because a Session IS questions. A bench sweep, a
