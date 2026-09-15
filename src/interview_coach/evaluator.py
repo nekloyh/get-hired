@@ -20,10 +20,11 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Any, Literal
 
+import openai
 from pydantic import BaseModel, Field, model_validator
 
 from . import telemetry
-from .llm import LLMClient, Message, StructuredOutputError, Validator
+from .llm import EmptyCompletionError, LLMClient, Message, StructuredOutputError, Validator
 from .rubric import TECHNICAL_DIMENSIONS, Rubric
 
 logger = logging.getLogger(__name__)
@@ -159,9 +160,10 @@ class TrustTrace(BaseModel):
     panel_suppressed: bool = Field(
         default=False,
         description=(
-            "True when escalation triggers fired but the caller's PanelBudget was spent — the "
-            "committee was wanted but rationed. Without this a suppressed escalation is "
-            "indistinguishable from a confident pass in every transcript and report."
+            "True when escalation triggers fired but the committee did not run — the caller's "
+            "PanelBudget was spent, or a panel voice failed on transport. Without this a "
+            "suppressed escalation is indistinguishable from a confident pass in every transcript "
+            "and report."
         ),
     )
 
@@ -925,15 +927,38 @@ def evaluate(
             panel_suppressed=panel_suppressed,
         )
 
-    skeptic = _panel_opinion(client, question, answer, rubric, first, role="skeptic")
-    advocate = _panel_opinion(client, question, answer, rubric, first, role="advocate")
-    verdict_noise_before = telemetry.snapshot()
-    raw_verdict = _evaluate_once(
-        client,
-        _build_panel_verdict_messages(question, answer, rubric, first, triggers, skeptic, advocate, language_mode),
-        answer,
-        rubric,
-    )
+    try:
+        skeptic = _panel_opinion(client, question, answer, rubric, first, role="skeptic")
+        advocate = _panel_opinion(client, question, answer, rubric, first, role="advocate")
+        verdict_noise_before = telemetry.snapshot()
+        raw_verdict = _evaluate_once(
+            client,
+            _build_panel_verdict_messages(question, answer, rubric, first, triggers, skeptic, advocate, language_mode),
+            answer,
+            rubric,
+        )
+    except (openai.APIError, EmptyCompletionError, StructuredOutputError) as err:
+        # ADR 0005: the panel is ADVISORY over an ALREADY-VALID first pass. A dead committee voice is
+        # infrastructure noise; letting it out of here makes question_node record a zero-evidence
+        # `failed` question for an answer the Candidate did give — the question is spent, the export
+        # reads 0.00/5, and the Supervisor is later shown that item as `score=0.00`. Keep the guarded
+        # first pass and mark the escalation suppressed, the same flag the rationed-budget path sets.
+        # The typed operator stops (ProviderQuotaExhausted, AccountingUnavailable) are deliberately
+        # NOT in this tuple: they are RuntimeErrors, none of these three classes, and still propagate.
+        telemetry.incr("evaluator.panel_unavailable")
+        logger.warning(
+            "panel triggers (%s) but a committee voice failed (%s: %s); keeping the guarded first pass",
+            ", ".join(triggers),
+            type(err).__name__,
+            err,
+        )
+        return _finalize(
+            first,
+            rubric,
+            pre_guard_confidence=raw.confidence,
+            noise_events=noise,
+            panel_suppressed=True,
+        )
     # The kept verdict inherits the FIRST pass's noise too: the exchange whose opening parse needed
     # folds or retries is exactly the shaky case the shadow data must not record as clean.
     verdict_noise = tuple(sorted({*noise, *_noise_events(verdict_noise_before, telemetry.snapshot())}))

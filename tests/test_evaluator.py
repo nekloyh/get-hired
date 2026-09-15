@@ -5,8 +5,11 @@ import logging
 import threading
 import unicodedata
 
+import httpx
+import openai as openai_sdk
 import pytest
 
+from interview_coach import llm as llm_module
 from interview_coach import telemetry, usage
 from interview_coach.config import load_settings
 from interview_coach.evaluator import (
@@ -936,6 +939,27 @@ def test_panel_budget_exhausted_keeps_guarded_first_pass(make_client):
     # The rationing is recorded on the judgment itself — a suppressed escalation must never read
     # as a confident pass in transcripts and reports.
     assert ev.trust is not None and ev.trust.panel_suppressed is True
+
+
+def test_a_dead_panel_voice_keeps_the_guarded_first_pass(monkeypatch, make_client):
+    # QA-06 / ADR 0005: the panel is ADVISORY over an ALREADY-VALID first pass. A Skeptic that dies
+    # on transport must not destroy that judgment — question_node's net would record a zero-evidence
+    # `failed` question for an answer the Candidate actually gave, the question would be spent, and
+    # the Supervisor would later be shown that item as `score=0.00`.
+    monkeypatch.setattr(llm_module, "_sleep", lambda _wait: None)
+    outage = openai_sdk.APIConnectionError(request=httpx.Request("POST", "http://test/v1/chat/completions"))
+    # The fake repeats its LAST scripted reply, so every transport attempt of the Skeptic call dies.
+    client, fake = make_client([_eval_json(_good_dimensions(), weighted=4.0, confidence=0.3), outage])
+
+    ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+
+    assert ev.weighted_score == pytest.approx(4.0)  # the valid first pass survives
+    assert ev.confidence == pytest.approx(0.3)
+    assert ev.panel is None  # no verdict was ever reached
+    assert ev.trust is not None and ev.trust.panel_suppressed is True
+    assert telemetry.snapshot()["evaluator.panel_unavailable"] == 1
+    # first pass + the Skeptic's bounded transport attempts; the Advocate and verdict are never paid.
+    assert fake.call_count == 1 + llm_module._TRANSPORT_ATTEMPTS
 
 
 def test_panel_budget_allows_one_escalation_then_stops(make_client):
