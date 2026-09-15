@@ -10,6 +10,7 @@ from .evaluator import Evaluation, evaluate
 from .fixtures import QUESTION, STRONG_ANSWER, WEAK_ANSWER
 from .llm import LLMClient
 from .rubric import Rubric
+from .usage import AccountingUnavailable, ProviderQuotaExhausted
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,11 @@ def run_golden_answer_harness(
     for case in cases:
         try:
             evaluation = evaluate(client, case.question, case.answer, case.rubric)
+        except (AccountingUnavailable, ProviderQuotaExhausted):
+            # QA-14: "we ran out of quota" is not a range regression. Recorded as a case error it
+            # reds the gate — and, through forge's admission gate, rejects a draft — on evidence
+            # nobody gathered.
+            raise
         except Exception as err:  # noqa: BLE001 - harness should report provider/schema failures as failed cases
             logger.warning("harness case %s errored (%s: %s)", case.case_id, type(err).__name__, err)
             results.append(GoldenAnswerResult(case=case, error=f"{type(err).__name__}: {err}"))

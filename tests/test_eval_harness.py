@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from interview_coach.eval_harness import (
     GoldenAnswerCase,
     GoldenAnswerResult,
@@ -107,3 +109,29 @@ def test_report_summary_counts_failures():
     assert "ok" in report
     assert "regressed" in report
     assert "summary: 1/2 passed" in report
+
+
+# --- typed operator stops (QA-14) ----------------------------------------------------------------
+
+
+def test_a_dead_quota_stops_the_harness_instead_of_becoming_a_failed_case(make_client):
+    # QA-14 / GH #119: "the judge could not be reached because we ran out of money" is not a judge
+    # regression. Recorded as a case error it reds the gate and prints a FAIL row that reads like one.
+    from interview_coach.usage import ProviderQuotaExhausted
+
+    case = GoldenAnswerCase("weak_answer", "answer", 1.0, 5.0)
+    client, _ = make_client([ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")])
+
+    with pytest.raises(ProviderQuotaExhausted):
+        run_golden_answer_harness(client, (case,))
+
+
+def test_broken_accounting_stops_the_harness_rather_than_scoring_a_refused_call(make_client):
+    # M0a / F1: the call was never made, so there is nothing to report about the Evaluator.
+    from interview_coach.usage import AccountingUnavailable
+
+    case = GoldenAnswerCase("weak_answer", "answer", 1.0, 5.0)
+    client, _ = make_client([AccountingUnavailable("Usage accounting is UNRECONCILED: 1 provider call(s) were billed")])
+
+    with pytest.raises(AccountingUnavailable):
+        run_golden_answer_harness(client, (case,))

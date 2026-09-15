@@ -37,6 +37,7 @@ from .eval_harness import GoldenAnswerCase, GoldenAnswerResult, run_golden_answe
 from .llm import LLMClient, Message, StructuredOutputError
 from .rubric import TECHNICAL_DIMENSIONS
 from .seeds import QUESTION_BANK, SeedQuestion
+from .usage import AccountingUnavailable, ProviderQuotaExhausted
 
 logger = logging.getLogger(__name__)
 
@@ -382,10 +383,16 @@ def admission_gate(client: LLMClient, question: SeedQuestion) -> AdmissionOutcom
     Reuses :class:`eval_harness.GoldenAnswerCase` + :func:`run_golden_answer_harness` with the
     draft's own question and rubric. Both answers in band → admitted; anything else — including a
     provider exception on either the answer generation or a judging call — is a recorded
-    ``admission`` rejection carrying the actual scores or error, never a crash.
+    ``admission`` rejection carrying the actual scores or error, never a crash. The two typed
+    operator stops are the exception (QA-14): a dead quota or refused accounting is not a verdict
+    about the draft, so it propagates to ``cli._dispatch`` instead of being written into the queue.
     """
     try:
         pair = generate_answer_pair(client, question)
+    except (AccountingUnavailable, ProviderQuotaExhausted):
+        # QA-14: an errors-as-result here writes a review-queue report saying the JUDGE turned the
+        # draft down — a claim about content quality that nothing measured. Stop the run instead.
+        raise
     except Exception as err:  # noqa: BLE001 — errors-as-results at the expensive provider-facing gate
         logger.warning(
             "forge admission: answer generation failed for %s draft %r (%s: %s)",

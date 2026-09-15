@@ -523,3 +523,60 @@ def test_live_forge_pipeline_completes_and_writes_a_queue(tmp_path):
     # every draft got a definite outcome: admitted or a gate-attributed rejection (never a crash)
     for outcome in run.outcomes:
         assert outcome.admitted or outcome.rejection.gate in {GATE_CONTRACT, GATE_NOVELTY, GATE_ADMISSION}
+
+
+# --- typed operator stops (QA-14) ----------------------------------------------------------------
+
+
+def test_a_dead_quota_in_answer_generation_stops_the_forge_instead_of_rejecting_the_draft(make_client):
+    # QA-14 / GH #119: recorded as an `admission` rejection, a dead quota writes a review-queue
+    # report saying the JUDGE turned the draft down — a claim about content quality nothing measured.
+    from interview_coach.usage import ProviderQuotaExhausted
+
+    client, _ = make_client([ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")])
+
+    with pytest.raises(ProviderQuotaExhausted):
+        admission_gate(client, _validated())
+
+
+def test_a_dead_quota_on_the_judging_call_stops_the_forge_too(make_client):
+    # The second net: the pair was generated, then the quota died inside run_golden_answer_harness.
+    from interview_coach.usage import ProviderQuotaExhausted
+
+    dead = ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")
+    client, _ = make_client([_answer_pair_json(), dead])
+
+    with pytest.raises(ProviderQuotaExhausted):
+        admission_gate(client, _validated())
+
+
+def test_broken_accounting_stops_the_forge_rather_than_rejecting_the_draft(make_client):
+    # M0a / F1: no call was made, so no gate verdict was earned.
+    from interview_coach.usage import AccountingUnavailable
+
+    client, _ = make_client([AccountingUnavailable("Usage accounting is UNRECONCILED: 1 provider call(s) were billed")])
+
+    with pytest.raises(AccountingUnavailable):
+        admission_gate(client, _validated())
+
+
+def test_cli_forge_writes_no_queue_or_report_when_the_quota_dies_mid_run(monkeypatch, make_client, tmp_path, capsys):
+    # `_dispatch` owns the exit; a half-judged batch must not leave a review queue behind.
+    from interview_coach.usage import ProviderQuotaExhausted
+
+    client, _ = make_client(
+        [
+            _draft_set_json(_draft_dict(concepts=["ml_fundamentals_bias_variance"])),
+            ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)"),
+        ]
+    )
+    monkeypatch.setattr(cli, "load_settings", _cli_settings)
+    monkeypatch.setattr(cli, "build_client", lambda settings: client)
+    out = tmp_path / "review-queue.yaml"
+
+    rc = cli.main(["forge", "--skill", SKILL, "--n", "1", "--out", str(out)])
+
+    assert not out.exists()
+    assert not (tmp_path / "review-queue-report.md").exists()
+    assert rc == 2
+    assert "insufficient_quota" in capsys.readouterr().err

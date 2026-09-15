@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -588,3 +589,53 @@ def test_report_marks_unstable_bias_rows_and_renders_tripwires():
 
     assert f"⚠ n<{BIAS_MIN_SAMPLES} — unstable estimate" in report  # english_delivery n=1
     assert "BIAS TRIPWIRE" in report  # correctness drift over n=9
+
+
+# --- typed operator stops (QA-14) ----------------------------------------------------------------
+
+
+def _cli_settings() -> SimpleNamespace:
+    return SimpleNamespace(
+        configured=True,
+        primary_provider="groq",
+        primary_config=SimpleNamespace(model="test-model"),
+    )
+
+
+def test_a_dead_quota_stops_the_bench_instead_of_filling_the_report_with_error_rows(make_client):
+    # QA-14 / ADR 0009: the report the bench writes into docs/audits/ IS the judge gate's artifact.
+    # Swallowed here, a quota death turned every case into an error row and a "0/N within band"
+    # report — an infrastructure failure legible as a judge regression. It must stop the run.
+    from interview_coach.usage import ProviderQuotaExhausted
+
+    client, _ = make_client([ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")])
+
+    with pytest.raises(ProviderQuotaExhausted):
+        run_bench(client, (_case("a"), _case("b")), k=3)
+
+
+def test_broken_accounting_stops_the_bench_rather_than_measuring_the_judge_on_refused_calls(make_client):
+    # M0a / F1: a refused call says nothing about the judge, so it must not become a bench result.
+    from interview_coach.usage import AccountingUnavailable
+
+    client, _ = make_client([AccountingUnavailable("Usage accounting is UNRECONCILED: 1 provider call(s) were billed")])
+
+    with pytest.raises(AccountingUnavailable):
+        run_bench(client, (_case("a"),))
+
+
+def test_cli_bench_writes_no_report_when_the_quota_dies_mid_run(monkeypatch, make_client, tmp_path, capsys):
+    # The whole point of the re-raise: `_dispatch` owns the exit, and docs/audits/ gains nothing.
+    from interview_coach import cli
+    from interview_coach.usage import ProviderQuotaExhausted
+
+    client, _ = make_client([ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")])
+    monkeypatch.setattr(cli, "load_settings", _cli_settings)
+    monkeypatch.setattr(cli, "build_client", lambda settings: client)
+    out = tmp_path / "calibration-bench.md"
+
+    rc = cli.main(["bench", "--out", str(out)])
+
+    assert not out.exists(), out.read_text(encoding="utf-8")[:200]
+    assert rc == 2
+    assert "insufficient_quota" in capsys.readouterr().err
