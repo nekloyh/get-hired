@@ -680,6 +680,41 @@ def test_a_resume_also_retries_a_dead_quota_and_says_which(tmp_path, monkeypatch
     assert clear_run_rails_for_resume("s", "openai", max_questions=5, max_turns=4) is None
 
 
+def test_a_resume_grants_its_own_session_one_retry_and_nobody_else(tmp_path, monkeypatch):
+    # NEW-05. The grant is one human saying "try again" about their own interview, not a fact about
+    # the account. Global, it converted a clean refusal into broken interviews: A resumes, B/C/D sail
+    # through the start gate, each burns a Diagnostic to rediscover the same dead quota — and the
+    # first of them re-latches it, cancelling A's attempt too.
+    _ledger(tmp_path, monkeypatch)
+    record_quota_exhausted("openai")
+
+    note = clear_run_rails_for_resume("sess-a", "openai", max_questions=5, max_turns=4)
+
+    assert note is not None and "retrying openai" in note
+    assert _stop(session_id="sess-a") is None  # A still gets its one real attempt
+    assert _stop(session_id="sess-b") is not None  # B's suspend is untouched
+    assert start_refusal_reason("openai", questions=1) is not None  # and a fresh start stays refused
+    assert quota_exhausted_today("openai")
+    assert not quota_exhausted_today("openai", session="sess-a")
+
+
+def test_the_granted_retry_is_one_attempt_and_a_billed_call_revives_everyone(tmp_path, monkeypatch):
+    # The two halves the scoping must not break: the grant is spent by the attempt that re-latches,
+    # and a call that actually billed tokens IS a fact about the account, so it clears for everybody.
+    _ledger(tmp_path, monkeypatch)
+    record_quota_exhausted("openai")
+    clear_run_rails_for_resume("sess-a", "openai", max_questions=5, max_turns=4)
+
+    record_quota_exhausted("openai")  # what llm.py latches when the granted attempt dies again
+    assert _stop(session_id="sess-a") is not None
+
+    clear_run_rails_for_resume("sess-a", "openai", max_questions=5, max_turns=4)
+    with session_scope("sess-a"):
+        record_usage("openai", "m", prompt_tokens=1, completion_tokens=0)
+    assert _stop(session_id="sess-b") is None
+    assert start_refusal_reason("openai", questions=1) is None
+
+
 def test_a_resume_does_not_clear_the_daily_rail(tmp_path, monkeypatch):
     # The daily ledger rail is arithmetic over the day, not a latch on this run — it clears at
     # 00:00 UTC whether anyone resumes or not. Forgiving it here would let a resume loop spend the

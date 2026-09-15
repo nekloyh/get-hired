@@ -364,15 +364,26 @@ def record_quota_exhausted(provider: str, *, path: Path | None = None) -> None:
     _append({"ts": _now_ts(), "kind": "quota_exhausted", "provider": provider}, path)
 
 
-def clear_quota_exhausted(provider: str, *, path: Path | None = None) -> None:
-    """Un-latch the quota so a resume gets one real attempt at the provider.
+def clear_quota_exhausted(provider: str, *, session: str = "", path: Path | None = None) -> None:
+    """Un-latch the quota so ``session``'s resume gets one real attempt at the provider.
 
     The latch cannot expire on its own before 00:00 UTC, and a Candidate whose Session is suspended
     on it makes no calls — so nothing would ever clear it and the resume ADR 0005 promises would
     loop forever. A resume is the human saying "try again": it costs at most one call to find out,
     and if the quota really is still spent, the very next call re-latches.
+
+    The grant is SCOPED to the resuming Session id, carried on the row and resolved by the same
+    write-order scan every other undo in this ledger uses. It is one human saying "try again" about
+    their own interview, not a fact about the account: left global, A's resume un-latched the provider
+    for B, C and D, who then passed the start gate and each died on their first call. Evidence of LIFE
+    stays global — a call that actually billed tokens is a fact about the account and clears the latch
+    for everybody. ``session=""`` writes the old unscoped grant, which still clears for everyone: that
+    is an operator saying "the account is fine now".
     """
-    _append({"ts": _now_ts(), "kind": "quota_retry", "provider": provider}, path)
+    entry: dict[str, object] = {"ts": _now_ts(), "kind": "quota_retry", "provider": provider}
+    if session:
+        entry["session"] = session
+    _append(entry, path)
 
 
 # --- accounting health (M0a / F1) ---------------------------------------------------------------
@@ -931,12 +942,19 @@ def session_run_spend(session_id: str, *, path: Path | None = None) -> int:
     return max(0, session_lifetime_spend(session_id, path=path) - session_baseline(session_id, path=path))
 
 
-def quota_exhausted_today(provider: str, *, day: str | None = None, path: Path | None = None) -> bool:
+def quota_exhausted_today(
+    provider: str, *, session: str = "", day: str | None = None, path: Path | None = None
+) -> bool:
     """Whether ``provider`` last told us its allowance is spent, and nothing has succeeded since.
 
     Scanned in write order so any later evidence of life — an explicit ``quota_retry`` from a resume,
     or simply a call that succeeded and billed tokens — clears the latch. Day-scoped because the
     allowance itself resets at 00:00 UTC.
+
+    ``session`` is who is asking. A ``quota_retry`` is one Session's granted attempt and answers the
+    latch only for that Session; a token row is the account itself proving it is alive and answers it
+    for everyone. A caller with no Session to name (a fresh start) therefore still sees the dead quota
+    somebody else was granted a retry against.
     """
     dead = False
     for entry in _rows_for_day(day or utc_date(), path):
@@ -945,7 +963,11 @@ def quota_exhausted_today(provider: str, *, day: str | None = None, path: Path |
         kind = entry.get("kind")
         if kind == "quota_exhausted":
             dead = True
-        elif kind == "quota_retry" or "prompt_tokens" in entry:
+        elif kind == "quota_retry":
+            granted = str(entry.get("session", ""))
+            if not granted or granted == session:
+                dead = False
+        elif "prompt_tokens" in entry:
             dead = False
     return dead
 
@@ -1094,7 +1116,9 @@ def budget_stop_reason(
     # so suspending here would throw away a whole interview's evidence to save a call already saved.
     if blocked := accounting_block_reason(path=path):
         return blocked
-    if quota_exhausted_today(provider, path=path):
+    # Scoped to THIS Session: the grant a resume writes is for this interview only, so another
+    # Candidate's retry must not silently un-suspend this one, and this one's must be honoured.
+    if quota_exhausted_today(provider, session=session_id, path=path):
         return (
             f"The {provider} account is out of quota (the provider returned insufficient_quota, "
             f"which no retry can fix). Suspending with {questions_resolved} question(s) resolved "
@@ -1206,8 +1230,8 @@ def clear_run_rails_for_resume(
     if forgiven := extend_budget_for_resume(session_id, max_questions=max_questions, max_turns=max_turns, path=path):
         budget = session_token_budget(max_questions=max_questions, max_turns=max_turns)
         notes.append(f"the previous run spent ~{forgiven:,} tokens; this resume grants ~{budget:,} more")
-    if quota_exhausted_today(provider, path=path):
-        clear_quota_exhausted(provider, path=path)
+    if quota_exhausted_today(provider, session=session_id, path=path):
+        clear_quota_exhausted(provider, session=session_id, path=path)
         notes.append(f"retrying {provider} after an insufficient_quota stop")
     if not notes:
         return None
