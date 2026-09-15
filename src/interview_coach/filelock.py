@@ -78,6 +78,48 @@ def locked(target: Path) -> Iterator[None]:
             handle.close()  # closing the last fd on the description releases the flock
 
 
+@contextmanager
+def claimed(target: Path) -> Iterator[bool]:
+    """Take ``target``'s sidecar lock WITHOUT waiting; yield whether this block got it.
+
+    :func:`locked` blocks, which is right for a ledger write measured in milliseconds. A Session
+    drive lasts as long as the interview, so a second driver has to be told *no*: parking a shell for
+    half an hour on a lock it cannot see is indistinguishable from a hang. Yields ``True`` when this
+    block holds the lock and ``False`` when another process already does. Like :func:`locked` it must
+    not nest, and a filesystem that refuses locks degrades to ``True`` with a warning rather than
+    refusing a Candidate over bookkeeping.
+    """
+    lock_file = lock_path_for(target)
+    handle = None
+    try:
+        lock_file.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_file.open("a+", encoding="utf-8")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        # A subclass of OSError, so it MUST be caught first: "someone else holds it" is an answer,
+        # not a failure, and it is the whole point of this function.
+        if handle is not None:
+            handle.close()
+        yield False
+        return
+    except OSError as err:
+        logger.warning(
+            "could not take the inter-process lock at %s (%s: %s); continuing unclaimed — a "
+            "concurrent process could drive the same Session.",
+            lock_file,
+            type(err).__name__,
+            err,
+        )
+        if handle is not None:
+            handle.close()
+            handle = None
+    try:
+        yield True
+    finally:
+        if handle is not None:
+            handle.close()  # closing the last fd on the description releases the flock
+
+
 def atomic_write_text(target: Path, text: str) -> None:
     """Publish ``text`` at ``target`` by rename, so no reader ever sees a half-written file.
 

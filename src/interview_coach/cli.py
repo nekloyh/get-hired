@@ -15,6 +15,7 @@ A bare ``coach`` prints the help and exits 2.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
 import sys
@@ -50,6 +51,7 @@ from .config import load_settings
 from .diagnostic import SKILLS, CandidateProfile, diagnose_or_degrade
 from .eval_harness import harness_passed, render_golden_answer_report, run_golden_answer_harness
 from .exporter import export_session_markdown
+from .filelock import claimed
 from .forge import MAX_DRAFTS, ForgeError, render_forge_report, run_forge, write_forge_outputs
 from .language import DEFAULT_LANGUAGE_MODE, LANGUAGE_MODES
 from .ledger import SAFE_CANDIDATE_ID, is_safe_candidate_id, load_priors, save_posteriors
@@ -318,9 +320,36 @@ def _inflight_session_message(session_id: str) -> str:
 
 def _completed_session_message(session_id: str) -> str:
     return (
-        f"A Session with id {session_id!r} has already finished. Choose a different --session-id, or "
-        "pass --resume to re-open its report — starting fresh would overwrite it."
+        f"A Session with id {session_id!r} has already finished. Choose a different --session-id — "
+        "starting fresh would overwrite its report, and --resume cannot re-open a finished Session."
     )
+
+
+def _finished_session_message(session_id: str) -> str:
+    return (
+        f"Session {session_id!r} already finished; there is nothing to resume. Re-opening it would "
+        "print that earlier interview's report as this run's result. Start a new interview with a "
+        "different --session-id."
+    )
+
+
+def _busy_session_message(session_id: str) -> str:
+    return (
+        f"Session {session_id!r} is already being driven by another process (the server, or a second "
+        "shell). One checkpoint thread takes one writer — wait for that run to finish, or choose a "
+        "different --session-id."
+    )
+
+
+def _checkpoint_lock_target(checkpoint_db: str, session_id: str) -> Path:
+    """The per-Session inter-process lock target beside the checkpoint DB.
+
+    Keyed by Session id, not by the DB: one file holds every thread, so a DB-wide lock would refuse
+    unrelated Sessions. The id is hashed rather than spelled into the name because it is unvalidated
+    input — a ``--session-id`` carrying a path separator would otherwise pick the lock's directory.
+    """
+    db = Path(checkpoint_db).resolve()  # so a relative and an absolute --checkpoint-db agree
+    return db.with_name(f"{db.name}.{hashlib.sha256(session_id.encode('utf-8')).hexdigest()[:16]}")
 
 
 def _print_resume_recap(state: Mapping[str, Any]) -> None:
@@ -404,7 +433,17 @@ def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
     )
 
     # The scope covers the Diagnostic call too, so every token this Session spends is attributed.
-    with SqliteSaver.from_conn_string(args.checkpoint_db) as checkpointer, session_scope(args.session_id):
+    with (
+        # NEW-20: one writer per checkpoint thread, across processes. Non-blocking on purpose — a
+        # drive lasts as long as the interview, so a second one is refused with a message instead of
+        # being parked for half an hour on a lock it cannot see.
+        claimed(_checkpoint_lock_target(args.checkpoint_db, args.session_id)) as sole_driver,
+        SqliteSaver.from_conn_string(args.checkpoint_db) as checkpointer,
+        session_scope(args.session_id),
+    ):
+        if not sole_driver:
+            print(_busy_session_message(args.session_id), file=sys.stderr)
+            return 2
         candidate_factory = None if args.scripted else lambda seed: InteractiveCandidate()
         graph = build_session_graph(
             roles,
@@ -423,6 +462,12 @@ def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
                     # An unknown --resume id would otherwise surface langgraph's EmptyInputError as a
                     # bare traceback; fail with a friendly one-liner that points at valid ids (0019).
                     print(_unknown_session_message(args.session_id, checkpointer, args.checkpoint_db), file=sys.stderr)
+                    return 2
+                if resumed.get("status") == SessionStatus.COMPLETE.value:
+                    # NEW-19: a finished interview has no next node, so the stream yields its stored
+                    # values once and hands them back — exit 0 and a full "(complete)" report for the
+                    # EARLIER interview, under a "RESUMING SESSION" banner, as if it were this run's.
+                    print(_finished_session_message(args.session_id), file=sys.stderr)
                     return 2
                 # The max_elapsed_seconds rail bounds a single sitting, so resuming after a gap
                 # restarts the time budget rather than force-completing on wall-clock since creation.

@@ -1240,3 +1240,73 @@ def test_session_refuses_an_unsafe_candidate_id_before_the_interview(tmp_path, m
 
     assert rc == 2
     assert "not a valid Skill ledger key" in capsys.readouterr().err
+
+
+# --- NEW-19 / NEW-20: one writer per checkpoint thread, and a finished Session is not resumable ---
+
+
+def test_resume_refuses_a_session_that_already_finished(tmp_path, monkeypatch, capsys):
+    # NEW-19. A finished interview has no next node, so `graph.stream(None, config)` yields the
+    # stored values once and hands them straight back: exit 0 and a full "(complete)" report for THAT
+    # interview, printed under a "RESUMING SESSION" banner as if it were this run's result.
+    # `--session-id` defaults to the constant "local-session", so the week's second interview is the
+    # default path into it. M0-2 closed the fresh-start half of QA-01; this is the resume half.
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: DemoLLMClient())
+    db_path = tmp_path / "finished.sqlite"
+    assert cli.main(_session_argv("finished", db_path)) == 0
+    finished_at = _checkpoint_state("finished", db_path)["started_at"]
+    capsys.readouterr()
+
+    rc = cli.main(
+        [
+            "session", "--resume", "--scripted", "--no-live",
+            "--session-id", "finished", "--checkpoint-db", str(db_path),
+        ]
+    )
+    out, err = capsys.readouterr()
+
+    assert rc == 2
+    assert "already finished" in err
+    assert "SESSION finished (complete)" not in out  # never re-served as this run's result
+    assert "RESUMING SESSION finished" not in out
+    # Refused above `graph.update_state`, so the finished record is not re-stamped either.
+    assert _checkpoint_state("finished", db_path)["started_at"] == finished_at
+
+
+def test_a_second_driver_is_refused_while_another_process_holds_the_session(tmp_path, monkeypatch, capsys):
+    # NEW-20. The server's in-process registry serialises drives inside the SERVER; nothing stopped a
+    # shell `coach session --resume` from streaming into the same thread_id from another process —
+    # two writers, one checkpoint. flock is held per OPEN FILE DESCRIPTION, so a second `open()` here
+    # is exactly the second process the guard has to refuse.
+    import fcntl
+
+    from interview_coach.filelock import lock_path_for
+
+    demo = DemoLLMClient()
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: demo)
+    db_path = tmp_path / "shared.sqlite"
+    _suspend_after_first_question(demo, db_path, "shared")
+    capsys.readouterr()
+
+    sidecar = lock_path_for(cli._checkpoint_lock_target(str(db_path), "shared"))
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    holder = sidecar.open("a+", encoding="utf-8")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        rc = cli.main(
+            [
+                "session", "--resume", "--scripted", "--no-live",
+                "--session-id", "shared", "--checkpoint-db", str(db_path),
+            ]
+        )
+    finally:
+        holder.close()
+    err = capsys.readouterr().err
+
+    assert rc == 2
+    assert "another process" in err
+    state = _checkpoint_state("shared", db_path)
+    assert state["question_count"] == 1  # refused before it drove anything
+    assert state["status"] == "active"
