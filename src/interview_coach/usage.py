@@ -176,17 +176,27 @@ DIAGNOSTIC_CALLS = STRUCTURED_ATTEMPTS
 STUDY_PLAN_CALLS = STRUCTURED_ATTEMPTS
 
 
+# One logical call through LLMRouter can bill TWO providers: the primary's token row is written
+# inside `_create()` and only THEN does an empty completion raise EmptyCompletionError, which
+# `is_provider_failure()` treats as an outage — so the fallback is asked, and billed, for the same
+# request. Two, never three: the router resolves exactly one fallback and its fallback call is
+# terminal. The judge is excluded deliberately — `build_role_clients` always seats it on a pinned
+# provider client (ADR 0009 addendum a), so it cannot fail over, and doubling its calls would loosen
+# the runaway ceiling by ~44% for a case that cannot happen.
+FAILOVER_PROVIDERS_PER_CALL = 2
+
+
 def worst_case_question_calls(max_turns: int) -> int:
-    """Provider calls one question can cost with every retry, degrade and escalation firing."""
+    """Provider calls one question can cost with every retry, degrade, escalation and failover."""
     turns = max(1, max_turns)
-    return (
+    routed = (
         SEED_RENDER_CALLS
-        + turns * EVALUATION_CALLS
-        + PANEL_ESCALATIONS_PER_QUESTION * PANEL_CALLS
         # The last turn hits the safety cap, so it never asks for a follow-up.
         + (turns - 1) * FOLLOW_UP_CALLS
         + SUPERVISOR_CALLS
     )
+    pinned = turns * EVALUATION_CALLS + PANEL_ESCALATIONS_PER_QUESTION * PANEL_CALLS
+    return FAILOVER_PROVIDERS_PER_CALL * routed + pinned
 
 
 def worst_case_session_calls(max_questions: int, max_turns: int) -> int:
@@ -994,8 +1004,15 @@ def questions_today(identity: str, *, day: str | None = None, path: Path | None 
 
 
 def remaining_today(provider: str = "openai", *, path: Path | None = None) -> int:
-    """Tokens left in ``provider``'s daily budget by our own count (never negative)."""
-    spent = usage_for_day(path=path).get(provider, {}).get("total", 0)
+    """Tokens left in today's budget by our own count, across EVERY provider (never negative).
+
+    ``provider`` names the provider the caller is about to spend on — it is what the refusal sentences
+    quote — but it deliberately does NOT narrow the sum. ``LLM_DAILY_TOKEN_BUDGET`` is one scalar, and
+    a failover bills a SECOND provider for the same logical call, so a per-provider bucket reports a
+    budget that is already spent; once the primary's circuit breaker opens, every call bills only the
+    fallback and a per-provider rail never fires at all.
+    """
+    spent = sum(bucket.get("total", 0) for bucket in usage_for_day(path=path).values())
     return max(0, daily_token_budget() - spent)
 
 

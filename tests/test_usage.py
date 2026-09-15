@@ -80,6 +80,20 @@ def test_remaining_today_subtracts_spend_from_budget(tmp_path, monkeypatch):
     assert remaining_today("openai") == 0
 
 
+def test_the_daily_rail_counts_what_a_failover_billed_on_the_other_provider(tmp_path, monkeypatch):
+    # LLMRouter bills the primary inside _create() and only THEN raises EmptyCompletionError, which
+    # is_provider_failure() treats as an outage, so the fallback answers and bills the same logical
+    # request; once the primary's breaker opens, only the fallback is billed at all. Either way the
+    # spend is real, and a rail that reads one provider's bucket hands out a budget already spent.
+    ledger = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
+    monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", str(estimated_session_tokens(1)))
+    record_usage("groq", "llama-3.3-70b-versatile", prompt_tokens=SESSION_TOKENS_PER_QUESTION, completion_tokens=0)
+
+    assert remaining_today("openai") == SESSION_SETUP_TOKENS
+    assert start_refusal_reason("openai", questions=1) is not None
+
+
 def test_other_days_do_not_count(tmp_path, monkeypatch):
     ledger = tmp_path / "ledger.jsonl"
     monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
@@ -194,14 +208,28 @@ def test_the_call_model_matches_the_constants_it_restates(monkeypatch):
 def test_the_worst_case_arithmetic_is_pinned():
     # Written out so the next person cannot quietly shave the ceiling: every term is a count of
     # PROVIDER calls, and a schema retry is a provider call that bills tokens.
-    #   per question (max_turns=4): 2 seed-render + 4x6 evaluations + 10 one panel
-    #                               + 3x6 follow-ups + 2 supervisor            = 56
-    #   per Session (max_questions=5): 2 Diagnostic + 5x56 + 2 Study Plan       = 284
+    # NEW-06: the routed roles are doubled, because a failover bills a SECOND provider for the same
+    # logical call. The judge is not — it is seated on a pinned client and cannot fail over (ADR
+    # 0009a), so doubling it would loosen the rail for a case that cannot happen.
+    #   per question (max_turns=4): 2x(2 seed-render + 3x6 follow-ups + 2 supervisor)
+    #                               + 4x6 evaluations + 10 one panel            = 78
+    #   per Session (max_questions=5): 2x2 Diagnostic + 5x78 + 2x2 Study Plan    = 394
     assert (usage.EVALUATION_CALLS, usage.PANEL_CALLS, usage.FOLLOW_UP_CALLS) == (6, 10, 6)
-    assert worst_case_question_calls(4) == 56
-    assert worst_case_session_calls(5, 4) == 284
-    assert worst_case_session_tokens(5, 4) == 284 * WORST_CASE_TOKENS_PER_CALL
-    assert worst_case_session_tokens(5, 4) == 766_800
+    assert worst_case_question_calls(4) == 78
+    assert worst_case_session_calls(5, 4) == 394
+    assert worst_case_session_tokens(5, 4) == 394 * WORST_CASE_TOKENS_PER_CALL
+    assert worst_case_session_tokens(5, 4) == 1_063_800
+
+
+def test_the_ceiling_counts_the_second_provider_a_failover_bills():
+    # Routed roles (seed render, follow-ups, Supervisor) ride LLMRouter and can bill two providers
+    # for one logical call; the judge is a pinned client (ADR 0009a) and never fails over, so
+    # doubling its calls would loosen the runaway rail for a case that cannot happen. Splitting the
+    # two is what stops a blanket 2x from being pinned by accident.
+    routed = usage.SEED_RENDER_CALLS + 3 * usage.FOLLOW_UP_CALLS + usage.SUPERVISOR_CALLS
+    pinned = 4 * usage.EVALUATION_CALLS + usage.PANEL_ESCALATIONS_PER_QUESTION * usage.PANEL_CALLS
+    assert worst_case_question_calls(4) == 2 * routed + pinned
+    assert usage.FAILOVER_PROVIDERS_PER_CALL == 2
 
 
 def test_every_sizing_constant_still_follows_from_its_measurement():
@@ -224,9 +252,10 @@ def test_the_ceiling_is_bracketed_by_what_the_ledger_measured():
     # Above: a ceiling a real Session can reach fires on compliant behaviour, so the whole ceiling
     # must dwarf the heaviest Session ever measured.
     assert worst_case_session_tokens(5, 4) > 20 * HEAVIEST_MEASURED_SESSION_TOKENS
-    # Below: a ceiling one Session cannot fit under three times over is not bounding anything, which
-    # is the thing the issue asked for ("nothing bounds a single session").
-    assert worst_case_session_tokens(5, 4) < DEFAULT_DAILY_TOKEN_BUDGET // 3
+    # Below: a ceiling one Session cannot fit under twice over is not bounding anything, which is the
+    # thing the issue asked for ("nothing bounds a single session"). Was `// 3` before NEW-06 added
+    # the failover multiplier — the bracket loosens by exactly that factor and no more.
+    assert worst_case_session_tokens(5, 4) < DEFAULT_DAILY_TOKEN_BUDGET // 2
 
 
 def test_the_ceiling_scales_with_the_rails_the_session_declared():
@@ -557,8 +586,11 @@ def test_start_refusal_fires_only_when_the_day_cannot_fund_the_session(tmp_path,
     reason = start_refusal_reason("openai", questions=2)
     assert reason is not None
     assert "00:00 UTC" in reason  # the remedy, not just the refusal
-    # Another provider's spend is not this provider's problem.
-    assert start_refusal_reason("groq", questions=2) is None
+    # NEW-06 inverts what this used to pin. LLM_DAILY_TOKEN_BUDGET is ONE scalar and a failover bills
+    # a second provider for the same logical call, so another provider's spend IS this provider's
+    # problem — and once the primary's breaker opens, only the fallback is billed at all, which a
+    # per-provider rail would never see.
+    assert start_refusal_reason("groq", questions=2) is not None
 
 
 def test_question_cap_reason_names_the_env_var(tmp_path, monkeypatch):
