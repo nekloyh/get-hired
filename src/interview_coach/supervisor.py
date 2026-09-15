@@ -59,6 +59,28 @@ DEFAULT_MAX_ELAPSED_SECONDS = 30 * 60
 SESSION_SCHEMA_VERSION = 1
 
 
+class UnsupportedSessionVersion(RuntimeError):
+    """A checkpoint written by a newer SessionState schema than this build understands."""
+
+
+def require_supported_session_version(state: Mapping[str, Any], *, source: str = "checkpoint") -> None:
+    """The one reader of ``schema_version`` (docs/data-model.md §4): refuse loudly, never guess.
+
+    Refuse higher, tolerate lower. A version this build does not know means keys it cannot interpret,
+    and partially reading a newer Session is how a v1 build silently half-loads a v2 checkpoint —
+    which the doc has promised does not happen since before any reader existed.
+
+    ``isinstance(version, bool)`` first, because ``True > 1`` is False in Python, so a JSON ``true``
+    would otherwise sail through as a valid version.
+    """
+    version = state.get("schema_version", 0)
+    if isinstance(version, bool) or not isinstance(version, int) or version > SESSION_SCHEMA_VERSION:
+        raise UnsupportedSessionVersion(
+            f"{source} carries schema_version {version!r}; this build understands up to "
+            f"{SESSION_SCHEMA_VERSION}. Refusing to load it rather than partially reading a newer Session."
+        )
+
+
 class SessionStatus(StrEnum):
     ACTIVE = "active"
     COMPLETE = "complete"
@@ -339,10 +361,27 @@ def build_session_graph(
             return {"study_plan": None, "study_plan_error": f"{type(err).__name__}: {err}"}
         return {"study_plan": plan.model_dump(mode="json"), "study_plan_error": None}
 
+    def _versioned(node: Callable[[SessionState], dict[str, Any]]) -> Callable[[SessionState], dict[str, Any]]:
+        """Gate the version on the way in, stamp it on the way out — on every node, every superstep.
+
+        Stamping only in ``initial_session_state`` was the bug: LangGraph merges only the keys a node
+        returns, so a Session started before the stamp landed ran to `complete`, was exported and had
+        its posteriors saved carrying no version at all. The check runs BEFORE the node, which puts it
+        outside ``question_node``'s broad isolation net — so a version refusal can never be recorded
+        as a zero-evidence `failed` question (ADR 0005), the same way the typed operator stops are.
+        The stamp is unconditional on purpose: a conditional one is how this bug came back.
+        """
+
+        def run(state: SessionState) -> dict[str, Any]:
+            require_supported_session_version(state)
+            return {**node(state), "schema_version": SESSION_SCHEMA_VERSION}
+
+        return run
+
     graph = StateGraph(SessionState)
-    graph.add_node("run_question", question_node)
-    graph.add_node("supervisor", supervisor_node)
-    graph.add_node("study_plan", study_plan_node)
+    graph.add_node("run_question", _versioned(question_node))
+    graph.add_node("supervisor", _versioned(supervisor_node))
+    graph.add_node("study_plan", _versioned(study_plan_node))
     graph.add_edge(START, "run_question")
     graph.add_edge("run_question", "supervisor")
     graph.add_conditional_edges(

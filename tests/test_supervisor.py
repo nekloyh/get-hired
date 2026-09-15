@@ -6,15 +6,19 @@ from pathlib import Path
 import pytest
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+from conftest import FakeOpenAI
 from interview_coach.bank import load_pack
+from interview_coach.config import Settings
 from interview_coach.diagnostic import CandidateProfile, diagnose
 from interview_coach.evaluator import DimensionScore, Evaluation
+from interview_coach.llm import GroqClient, LLMRouter
 from interview_coach.microloop import MicroLoopResult, ScriptedCandidate, StopReason, Turn
 from interview_coach.rubric import Rubric
 from interview_coach.seeds import SeedQuestion, SeedQuestionsExhausted, seed_count
 from interview_coach.session_serde import TranscriptItem
 from interview_coach.skill import SkillState, apply_evaluation
 from interview_coach.supervisor import (
+    SESSION_SCHEMA_VERSION,
     SessionStatus,
     SupervisorAction,
     SupervisorDecision,
@@ -1298,3 +1302,84 @@ def test_an_accounting_fault_at_the_study_plan_node_stops_instead_of_completing_
 
     assert final["study_plan"] is not None  # the resume re-runs only the end-matter node
     assert len(final["transcript"]) == 1
+
+
+def _versioning_client(replies):
+    """A router over the scripted fake, built locally so these tests can open two graphs in a row."""
+    settings = Settings(
+        _env_file=None,
+        primary_provider="groq",
+        groq_api_key="test",
+        groq_base_url="http://test",
+        groq_model="test-model",
+    )
+    fake = FakeOpenAI(list(replies))
+    return LLMRouter("groq", {"groq": GroqClient(settings.provider_config("groq"), client=fake)}), fake
+
+
+# --- QA-11 / NEW-27: schema_version is stamped by every node, and one reader refuses a newer one ---
+
+
+def test_a_prestamp_session_is_stamped_by_the_nodes_not_only_at_setup(tmp_path, monkeypatch):
+    # QA-11: SESSION_SCHEMA_VERSION was written only by initial_session_state, and LangGraph merges
+    # only the keys a node returns — so a Session started before the stamp landed ran to `complete`,
+    # was exported and had its posteriors saved with no version marker at all. Starting from a state
+    # with the key deleted reproduces exactly that checkpoint.
+    from interview_coach import supervisor
+
+    monkeypatch.setattr(supervisor, "run_micro_loop", _fake_micro_loop(4.0))
+    db = str(tmp_path / "session.sqlite")
+    session_id = "prestamp-session"
+    state = initial_session_state(session_id, _diagnostic(), max_questions=3, started_at=0)
+    del state["schema_version"]
+
+    with SqliteSaver.from_conn_string(db) as checkpointer:
+        client, _ = _versioning_client([_decision("advance_plan", "next planned Skill")])
+        graph = build_session_graph(client, checkpointer=checkpointer, now=lambda: 1)
+        graph.invoke(state, session_config(session_id), interrupt_after=["run_question"])
+
+    with SqliteSaver.from_conn_string(db) as checkpointer:
+        client, _ = _versioning_client(
+            [
+                _decision("advance_plan", "continue"),
+                _decision("end_early", "enough evidence"),
+                _plan("mlops", "system_design", "vietnamese_nlp"),
+            ]
+        )
+        graph = build_session_graph(client, checkpointer=checkpointer, now=lambda: 1)
+        final = graph.invoke(None, session_config(session_id))
+
+    assert final["status"] == SessionStatus.COMPLETE.value
+    assert final["schema_version"] == SESSION_SCHEMA_VERSION
+
+
+def test_a_checkpoint_from_a_newer_schema_refuses_to_run(tmp_path, monkeypatch):
+    # QA-11 / NEW-27: schema_version was write-only — zero readers anywhere — so a checkpoint stamped
+    # by a NEWER build was partially read without a word. docs/data-model.md section 4 already
+    # promises the opposite: a reader that meets a higher version refuses loudly and does not guess.
+    from interview_coach import supervisor
+
+    monkeypatch.setattr(supervisor, "run_micro_loop", _fake_micro_loop(4.0))
+    db = str(tmp_path / "future.sqlite")
+    session_id = "future-session"
+    config = session_config(session_id)
+    state = initial_session_state(session_id, _diagnostic(), max_questions=3, started_at=0)
+
+    with SqliteSaver.from_conn_string(db) as checkpointer:
+        client, _ = _versioning_client([_decision("advance_plan", "next planned Skill")])
+        graph = build_session_graph(client, checkpointer=checkpointer, now=lambda: 1)
+        graph.invoke(state, config, interrupt_after=["run_question"])
+        # What a future build's checkpoint looks like to this one.
+        graph.update_state(config, {"schema_version": SESSION_SCHEMA_VERSION + 98})
+
+    with SqliteSaver.from_conn_string(db) as checkpointer:
+        client, _ = _versioning_client([_decision("end_early", "enough")])
+        graph = build_session_graph(client, checkpointer=checkpointer, now=lambda: 1)
+        with pytest.raises(supervisor.UnsupportedSessionVersion) as err:
+            graph.invoke(None, config)
+        # ADR 0005: the refusal must not become fake Skill evidence. The gate runs BEFORE the node,
+        # so it is outside question_node's isolation net and cannot be recorded as `failed`.
+        stops = {item["stop_reason"] for item in graph.get_state(config).values["transcript"]}
+
+    assert str(SESSION_SCHEMA_VERSION + 98) in str(err.value)
+    assert StopReason.FAILED.value not in stops
