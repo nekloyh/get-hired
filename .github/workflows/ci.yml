@@ -72,11 +72,17 @@ jobs:
       # the health endpoint answered BEFORE the spec runs is what stops a backend that failed to
       # start from silently emptying this job.
       - run: curl -sf --retry 30 --retry-delay 1 --retry-connrefused http://127.0.0.1:8000/api/health
-      - run: npx playwright test e2e/demo-flow.spec.ts --project=chromium --reporter=line
+      # Both specs run through `ran.sh`, which fails the job when Playwright reports a SKIP. Between
+      # them these two have four `test.skip` branches — no backend, wrong project, wrong
+      # VITE_API_URL, backend never came up — and every one of them exits 0 and reads as green.
+      - run: bash ../.github/e2e-ran.sh demo npx playwright test e2e/demo-flow.spec.ts --project=chromium
         working-directory: web
       # Separate invocation, not a second spec in the same run: this one drives its own backend on
       # :8010 and VITE_API_URL has to be set when Playwright starts the Vite dev server, not after.
-      - run: npm run test:e2e:reconnect
+      # It runs in DEMO mode (the spec's default): what it proves is that the graph, the checkpointer
+      # and the socket survive the server being killed, none of which know which provider answered,
+      # and running it live would spend real API money on every push.
+      - run: bash ../.github/e2e-ran.sh reconnect npm run test:e2e:reconnect --
         working-directory: web
       - if: failure()
         run: cat api.log

@@ -12,6 +12,13 @@ import { expect, test } from '@playwright/test'
 const CONTAINER = process.env.COACH_E2E_CONTAINER ?? ''
 const API_PORT = Number(process.env.COACH_E2E_PORT ?? 8010)
 const API_BASE = `http://127.0.0.1:${API_PORT}`
+// Demo by default, live opt-in. What this spec proves — the Session survives the server being
+// killed mid-question, and the browser reconnects to the same checkpoint — is a property of the
+// graph, the SQLite checkpointer and the socket, none of which know which provider answered. It
+// ran `live` only, which meant it could not run anywhere without a funded API key: on CI that is
+// real money on every push, and without the key the Session simply never starts and the spec
+// fails looking like a reconnect bug. `COACH_E2E_MODE=live` still gets the original run.
+const MODE = process.env.COACH_E2E_MODE === 'live' ? 'live' : 'demo'
 const REPO_ROOT = path.resolve(process.cwd(), '..')
 
 let apiProcess: ChildProcess | null = null
@@ -102,7 +109,7 @@ test.describe('web kill/restart/reconnect (issue 0016)', () => {
     // The dev server must be started with VITE_API_URL=http://127.0.0.1:8010 (see package.json's
     // test:e2e:reconnect script) so the page's fixed API_BASE points at this test's own backend.
     await page.goto('/')
-    await page.getByLabel('Mode').selectOption('live')
+    await page.getByLabel('Mode').selectOption(MODE)
     // R-06: generated per browser, read-only. A fresh context gets its own id, and it must survive
     // the drop/reconnect below — resume identifies the Session by id, so a rotating one would
     // orphan the very interview this spec reconnects to.
