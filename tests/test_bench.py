@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from interview_coach import cli, usage
 from interview_coach.bench import (
     BenchCase,
     BenchResult,
@@ -639,3 +640,66 @@ def test_cli_bench_writes_no_report_when_the_quota_dies_mid_run(monkeypatch, mak
     assert not out.exists(), out.read_text(encoding="utf-8")[:200]
     assert rc == 2
     assert "insufficient_quota" in capsys.readouterr().err
+
+
+# --- NEW-10: the bench is a batch job with a budget rail, not a warning -------------------------
+
+
+@pytest.fixture
+def spent_day(tmp_path, monkeypatch, make_client):
+    client, _ = make_client([])
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(tmp_path / "usage-ledger.jsonl"))
+    for name in ("LLM_SESSION_TOKEN_BUDGET", "COACH_DAILY_QUESTION_CAP"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "1000")
+    usage.record_usage("groq", "test-model", prompt_tokens=900, completion_tokens=50)
+    monkeypatch.setattr(cli, "load_settings", _cli_settings)
+    monkeypatch.setattr(cli, "build_client", lambda settings: client)
+    return client
+
+
+def test_bench_refuses_a_sweep_the_day_cannot_fund(spent_day, tmp_path, monkeypatch, capsys):
+    # THE finding: `coach bench --k 3` is ~210,000 tokens — about 8 default Sessions of the shared
+    # daily allowance — and it used to WARN and then spend it under a live interview (ADR 0005).
+    def _never(*args, **kwargs):
+        raise AssertionError("the bench must refuse BEFORE the first sweep")
+
+    monkeypatch.setattr(cli, "run_bench", _never)
+    out = tmp_path / "report.md"
+
+    rc = cli.main(["bench", "--k", "3", "--out", str(out)])
+
+    err = capsys.readouterr().err
+    assert rc == 2  # neither the gate's green (0) nor its red (1)
+    assert not out.exists()  # ...and no ADR 0009 artifact that could be read as a judge verdict
+    assert f"~{cli.BENCH_MIN_BUDGET_TOKENS_PER_PASS * 3:,}" in err
+    assert "--ignore-budget" in err  # the refusal names its own override
+
+
+def test_ignore_budget_lets_an_operator_re_bench_the_judge(spent_day, tmp_path, monkeypatch, capsys):
+    # ADR 0009 needs the bench re-runnable: the daily budget is OUR count, not the provider's, so a
+    # rail with no deliberate override would make a judge change impossible to measure.
+    sweeps: list[int] = []
+    monkeypatch.setattr(cli, "run_bench", lambda judge, cases, *, k=1: sweeps.append(k) or [])
+    out = tmp_path / "report.md"
+
+    rc = cli.main(["bench", "--k", "1", "--ignore-budget", "--out", str(out)])
+
+    assert sweeps == [1]  # it RAN
+    assert rc == 1  # bench_passed([]) is False — unchanged, the gate still decides the verdict
+    assert out.exists()
+    assert "WARNING (--ignore-budget)" in capsys.readouterr().err  # loud, never silent
+
+
+def test_ignore_budget_cannot_override_a_broken_ledger(tmp_path, monkeypatch, make_client, capsys):
+    # --ignore-budget buys tokens the operator believes they have; it cannot buy a working counter.
+    client, _ = make_client([])
+    ledger = tmp_path / "usage-ledger.jsonl"
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
+    ledger.mkdir()  # appends now fail
+    usage.reset_accounting_state()
+    monkeypatch.setattr(cli, "load_settings", _cli_settings)
+    monkeypatch.setattr(cli, "build_client", lambda settings: client)
+    monkeypatch.setattr(cli, "run_bench", lambda *a, **kw: pytest.fail("must not spend"))
+
+    assert cli.main(["bench", "--k", "1", "--ignore-budget", "--out", str(tmp_path / "r.md")]) == 2

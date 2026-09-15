@@ -12,8 +12,9 @@ land inside another Candidate's judge-call window, where ``evaluator._noise_even
 judgment's noise and haircut a clean confidence: one Candidate's provider hiccup altering another
 Candidate's scored evidence, which ADR 0005 forbids. ``session_counters()`` swaps in a fresh Counter
 for the current context and ``usage.session_scope`` enters it, so both Session drivers (CLI and web
-API) get isolation without threading a parameter through every call site. Outside a Session — bench,
-forge, one-off CLI commands — the module-level Counter is untouched, so those reports read as before.
+API) get isolation without threading a parameter through every call site. Outside a Session — bench
+and forge, which snapshot it around a run for the ADR 0009 report — the module-level Counter is
+untouched, so those reports read as before.
 Not persisted — persistence belongs to the usage ledger (usage.py), which tracks spend, not noise.
 """
 

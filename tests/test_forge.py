@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from interview_coach import cli
+from interview_coach import cli, usage
 from interview_coach.bank import validate_question
 from interview_coach.concepts import ConceptNote
 from interview_coach.config import load_settings
@@ -580,3 +580,22 @@ def test_cli_forge_writes_no_queue_or_report_when_the_quota_dies_mid_run(monkeyp
     assert not (tmp_path / "review-queue-report.md").exists()
     assert rc == 2
     assert "insufficient_quota" in capsys.readouterr().err
+
+
+def test_cli_forge_refuses_a_batch_the_day_cannot_fund(monkeypatch, make_client, tmp_path, capsys):
+    # NEW-10: a forge batch is a batch job on the same shared allowance a live interview spends.
+    client, fake = make_client([])
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(tmp_path / "usage-ledger.jsonl"))
+    monkeypatch.delenv("COACH_DAILY_QUESTION_CAP", raising=False)
+    monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "1000")
+    usage.record_usage("groq", "test-model", prompt_tokens=900, completion_tokens=50)
+    monkeypatch.setattr(cli, "load_settings", _cli_settings)
+    monkeypatch.setattr(cli, "build_client", lambda settings: client)
+    out = tmp_path / "queue.yaml"
+
+    rc = cli.main(["forge", "--skill", SKILL, "--n", "5", "--out", str(out)])
+
+    assert rc == 2
+    assert fake.call_count == 0  # refused before the Writer call, not mid-queue
+    assert not out.exists()  # no half-written review file
+    assert "Refusing to run `coach forge`" in capsys.readouterr().err

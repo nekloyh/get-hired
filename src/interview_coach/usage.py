@@ -1143,6 +1143,38 @@ def start_refusal_reason(provider: str, *, questions: int, path: Path | None = N
     )
 
 
+def metered_command_refusal_reason(
+    provider: str, *, work: str, needed: int, path: Path | None = None
+) -> str | None:
+    """Why a metered CLI batch command must not start, or None. Checked BEFORE the first token.
+
+    ``start_refusal_reason`` is sized in questions because a Session IS questions. A bench sweep, a
+    forge batch and a debrief are not, so this one takes the token estimate its caller measured and
+    names the work in the operator's own words — same three checks, same order, same remedies, one
+    implementation so the CLI and the web keep saying the same thing. For the Candidate it is the
+    same event either way: a `coach bench --k 3` drains the allowance their live Session is spending,
+    and their Session suspends for a batch job nobody rationed (ADR 0005).
+
+    ``quota_exhausted_today`` is asked UNSCOPED on purpose: a batch command has no Session of its
+    own, so a retry granted to somebody else's resume must not answer the latch for it.
+    """
+    if blocked := accounting_block_reason(path=path):
+        return blocked
+    if quota_exhausted_today(provider, path=path):
+        return (
+            f"The {provider} account is out of quota — the provider returned insufficient_quota and "
+            f"no retry can fix that, so {work} would die on its first call. {daily_reset_hint()}"
+        )
+    left = remaining_today(provider, path=path)
+    if left >= needed:
+        return None
+    return (
+        f"Not enough of today's {provider} budget left to run {work}: ~{left:,} tokens remain by "
+        f"our count and it is estimated at ~{needed:,}. {daily_reset_hint()} Raise "
+        f"LLM_DAILY_TOKEN_BUDGET if your real allowance is larger."
+    )
+
+
 def question_cap_reason(identity: str, *, questions: int, path: Path | None = None) -> str | None:
     """Why this identity may not start another Session today, or None (the product cap, AC d).
 

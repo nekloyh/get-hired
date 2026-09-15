@@ -581,6 +581,106 @@ def test_session_starts_when_the_day_can_fund_it(tmp_path, monkeypatch, capsys):
     assert "00:00 UTC" not in capsys.readouterr().err
 
 
+# --- NEW-10: the same rail on every OTHER metered command ---------------------------------------
+
+
+def _spend_the_day(monkeypatch, tmp_path):
+    """A day with 50 tokens left — enough for nothing, and the rails read it from the ledger."""
+    _tmp_ledger(monkeypatch, tmp_path)
+    monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "1000")
+    usage.record_usage("groq", "test-model", prompt_tokens=900, completion_tokens=50)
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: _ProviderDemoClient())
+
+
+def _never(*args, **kwargs):
+    raise AssertionError("the budget rail must refuse BEFORE any token is spent")
+
+
+def test_diagnose_refuses_into_a_spent_day(tmp_path, monkeypatch, capsys):
+    # `coach diagnose` is one Diagnostic call — the cheapest metered command there is — and it had
+    # no rail at all. The spy makes the test fail if the gate is ever deleted.
+    _spend_the_day(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "diagnose_or_degrade", _never)
+
+    rc = cli.main(["diagnose", "--target-role", "machine learning engineer"])
+
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "Refusing to run `coach diagnose`" in err
+    assert "00:00 UTC" in err  # the remedy is named, not just the refusal
+
+
+def test_eval_harness_refuses_into_a_spent_day(tmp_path, monkeypatch, capsys):
+    _spend_the_day(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "run_golden_answer_harness", _never)
+
+    rc = cli.main(["eval-harness"])
+
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert f"~{cli.HARNESS_MIN_BUDGET_TOKENS:,}" in err  # the estimate it was refused against
+
+
+def test_postmortem_refuses_into_a_spent_day(tmp_path, monkeypatch, capsys):
+    _spend_the_day(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "run_postmortem", _never)
+
+    rc = cli.main(
+        [
+            "postmortem",
+            "--candidate",
+            "cand-1",
+            "--scripted-recollection",
+            "I was asked about overfitting.",
+            "--ledger-db",
+            str(tmp_path / "ledger.json"),
+        ]
+    )
+
+    assert rc == 2
+    assert "Refusing to run `coach postmortem`" in capsys.readouterr().err
+
+
+def test_a_metered_command_names_what_it_would_cost_a_candidate(tmp_path, monkeypatch, capsys):
+    # The refusal has to be actionable by the operator standing between a batch job and a live
+    # interview, so it states the spend in the unit that matters: Sessions, not raw tokens.
+    _spend_the_day(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "run_golden_answer_harness", _never)
+
+    cli.main(["eval-harness"])
+
+    assert "Session(s) of the same allowance" in capsys.readouterr().err
+
+
+def test_the_harness_attributes_its_spend_instead_of_leaving_it_loose(tmp_path, monkeypatch, capsys):
+    # Without session_scope every row a batch command writes lands in the "" bucket, where
+    # `coach usage` files it under "unattributed" and nobody can tell which command spent it.
+    _tmp_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: _ProviderDemoClient())
+
+    def _harness(client):
+        usage.record_usage("groq", "test-model", prompt_tokens=10, completion_tokens=5)
+        return []
+
+    monkeypatch.setattr(cli, "run_golden_answer_harness", _harness)
+
+    assert cli.main(["eval-harness"]) == 1  # harness_passed([]) is False; the point is the ledger
+    assert usage.sessions_for_day() == {"eval-harness": 15}
+
+
+def test_demo_diagnose_is_still_exempt_from_the_new_rail(tmp_path, monkeypatch, capsys, spy_diagnose):
+    # The UNKNOWN_PROVIDER exemption is what keeps the rest of the suite (and demo mode) untouched.
+    _tmp_ledger(monkeypatch, tmp_path)
+    monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "1")
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: DemoLLMClient())
+
+    assert cli.main(["diagnose", "--target-role", "machine learning engineer"]) == 0
+    assert "Refusing" not in capsys.readouterr().err
+
+
 # --- M0a / F1: accounting health on the CLI surface ----------------------------------------------
 
 

@@ -49,7 +49,12 @@ from .concepts import (
 )
 from .config import load_settings
 from .diagnostic import SKILLS, CandidateProfile, diagnose_or_degrade
-from .eval_harness import harness_passed, render_golden_answer_report, run_golden_answer_harness
+from .eval_harness import (
+    GOLDEN_ANSWER_CASES,
+    harness_passed,
+    render_golden_answer_report,
+    run_golden_answer_harness,
+)
 from .exporter import export_session_markdown
 from .filelock import claimed
 from .forge import MAX_DRAFTS, ForgeError, render_forge_report, run_forge, write_forge_outputs
@@ -71,7 +76,12 @@ from .microloop import (
     ScriptedCandidate,
     display_stop_reason,
 )
-from .postmortem import PostmortemResult, export_postmortem_markdown, run_postmortem
+from .postmortem import (
+    MAX_ELICITATION_QUESTIONS,
+    PostmortemResult,
+    export_postmortem_markdown,
+    run_postmortem,
+)
 from .resources import SEED_RESOURCES, ChromaResourceStore, build_resource_store
 from .seeds import QUESTION_BANK
 from .session_serde import measured_skill_states
@@ -88,6 +98,7 @@ from .supervisor import (
 )
 from .ui import render_skill_state_rows
 from .usage import (
+    WORST_CASE_TOKENS_PER_CALL,
     AccountingUnavailable,
     ProviderQuotaExhausted,
     SessionBudgetSuspended,
@@ -99,6 +110,7 @@ from .usage import (
     daily_token_budget,
     estimated_session_tokens,
     ledger_path,
+    metered_command_refusal_reason,
     reconcile_accounting,
     remaining_today,
     session_budget_guard,
@@ -147,6 +159,48 @@ def _parse_claim(raw: str) -> tuple[str, float]:
     return skill.strip(), score
 
 
+# What a "Session's worth" is for a batch command, in the ledger's own measured units. Each is a
+# FLOOR on what the day must be able to fund, never a ceiling on what the run can spend — a
+# ceiling-sized start gate refuses runs the day could have paid for.
+#   eval-harness : one judgment per golden case at the largest call ever measured.
+#   postmortem   : MAX_ELICITATION_QUESTIONS turns + reconstruction + study plan.
+#   forge        : ~4 live calls per draft that survives to the admission gate, x --n.
+HARNESS_MIN_BUDGET_TOKENS = len(GOLDEN_ANSWER_CASES) * WORST_CASE_TOKENS_PER_CALL
+POSTMORTEM_MIN_BUDGET_TOKENS = (MAX_ELICITATION_QUESTIONS + 2) * WORST_CASE_TOKENS_PER_CALL
+FORGE_MIN_BUDGET_TOKENS_PER_DRAFT = 4 * WORST_CASE_TOKENS_PER_CALL
+
+
+def _refuse_metered_start(
+    client: LLMClient, *, work: str, needed: int, allow_overspend: bool = False, hint: str = ""
+) -> str | None:
+    """The start gate every metered command shares (NEW-10): the refusal to print, or None.
+
+    `coach session` has had one since R-25; the batch commands had none, so `coach bench --k 3` —
+    ~210,000 tokens, about 8 default Sessions of the shared allowance, and the two heaviest sweeps in
+    the ledger are 455 and 778 calls — could drain the daily allowance out from under a Candidate
+    mid-interview and suspend their Session (ADR 0005).
+
+    A client with no provider identity (demo, test fakes) spends nobody's allowance, so the rail is
+    inert for it: the same UNKNOWN_PROVIDER exemption `_cmd_session` grants.
+
+    ``allow_overspend`` (the `--ignore-budget` flag) zeroes only the ARITHMETIC comparison, because
+    that number is our own count and can be wrong — an operator who knows their real allowance is
+    larger must always be able to re-bench a judge (ADR 0009). It deliberately cannot buy a working
+    ledger or a live quota: the accounting-fault and dead-quota refusals still fire.
+    """
+    provider = provider_label(client)
+    if provider == UNKNOWN_PROVIDER:
+        return None
+    reason = metered_command_refusal_reason(provider, work=work, needed=0 if allow_overspend else needed)
+    if reason is None:
+        return None
+    sessions = max(1, round(needed / estimated_session_tokens(DEFAULT_MAX_QUESTIONS)))
+    return (
+        f"{reason} At ~{needed:,} tokens this run is worth about {sessions} default "
+        f"{DEFAULT_MAX_QUESTIONS}-question Session(s) of the same allowance.{hint}"
+    )
+
+
 def _cmd_diagnose(client: ClientArg, args: argparse.Namespace) -> int:
     profile = CandidateProfile(
         target_role=args.target_role,
@@ -154,7 +208,13 @@ def _cmd_diagnose(client: ClientArg, args: argparse.Namespace) -> int:
         claimed_skills=dict(args.claim),
     )
     roles = ensure_role_clients(client)
-    result = diagnose_or_degrade(profile, roles.diagnostic if roles is not None else None)
+    if roles is not None and (
+        refusal := _refuse_metered_start(roles.diagnostic, work="a Diagnostic", needed=estimated_session_tokens(0))
+    ):
+        print(f"Refusing to run `coach diagnose`: {refusal}", file=sys.stderr)
+        return 2
+    with session_scope("diagnose"):
+        result = diagnose_or_degrade(profile, roles.diagnostic if roles is not None else None)
     print(f"=== TOPIC PLAN (source: {result.topic_plan_source.value}) ===")
     for i, entry in enumerate(result.topic_plan, start=1):
         print(f"{i}. {entry.skill}  difficulty={entry.target_difficulty}  {entry.rationale}")
@@ -632,6 +692,11 @@ def _cmd_postmortem(client: ClientArg, args: argparse.Namespace) -> int:
     roles = ensure_role_clients(client)
     if roles is None:
         raise RuntimeError("postmortem requires an LLM client")
+    if refusal := _refuse_metered_start(
+        roles.diagnostic, work="a post-mortem debrief", needed=POSTMORTEM_MIN_BUDGET_TOKENS
+    ):
+        print(f"Refusing to run `coach postmortem`: {refusal}", file=sys.stderr)
+        return 2
     resource_store = build_resource_store(
         args.resource_store,
         persist_dir=args.resource_persist_dir,
@@ -689,7 +754,15 @@ def _cmd_eval_harness(client: ClientArg, args: argparse.Namespace) -> int:
     roles = ensure_role_clients(client)
     if roles is None:
         raise RuntimeError("eval-harness requires an LLM client")
-    results = run_golden_answer_harness(roles.judge)
+    if refusal := _refuse_metered_start(
+        roles.judge,
+        work=f"the {len(GOLDEN_ANSWER_CASES)}-case golden-answer harness",
+        needed=HARNESS_MIN_BUDGET_TOKENS,
+    ):
+        print(f"Refusing to run `coach eval-harness`: {refusal}", file=sys.stderr)
+        return 2
+    with session_scope("eval-harness"):
+        results = run_golden_answer_harness(roles.judge)
     print(render_golden_answer_report(results))
     return 0 if harness_passed(results) else 1
 
@@ -730,10 +803,25 @@ def _cmd_bench(client: ClientArg, args: argparse.Namespace) -> int:
     left = max(0, budget - usage_before.get(provider, {}).get("total", 0))
     needed = BENCH_MIN_BUDGET_TOKENS_PER_PASS * k
     print(f"Daily budget check ({provider}): ~{left:,} of {budget:,} tokens left by our count.")
-    if left < needed:
+    if refusal := _refuse_metered_start(
+        judge,
+        work=f"a {k}-sweep calibration bench",
+        needed=needed,
+        allow_overspend=args.ignore_budget,
+        hint=(
+            " Pass --ignore-budget to spend it deliberately (that cannot override a broken ledger "
+            "or a dead quota)."
+        ),
+    ):
+        # Refused, not warned (NEW-10): the warning let a `--k 3` sweep drain the day under a live
+        # Session. Exit 2 is neither the gate's green (0) nor its red (1), and NO report is written,
+        # so a refusal can never be mistaken for a judge verdict (ADR 0009).
+        print(f"Refusing to run `coach bench`: {refusal}", file=sys.stderr)
+        return 2
+    if args.ignore_budget and left < needed:
         print(
-            f"WARNING: under {needed:,} tokens left (k={k} sweeps) — a full bench run may die "
-            "mid-run on insufficient_quota. Consider waiting for the daily reset (00:00 UTC).",
+            f"WARNING (--ignore-budget): under {needed:,} tokens left (k={k} sweeps) — a full bench "
+            "run may die mid-run on insufficient_quota, and any Session running now may suspend.",
             file=sys.stderr,
         )
     telemetry_before = telemetry.snapshot()
@@ -846,6 +934,15 @@ def _cmd_forge(client: ClientArg, args: argparse.Namespace) -> int:
         f"Daily budget check ({provider}): ~{remaining_today(provider):,} of "
         f"{daily_token_budget():,} tokens left by our count."
     )
+    if refusal := _refuse_metered_start(
+        judge,
+        work=f"a {args.n}-draft forge batch",
+        needed=args.n * FORGE_MIN_BUDGET_TOKENS_PER_DRAFT,
+        allow_overspend=args.ignore_budget,
+        hint=" Pass --ignore-budget to spend it deliberately.",
+    ):
+        print(f"Refusing to run `coach forge`: {refusal}", file=sys.stderr)
+        return 2
     # Gate 2 must dedup across everything the merged install would serve: the built-in bank plus,
     # when the drafts target a pack, that pack's questions. The pack's concept notes then also
     # become valid Writer grounding / expected_concepts targets.
@@ -1192,6 +1289,16 @@ def main(argv: list[str] | None = None) -> int:
     bench_parser.add_argument(
         "--out", default="", help="Report output path (default: docs/audits/calibration-bench-<date>.md)."
     )
+    bench_parser.add_argument(
+        "--ignore-budget",
+        action="store_true",
+        help=(
+            "Run even when today's budget cannot fund the sweep. The daily budget is OUR count, not "
+            "the provider's, so an operator re-benching a judge must always be able to spend "
+            "deliberately (ADR 0009). Loud, never silent; it cannot override a broken ledger or a "
+            "dead quota."
+        ),
+    )
     bench_parser.set_defaults(func=_cmd_bench, requires_llm=True)
 
     forge_parser = sub.add_parser(
@@ -1223,6 +1330,14 @@ def main(argv: list[str] | None = None) -> int:
         "--out",
         default="",
         help="Explicit review-queue YAML path (default: <queue-dir>/review-queue-<date>.yaml).",
+    )
+    forge_parser.add_argument(
+        "--ignore-budget",
+        action="store_true",
+        help=(
+            "Run even when today's budget cannot fund the batch. Loud, never silent; it cannot "
+            "override a broken ledger or a dead quota."
+        ),
     )
     forge_parser.set_defaults(func=_cmd_forge, requires_llm=True)
 
