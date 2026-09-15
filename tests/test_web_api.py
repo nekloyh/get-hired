@@ -1622,7 +1622,14 @@ def test_a_start_that_dies_before_anything_is_checkpointed_gives_the_questions_b
     with client.websocket_connect("/api/sessions/crashed") as ws:
         _start_live(ws, max_questions=10)
         event = _receive_until(ws, "session_error")
+        # The refund is written in the run thread's `finally`, which runs AFTER the error frame the
+        # Candidate sees — the release is server-side bookkeeping, not part of the socket contract.
+        # Join the thread rather than sleeping, or this assertion is a coin toss.
+        run_thread = client.app.state.web_api.runtimes["crashed"].thread
 
+    assert run_thread is not None
+    run_thread.join(10)
+    assert not run_thread.is_alive()
     assert "RuntimeError" in event["error"], event
     assert web_api._checkpoint_values(client.app.state.web_api, "crashed") == {}  # nothing to resume
     assert usage.questions_today(usage.token_identity("")) == 0
