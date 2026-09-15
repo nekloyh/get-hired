@@ -35,9 +35,11 @@ Resolved score: **2.00/5**; confidence: **0.82**; evidence weight: **1.73**; sto
 
 #### Turn 1: Question
 
-**Interviewer:** You have a 1-to-100 imbalanced dataset. Walk me through training and evaluating a classifier on it without fooling yourself.
+**Interviewer:**
+> You have a 1-to-100 imbalanced dataset. Walk me through training and evaluating a classifier on it without fooling yourself.
 
-**Candidate:** A strong answer.
+**Candidate:**
+> A strong answer.
 
 | Dimension | Score | Evidence |
 | --- | ---: | --- |
@@ -55,9 +57,11 @@ Resolved score: **2.00/5**; confidence: **0.82**; evidence weight: **1.73**; sto
 
 #### Turn 1: Question
 
-**Interviewer:** How would you monitor a production model for data drift and decide when retraining is actually justified?
+**Interviewer:**
+> How would you monitor a production model for data drift and decide when retraining is actually justified?
 
-**Candidate:** A weak answer.
+**Candidate:**
+> A weak answer.
 
 | Dimension | Score | Evidence |
 | --- | ---: | --- |
@@ -76,9 +80,11 @@ Resolved score: **2.00/5**; confidence: **0.82**; evidence weight: **1.73**; sto
 
 #### Turn 1: Question
 
-**Interviewer:** When would you choose SGD with momentum over Adam, and what does AdamW change?
+**Interviewer:**
+> When would you choose SGD with momentum over Adam, and what does AdamW change?
 
-**Candidate:** A strong answer.
+**Candidate:**
+> A strong answer.
 
 | Dimension | Score | Evidence |
 | --- | ---: | --- |
