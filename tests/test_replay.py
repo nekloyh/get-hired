@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Sequence
+from pathlib import Path
+
+import pytest
 
 from interview_coach.llm import LLMClient, Message, ResponseFormat
 from interview_coach.replay import (
@@ -19,7 +22,7 @@ from interview_coach.replay import (
     run_persona_session,
 )
 from interview_coach.rubric import DIMENSIONS
-from interview_coach.supervisor import SessionStatus
+from interview_coach.supervisor import SESSION_SCHEMA_VERSION, SessionStatus
 
 
 class _PersonaTextClient(LLMClient):
@@ -149,3 +152,53 @@ def test_replay_artifact_roundtrips_and_reruns_the_decision_node(tmp_path):
     # Counterfactual: re-run the decision node over the dumped state with a *different* model.
     decision = replay_decision(artifact, _SimJudge(supervisor_action="end_early"), now=lambda: 1.0)
     assert decision.action.value == "end_early"
+
+
+# --- NEW-26: the envelope version is not the Session state's version ------------------------------
+
+_CHECKED_IN_ARTIFACT = Path(__file__).resolve().parents[1] / "data" / "replay" / "deep-learning-strong.json"
+
+
+def _dumped_trajectory(tmp_path, name):
+    persona = Persona(name="alice", mastery={"deep_learning": 0.9, "mlops": 0.2})
+    final = run_persona_session(
+        _SimJudge(),
+        persona,
+        session_id="alice-stale",
+        candidate_client=_PersonaTextClient(),
+        max_questions=1,
+        now=lambda: 1.0,
+    )
+    return dump_replay_artifact(tmp_path / name, persona, final)
+
+
+def test_an_artifact_holding_a_pre_stamp_session_state_is_refused(tmp_path):
+    # The envelope stays version 1; only the Session state inside it is old — exactly the shape of
+    # the trajectory dumped before SESSION_SCHEMA_VERSION existed. Validating only the envelope let
+    # `replay_decision` feed the Supervisor an old-shaped state and report the decision as a fair
+    # measurement.
+    path = _dumped_trajectory(tmp_path, "stale.json")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["final_state"].pop("schema_version")
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Session state"):
+        load_replay_artifact(path)
+
+
+def test_an_artifact_holding_a_future_session_state_is_refused(tmp_path):
+    path = _dumped_trajectory(tmp_path, "future.json")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["final_state"]["schema_version"] = SESSION_SCHEMA_VERSION + 1
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Session state"):
+        load_replay_artifact(path)
+
+
+def test_the_checked_in_replay_artifact_carries_the_current_state_version():
+    # The one artifact in the repo is what the replay bench and the serde goldens actually load; if
+    # it drifts below the reader, every decision replayed over it is measured against an old shape.
+    artifact = load_replay_artifact(_CHECKED_IN_ARTIFACT)
+
+    assert artifact.final_state["schema_version"] == SESSION_SCHEMA_VERSION

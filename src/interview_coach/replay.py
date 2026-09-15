@@ -27,6 +27,7 @@ from .seeds import SeedQuestion
 from .session_serde import transcript_items
 from .skill import SkillState
 from .supervisor import (
+    SESSION_SCHEMA_VERSION,
     SessionState,
     SupervisorDecision,
     build_session_graph,
@@ -173,10 +174,21 @@ def load_replay_artifact(path: str | Path) -> ReplayArtifact:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if data.get("version") != REPLAY_ARTIFACT_VERSION:
         raise ValueError(f"unsupported replay artifact version {data.get('version')!r}")
+    final_state = dict(data["final_state"])
+    # The envelope version says how the *file* is shaped; it says nothing about the Session state
+    # inside it. `replay_decision` casts that state to SessionState unchecked, so a trajectory dumped
+    # under an older (or newer) schema would be replayed as if it were current and the decision
+    # reported as a fair measurement. Refuse instead of measuring the wrong thing.
+    state_version = final_state.get("schema_version", 0)
+    if state_version != SESSION_SCHEMA_VERSION:
+        raise ValueError(
+            f"replay artifact {Path(path).name} holds a version {state_version!r} Session state; "
+            f"this build reads version {SESSION_SCHEMA_VERSION}. Re-dump the trajectory before replaying it."
+        )
     return ReplayArtifact(
         version=int(data["version"]),
         persona=str(data["persona"]),
-        final_state=dict(data["final_state"]),
+        final_state=final_state,
         ground_truth={k: float(v) for k, v in data.get("ground_truth", {}).items()},
     )
 
