@@ -94,3 +94,23 @@ export function withEvaluation(patch: Partial<Evaluation>): SessionState {
     transcript: [{ ...item, turns: [{ ...turn, evaluation: { ...turn.evaluation, ...patch } }] }],
   }
 }
+
+/** A `failed` question exactly as `session_serde.TranscriptItem.failed` persists it (slice 0014). */
+export function withFailedQuestion(error = 'RuntimeError: judge returned malformed JSON'): SessionState {
+  return {
+    ...stateFixture,
+    transcript: [
+      {
+        skill: 'mlops',
+        plan_index: 0,
+        stop_reason: 'failed',
+        resolved_weighted_score: 0,
+        resolved_confidence: 0,
+        evidence_weight: 0,
+        skill_state: { skill: 'mlops', alpha: 3, beta: 2 },
+        turns: [],
+        error,
+      },
+    ],
+  }
+}

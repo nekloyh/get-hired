@@ -4,7 +4,7 @@ import { ReportView } from './ReportView'
 import { SessionAlert } from './SessionAlert'
 import { SkillBars } from './SkillBars'
 import { TopicPlan } from './TopicPlan'
-import { stateFixture, withEvaluation } from '../test/fixtures'
+import { stateFixture, withEvaluation, withFailedQuestion } from '../test/fixtures'
 
 describe('Skill and progress rendering', () => {
   it('renders mastery, confidence context, and role criticality', () => {
@@ -97,4 +97,13 @@ describe('report rendering', () => {
     expect(block).toHaveTextContent('Skeptic 2/5 · Advocate 4/5')
     expect(screen.queryByText(/citations unverifiable/)).not.toBeInTheDocument()
   })
+  it('shows why a question failed and never prints a 0.00/5 the Candidate did not earn (ADR 0005)', () => {
+    render(<ReportView state={withFailedQuestion()} />)
+
+    const summary = screen.getByText(/Q1 mlops/)
+    expect(summary).not.toHaveTextContent('0.00/5')
+    expect(summary).toHaveTextContent('not scored')
+    expect(screen.getByText(/RuntimeError: judge returned malformed JSON/)).toBeInTheDocument()
+  })
+
 })

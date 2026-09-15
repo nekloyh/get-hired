@@ -115,8 +115,19 @@ export function ReportView({ state }: { state: SessionState | null }) {
         {state.transcript.map((item, index) => (
           <details key={`${item.skill}-${index}`}>
             <summary>
-              Q{index + 1} {item.skill} · {item.resolved_weighted_score.toFixed(2)}/5 · {item.stop_reason}
+              Q{index + 1} {item.skill} ·{' '}
+              {item.stop_reason === 'failed' ? 'not scored' : `${item.resolved_weighted_score.toFixed(2)}/5`} ·{' '}
+              {item.stop_reason}
             </summary>
+            {/* ADR 0005: a crashed question is infrastructure noise, never evidence. The stored
+                sentinel is 0.0, and printing it as `0.00/5` reads as "the Candidate scored zero"
+                for a question that never produced an answer. Show the recorded error instead. */}
+            {item.stop_reason === 'failed' ? (
+              <div className="turn-detail">
+                <strong>Question failed — no evidence recorded</strong>
+                <p>{item.error ?? 'unknown error'}</p>
+              </div>
+            ) : null}
             {item.turns.map((turn, turnIndex) => (
               <div className="turn-detail" key={`${turn.question}-${turnIndex}`}>
                 <strong>{turn.is_follow_up ? 'Follow-up' : 'Question'}</strong>
