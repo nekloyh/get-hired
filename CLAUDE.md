@@ -5,15 +5,14 @@ This file tells any agent or contributor where the authoritative design lives, s
 ## Quick Links (authoritative — read in this order)
 
 1. **`/CONTEXT.md`** — domain glossary. Use these exact terms (Candidate, Session, Interviewer, Evaluator, Supervisor, Micro-loop, Macro-loop, Skill, Topic Plan, Role criticality, Follow-up, Self-critique, Derived confidence, Budget exhaustion, Coaching memory).
-2. **`/docs/adr/`** — the binding architectural decisions (0001–0014). **These win over everything else.** Sections and files marked `Status: Proposed` are experiment-gated hypotheses — do NOT implement from them until their status is Accepted; everything else (including addenda dated 2026-07-19) is binding now.
+2. **`/docs/adr/`** — the binding architectural decisions. Twelve files, numbered 0001–0011 and 0014; **there is no 0012 or 0013** and never was, so a missing number is not a missing document. **These win over everything else.** Sections and files marked `Status: Proposed` are experiment-gated hypotheses — do NOT implement from them until their status is Accepted; everything else (including addenda dated 2026-07-19) is binding now.
 3. **[`/docs/issues/README.md`](docs/issues/README.md)** — the canonical milestone order, dependencies, and quality gates (updated 2026-09-13). **`/docs/issues/`** holds the build plan as vertical slices (0001–0037). Slice status lives in the doc's `## Status` section; live work status lives in GitHub Issues (the remediation backlog R-01→R-33 maps to GH #56–#88, `R-NN = #(55+NN)`).
 
-## Reference — background only, do NOT implement from these
+## Deleted: the original MVP planning docs
 
-- `/docs/reference/MVP_v1_2day.md` — original 2-day build blueprint. ⚠️ archived
-- `/docs/reference/MVP_v2.md` — original V2 critique/roadmap. ⚠️ archived
+`/docs/reference/MVP_v1_2day.md` and `MVP_v2.md` (1,261 lines) were removed — every agent was told to load them and then told not to implement from them, which is the worst of both. They are in git history if you need them; `git log --diff-filter=D -- docs/reference` finds the commit.
 
-These are optimized for shipping fast / recruiter signal. That is **not** this project's priority order, which is: **(1) learn agentic systems, (2) a usable prep tool, (3) recruiter signal.** Where these docs conflict with an ADR, the ADR wins.
+They were optimized for shipping fast / recruiter signal. That is **not** this project's priority order, which is: **(1) learn agentic systems, (2) a usable prep tool, (3) recruiter signal.** Everything they said that still holds is in an ADR, and where they conflicted with one, the ADR won.
 
 ## For Implementers
 
