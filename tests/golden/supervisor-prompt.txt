@@ -20,7 +20,7 @@ SKILL STATES:
 RESOLVED QUESTION EVIDENCE:
 - Q1 skill=ml_fundamentals score=4.00 confidence=0.90 stop=resolved
 - Q2 skill=mlops score=2.00 confidence=0.80 stop=safety_cap
-- Q3 skill=mlops score=0.00 confidence=0.00 stop=failed
+- Q3 skill=mlops NOT ASKED (infrastructure failure; no evidence)
 
 SEED AVAILABILITY (a Skill with 0 left cannot be probed again):
 - ml_fundamentals: probed 1/9 seeds (8 left)

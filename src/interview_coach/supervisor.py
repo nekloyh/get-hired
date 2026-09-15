@@ -717,6 +717,13 @@ def _skill_state_summary(state: SessionState) -> str:
 def _evidence_summary(state: SessionState) -> str:
     rows = []
     for i, item in enumerate(transcript_items(state), start=1):
+        if item.stop_reason == StopReason.FAILED.value:
+            # ADR 0005: a crashed question is infrastructure noise, not evidence. Its zero-evidence
+            # sentinels (session_serde.TranscriptItem.failed) are a STORAGE shape, and rendering them
+            # here told the deciding model the Candidate scored 0.00/5 on this Skill — so a provider
+            # timeout on a MUST_HAVE Skill steered the rest of the interview.
+            rows.append(f"- Q{i} skill={item.skill} NOT ASKED (infrastructure failure; no evidence)")
+            continue
         rows.append(
             f"- Q{i} skill={item.skill} score={item.resolved_weighted_score:.2f} "
             f"confidence={item.resolved_confidence:.2f} stop={item.stop_reason}"

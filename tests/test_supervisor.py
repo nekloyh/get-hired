@@ -12,6 +12,7 @@ from interview_coach.evaluator import DimensionScore, Evaluation
 from interview_coach.microloop import MicroLoopResult, ScriptedCandidate, StopReason, Turn
 from interview_coach.rubric import Rubric
 from interview_coach.seeds import SeedQuestion, SeedQuestionsExhausted, seed_count
+from interview_coach.session_serde import TranscriptItem
 from interview_coach.skill import SkillState, apply_evaluation
 from interview_coach.supervisor import (
     SessionStatus,
@@ -1178,6 +1179,32 @@ def test_the_prompt_cannot_promise_a_seed_the_pack_does_not_have():
 
     assert f"- mlops: probed {probes}/{probes} seeds (0 left)" in body
     assert "another seed remains" not in body
+
+
+def test_a_failed_question_is_not_offered_to_the_supervisor_as_a_zero_score():
+    # NEW-16 / ADR 0005. `TranscriptItem.failed` stores zero-evidence sentinels and keeps the Skill's
+    # prior untouched, but the prompt renderer read them as if they were scores: a provider timeout on
+    # a MUST_HAVE Skill reached the deciding model as "score=0.00 confidence=0.00", steering the rest
+    # of the interview off infrastructure noise. The second and third assertions pin the absence of
+    # the sentinels rather than one row's wording, so a reworded label cannot reintroduce them.
+    state = _plan_state(["ml_fundamentals", "mlops"], current_index=1, question_count=2)
+    state["transcript"] = [
+        _transcript_item("ml_fundamentals", score=4.0),
+        TranscriptItem.failed(
+            "mlops",
+            SkillState.neutral("mlops"),
+            plan_index=1,
+            error=ConnectionError("provider timed out"),
+        ),
+    ]
+
+    body = _build_supervisor_messages(state)[1]["content"]
+
+    assert "- Q2 skill=mlops NOT ASKED (infrastructure failure; no evidence)" in body
+    assert "score=0.00" not in body
+    assert f"stop={StopReason.FAILED.value}" not in body
+    # The resolved question is still rendered as evidence, unchanged.
+    assert "- Q1 skill=ml_fundamentals score=4.00 confidence=0.70 stop=resolved" in body
 
 
 def test_an_accounting_fault_at_the_supervisor_decision_suspends_instead_of_degrading(
