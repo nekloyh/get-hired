@@ -10,71 +10,37 @@ Suite: **848 → 972** pytest, **27 → 35** vitest. Every gate green after ever
 
 ---
 
-## 1. Status: tagged
-
-**Tagged `v0.1.0-pilot`, annotated, local only.** It sits on this branch's HEAD — the commit that
-carries this report. It is deliberately **not pushed**: the PR is not merged, and a pushed tag that
-later has to move is worse than a tag that waits. Push it yourself after merging:
-
-```
-git push origin v0.1.0-pilot
-```
-
-The tag message states the milestone's scope and, explicitly, the six things it does **not** include —
-no per-user auth, no per-turn ACK, no Skill-ledger history, no live judge in CI, no load/latency/cost
-SLO, no browser E2E — plus the bench red and why it was accepted.
+## 1. Status: merged, tagged, and dry-run against the real stack
 
 | | |
 |---|---|
-| M-0 | **complete** — 16 of 16. M0-1 (`.env`) and M0-16 (push/PR) were done this pass |
-| M-1 | **complete** — all 24 |
-| M-2 | not coded. Now **filed**, one GitHub issue each (§8) |
-| Stable checklist | **20 of 21 PASS, 1 FAIL** — re-run end to end, §4 |
-| Tag | `v0.1.0-pilot`, annotated, **local** — push it after you merge the PR |
-| PR | **#133**, CI **green** — `docker pass · python pass · web pass` |
+| PR **#133** | **MERGED** as a merge commit — `92d4dd1` |
+| Tag `v0.1.0-pilot` | **pushed**, annotated, on `83ed13b` — `git merge-base --is-ancestor v0.1.0-pilot main` → **TAG OK** |
+| `main` | green: ruff clean, mypy clean (34 files), **973** passed; CI `python / web / docker` all pass |
+| #119 | **CLOSED** by the PR body's `Closes #119` |
+| #59 (blocker) | **CLOSED** — measured 38 s cold / 8 s repo-controlled, §6 |
+| Deploy dry-run | **first ever full-stack run** (nginx + TLS + `wss://`) — 11 of 11 pass, 2 defects found and fixed, §5 |
+| Stable checklist | unchanged: 20 PASS / 1 FAIL (item 8, bench 34/35, accepted) |
 
-### The one FAIL: checklist item 8, accepted with recorded rationale
+### Why a merge commit, and why the tag survived
 
-`coach bench --k 3` came back **34/35, exit 1**. Per the instruction for this pass, option 3 was taken:
-**tag with the red recorded**. It is not marked PASS and must not be.
+`v0.1.0-pilot` pointed at `83ed13b`. A squash or rebase merge rewrites that sha, leaving the tag
+pointing at a commit unreachable from `main` — present, but meaningless. The repo allows all three
+methods (`gh repo view --json squashMergeAllowed,mergeCommitAllowed,rebaseMergeAllowed` → all true),
+so a merge commit was chosen deliberately: it keeps `83ed13b` reachable, and it preserves the 58
+one-task-per-commit records whose messages carry each fix's red test output. `git log --no-merges
+2dac711..main` → **58**, intact.
 
-Why accepting it is defensible here, and where it is not:
+**One thing bit anyway, and is worth knowing:** this machine has `fetch.pruneTags=true`, so the
+mandated `git fetch --all --tags` *deleted the local, never-pushed tag* — `- [deleted] (none) -> v0.1.0-pilot`.
+The commit was fine and still an ancestor of `main`, so the tag was recreated with an identical
+message and pushed immediately. If you keep a tag local "until the merge", that config will eat it.
 
-- **This branch did not cause it.** `rubric.py` and `data/bench/` are **byte-identical to `main`**
-  (`git diff --quiet 2dac711..HEAD` on both → clean). The only scoring-path delta is `evaluator.py`
-  (+38 / −13), which is a `try/except` around the panel block — and the panel **never ran**: the
-  artifact records 105 LLM calls for 35 cases × 3 sweeps (exactly 1.0 per case-sweep; a committee
-  adds 3), every `escalation` cell is `—`, and shadow escalations are 0 at all three thresholds.
-  Code that does not execute cannot move a score.
-- **It is judge drift inside a pinned model.** `vnlp_segmentation_weak_vi` moved 2.10 / 2.60 / 2.00
-  (2026-07-27) → **2.70 / 2.70 / 2.70** (today), against band 1.0–2.6. Zero spread across three draws
-  is a stable judge position, not sampling noise. Same model id, same cases, same bands.
-- **The cause is a known open bug, not a new one.** Both flagged cases are Vietnamese answers scoring
-  high — the signature of a missing middle BARS anchor. The artifact's own anchor dump confirms
-  `depth` and `system_thinking` still carry only `2` and `4`, while `correctness` and `communication`
-  (which gained a `3` in #92) now show bias −0.29 and −0.14. That is GH **#96**, updated today with
-  these measurements and raised to `severity:high`.
-- **Where this is NOT defensible:** the milestone's declared scope is a **trusted pilot** with *no live
-  judge gate in CI*. Ship this to strangers whose scores matter, and a judge you know has moved is no
-  longer an acceptable risk. #96 is what turns the gate green.
+### The one FAIL is unchanged and still not PASS
 
-The bench was **not** re-run and no anchor, band or case was touched — "never widen to go green".
-
-### Two things to read before you merge
-
-1. **M0-4 ended up stricter than the plan.** `turn_id` is now REQUIRED on every answer frame, not
-   optional. The optional version had a measured 1-in-8 misbinding race and did not close NEW-01. Cost:
-   an old client bundle held open across a deploy is refused rather than misattributed — the safer
-   failure, recoverable by reloading, but a stricter wire contract than the QA report proposed.
-   Verified live this pass: three hostile frames (replay, wrong `turn_id`, absent `turn_id`) were all
-   refused and none reached the transcript. (`fd9c55d`)
-2. **QA-02 is half closed and cannot be fully closed at this milestone** — see §6 and GH #84, where the
-   verified mechanism is now recorded: the Skill-ledger key is **supplied by the client and never
-   authenticated** (`web_api.py:111` validates a charset, `web_api.py:1067` loads priors for whatever
-   string arrived). Under one shared token that is read *and* write access to another pilot user's
-   Skill history by typing their id. The QA report's proposed `HMAC(token identity, name)` cannot fix
-   it: `token_identity()` (`usage.py:917`) digests the one deployment-wide secret, so it is identical
-   for every user — its own docstring says the per-user seam is R-29.
+`coach bench --k 3` → 34/35. Not re-run this session; no anchor, band or case touched. Attribution
+and rationale are in §4 item 8 and were argued from the run itself. The pilot runbook now states the
+consequence in words a Candidate can act on: **these scores are practice, not measurement** (§5).
 
 ---
 
@@ -258,7 +224,117 @@ only the earlier counts were unreproducible.
 
 ---
 
-## 5. M-2: filed, not coded
+## 5. Pilot deploy dry-run — the part nobody had ever run
+
+`QA-REPORT.md` recorded *"Not executed: `docker compose up` with nginx/TLS (certs are untracked)"*.
+`docs/deploy.md` §8 **claimed** the stack was verified on 2026-07-27. This pass treated that as a
+claim and re-executed it at `92d4dd1`, against `coach.localtest.me` (resolves to 127.0.0.1, so it is
+a real hostname with real SNI, not a loopback shortcut) with a fresh self-signed certificate.
+
+| # | check | result | evidence |
+|---|---|---|---|
+| 1 | `docker compose up -d --build` | **PASS** | exit 0; `app` healthy, `nginx` healthy |
+| 2 | HTTP :80 redirects | **PASS** | `/` and `/api/health` → **301** → `https://coach.localtest.me/…` |
+| 3 | HTTPS :443 serves the API | **PASS** | `{"status":"ok",…,"auth_required":true,…}`; UI on the same origin → **200** |
+| 4 | auth enforced through the proxy | **PASS** | no bearer **401** · wrong bearer **401** · right bearer **404** |
+| 5 | **a whole Session over `wss://` through nginx** | **PASS** | `session_started state_update question state_update state_update question state_update state_update state_update session_completed`; `status=complete questions=2 transcript=2` |
+| 6 | Origin gate at the handshake | **PASS** | only `https://coach.localtest.me` accepted; `https://evil.example.com`, **`http://` of the same host**, and `null` all **HTTP 403**. Scheme is part of an origin, and nginx forwards `Origin` verbatim so the check survives the proxy |
+| 7 | answer size at the boundary | **PASS after a fix** | see below |
+| 8 | `docker compose restart app` mid-question | **PASS** | Q2 left unanswered → restart (0.4 s) → resume re-emitted **the same question** → answered → `status=complete`; the export contains `POST-RESTART ANSWER` |
+| 9 | `docker compose down && up -d` | **PASS** | export md5 `e848a3c8…` / `f0cb41f4…` **identical** before and after; endpoints 200 |
+| 10 | ACME http-01 webroot | **PASS** | `/.well-known/acme-challenge/<token>` → **200** with the token body, while `/other` → 301. Cert renewal in 90 days depends on exactly this |
+| 11 | backup **and restore** | **PASS** | archive → empty volume → new container → both exports **200, byte-identical md5** |
+
+### Two defects found, both fixed
+
+**(a) nginx's `client_max_body_size 1m` does not bound the Session socket at all.** `a95deaf`
+
+The directive governs an HTTP request body. After the 101 Upgrade nginx forwards a byte stream, so
+it never applies to the frames that carry every answer. Measured before the fix:
+
+```
+frame 1,500,056 bytes -> session_error: String should have at most 20000 characters
+frame 5,000,056 bytes -> session_error: String should have at most 20000 characters
+```
+
+A 5 MB frame — 5× the nginx cap — crossed untouched and was refused only by
+`CandidateAnswerPayload`, i.e. **after uvicorn had buffered the whole thing.** The real ceiling was
+uvicorn's own `ws_max_size` default of **16 MiB**, which the app never set; on a deliberately
+single-worker deployment (R-12) that is attacker-controlled allocation × uvicorn's 32-deep queue.
+
+`WS_MAX_FRAME_BYTES = 256 KiB` now sits with `MAX_ANSWER_CHARS` and `ANSWER_QUEUE_MAXSIZE` — the
+bound belongs with the other input bounds precisely because nginx cannot supply it. After the fix,
+against the rebuilt image:
+
+```
+frame    20,055 B -> state_update      (a legitimate 19,999-char answer still works)
+frame    20,057 B -> session_error     (the app's friendly refusal is preserved)
+frame   300,056 B -> CLOSED AT THE TRANSPORT, code 1009
+frame 5,000,056 B -> CLOSED AT THE TRANSPORT, code 1009
+```
+
+**(b) nginx had no healthcheck.** `97206aa`
+
+`docker compose ps` printed a bare `Up` for the container terminating TLS and proxying every
+socket — a config that failed to load would have read identically, and the first symptom would have
+been a Candidate's browser not connecting. It now probes `:80` for the 301.
+
+It probes `:80` and not `:443` deliberately: the image has neither `curl` nor `openssl`, and busybox
+`wget` follows the redirect into TLS and fails certificate verification — so a `:443` probe reports
+unhealthy for the whole self-signed bootstrap that `deploy.md` §3 makes step one of getting a real
+certificate. Both directions were measured rather than asserted:
+
+- probe against a dead port → **exit 1** (not a rubber stamp)
+- `docker compose stop app`, wait 35 s → nginx **still healthy** while https returns **502**
+
+That limitation is real, so it is written into the compose comment and covered by pre-flight lines
+6–9, which run against the real hostname.
+
+### `COACH_ALLOWED_ORIGINS` behind a proxy
+
+For a stack behind nginx the origin must be the **browser's** origin (`https://<host>`), not the
+Vite dev origin. Verified above: the exact value is accepted and every near-miss — including
+`http://` of the same host — is refused at the handshake with 403. The local `.env` now holds the
+**dry-run** value `https://coach.localtest.me`. It is still not a production value; pre-flight line
+2 in [`docs/pilot-runbook.md`](docs/pilot-runbook.md) is the gate that catches it.
+
+---
+
+## 6. #59 — the onboarding blocker, measured and closed
+
+`severity:blocker`, open since the remediation backlog was filed. Its DoD was a timed walkthrough on
+a clean checkout; the README carried **estimates that had never been measured** ("~10 minutes",
+"~4 min, mostly `npm install`").
+
+Executed on a fresh `git clone` of `main` into a temp dir outside any existing checkout, on a
+machine with no prior `.env` for that clone. Run twice. The uv-managed Python lives **outside**
+`UV_CACHE_DIR`, so it was measured separately rather than silently counted as warm.
+
+| | wall | breakdown |
+|---|---:|---|
+| **Repo-controlled** (caches warm) | **8 s** | clone 3s · `uv sync` 1s · `npm install` 2s · backend answering 2s · vite 0s · completed interview 0s |
+| **Cold total** (nothing cached) | **38 s** | clone 2s · managed Python 4s (103 MB) · `uv sync` 24s (171 MB) · `npm install` 5s (41 MB) · backend 2s · vite 1s · interview <1s |
+
+Splitting the DoD into two numbers is what resolves the old 15-min-vs-37s confusion: **~275 MB of
+downloads is network-bound and not this repo's to control.** The 8 s is what moves when the
+repository changes and is the number to watch in review. Both are far inside the ≤10 min DoD, and
+`rg -i mimo .env.example` returns **0** — stronger than the DoD's "optional/fallback, not default".
+
+README timings replaced with the measurements (`cbbbb22`). #59 **closed**.
+
+**What was not executed:** step 5 ran in **demo** mode. The documented step needs a real OpenAI key
+and a paid call, which was outside this pass's authorisation. The whole WebSocket path ran end to
+end; the live *configuration* half was verified without spending — with a real key present,
+`/api/health` reports `"primary_configured": true`, which is the check README step 3 itself
+specifies. The key was scrubbed from the throwaway clone immediately.
+
+**Worth knowing for a deploy:** a fresh clone using `.env.example` verbatim starts with
+`auth_required: false` — correct and documented for localhost dev, and exactly what pre-flight
+line 3 exists to catch before anything is exposed.
+
+---
+
+## 7. M-2: filed, not coded
 
 All ten are now GitHub issues with verified `file:line` evidence and a trigger. **Every number below was
 re-measured at `db73419`; four of the ten figures in the previous table were stale and are corrected.**
@@ -289,7 +365,7 @@ re-measured at `db73419`; four of the ten figures in the previous table were sta
 
 ---
 
-## 6. Residual risk after this wave
+## 8. Residual risk after this wave
 
 Rewritten against the current code and this pass's measurements. Rows the wave closed are gone; rows
 whose premise this pass disproved are corrected, not repeated.
@@ -310,7 +386,7 @@ whose premise this pass disproved are corrected, not repeated.
 
 ---
 
-## 7. Decision log
+## 9. Decision log
 
 Every fork taken without asking, with the option that was dropped and its cost.
 
@@ -328,10 +404,18 @@ Every fork taken without asking, with the option that was dropped and its cost.
 | 10 | Push the `v0.1.0-pilot` tag? | **Create it locally, do not push** | the PR is unmerged; a pushed tag that later has to move is worse than one that waits | pushing it; cost: a public tag pointing at a commit that may be rebased or amended during review |
 | 11 | Rotate the Groq key? | **Not done — cannot be** | key rotation happens on the provider's dashboard, which is outside this machine. Recorded as yours (§9) | editing `.env` with an invented value; cost: a deployment that cannot fail over |
 | 12 | `.env` changes — commit them? | **No commit** | `.env` is gitignored (`.gitignore:24`); there is no tracked change to commit. The backup `.env.bak.1789444582` is ignored by the same rule | force-adding it; cost: live credentials in git history, permanently |
+| 13 | Merge method for #133 | **Merge commit (`--merge`)** | the tag pointed at `83ed13b`; squash or rebase rewrites that sha and orphans the tag. Also preserves 58 one-task-per-commit records carrying each fix's red output | squash; cost: a tag pointing at an unreachable commit, and the loss of every per-commit red→green record into one blob |
+| 14 | `fetch --all --tags` deleted the local tag | **Recreate identically and push immediately** | `fetch.pruneTags=true` prunes local tags absent from the remote. `83ed13b` was untouched and still an ancestor of `main`, so only the tag object was lost | leaving it local until "later"; cost: the same prune deletes it again on the next fetch, silently |
+| 15 | 16 MiB WS frames — fix or file? | **Fixed** (`a95deaf`) | one line plus a test, and it is a deploy-safety property: 5 MB frames crossed nginx and were buffered whole on a single-worker box about to take five real users | filing an issue; cost: shipping a known attacker-controlled allocation into the pilot, with a runbook that claims the request cap covers it |
+| 16 | nginx healthcheck on `:443` or `:80`? | **`:80`, with the limitation documented and measured** | the image has no curl/openssl and busybox wget fails the self-signed cert, so a `:443` probe reports unhealthy through the entire bootstrap `deploy.md` §3 mandates | a `:443` probe; cost: a healthcheck that flaps during the documented happy path, training the operator to ignore it |
+| 17 | Close #59 without the live leg? | **Close it, and state exactly what is unverified** | the blocker is "a new user follows the docs and cannot get running" — disproven end to end. The live leg is one env var plus a paid call, and `primary_configured: true` proves the config path without spending | leaving it open; cost: a `severity:blocker` staying open on a question that has been answered, for a leg that costs money to run |
+| 18 | Run the dry-run against `localhost` or a hostname? | **`coach.localtest.me`** (public DNS → 127.0.0.1) | exercises real SNI, a real `Host`, and a real browser-shaped `Origin` — the three things a loopback shortcut would not have tested, and origin handling is where a proxied WebSocket actually breaks | `127.0.0.1`; cost: the Origin/SNI checks would have been vacuous, which is the half most likely to be wrong |
+| 19 | Leave the dry-run stack running? | **Tore it down** | it holds :80 and :443 on a dev machine indefinitely, with a self-signed cert. One command rebuilds it | leaving it up; cost: two privileged ports occupied on the user's machine for a dry-run they did not ask to keep |
+| 20 | `.env` origin after the dry-run | **Left at `https://coach.localtest.me`, flagged** | both it and the previous `http://localhost:5173` are wrong for production; neither is more correct. Pre-flight line 2 is the gate | silently restoring the dev value; cost: swapping one wrong value for another while looking like a cleanup |
 
 ---
 
-## 8. Issues filed
+## 10. Issues filed
 
 Two comments on existing issues, twelve new. Every body carries verified `file:line` evidence, a
 trigger, and an AC checklist; every one was adversarially re-checked before filing.
@@ -357,45 +441,48 @@ trigger, and an AC checklist; every one was adversarially re-checked before fili
 
 ---
 
-## 9. What is left for you
+## 11. What is left for you
 
-| # | task | why it is not mine |
-|---|---|---|
-| 1 | **Rotate the Groq key** | rotation happens on Groq's dashboard. The key in `.env` is live and was in a file that has been read repeatedly during this audit. Groq is the availability fallback and must never take the judge role (ADR 0009a; M0-13 enforces it in code) |
-| 2 | **Set `COACH_ALLOWED_ORIGINS` to the production origin** | it is `http://localhost:5173` — a **dev** value. No production hostname exists in the repo to infer. `*` is refused at startup (M1-11), so this must be a real origin |
-| 3 | **Merge the PR** | explicitly yours. CI result in §4 |
-| 4 | **Push the tag** after merging: `git push origin v0.1.0-pilot` | it is annotated and local; pushing before the merge risks a tag pointing at a rebased commit |
-| 5 | **Decide #96** | the bench gate is red until `depth` and `system_thinking` gain a `3`. Budget ~181k–207k tokens **per k=3 invocation**, and **3+ invocations** — every re-wording restarts the repeatability count from zero |
+| # | task | blocking what | why it is not mine |
+|---|---|---|---|
+| 1 | **Rotate the Groq key** | **pre-flight line 1 — nothing else can tick it** | rotation happens on Groq's dashboard. The key in `.env` is live and has sat in a file read repeatedly across two audits. Groq is the availability fallback and must never take the judge role (ADR 0009a; M0-13 enforces it) |
+| 2 | **Set `COACH_ALLOWED_ORIGINS` to the production origin** | pre-flight line 2 | it holds the dry-run value `https://coach.localtest.me`. No production hostname exists in the repo to infer — `deploy/nginx/conf.d/coach.conf` is `server_name _` by design |
+| 3 | **Generate a production `COACH_AUTH_TOKEN`** | pre-flight line 3 | the token in `.env` was generated on this dev machine and has been used in local containers all session. It is a dev token; do not carry it to a host strangers can reach |
+| 4 | **Replace the self-signed cert** and set `server_name` | lines 6, 11 | the dry-run cert is for `coach.localtest.me`. `deploy.md` §3 has the certbot path; pre-flight line 11 proves the ACME webroot works |
+| 5 | **Decide #96** | the bench gate stays red | budget ~181k–207k tokens **per k=3 invocation** and **3+ invocations** — every re-wording restarts the repeatability count from zero |
 
-Two things you do **not** need to do:
+Nothing else is outstanding on my side. The PR is merged, the tag is pushed and reachable, `main` is
+green, and both blockers that were open at the start of this session (#119, #59) are closed.
 
-- **`.env` is done** — token generated (64 hex), origins set, all three `MIMO_*` keys removed
-  (`grep -c '^MIMO_' .env` → 0), backup at `.env.bak.1789444582` (gitignored by `.gitignore:24`).
-  Verified by loading a real `Settings()` (`auth token set: True`) and by a container returning
-  `auth_required: true` with 401 on an unauthenticated export.
-- **Skill-ledger migration** — there is nothing to migrate. No real ledger exists on this machine; the
-  only `_`-prefixed key any ledger carries is `_meta`, which is the schema envelope M1-21 reserves the
-  prefix *for* (`ledger.py:49`), not a Candidate.
+**To bring the dry-run stack back up** (it was torn down — decision 19):
+
+```bash
+# certs, if you have not issued real ones yet — deploy.md §3
+mkdir -p deploy/nginx/certs deploy/certbot-webroot && cd deploy/nginx/certs
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 -keyout privkey.pem -out fullchain.pem \
+  -subj "/CN=<your host>" -addext "subjectAltName=DNS:<your host>"
+cd - && docker compose up -d --build
+```
+
+Then work through [`docs/pilot-runbook.md`](docs/pilot-runbook.md) §1 before anyone else connects.
 
 ---
 
-## 10. Numbers
+## 12. Numbers
 
 ```
-commits on the branch               58   (git log --no-merges 2dac711..HEAD, at the tag)
-pytest                              848 → 972   (+124), green twice, identical summaries
-vitest                              27  → 35    (+8)
-mypy                                34 source files, clean
-stable checklist                    20 PASS · 1 FAIL (item 8: bench 34/35, judge drift,
-                                    accepted with recorded rationale)
-bench                               34/35, 181,424 tokens, 105 calls, exit 1
-                                    docs/audits/calibration-bench-2026-09-15.md
-QA findings closed                  45 of 47 fully; 2 partial (QA-02 isolation half — unfixable
-                                    under one shared token, GH #84; QA-16 trace-type half —
-                                    never in the plan, GH #121)
-issues filed                        12 new (#121–#132) + 2 comments (#96, #84)
-bad citations caught before filing   36, across all 12 drafts
-PR                                  #133, CI green (docker / python / web)
-tag                                 v0.1.0-pilot — annotated, LOCAL, not pushed
-still yours                         Groq key rotation · production origin · merge · push the tag · #96
+commits above main at the tag        58   (git log --no-merges 2dac711..HEAD, at 83ed13b)
+commits on main after this session   63   (58 + 4 pilot-hardening + this report)
+pytest                               848 -> 973   (+125; +1 this session, the WS frame bound)
+vitest                               27  -> 35
+mypy                                 34 source files, clean
+stable checklist                     20 PASS / 1 FAIL (item 8: bench 34/35, judge drift, accepted)
+deploy dry-run                       11 of 11 PASS, 2 defects found and fixed
+onboarding (#59)                     38 s cold / 8 s repo-controlled  (DoD was <= 10 min)
+bench                                34/35 — NOT re-run this session, nothing widened
+PR #133                              MERGED as a merge commit (92d4dd1)
+tag v0.1.0-pilot                     PUSHED, annotated, on 83ed13b, ancestor of main (TAG OK)
+issues closed this session           #119, #59
+issues open from this work           #96 (bench red), #84 (isolation), #121-#132
+blocking the pilot                   1 line: the Groq key rotation (pre-flight line 1)
 ```
