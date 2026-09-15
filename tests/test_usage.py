@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import multiprocessing as mp
 import threading
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -1188,3 +1190,63 @@ def test_two_simultaneous_starts_cannot_both_pass_the_question_cap(tmp_path, mon
     assert outcomes.count(None) == 1, outcomes
     assert sum("COACH_DAILY_QUESTION_CAP" in (reason or "") for reason in outcomes) == 1
     assert questions_today("id-1") == 3
+
+
+
+def _reserve_and_park(read_flag, release, outcome: str) -> None:
+    """Child process: enter reserve_questions' check->append window and park inside it.
+
+    The widening is test-only and lives entirely in the child, so production ships no sleep: the
+    child swaps in its own `_rows_for_day`, which signals after the read and waits before returning.
+    The parent then knows the child is mid-reservation rather than hoping it is.
+    """
+    real_rows_for_day = usage._rows_for_day
+
+    def parked(day, path):
+        rows = list(real_rows_for_day(day, path))
+        read_flag.set()
+        release.wait(10)
+        return iter(rows)
+
+    usage._rows_for_day = parked
+    reason = reserve_questions("id-1", questions=10)
+    Path(outcome).write_text(reason or "", encoding="utf-8")
+
+
+def test_a_second_process_cannot_pass_the_cap_the_first_is_already_taking(tmp_path, monkeypatch):
+    # QA-09. `_RESERVATION_LOCK` is an object inside one interpreter; the ledger is a file every
+    # process that can write it shares — two `coach api` processes on one state volume, a CLI beside
+    # the server. A cap enforced only within one interpreter is not a cap: measured, both processes
+    # read the same pre-reservation count of 0 and both reserved 10 against a cap of 10, and the day
+    # closed on `questions_today() == 20`.
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(tmp_path / "ledger.jsonl"))
+    monkeypatch.setenv("COACH_DAILY_QUESTION_CAP", "10")
+    child_outcome = tmp_path / "child-outcome.txt"
+
+    # Forked before this process starts a thread of its own (3.12 deprecates fork from a
+    # multi-threaded process), and forked rather than spawned so the child inherits the environment
+    # this test just set and pays no interpreter start-up.
+    ctx = mp.get_context("fork")
+    child_read, release = ctx.Event(), ctx.Event()
+    child = ctx.Process(target=_reserve_and_park, args=(child_read, release, str(child_outcome)))
+    child.start()
+    assert child_read.wait(10), "the child never reached its reservation"
+
+    outcomes: list[str | None] = []
+
+    def reserve() -> None:
+        outcomes.append(reserve_questions("id-1", questions=10))
+
+    thread = threading.Thread(target=reserve)
+    thread.start()
+    # Unlocked this returns instantly with None — the bug. Locked, it is parked in flock() until the
+    # child releases, so the join times out and the release below is what lets either finish.
+    thread.join(0.5)
+    release.set()
+    child.join(10)
+    thread.join(10)
+
+    assert child.exitcode == 0
+    assert questions_today("id-1") == 10  # the cap holds across the process boundary
+    assert child_outcome.read_text(encoding="utf-8") == ""  # the child won the race and reserved
+    assert outcomes and "COACH_DAILY_QUESTION_CAP" in (outcomes[0] or "")  # this process was refused

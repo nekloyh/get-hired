@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import json
+import multiprocessing as mp
 import os
 import stat
 import tempfile
@@ -239,6 +240,54 @@ def test_concurrent_saves_for_different_candidates_both_persist(tmp_path, monkey
     assert load_priors(path, "bob", now=0.0).raw_mastery["mlops"] == pytest.approx(2.0 / 3.0)
 
 
+def _merge_and_park(path: str, read_flag, release) -> None:
+    """Child process: enter save_posteriors' load->merge->publish window and park inside it."""
+    target = Path(path)
+    real_read_text = Path.read_text
+
+    def parked(self, *args, **kwargs):
+        raw = real_read_text(self, *args, **kwargs)
+        if self == target:
+            read_flag.set()
+            release.wait(10)
+        return raw
+
+    Path.read_text = parked
+    save_posteriors(target, "alice", {"mlops": SkillState("mlops", alpha=9.0, beta=1.0)}, now=0.0)
+
+
+def test_a_concurrent_second_process_cannot_erase_this_processs_record(tmp_path):
+    # QA-09. `_SAVE_LOCK` only serialises threads of ONE interpreter, and `coach postmortem` and
+    # `coach session` call save_posteriors from a second OS process against the same
+    # COACH_LEDGER_DB. Measured: the loser merges into a read taken before the winner's rename and
+    # the winner's Candidate simply vanishes — and save_posteriors never raises, so nothing anywhere
+    # reports it. Infrastructure noise erasing Skill evidence is exactly what ADR 0005 forbids.
+    # "carol" is seeded first because an absent file is never read, so the child's hook would never
+    # fire — the same reason the thread-level sibling above seeds her.
+    path = tmp_path / "ledger.json"
+    save_posteriors(path, "carol", {"mlops": SkillState("mlops", alpha=4.0, beta=4.0)}, now=0.0)
+
+    ctx = mp.get_context("fork")
+    child_read, release = ctx.Event(), ctx.Event()
+    child = ctx.Process(target=_merge_and_park, args=(str(path), child_read, release))
+    child.start()
+    assert child_read.wait(10), "the child never reached the merge"
+
+    def save() -> None:
+        save_posteriors(path, "bob", {"mlops": SkillState("mlops", alpha=2.0, beta=1.0)}, now=0.0)
+
+    thread = threading.Thread(target=save)
+    thread.start()
+    thread.join(0.5)
+    release.set()
+    child.join(10)
+    thread.join(10)
+
+    assert child.exitcode == 0
+    candidates = sorted(key for key in json.loads(path.read_text(encoding="utf-8")) if key != "_meta")
+    assert candidates == ["alice", "bob", "carol"]
+
+
 def test_the_ledger_carries_a_schema_version_that_is_never_read_as_a_candidate(tmp_path):
     path = tmp_path / "ledger.json"
     save_posteriors(path, "alice", {"mlops": SkillState("mlops", alpha=8.0, beta=2.0)}, now=0.0)
@@ -271,7 +320,9 @@ def test_failed_publish_keeps_the_old_ledger_and_leaves_no_temp_file(tmp_path, m
     save_posteriors(path, "bob", {"mlops": SkillState("mlops", alpha=2.0, beta=8.0)}, now=0.0)
 
     assert path.read_bytes() == before
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["ledger.json"]
+    # The `.lock` sidecar is a permanent fixture of the directory (the inter-process lock target,
+    # never replaced or unlinked), so the claim is about STAGED files, not about the directory.
+    assert sorted(p.name for p in tmp_path.iterdir() if not p.name.endswith(".lock")) == ["ledger.json"]
     assert "not persisted" in caplog.text
     # The staged file has to be a sibling of the target, not somewhere under the system temp dir:
     # os.replace is only atomic within a single filesystem and raises EXDEV across a mount boundary,
@@ -340,7 +391,7 @@ def test_a_write_that_dies_mid_flight_leaves_no_tempfile_behind(tmp_path, monkey
     for _ in range(3):  # repeated, because the leak is one file *per* failed Session
         save_posteriors(path, "bob", {"mlops": SkillState("mlops", alpha=2.0, beta=8.0)}, now=0.0)
 
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["ledger.json"]
+    assert sorted(p.name for p in tmp_path.iterdir() if not p.name.endswith(".lock")) == ["ledger.json"]
     assert path.read_bytes() == before  # a half-written save is a no-op, not a truncation
     assert "not persisted" in caplog.text
 
@@ -359,7 +410,9 @@ def test_a_tempfile_that_never_opens_still_never_raises(tmp_path, monkeypatch, c
     save_posteriors(path, "alice", {"mlops": SkillState("mlops", alpha=8.0, beta=2.0)}, now=0.0)
 
     assert "not persisted" in caplog.text
-    assert list(tmp_path.iterdir()) == []
+    # Nothing was STAGED. The lock sidecar is created before the write is attempted at all, so it is
+    # not a leak; excluding it keeps the assertion about the tempfile this test is named for.
+    assert [p.name for p in tmp_path.iterdir() if not p.name.endswith(".lock")] == []
 
 
 def test_cleanup_that_itself_fails_still_never_raises(tmp_path, caplog, monkeypatch):

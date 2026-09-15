@@ -56,6 +56,8 @@ from threading import Lock
 from typing import Any
 from uuid import uuid4
 
+from .filelock import locked
+
 logger = logging.getLogger(__name__)
 
 # Anchored to the repo root (the same parent-hop pattern bench._default_cases_path uses), NOT the
@@ -1002,15 +1004,24 @@ def question_cap_reason(identity: str, *, questions: int, path: Path | None = No
 
 
 # Check-and-record is one step: two simultaneous starts must not both read the pre-reservation count.
+# One step ACROSS PROCESSES too — two `coach api` processes sharing a state volume (a compose
+# `scale`, an overlapping redeploy, a second `coach api` pointed at the same COACH_USAGE_LEDGER) are
+# two independent `_RESERVATION_LOCK`s over one file, and both would read the same pre-reservation
+# count. The flock on the ledger's `.lock` sidecar is what makes the window exclusive, and it is
+# taken INSIDE the thread lock, never outside (flock is per open file description, so the reverse
+# order deadlocks two threads of this process against each other). Nothing inside this block may take
+# the same file lock again: `record_questions` appends without it, and a nested acquisition on a
+# second descriptor would block this process on itself.
 _RESERVATION_LOCK = Lock()
 
 
 def reserve_questions(identity: str, *, questions: int, path: Path | None = None) -> str | None:
     """Reserve ``questions`` against the daily cap atomically; returns the refusal reason, or None."""
-    with _RESERVATION_LOCK:
-        if reason := question_cap_reason(identity, questions=questions, path=path):
+    target = path or ledger_path()
+    with _RESERVATION_LOCK, locked(target):
+        if reason := question_cap_reason(identity, questions=questions, path=target):
             return reason
-        record_questions(identity, questions, path=path)
+        record_questions(identity, questions, path=target)
         return None
 
 

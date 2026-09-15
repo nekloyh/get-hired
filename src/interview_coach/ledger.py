@@ -29,6 +29,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from .filelock import locked
 from .skill import NEUTRAL_ALPHA, NEUTRAL_BETA, SkillState
 
 logger = logging.getLogger(__name__)
@@ -47,9 +48,13 @@ LEDGER_HALF_LIFE_DAYS = 30.0
 # own thread and saves posteriors when it completes, so two Candidates finishing together race the
 # same file: without this, the later writer merges into a stale read and silently drops the earlier
 # Candidate's record — infrastructure noise corrupting Skill evidence, which ADR 0005 forbids.
-# A process-local Lock suffices only because the server is documented single-process (docs/deploy.md
-# §6 "Do not add workers"; R-12/#67 adds the guard that enforces it). Multi-process — R-29's Postgres
-# store — needs real locking, not this. Readers deliberately do NOT take it: publication is an atomic
+# A process-local Lock is not enough on its own, and the old "the server is documented
+# single-process" argument (docs/deploy.md §6) never covered the case that breaks it: `coach session`
+# and `coach postmortem` write this same file from a SECOND OS process. So the merge also takes an
+# advisory flock on a `.lock` sidecar — thread lock OUTER, file lock inner, because flock is held per
+# open file description and two threads of one process each open their own, so the reverse order is a
+# lock-order inversion that deadlocks them against each other. Readers deliberately take neither:
+# publication is an atomic
 # rename, so a reader sees the whole old file or the whole new one, and holding it on the hot
 # start-of-Session path would only add contention plus a deadlock surface (`postmortem` already
 # chains load_states → save_posteriors around it).
@@ -171,9 +176,10 @@ def save_posteriors(
 ) -> None:
     """Persist a Candidate's final per-Skill posteriors, merging into any existing ledger.
 
-    The merge is serialised under ``_SAVE_LOCK`` and published by atomic rename, so concurrent
-    completions cannot lose each other's records and a save that dies mid-flight leaves the previous
-    ledger intact rather than a truncated file that cold-starts every Candidate in it.
+    The merge is serialised under ``_SAVE_LOCK`` *and* an inter-process flock, and published by
+    atomic rename, so concurrent completions — another thread here, or a concurrent ``coach
+    postmortem`` — cannot lose each other's records, and a save that dies mid-flight leaves the
+    previous ledger intact rather than a truncated file that cold-starts every Candidate in it.
 
     Never raises on a write problem: failing to record memory must not fail an otherwise-complete
     Session — it logs a warning and moves on.
@@ -181,7 +187,7 @@ def save_posteriors(
     if not candidate_id:
         return
     target = Path(path)
-    with _SAVE_LOCK:
+    with _SAVE_LOCK, locked(target):
         data: dict[str, object] = {}
         try:
             if target.exists():
