@@ -194,6 +194,24 @@ def test_resume_after_cancel_preserves_the_in_flight_question(tmp_path):
 # --- NEW-01: an answer is bound to the turn it answers -------------------------------------------
 
 
+def _receive_both(ws, first_type: str, second_type: str, *, limit: int = 60) -> tuple[dict, dict]:
+    """Wait for one frame of each type, in either order.
+
+    Two different threads emit these — the socket loop refuses the answer, the graph thread asks the
+    next question — so a `_receive_until(a)` followed by `_receive_until(b)` silently discards b when
+    b arrives first and then blocks forever waiting for it.
+    """
+    found: dict[str, dict] = {}
+    for _ in range(limit):
+        event = ws.receive_json()
+        if event["type"] in (first_type, second_type):
+            found.setdefault(event["type"], event)
+        if len(found) == 2:
+            return found[first_type], found[second_type]
+    raise AssertionError(f"did not receive both {first_type!r} and {second_type!r}; got {sorted(found)}")
+
+
+
 def test_an_answer_is_bound_to_the_turn_it_answers(tmp_path):
     # NEW-01 / ADR 0005. The queue used to be a bare FIFO, so a second answer sent while only the
     # first question was pending was held and consumed by the NEXT question — the answer typed for
@@ -211,11 +229,13 @@ def test_an_answer_is_bound_to_the_turn_it_answers(tmp_path):
         ws.send_json(
             {"type": "candidate_answer", "answer": "STOLEN: typed for the first question.", "turn_id": first["turn_id"]}
         )
-        refusal = _receive_until(ws, "session_error", limit=40)
+        # The refusal comes from the socket loop and Q2 from the graph thread, so their order on the
+        # wire is genuinely racy — wait for BOTH rather than for one and then the other, or whichever
+        # arrives first gets swallowed by the wait for the second.
+        refusal, second = _receive_both(ws, "session_error", "question")
         assert "does not answer" in refusal["error"]
-        # The queue-jump is refused, so Q2 is now genuinely unanswered — answer it properly, which
-        # is also the proof the refusal did not wedge the Session.
-        second = _receive_until(ws, "question", limit=40)
+        # The queue-jump is refused, so Q2 is now genuinely unanswered — answer it properly, which is
+        # also the proof the refusal did not wedge the Session.
         assert second["turn_id"] != first["turn_id"]
         ws.send_json(
             {
@@ -242,9 +262,8 @@ def test_an_id_less_client_still_cannot_answer_a_question_nobody_asked(tmp_path)
         first_turn_id = _receive_until(ws, "question")["turn_id"]
         ws.send_json({"type": "candidate_answer", "answer": "REAL: bias and variance trade off."})
         ws.send_json({"type": "candidate_answer", "answer": "STOLEN: typed for the first question."})
-        refusal = _receive_until(ws, "session_error", limit=40)
+        refusal, second = _receive_both(ws, "session_error", "question")
         assert "does not answer" in refusal["error"]
-        second = _receive_until(ws, "question", limit=40)
         ws.send_json({"type": "candidate_answer", "answer": "REAL: an answer for the second question."})
         completed = _receive_until(ws, "session_completed", limit=60)
 
