@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import multiprocessing as mp
 import os
 import stat
@@ -254,6 +255,34 @@ def _merge_and_park(path: str, read_flag, release) -> None:
 
     Path.read_text = parked
     save_posteriors(target, "alice", {"mlops": SkillState("mlops", alpha=9.0, beta=1.0)}, now=0.0)
+
+
+def test_a_ledger_from_a_newer_build_is_neither_read_nor_overwritten(tmp_path, caplog):
+    # QA-11's ledger half. LEDGER_SCHEMA_VERSION was write-only too, so an old build handed a v2
+    # ledger read it as if it understood it and — far worse — rewrote it on the next completion,
+    # stamping _meta back down to v1 and clobbering whatever the newer shape held. Both loaders and
+    # the writer are contractually forbidden to raise, so this degrades loudly instead of refusing.
+    path = tmp_path / "ledger.json"
+    path.write_text(
+        json.dumps(
+            {
+                "_meta": {"schema_version": 99},
+                "alice": {"completed_at": 0.0, "skills": {"mlops": {"alpha": 8.0, "beta": 2.0}}},
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    before = path.read_bytes()
+
+    with caplog.at_level(logging.ERROR, logger="interview_coach.ledger"):
+        carried = load_priors(path, "alice", now=0.0)
+        save_posteriors(path, "bob", {"mlops": SkillState("mlops", alpha=2.0, beta=1.0)}, now=0.0)
+
+    assert carried is None  # a cold start, not a guess at a shape we do not know
+    assert "schema_version 99" in caplog.text
+    assert path.read_bytes() == before  # and above all: not downgraded, not clobbered
 
 
 def test_a_concurrent_second_process_cannot_erase_this_processs_record(tmp_path):

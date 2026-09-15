@@ -122,24 +122,26 @@ open or sweep the checkpoint DB (`:703`), or mount static files (`:706`); those 
 
 ## 4. Versioning
 
-> **Status — intended contract, not current behaviour.** The markers below are *written* today; nothing
-> **reads** them to decide anything. `SESSION_SCHEMA_VERSION` and `LEDGER_SCHEMA_VERSION` appear only at their
-> definition, their one write site each, and the `SessionState` field declaration — no code in `src/`, `scripts/`
-> or `web/` compares either against a version it knows or branches on one, so a checkpoint or a Skill ledger
-> carrying an unknown version loads today without a word (QA-11 measured a checkpoint stamped
-> `schema_version: 99` resuming on HEAD in silence). Read every "reader" rule below as the contract that reader
-> must satisfy **once it is written**, not as a guarantee you inherit.
+> **Status — enforced since M1-20 (QA-11).** Both markers are written *and read*. The checkpoint is stamped by
+> every graph node, and `supervisor.require_supported_session_version` gates every entry into the graph: a
+> checkpoint carrying a version this build does not know raises `UnsupportedSessionVersion` before any node runs,
+> so the refusal can never be recorded as a `failed` question. The Skill ledger is guarded by
+> `ledger._ledger_version_is_supported`, which returns a bool rather than raising — both loaders and
+> `save_posteriors` are contractually forbidden to raise — so a newer ledger degrades to a cold start with an
+> ERROR log and, critically, is **not rewritten**: an old build must never downgrade `_meta` and clobber a shape
+> it cannot read. Before M1-20 neither marker had any reader at all, and a checkpoint stamped `schema_version: 99`
+> resumed in silence.
 
 | Store | Marker | Rule |
 |---|---|---|
-| Checkpoint (#1) | `SessionState["schema_version"] = SESSION_SCHEMA_VERSION` (`= 1`, `supervisor.py:59`), set in `initial_session_state` (`supervisor.py:163`) | Absent on `a576501` and older checkpoints, so a reader must use `.get("schema_version", 0)` and must never subscript — the field is declared under `total=False` and carries that warning (`supervisor.py:76`). **No such reader exists yet.** |
+| Checkpoint (#1) | `SessionState["schema_version"] = SESSION_SCHEMA_VERSION` (`= 1`, `supervisor.py:59`), set in `initial_session_state` (`supervisor.py:163`) | Absent on `a576501` and older checkpoints, so the reader uses `.get("schema_version", 0)` and never subscripts — the field is declared under `total=False` and carries that warning. A pre-stamp checkpoint is upgraded in place on its first resume, because every node now stamps it. |
 | Skill ledger (#2) | top-level `"_meta": {"schema_version": LEDGER_SCHEMA_VERSION}` (`= 1`, `ledger.py:38`; written `:193`) | Absent on files last saved before the write → version 0. `_meta` is not a Candidate record. |
 | Usage ledger (#3) | none | Append-only rows already identified by `kind`/keys, and every reader tolerates unknown rows (`usage.py:635-655`). A version belongs in a header row; deferred. |
 | Exports (#4), Chroma (#5, #6), log (#7) | none | Renderings / derived indexes / trace; regenerate, do not migrate. |
 
 A reader that meets a version **higher** than it knows must refuse loudly (raise, log the path and both versions) and
-must not guess, default, or partially load. A reader that meets a **lower** version must apply the documented
-`.get` defaults for that version. Bumping a version is a wire change: update this file, the client types
+must not guess, default, or partially load. A reader that meets a **lower** version applies the documented `.get`
+defaults for that version. Bumping a version is a wire change: update this file, the client types
 (`web/src/lib/types.ts`), and the goldens in `tests/test_serde_golden.py` in the same change.
 
 ## 5. Duplicated sources of truth

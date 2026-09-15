@@ -26,6 +26,7 @@ import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .filelock import atomic_write_text, locked
 from .skill import NEUTRAL_ALPHA, NEUTRAL_BETA, SkillState
@@ -106,6 +107,30 @@ class LedgerPriors:
     days_elapsed: float
 
 
+def _ledger_version_is_supported(data: Mapping[str, Any], path: object) -> bool:
+    """The one reader of ``LEDGER_SCHEMA_VERSION`` (docs/data-model.md §4). Never raises.
+
+    Refuse higher, tolerate lower — the same rule as the checkpoint's reader, but expressed as a bool
+    because both loaders and ``save_posteriors`` are contractually forbidden to raise. The
+    load-bearing half is the WRITE refusal: without it an old build handed a v2 ledger rewrites it on
+    the next completion, stamping ``_meta`` back down and clobbering whatever the newer shape held.
+    Declining to save costs one Session's cross-session memory, which ADR 0006 already tolerates as a
+    cold start; downgrading the file costs every Candidate in it, permanently.
+    """
+    meta = data.get("_meta")
+    version = meta.get("schema_version", 0) if isinstance(meta, Mapping) else 0
+    if isinstance(version, bool) or not isinstance(version, int) or version > LEDGER_SCHEMA_VERSION:
+        logger.error(
+            "Skill ledger at %s carries schema_version %r; this build understands up to %d. "
+            "Refusing to read or overwrite it.",
+            path,
+            version,
+            LEDGER_SCHEMA_VERSION,
+        )
+        return False
+    return True
+
+
 def _load_candidate(
     path: str | Path, candidate_id: str, now: float
 ) -> tuple[float, dict[str, tuple[float, float]]] | None:
@@ -127,7 +152,10 @@ def _load_candidate(
         logger.warning("Skill ledger unreadable at %s (%s); starting cold.", path, err)
         return None
     try:
-        entry = json.loads(raw)[candidate_id]
+        payload = json.loads(raw)
+        if isinstance(payload, Mapping) and not _ledger_version_is_supported(payload, path):
+            return None
+        entry = payload[candidate_id]
         completed_at = float(entry["completed_at"])
         if not math.isfinite(completed_at):
             raise ValueError("non-finite completed_at")
@@ -216,6 +244,8 @@ def save_posteriors(
                     data = loaded
         except (OSError, json.JSONDecodeError) as err:
             logger.warning("Skill ledger at %s unreadable before save (%s); overwriting.", path, err)
+        if not _ledger_version_is_supported(data, target):
+            return  # never downgrade a ledger a newer build wrote
         data["_meta"] = {"schema_version": LEDGER_SCHEMA_VERSION}
         data[candidate_id] = {
             "completed_at": now,
