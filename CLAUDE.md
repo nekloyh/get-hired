@@ -7,6 +7,7 @@ This file tells any agent or contributor where the authoritative design lives, s
 1. **`/CONTEXT.md`** — domain glossary. Use these exact terms (Candidate, Session, Interviewer, Evaluator, Supervisor, Micro-loop, Macro-loop, Skill, Topic Plan, Role criticality, Follow-up, Self-critique, Derived confidence, Budget exhaustion, Coaching memory).
 2. **`/docs/adr/`** — the binding architectural decisions. Twelve files, numbered 0001–0011 and 0014; **there is no 0012 or 0013** and never was, so a missing number is not a missing document. **These win over everything else.** Sections and files marked `Status: Proposed` are experiment-gated hypotheses — do NOT implement from them until their status is Accepted; everything else (including addenda dated 2026-07-19) is binding now.
 3. **[`/docs/issues/README.md`](docs/issues/README.md)** — the canonical milestone order, dependencies, and quality gates (updated 2026-09-13). **`/docs/issues/`** holds the build plan as vertical slices (0001–0037). Slice status lives in the doc's `## Status` section; live work status lives in GitHub Issues (the remediation backlog R-01→R-33 maps to GH #56–#88, `R-NN = #(55+NN)`).
+4. **[`/docs/roadmap.md`](docs/roadmap.md)** — direction: what unblocks what, what the hardware can host, and which build-with-AI practices are already in place vs missing. Subordinate to the ADRs and to the plan above; it answers *why in this order*, not *what is in each milestone*.
 
 ## Deleted: the original MVP planning docs
 

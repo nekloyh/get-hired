@@ -6,6 +6,7 @@ glossary.
 
 Development sequencing and acceptance gates live in **[the implementation plan](docs/issues/README.md)**.
 It links the existing slices and separates personal/trusted-pilot milestones from public-launch requirements.
+**[The roadmap](docs/roadmap.md)** says what to do next and why in that order.
 
 ## Quickstart (live) — clone to a real interview
 
