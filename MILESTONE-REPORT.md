@@ -1,11 +1,11 @@
 # Milestone report — branch `audit/stabilize-2026-09-14`
 
 Input: `QA-REPORT.md` (47 findings; M-0 16 tasks, M-1 24 tasks, M-2 10 debts), committed at `db73419`.
-Work: **55 commits** on `main` (`2dac711`), of which the QA report had already reviewed the first 8.
+Work: **58 commits** on `main` (`2dac711`), of which the QA report had already reviewed the first 8.
 Suite: **848 → 972** pytest, **27 → 35** vitest. Every gate green after every commit.
 
-> Correction to this report's own earlier text: the branch carries **55** commits above `main`, not
-> "43 new on top of 8" (= 51). Measured: `git log --oneline --no-merges 2dac711..HEAD | wc -l` → 55.
+> Correction to this report's own earlier text: the branch carries **58** commits above `main` at the
+> tagged commit, not "43 new on top of 8" (= 51). Measured: `git log --no-merges 2dac711..HEAD | wc -l`.
 > Other stale numbers this pass re-measured are corrected in place and listed in §5.
 
 ---
@@ -382,7 +382,7 @@ Two things you do **not** need to do:
 ## 10. Numbers
 
 ```
-commits on the branch               55   (git log --no-merges 2dac711..HEAD)
+commits on the branch               58   (git log --no-merges 2dac711..HEAD, at the tag)
 pytest                              848 → 972   (+124), green twice, identical summaries
 vitest                              27  → 35    (+8)
 mypy                                34 source files, clean
