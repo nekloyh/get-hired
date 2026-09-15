@@ -50,6 +50,25 @@ services:
       # challenge 404'd and the only authenticator left was `--standalone` — which needs :80, and
       # this container holds :80 for the life of the deployment. Renewal therefore could not work.
       - ./deploy/certbot-webroot:/var/www/certbot:ro
+    # Without this, `docker compose ps` reads "Up" for a container whose config never loaded, and the
+    # first sign of trouble is a Candidate's browser failing to connect. `app` has had a healthcheck
+    # since R-11; this is the other half of the stack.
+    #
+    # It probes :80 for the redirect, NOT :443, and that is deliberate rather than lazy: the image
+    # carries neither curl nor openssl, and busybox wget follows the 301 into TLS and then fails
+    # certificate verification — so any :443 probe would report unhealthy for the whole self-signed
+    # bootstrap phase that docs/deploy.md §3 makes step one of getting a real certificate. A probe
+    # that flaps during the documented happy path is worse than a narrower one.
+    #
+    # What this proves: nginx is listening and coach.conf's server block is loaded. What it does NOT
+    # prove: that TLS serves, or that the upstream is reachable. Those are pre-flight checks, run
+    # once at deploy time against the real hostname — see docs/pilot-runbook.md.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -S -O /dev/null http://127.0.0.1/api/health 2>&1 | grep -q '301 Moved Permanently'"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
 
 volumes:
   coach-state:
