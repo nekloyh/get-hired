@@ -77,6 +77,17 @@ SessionMode = Literal["auto", "demo", "live"]
 MAX_ANSWER_CHARS = 20_000
 MAX_ELAPSED_SECONDS_CEILING = 4 * 3600.0
 ANSWER_QUEUE_MAXSIZE = 8
+# The largest inbound WebSocket frame uvicorn will assemble before handing it to us. It has to live
+# here with the other input bounds because nginx cannot supply it: `client_max_body_size` governs an
+# HTTP request body, and after the 101 Upgrade the proxy is forwarding a byte stream — measured
+# through the real compose stack on 2026-09-15, a 5,000,056-byte frame crossed nginx untouched and
+# was refused only by `CandidateAnswerPayload`'s 20,000-character bound, i.e. after the whole frame
+# had been buffered. uvicorn's own default is 16 MiB, and the deployment is deliberately
+# single-worker (R-12), so that default is an attacker-controlled allocation times uvicorn's 32-deep
+# queue. 256 KiB is ~12x the largest legitimate frame (a full-length answer is ~20 KB of JSON).
+# Inbound only: frames this server SENDS (a `state_update` carrying the whole transcript) are bounded
+# by the client's own limit, not this one.
+WS_MAX_FRAME_BYTES = 256 * 1024
 
 # How long a reconnect waits for the previous run's thread to leave an in-flight provider call. Covers
 # one timed-out call plus a retry (LLM_TIMEOUT_SECONDS 60 x 2); a full 4-attempt retry storm can run

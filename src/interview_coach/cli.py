@@ -1020,9 +1020,9 @@ def _cmd_api(client: ClientArg, args: argparse.Namespace) -> int:
     # would otherwise reach the operator as a traceback out of uvicorn's app loader. The import
     # itself is not extra work — `uvicorn.run` on an import string loads the same module a few lines
     # down, in this same process (`config.load_app()`, reload or not).
-    try:
-        from .web_api import guard_single_worker
+    from .web_api import WS_MAX_FRAME_BYTES, guard_single_worker
 
+    try:
         # argv=[] on purpose: `coach api` has no --workers flag, so argparse has already rejected
         # one, and sniffing this process's argv here would only read someone else's command line.
         guard_single_worker(argv=[])
@@ -1034,6 +1034,9 @@ def _cmd_api(client: ClientArg, args: argparse.Namespace) -> int:
         host=args.host,
         port=args.port,
         reload=args.reload,
+        # Not a tuning knob: uvicorn's 16 MiB default is the only ceiling on an inbound Session
+        # frame, because nginx's `client_max_body_size` does not apply once the socket is upgraded.
+        ws_max_size=WS_MAX_FRAME_BYTES,
     )
     return 0
 

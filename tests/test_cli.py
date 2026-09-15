@@ -23,6 +23,7 @@ from interview_coach.fixtures import QUESTION
 from interview_coach.microloop import DEFAULT_MAX_TURNS
 from interview_coach.rubric import DIMENSIONS
 from interview_coach.supervisor import build_session_graph, initial_session_state, session_config
+from interview_coach.web_api import MAX_ANSWER_CHARS, WS_MAX_FRAME_BYTES
 
 
 @pytest.fixture
@@ -446,6 +447,24 @@ def test_coach_api_starts_normally_with_no_worker_config(uvicorn_spy):
     # `monkeypatch.delenv` cannot undo a variable the code under test creates.
     assert cli.main(["api"]) == 0
     assert len(uvicorn_spy) == 1
+
+
+def test_the_session_socket_is_bounded_well_below_uvicorns_default(uvicorn_spy):
+    # nginx's `client_max_body_size 1m` does NOT bound a WebSocket frame: after the 101 Upgrade the
+    # proxy forwards a byte stream, so the only ceiling on an inbound frame is uvicorn's own
+    # `ws_max_size` — whose default is 16 MiB. Measured through the real compose stack on
+    # 2026-09-15: a 5,000,056-byte frame reached the app untouched and was refused only by
+    # `CandidateAnswerPayload`'s 20,000-character bound — i.e. after the whole frame was buffered.
+    # On a deliberately single-worker deployment (R-12) that is an attacker-controlled allocation
+    # multiplied by uvicorn's 32-deep queue.
+    assert cli.main(["api"]) == 0
+    assert len(uvicorn_spy) == 1
+    ws_max_size = uvicorn_spy[0]["ws_max_size"]
+    assert ws_max_size == WS_MAX_FRAME_BYTES
+    # Generous for every legitimate frame (the largest is a 20,000-char answer, ~20 KB of JSON)
+    # and far below the default it replaces.
+    assert ws_max_size > MAX_ANSWER_CHARS * 4
+    assert ws_max_size < 16 * 1024 * 1024
 
 
 def test_log_file_flag_reaches_the_serving_process(uvicorn_spy, tmp_path):
