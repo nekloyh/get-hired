@@ -1,0 +1,158 @@
+"""One advisory inter-process lock, for the two on-disk ledgers a second process can also write.
+
+``threading.Lock`` serialises threads inside one interpreter. Both ledgers are written from more
+than one OS process — ``coach session`` and ``coach postmortem`` write the Skill ledger while the
+server does, and two ``coach api`` processes sharing one ``/app/state`` volume write the usage
+ledger — so the in-process lock leaves the read-modify-write unserialised exactly where it matters.
+
+The lock target is a ``.lock`` SIDECAR, never the data file. ``ledger.save_posteriors`` publishes by
+``os.replace``, which swaps the inode: two processes that each opened the *data file* can end up
+holding exclusive locks on two different inodes and both believe they are alone. The sidecar is
+created once and never replaced or unlinked, so every process locks the same inode. It is a sibling
+of the file it guards, so it lives on the same filesystem and the same volume.
+
+flock is advisory and POSIX-only. The deployment target is Linux (Dockerfile: bookworm-slim) and CI
+is ubuntu-only, so the import is unconditional; a filesystem that refuses locks (some NFS and FUSE
+mounts answer ENOLCK) degrades to the in-process lock with a warning rather than taking down a
+Session, because both call sites are forbidden to fail a Candidate over bookkeeping.
+
+This module imports nothing from the package on purpose: ``usage`` cannot import ``ledger``
+(ledger -> skill -> evaluator -> llm -> usage is a cycle), so the shared helper has to stand alone.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import fcntl
+import logging
+import os
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+LOCK_SUFFIX = ".lock"
+
+
+def lock_path_for(target: Path) -> Path:
+    """The sidecar that guards ``target``."""
+    return target.with_name(target.name + LOCK_SUFFIX)
+
+
+@contextmanager
+def locked(target: Path) -> Iterator[None]:
+    """Hold an exclusive advisory lock on ``target``'s sidecar for the whole block.
+
+    MUST be entered INSIDE the caller's own ``threading.Lock``, never outside it. flock is held per
+    *open file description*, so two threads of one process that each open the sidecar get
+    independent locks and the second blocks on the first; taking the file lock first and the thread
+    lock second is then a lock-order inversion that deadlocks them against each other. Thread lock
+    outer, file lock inner.
+
+    For the same reason this must never nest: a second ``locked()`` on the same target from the same
+    process opens a second description and blocks the process on itself.
+    """
+    lock_file = lock_path_for(target)
+    handle = None
+    try:
+        lock_file.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_file.open("a+", encoding="utf-8")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    except OSError as err:
+        logger.warning(
+            "could not take the inter-process lock at %s (%s: %s); continuing under the in-process "
+            "lock only — a concurrent process could interleave with this write.",
+            lock_file,
+            type(err).__name__,
+            err,
+        )
+        if handle is not None:
+            handle.close()
+            handle = None
+    try:
+        yield
+    finally:
+        if handle is not None:
+            handle.close()  # closing the last fd on the description releases the flock
+
+
+@contextmanager
+def claimed(target: Path) -> Iterator[bool]:
+    """Take ``target``'s sidecar lock WITHOUT waiting; yield whether this block got it.
+
+    :func:`locked` blocks, which is right for a ledger write measured in milliseconds. A Session
+    drive lasts as long as the interview, so a second driver has to be told *no*: parking a shell for
+    half an hour on a lock it cannot see is indistinguishable from a hang. Yields ``True`` when this
+    block holds the lock and ``False`` when another process already does. Like :func:`locked` it must
+    not nest, and a filesystem that refuses locks degrades to ``True`` with a warning rather than
+    refusing a Candidate over bookkeeping.
+    """
+    lock_file = lock_path_for(target)
+    handle = None
+    try:
+        lock_file.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_file.open("a+", encoding="utf-8")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        # A subclass of OSError, so it MUST be caught first: "someone else holds it" is an answer,
+        # not a failure, and it is the whole point of this function.
+        if handle is not None:
+            handle.close()
+        yield False
+        return
+    except OSError as err:
+        logger.warning(
+            "could not take the inter-process lock at %s (%s: %s); continuing unclaimed — a "
+            "concurrent process could drive the same Session.",
+            lock_file,
+            type(err).__name__,
+            err,
+        )
+        if handle is not None:
+            handle.close()
+            handle = None
+    try:
+        yield True
+    finally:
+        if handle is not None:
+            handle.close()  # closing the last fd on the description releases the flock
+
+
+def atomic_write_text(target: Path, text: str) -> None:
+    """Publish ``text`` at ``target`` by rename, so no reader ever sees a half-written file.
+
+    ``Path.write_text`` truncates the existing file *first*, so a volume that fills mid-write leaves
+    0 bytes or a fragment under the real name — and reading that back raises nothing at all. The
+    Skill ledger cold-starts every Candidate in it; the Markdown export serves a truncated transcript
+    at 200 OK (NEW-04). Staging a sibling and renaming makes a failed write a no-op instead.
+
+    Raises ``OSError``, having staged nothing: whether a failed write is fatal is the caller's call.
+    """
+    tmp_path: Path | None = None
+    try:
+        # The tempfile must be a sibling of the target: os.replace is only atomic within one
+        # filesystem and raises EXDEV across a mount boundary (the Docker /state volume is one).
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)  # bound first, so a failed write still gets cleaned up
+            handle.write(text)
+            handle.flush()
+            # Rename is atomic w.r.t. readers but says nothing about durability: without fsync a
+            # container restart can publish a name pointing at unflushed (zero) bytes.
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, target)
+    except OSError:
+        # The cleanup runs on the same sick disk that caused the failure, so it must not become what
+        # escapes: the caller is owed the original error, not the unlink's.
+        if tmp_path is not None:
+            with contextlib.suppress(OSError):
+                tmp_path.unlink()
+        raise

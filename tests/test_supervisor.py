@@ -6,14 +6,19 @@ from pathlib import Path
 import pytest
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+from conftest import FakeOpenAI
 from interview_coach.bank import load_pack
+from interview_coach.config import Settings
 from interview_coach.diagnostic import CandidateProfile, diagnose
 from interview_coach.evaluator import DimensionScore, Evaluation
+from interview_coach.llm import GroqClient, LLMRouter
 from interview_coach.microloop import MicroLoopResult, ScriptedCandidate, StopReason, Turn
 from interview_coach.rubric import Rubric
 from interview_coach.seeds import SeedQuestion, SeedQuestionsExhausted, seed_count
+from interview_coach.session_serde import TranscriptItem
 from interview_coach.skill import SkillState, apply_evaluation
 from interview_coach.supervisor import (
+    SESSION_SCHEMA_VERSION,
     SessionStatus,
     SupervisorAction,
     SupervisorDecision,
@@ -292,6 +297,88 @@ def test_candidate_intent_aborts_session_and_is_not_recorded_as_failed(make_clie
 
     # The Candidate aborted before the Evaluator ran, so no LLM call and no failed question was recorded.
     assert fake.call_count == 0
+
+
+def test_an_accounting_refusal_is_not_recorded_as_a_failed_question(make_client, monkeypatch):
+    # M0a / F1, the same rule ADR 0005 states for Candidate intent and for budget exhaustion: a stop
+    # that is a fact about OUR bookkeeping must never be written down as evidence about the
+    # Candidate. Without the typed re-raise this lands in question_node's `except Exception` net and
+    # becomes a zero-evidence `failed` item — and then the Session ADVANCES, so a broken ledger does
+    # not merely stop the interview, it manufactures a transcript of failures and a Study Plan built
+    # on them. The contrast is deliberate: test_question_failure_is_isolated_and_session_continues
+    # asserts the opposite outcome for a RuntimeError, which is genuine infrastructure noise.
+    from interview_coach import supervisor
+    from interview_coach.usage import AccountingUnavailable
+
+    def _refusing_micro_loop(*args, **kwargs):
+        raise AccountingUnavailable("Usage accounting is UNRECONCILED: 1 provider call(s) were billed")
+
+    monkeypatch.setattr(supervisor, "run_micro_loop", _refusing_micro_loop)
+    client, fake = make_client([_plan("mlops", "system_design", "vietnamese_nlp")])
+    state = initial_session_state("accounting-stop-session", _diagnostic(), max_questions=3, started_at=0)
+    graph = build_session_graph(client, now=lambda: 1)
+
+    with pytest.raises(AccountingUnavailable):
+        graph.invoke(state, session_config("accounting-stop-session"))
+
+    # Nothing advanced: no transcript item, no Supervisor decision call, no Study Plan.
+    assert fake.call_count == 0
+
+
+def test_a_dead_quota_mid_session_suspends_and_resumes_without_a_failed_question(tmp_path, make_client, monkeypatch):
+    # GH #119 (ADR 0005's third category). insufficient_quota inside a question used to land in
+    # question_node's `except Exception` net: one zero-evidence `failed` item, question_count + 1.
+    # It must propagate like AccountingUnavailable, leave the checkpoint at the last resolved
+    # question, and let a plain resume pick the same question back up.
+    from interview_coach import supervisor
+    from interview_coach.usage import ProviderQuotaExhausted
+
+    base = _fake_micro_loop(4.0)
+    quota = {"dead": True, "calls": 0}
+
+    def _quota_dies_on_the_second_question(*args, **kwargs):
+        quota["calls"] += 1
+        if quota["calls"] == 2 and quota["dead"]:
+            raise ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")
+        return base(*args, **kwargs)
+
+    monkeypatch.setattr(supervisor, "run_micro_loop", _quota_dies_on_the_second_question)
+    client, _ = make_client(
+        [
+            _decision("advance_plan", "Need the next planned Skill."),
+            _decision("advance_plan", "Need the next planned Skill."),
+            _plan("mlops", "system_design", "vietnamese_nlp"),
+        ]
+    )
+    session_id = "quota-mid-session"
+    config = session_config(session_id)
+    state = initial_session_state(session_id, _diagnostic(), max_questions=3, started_at=0)
+    second_skill = state["topic_plan"][1]["skill"]
+    prior_of_second_skill = dict(state["skill_states"][second_skill])
+
+    with SqliteSaver.from_conn_string(str(tmp_path / "quota.sqlite")) as checkpointer:
+        graph = build_session_graph(client, checkpointer=checkpointer, now=lambda: 1)
+        raised: list[BaseException] = []
+        try:
+            for _ in graph.stream(state, config, stream_mode="values"):
+                pass
+        except ProviderQuotaExhausted as err:
+            raised.append(err)
+        checkpoint = graph.get_state(config).values
+
+        assert checkpoint["question_count"] == 1
+        assert [item["stop_reason"] for item in checkpoint["transcript"]] == ["resolved"]
+        assert checkpoint["skill_states"][second_skill] == prior_of_second_skill
+        assert checkpoint["status"] == SessionStatus.ACTIVE.value
+        assert raised, "the quota stop was swallowed by question_node's failure-isolation net"
+
+        quota["dead"] = False
+        final = list(graph.stream(None, config, stream_mode="values"))[-1]
+
+    assert final["status"] == SessionStatus.COMPLETE.value
+    assert len(final["transcript"]) == 3
+    assert final["transcript"][1]["skill"] == second_skill
+    assert StopReason.FAILED.value not in {item["stop_reason"] for item in final["transcript"]}
 
 
 def test_supervisor_degrades_on_transport_error_at_decision_node(make_client, monkeypatch):
@@ -778,15 +865,13 @@ def test_skip_ahead_to_an_explicit_index_moves_the_pointer_and_the_skill():
     assert result["stop_reason"] is None
 
 
-def test_skip_ahead_without_a_target_jumps_two_entries():
-    # The documented default: skipping "over already-satisfied plan entries" means current + 2, not
-    # current + 1 (which would just be advance_plan).
+def test_skip_ahead_without_a_target_is_a_bug_not_a_silent_default():
+    # The validator already rejects a target-less skip_ahead and the fallback never emits one, so
+    # reaching here means a caller bypassed both — say so instead of inventing an index.
     state = _plan_state(["ml_fundamentals", "deep_learning", "mlops", "system_design"])
 
-    result = _apply(state, "skip_ahead")
-
-    assert result["current_plan_index"] == 2
-    assert result["next_skill"] == "mlops"
+    with pytest.raises(ValueError, match="skip_ahead requires target_plan_index"):
+        _apply(state, "skip_ahead")
 
 
 def test_skip_ahead_off_the_end_of_the_plan_completes_the_session():
@@ -1098,3 +1183,203 @@ def test_the_prompt_cannot_promise_a_seed_the_pack_does_not_have():
 
     assert f"- mlops: probed {probes}/{probes} seeds (0 left)" in body
     assert "another seed remains" not in body
+
+
+def test_a_failed_question_is_not_offered_to_the_supervisor_as_a_zero_score():
+    # NEW-16 / ADR 0005. `TranscriptItem.failed` stores zero-evidence sentinels and keeps the Skill's
+    # prior untouched, but the prompt renderer read them as if they were scores: a provider timeout on
+    # a MUST_HAVE Skill reached the deciding model as "score=0.00 confidence=0.00", steering the rest
+    # of the interview off infrastructure noise. The second and third assertions pin the absence of
+    # the sentinels rather than one row's wording, so a reworded label cannot reintroduce them.
+    state = _plan_state(["ml_fundamentals", "mlops"], current_index=1, question_count=2)
+    state["transcript"] = [
+        _transcript_item("ml_fundamentals", score=4.0),
+        TranscriptItem.failed(
+            "mlops",
+            SkillState.neutral("mlops"),
+            plan_index=1,
+            error=ConnectionError("provider timed out"),
+        ),
+    ]
+
+    body = _build_supervisor_messages(state)[1]["content"]
+
+    assert "- Q2 skill=mlops NOT ASKED (infrastructure failure; no evidence)" in body
+    assert "score=0.00" not in body
+    assert f"stop={StopReason.FAILED.value}" not in body
+    # The resolved question is still rendered as evidence, unchanged.
+    assert "- Q1 skill=ml_fundamentals score=4.00 confidence=0.70 stop=resolved" in body
+
+
+def test_an_accounting_fault_at_the_supervisor_decision_suspends_instead_of_degrading(
+    tmp_path, make_client, monkeypatch
+):
+    # QA-05 / M0-6. `decide_next_move` re-raised ProviderQuotaExhausted but not AccountingUnavailable,
+    # so a ledger that goes unwritable mid-Session landed in the transport backstop: the Supervisor
+    # degraded to the deterministic fallback, advanced the plan past a question that never ran, and
+    # wrote a decision record blaming "a provider transport error" — an operator stop disguised as a
+    # provider blip, permanently, in the checkpoint and the Markdown export. It must suspend like the
+    # quota stop does and resume clean.
+    from interview_coach import supervisor
+    from interview_coach.usage import AccountingUnavailable
+
+    monkeypatch.setattr(supervisor, "run_micro_loop", _fake_micro_loop(4.0))
+    client, _ = make_client(
+        [
+            AccountingUnavailable("Usage accounting is UNRECONCILED: 1 provider call(s) were billed"),
+            _decision("advance_plan", "Need the next planned Skill."),
+            _decision("advance_plan", "Need the next planned Skill."),
+            _plan("mlops", "system_design", "vietnamese_nlp"),
+        ]
+    )
+    session_id = "accounting-decide-session"
+    config = session_config(session_id)
+    state = initial_session_state(session_id, _diagnostic(), max_questions=3, started_at=0)
+
+    with SqliteSaver.from_conn_string(str(tmp_path / "accounting.sqlite")) as checkpointer:
+        graph = build_session_graph(client, checkpointer=checkpointer, now=lambda: 1)
+        raised: list[BaseException] = []
+        try:
+            for _ in graph.stream(state, config, stream_mode="values"):
+                pass
+        except AccountingUnavailable as err:
+            raised.append(err)
+        checkpoint = graph.get_state(config).values
+
+        assert raised, "the accounting fault was swallowed by the Supervisor's transport backstop"
+        assert checkpoint["question_count"] == 1
+        assert [item["stop_reason"] for item in checkpoint["transcript"]] == ["resolved"]
+        assert checkpoint["status"] == SessionStatus.ACTIVE.value
+        # No decision record, so nothing mislabels the accounting fault as a transport error.
+        assert checkpoint.get("supervisor_decisions", []) == []
+
+        final = list(graph.stream(None, config, stream_mode="values"))[-1]
+
+    assert final["status"] == SessionStatus.COMPLETE.value
+    assert len(final["transcript"]) == 3
+    assert StopReason.FAILED.value not in {item["stop_reason"] for item in final["transcript"]}
+    assert not any("transport error" in d["llm_reasoning"] for d in final["supervisor_decisions"])
+
+
+def test_an_accounting_fault_at_the_study_plan_node_stops_instead_of_completing_silently(
+    tmp_path, make_client, monkeypatch
+):
+    # QA-05 / M0-6, second net. study_plan_node's `except Exception` swallowed both typed operator
+    # stops into `study_plan_error` and let the graph reach END, so `coach session` exited 0 on a
+    # broken ledger with the fault buried in an export field. The interview is already COMPLETE in
+    # the checkpoint, so re-raising here is a suspend, not a loss: a resume re-runs only this node.
+    from interview_coach import supervisor
+    from interview_coach.usage import AccountingUnavailable
+
+    monkeypatch.setattr(supervisor, "run_micro_loop", _fake_micro_loop(5.0))
+    client, _ = make_client(
+        [
+            AccountingUnavailable("Usage accounting is UNRECONCILED: 1 provider call(s) were billed"),
+            _plan("system_design", "vietnamese_nlp", "ml_fundamentals"),
+        ]
+    )
+    session_id = "accounting-plan-session"
+    config = session_config(session_id)
+    state = initial_session_state(session_id, _diagnostic(), max_questions=1, started_at=0)
+
+    with SqliteSaver.from_conn_string(str(tmp_path / "accounting-plan.sqlite")) as checkpointer:
+        graph = build_session_graph(client, checkpointer=checkpointer, now=lambda: 1)
+        raised: list[BaseException] = []
+        try:
+            for _ in graph.stream(state, config, stream_mode="values"):
+                pass
+        except AccountingUnavailable as err:
+            raised.append(err)
+        checkpoint = graph.get_state(config).values
+
+        assert raised, "the accounting fault was swallowed into study_plan_error"
+        assert checkpoint["status"] == SessionStatus.COMPLETE.value  # the interview itself resolved
+        assert [item["stop_reason"] for item in checkpoint["transcript"]] == ["resolved"]
+        assert checkpoint.get("study_plan") is None
+        assert checkpoint.get("study_plan_error") is None  # not recorded as a degraded planner
+
+        final = list(graph.stream(None, config, stream_mode="values"))[-1]
+
+    assert final["study_plan"] is not None  # the resume re-runs only the end-matter node
+    assert len(final["transcript"]) == 1
+
+
+def _versioning_client(replies):
+    """A router over the scripted fake, built locally so these tests can open two graphs in a row."""
+    settings = Settings(
+        _env_file=None,
+        primary_provider="groq",
+        groq_api_key="test",
+        groq_base_url="http://test",
+        groq_model="test-model",
+    )
+    fake = FakeOpenAI(list(replies))
+    return LLMRouter("groq", {"groq": GroqClient(settings.provider_config("groq"), client=fake)}), fake
+
+
+# --- QA-11 / NEW-27: schema_version is stamped by every node, and one reader refuses a newer one ---
+
+
+def test_a_prestamp_session_is_stamped_by_the_nodes_not_only_at_setup(tmp_path, monkeypatch):
+    # QA-11: SESSION_SCHEMA_VERSION was written only by initial_session_state, and LangGraph merges
+    # only the keys a node returns — so a Session started before the stamp landed ran to `complete`,
+    # was exported and had its posteriors saved with no version marker at all. Starting from a state
+    # with the key deleted reproduces exactly that checkpoint.
+    from interview_coach import supervisor
+
+    monkeypatch.setattr(supervisor, "run_micro_loop", _fake_micro_loop(4.0))
+    db = str(tmp_path / "session.sqlite")
+    session_id = "prestamp-session"
+    state = initial_session_state(session_id, _diagnostic(), max_questions=3, started_at=0)
+    del state["schema_version"]
+
+    with SqliteSaver.from_conn_string(db) as checkpointer:
+        client, _ = _versioning_client([_decision("advance_plan", "next planned Skill")])
+        graph = build_session_graph(client, checkpointer=checkpointer, now=lambda: 1)
+        graph.invoke(state, session_config(session_id), interrupt_after=["run_question"])
+
+    with SqliteSaver.from_conn_string(db) as checkpointer:
+        client, _ = _versioning_client(
+            [
+                _decision("advance_plan", "continue"),
+                _decision("end_early", "enough evidence"),
+                _plan("mlops", "system_design", "vietnamese_nlp"),
+            ]
+        )
+        graph = build_session_graph(client, checkpointer=checkpointer, now=lambda: 1)
+        final = graph.invoke(None, session_config(session_id))
+
+    assert final["status"] == SessionStatus.COMPLETE.value
+    assert final["schema_version"] == SESSION_SCHEMA_VERSION
+
+
+def test_a_checkpoint_from_a_newer_schema_refuses_to_run(tmp_path, monkeypatch):
+    # QA-11 / NEW-27: schema_version was write-only — zero readers anywhere — so a checkpoint stamped
+    # by a NEWER build was partially read without a word. docs/data-model.md section 4 already
+    # promises the opposite: a reader that meets a higher version refuses loudly and does not guess.
+    from interview_coach import supervisor
+
+    monkeypatch.setattr(supervisor, "run_micro_loop", _fake_micro_loop(4.0))
+    db = str(tmp_path / "future.sqlite")
+    session_id = "future-session"
+    config = session_config(session_id)
+    state = initial_session_state(session_id, _diagnostic(), max_questions=3, started_at=0)
+
+    with SqliteSaver.from_conn_string(db) as checkpointer:
+        client, _ = _versioning_client([_decision("advance_plan", "next planned Skill")])
+        graph = build_session_graph(client, checkpointer=checkpointer, now=lambda: 1)
+        graph.invoke(state, config, interrupt_after=["run_question"])
+        # What a future build's checkpoint looks like to this one.
+        graph.update_state(config, {"schema_version": SESSION_SCHEMA_VERSION + 98})
+
+    with SqliteSaver.from_conn_string(db) as checkpointer:
+        client, _ = _versioning_client([_decision("end_early", "enough")])
+        graph = build_session_graph(client, checkpointer=checkpointer, now=lambda: 1)
+        with pytest.raises(supervisor.UnsupportedSessionVersion) as err:
+            graph.invoke(None, config)
+        # ADR 0005: the refusal must not become fake Skill evidence. The gate runs BEFORE the node,
+        # so it is outside question_node's isolation net and cannot be recorded as `failed`.
+        stops = {item["stop_reason"] for item in graph.get_state(config).values["transcript"]}
+
+    assert str(SESSION_SCHEMA_VERSION + 98) in str(err.value)
+    assert StopReason.FAILED.value not in stops

@@ -11,9 +11,9 @@ import os
 
 import pytest
 
-from interview_coach import telemetry
+from interview_coach import telemetry, usage
 from interview_coach.config import ProviderSettings, Settings
-from interview_coach.llm import GroqClient, LLMRouter, MimoClient
+from interview_coach.llm import GroqClient, LLMRouter, reset_breakers
 
 # At conftest import, not in a fixture, and deliberately: `interview_coach.web_api` runs BOTH of its
 # module-scope environment readers — `guard_single_worker()` and `configure_session_logging(...)` —
@@ -26,7 +26,7 @@ from interview_coach.llm import GroqClient, LLMRouter, MimoClient
 # documents, `set -a; . .env` as one does, and collection attaches a second RotatingFileHandler to
 # the process-global `interview_coach` logger — one no fixture can remove, because it predates every
 # snapshot a fixture could take. The suite then appends its fixtures' output — measured at 1,939
-# lines / 208 KB, 415 of them `llm-call provider=mimo model=test-model ... outcome=ok` — into the
+# lines / 208 KB, 415 of them `llm-call ... model=test-model ... outcome=ok` — into the
 # operator's real server log. That trace is the artifact ADR 0009 addendum a leans on to detect a
 # silent judge failover after the fact, so counterfeits in it are not noise; they are fabricated
 # evidence about the judge, written by a command whose whole job was to tell the truth.
@@ -43,6 +43,41 @@ def _reset_telemetry():
     """Noise counters are process-global; every test starts from a clean slate."""
     telemetry.reset()
     yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_breakers():
+    """Provider circuit-breaker state is process-global now; every test starts from a clean slate.
+
+    Reset on BOTH sides, unlike `_reset_telemetry`: the breaker tests monkeypatch `llm._now` to a
+    fake clock, so a leaked `opened_at` of 500.0 is compared against real `time.monotonic()`
+    afterwards — which reads as expired on a long-lived box and as open on a freshly booted one.
+    That is a failure whose outcome depends on machine uptime, not just on test order.
+    """
+    reset_breakers()
+    yield
+    reset_breakers()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_usage_ledger(tmp_path_factory, monkeypatch):
+    """Point every test at its own token ledger, and forget any accounting fault it latched.
+
+    Two separate reasons, both process-global state:
+
+    * ``COACH_USAGE_LEDGER`` was unset for most of the suite, so any fixture scripting a ``usage``
+      block appended into the operator's real ``logs/usage-ledger.jsonl`` — 51 ``test-model``
+      rows were counted there in the 2026-09-02 baseline. That ledger is the input to every budget
+      rail; fabricated rows in it are fabricated evidence about spend. Tests that want a specific
+      path still set their own, which wins (an autouse fixture runs before the test body).
+    * M0a's accounting latch lives in module globals by design — it has to work when nothing at all
+      can be written — so a test that deliberately breaks the ledger would otherwise refuse metered
+      calls for every test that follows it.
+    """
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(tmp_path_factory.mktemp("ledger") / "usage-ledger.jsonl"))
+    usage.reset_accounting_state()
+    yield
+    usage.reset_accounting_state()
 
 
 @pytest.fixture(autouse=True)
@@ -73,15 +108,8 @@ class _FakeToolCall:
 
 
 class _FakeMessage:
-    def __init__(
-        self,
-        content: str | None = None,
-        reasoning_content: str | None = None,
-        tool_calls: list | None = None,
-    ) -> None:
+    def __init__(self, content: str | None = None, tool_calls: list | None = None) -> None:
         self.content = content
-        self.reasoning_content = reasoning_content
-        self.model_extra = {"reasoning_content": reasoning_content} if reasoning_content else {}
         self.tool_calls = tool_calls
 
 
@@ -127,8 +155,7 @@ class _FakeCompletions:
             # A scripted reply carrying token usage: exercises the client-side daily ledger.
             usage = _FakeUsage(reply["usage"]["prompt_tokens"], reply["usage"]["completion_tokens"])
             return _FakeResponse(_FakeMessage(content=reply.get("content", "")), usage=usage)
-        content, reasoning = reply if isinstance(reply, tuple) else (reply, None)
-        return _FakeResponse(_FakeMessage(content=content, reasoning_content=reasoning))
+        return _FakeResponse(_FakeMessage(content=reply))
 
 
 class _FakeChat:
@@ -137,7 +164,7 @@ class _FakeChat:
 
 
 class FakeOpenAI:
-    """Scripts a list of replies; each is a JSON string or a (content, reasoning_content) tuple."""
+    """Scripts a list of replies; each is a JSON string, an exception, or a tool_calls/usage dict."""
 
     def __init__(self, replies: list) -> None:
         self.chat = _FakeChat(replies)
@@ -151,10 +178,10 @@ class FakeOpenAI:
 def settings() -> Settings:
     return Settings(
         _env_file=None,
-        primary_provider="mimo",
-        mimo_api_key="test",
-        mimo_base_url="http://test",
-        mimo_model="test-model",
+        primary_provider="groq",
+        groq_api_key="test",
+        groq_base_url="http://test",
+        groq_model="test-model",
     )
 
 
@@ -167,15 +194,18 @@ def fake_openai_factory():
 def make_client(settings: Settings):
     def _make(replies: list) -> tuple[LLMRouter, FakeOpenAI]:
         fake = FakeOpenAI(replies)
-        mimo = MimoClient(settings.provider_config("mimo"), client=fake)
-        return LLMRouter("mimo", {"mimo": mimo}), fake
+        groq = GroqClient(settings.provider_config("groq"), client=fake)
+        return LLMRouter("groq", {"groq": groq}), fake
 
     return _make
 
 
 @pytest.fixture
 def make_tool_client():
-    """A router whose primary (Groq) does native function-calling — exercises the real tool path."""
+    """A router whose primary (Groq) does native function-calling — exercises the real tool path.
+
+    Same shape as ``make_client`` now that the fake provider is Groq; both fixture names remain in use.
+    """
 
     def _make(replies: list) -> tuple[LLMRouter, FakeOpenAI]:
         fake = FakeOpenAI(replies)

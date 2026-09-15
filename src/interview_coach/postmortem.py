@@ -34,12 +34,13 @@ from pydantic import BaseModel, Field
 
 from .diagnostic import CRITICALITY_SETTINGS, SKILLS, RoleCriticality, role_criticality
 from .exporter import _md
-from .ledger import load_states, save_posteriors
+from .ledger import SAFE_CANDIDATE_ID, is_safe_candidate_id, load_states, save_posteriors
 from .llm import LLMClient, Message, Validator
 from .microloop import Candidate, CandidateIntent
 from .resources import ResourceStore
 from .skill import POSTMORTEM_WEIGHT_RATIO, SkillState, confidence_weight, score_to_quality
 from .study_planner import StudyTarget, plan_study, rank_study_targets
+from .usage import AccountingUnavailable, ProviderQuotaExhausted
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +171,10 @@ def run_postmortem(
     """
     if not candidate_id:
         raise ValueError("postmortem requires a candidate id — the Skill ledger is the whole point")
+    if not is_safe_candidate_id(candidate_id):
+        # Before elicitation, not after: the ledger guard is silent by contract, so without this the
+        # debrief would spend a whole elicitation + reconstruction and then persist nothing.
+        raise ValueError(f"{candidate_id!r} is not a valid Skill ledger key (expected {SAFE_CANDIDATE_ID.pattern})")
     now = time.time() if now is None else now
 
     transcript = run_elicitation(client, candidate, target_role=target_role, companies=companies)
@@ -183,6 +188,12 @@ def run_postmortem(
     states_after = fuse_scorecard(states_before, scorecard)
     # save_posteriors replaces the whole record and restamps the decay clock, so the untouched
     # Skills' *decayed* states ride along — their mass is preserved, not silently un-decayed.
+    # NEW-17 deliberately does NOT apply here: `save_measured_posteriors`' predicate is the
+    # TRANSCRIPT, and a post-mortem has none — `_synthesized_session_state` carries an empty one, so
+    # a transcript-shaped filter would return {} and silently stop persisting the fused evidence.
+    # The rule the three callers share is "only evidence-bearing Skills"; each supplies its own
+    # notion of evidence, and here it is the reconstructed scorecard, which is real (second-hand,
+    # at half weight) for Skills that have no transcript item anywhere.
     save_posteriors(ledger_db, candidate_id, states_after, now=now)
 
     before_state = _synthesized_session_state(candidate_id, states_before, target_role, companies)
@@ -197,6 +208,11 @@ def run_postmortem(
     try:
         study_plan = plan_study(client, after_state, resource_store=resource_store).model_dump(mode="json")
     except CandidateIntent:  # ADR 0005: intent propagates out of every net, always re-raised first
+        raise
+    except (AccountingUnavailable, ProviderQuotaExhausted):
+        # M0a / F1 and GH #119: a refused or dead call is an operator stop, not a planner blip. The
+        # ledger fusion above is already durable, so nothing is lost by stopping here; `_dispatch`
+        # turns this into exit 2 with the remedy instead of exit 0 with a `study_plan_error` field.
         raise
     except Exception as err:  # noqa: BLE001 — optional end-matter; a planner blip must not void the fusion
         logger.warning("post-mortem study planner failed; keeping the ledger fusion without a plan: %s", err)

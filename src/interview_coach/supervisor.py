@@ -14,12 +14,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypedDict, cast
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
-from typing_extensions import TypedDict
 
 from .concepts import ConceptStore
 from .diagnostic import SKILLS, DiagnosticResult
@@ -50,11 +49,36 @@ from .session_serde import (
 )
 from .skill import SkillState
 from .study_planner import plan_study
+from .usage import AccountingUnavailable, ProviderQuotaExhausted
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_QUESTIONS = 5
 DEFAULT_MAX_ELAPSED_SECONDS = 30 * 60
+# Stamped into every new checkpoint; readers tolerate its absence (pre-stamp checkpoints).
+SESSION_SCHEMA_VERSION = 1
+
+
+class UnsupportedSessionVersion(RuntimeError):
+    """A checkpoint written by a newer SessionState schema than this build understands."""
+
+
+def require_supported_session_version(state: Mapping[str, Any], *, source: str = "checkpoint") -> None:
+    """The one reader of ``schema_version`` (docs/data-model.md §4): refuse loudly, never guess.
+
+    Refuse higher, tolerate lower. A version this build does not know means keys it cannot interpret,
+    and partially reading a newer Session is how a v1 build silently half-loads a v2 checkpoint —
+    which the doc has promised does not happen since before any reader existed.
+
+    ``isinstance(version, bool)`` first, because ``True > 1`` is False in Python, so a JSON ``true``
+    would otherwise sail through as a valid version.
+    """
+    version = state.get("schema_version", 0)
+    if isinstance(version, bool) or not isinstance(version, int) or version > SESSION_SCHEMA_VERSION:
+        raise UnsupportedSessionVersion(
+            f"{source} carries schema_version {version!r}; this build understands up to "
+            f"{SESSION_SCHEMA_VERSION}. Refusing to load it rather than partially reading a newer Session."
+        )
 
 
 class SessionStatus(StrEnum):
@@ -71,6 +95,7 @@ class SupervisorAction(StrEnum):
 
 
 class SessionState(TypedDict, total=False):
+    schema_version: int  # SESSION_SCHEMA_VERSION; absent in pre-stamp checkpoints — never subscript it
     session_id: str
     topic_plan: list[dict[str, Any]]
     skill_states: dict[str, dict[str, float | str]]
@@ -157,6 +182,7 @@ def initial_session_state(
     language_mode = validate_language_mode(language_mode)
     topic_plan = [asdict(entry) for entry in diagnostic.topic_plan]
     state: SessionState = {
+        "schema_version": SESSION_SCHEMA_VERSION,
         "session_id": session_id,
         "topic_plan": topic_plan,
         "skill_states": {skill: prior.state.to_dict() for skill, prior in diagnostic.priors.items()},
@@ -274,6 +300,12 @@ def build_session_graph(
             # never be recorded as a zero-evidence `failed` question. The CLI turns it into exit code 2;
             # the web layer converts it into a session_error event.
             raise
+        except (AccountingUnavailable, ProviderQuotaExhausted):
+            # M0a / F1 and GH #119: a refused call (broken accounting) or a dead daily quota is a
+            # fact about our bookkeeping or the provider, not evidence about the Candidate — the net
+            # below would turn either into the zero-evidence `failed` question ADR 0005 forbids.
+            # The drivers convert them into a visible stop with a reconcile/resume instruction.
+            raise
         except Exception as err:  # noqa: BLE001 — one bad question must not abort the Session (slice 0014)
             # A failure inside a single question (a malformed Evaluator output that survived its retry,
             # a provider blip, an unexpected tool error) must not discard every question resolved so
@@ -319,15 +351,42 @@ def build_session_graph(
         # discard the completed Session — degrade to no plan and let the graph reach END.
         try:
             plan = plan_study(roles.planner, state, resource_store=resource_store)
+        except (AccountingUnavailable, ProviderQuotaExhausted):
+            # Not a planner blip to degrade around: the Session is COMPLETE in the checkpoint, so a
+            # resume re-runs only this node once accounting is healthy or the quota resets. Swallowed,
+            # this reached END and `coach session` exited 0 on a broken ledger.
+            raise
         except Exception as err:  # noqa: BLE001 — last optional node; any failure here must not crash the run
             logger.warning("study planner failed; completing the Session without a Study Plan: %s", err)
             return {"study_plan": None, "study_plan_error": f"{type(err).__name__}: {err}"}
         return {"study_plan": plan.model_dump(mode="json"), "study_plan_error": None}
 
+    # Returns Any, deliberately and narrowly: `add_node`'s overloads solve their node TypeVar from a
+    # concrete `def`, and cannot solve it from a `Callable[...]` value — it resolves to `Never`, so a
+    # correctly-typed wrapper is rejected. The closure BODY below is still fully checked, and the
+    # parameter type still checks that a real node is what gets wrapped; only the handoff to langgraph
+    # is untyped. (Reproduced in isolation against langgraph's own stubs.)
+    def _versioned(node: Callable[[SessionState], dict[str, Any]]) -> Any:
+        """Gate the version on the way in, stamp it on the way out — on every node, every superstep.
+
+        Stamping only in ``initial_session_state`` was the bug: LangGraph merges only the keys a node
+        returns, so a Session started before the stamp landed ran to `complete`, was exported and had
+        its posteriors saved carrying no version at all. The check runs BEFORE the node, which puts it
+        outside ``question_node``'s broad isolation net — so a version refusal can never be recorded
+        as a zero-evidence `failed` question (ADR 0005), the same way the typed operator stops are.
+        The stamp is unconditional on purpose: a conditional one is how this bug came back.
+        """
+
+        def run(state: SessionState) -> dict[str, Any]:
+            require_supported_session_version(state)
+            return {**node(state), "schema_version": SESSION_SCHEMA_VERSION}
+
+        return run
+
     graph = StateGraph(SessionState)
-    graph.add_node("run_question", question_node)
-    graph.add_node("supervisor", supervisor_node)
-    graph.add_node("study_plan", study_plan_node)
+    graph.add_node("run_question", _versioned(question_node))
+    graph.add_node("supervisor", _versioned(supervisor_node))
+    graph.add_node("study_plan", _versioned(study_plan_node))
     graph.add_edge(START, "run_question")
     graph.add_edge("run_question", "supervisor")
     graph.add_conditional_edges(
@@ -382,6 +441,12 @@ def decide_next_move(
             err,
         )
         return fallback
+    except (AccountingUnavailable, ProviderQuotaExhausted):
+        # GH #119 and M0a / F1: the resolved question is already checkpointed, so suspending here is
+        # safe; a deterministic fallback would only walk the Session into the next dead or refused
+        # call — and would leave a decision record permanently reading "a provider transport error",
+        # which neither of these is, in the checkpoint and the Markdown export.
+        raise
     except Exception as err:  # noqa: BLE001 — the only otherwise-unguarded macro-loop LLM call site
         # A provider/transport failure (timeout, HTTP error after fallback exhaustion) is an
         # infrastructure failure, not schema-invalid output. Per ADR 0005 the Supervisor degrades to
@@ -433,7 +498,9 @@ def _apply_supervisor_decision(
     elif decision.action is SupervisorAction.EXTRA_QUESTION:
         next_skill = _last_probed_skill(state) or next_skill
     elif decision.action is SupervisorAction.SKIP_AHEAD:
-        next_index = decision.target_plan_index if decision.target_plan_index is not None else current_index + 2
+        if decision.target_plan_index is None:
+            raise ValueError("skip_ahead requires target_plan_index")
+        next_index = decision.target_plan_index
         next_skill = plan[next_index]["skill"] if next_index < len(plan) else None
         if next_skill is None:
             status = SessionStatus.COMPLETE.value
@@ -680,9 +747,6 @@ def skill_states_from_state(state: Mapping[str, Any]) -> dict[str, SkillState]:
     return skill_states_from_mapping(state)
 
 
-
-
-
 def _skill_state_summary(state: SessionState) -> str:
     lines = []
     for skill, s in sorted_skill_states(state):
@@ -697,6 +761,13 @@ def _skill_state_summary(state: SessionState) -> str:
 def _evidence_summary(state: SessionState) -> str:
     rows = []
     for i, item in enumerate(transcript_items(state), start=1):
+        if item.stop_reason == StopReason.FAILED.value:
+            # ADR 0005: a crashed question is infrastructure noise, not evidence. Its zero-evidence
+            # sentinels (session_serde.TranscriptItem.failed) are a STORAGE shape, and rendering them
+            # here told the deciding model the Candidate scored 0.00/5 on this Skill — so a provider
+            # timeout on a MUST_HAVE Skill steered the rest of the interview.
+            rows.append(f"- Q{i} skill={item.skill} NOT ASKED (infrastructure failure; no evidence)")
+            continue
         rows.append(
             f"- Q{i} skill={item.skill} score={item.resolved_weighted_score:.2f} "
             f"confidence={item.resolved_confidence:.2f} stop={item.stop_reason}"

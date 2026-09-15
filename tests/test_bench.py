@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
+from interview_coach import cli, usage
 from interview_coach.bench import (
     BenchCase,
     BenchResult,
@@ -588,3 +590,116 @@ def test_report_marks_unstable_bias_rows_and_renders_tripwires():
 
     assert f"⚠ n<{BIAS_MIN_SAMPLES} — unstable estimate" in report  # english_delivery n=1
     assert "BIAS TRIPWIRE" in report  # correctness drift over n=9
+
+
+# --- typed operator stops (QA-14) ----------------------------------------------------------------
+
+
+def _cli_settings() -> SimpleNamespace:
+    return SimpleNamespace(
+        configured=True,
+        primary_provider="groq",
+        primary_config=SimpleNamespace(model="test-model"),
+    )
+
+
+def test_a_dead_quota_stops_the_bench_instead_of_filling_the_report_with_error_rows(make_client):
+    # QA-14 / ADR 0009: the report the bench writes into docs/audits/ IS the judge gate's artifact.
+    # Swallowed here, a quota death turned every case into an error row and a "0/N within band"
+    # report — an infrastructure failure legible as a judge regression. It must stop the run.
+    from interview_coach.usage import ProviderQuotaExhausted
+
+    client, _ = make_client([ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")])
+
+    with pytest.raises(ProviderQuotaExhausted):
+        run_bench(client, (_case("a"), _case("b")), k=3)
+
+
+def test_broken_accounting_stops_the_bench_rather_than_measuring_the_judge_on_refused_calls(make_client):
+    # M0a / F1: a refused call says nothing about the judge, so it must not become a bench result.
+    from interview_coach.usage import AccountingUnavailable
+
+    client, _ = make_client([AccountingUnavailable("Usage accounting is UNRECONCILED: 1 provider call(s) were billed")])
+
+    with pytest.raises(AccountingUnavailable):
+        run_bench(client, (_case("a"),))
+
+
+def test_cli_bench_writes_no_report_when_the_quota_dies_mid_run(monkeypatch, make_client, tmp_path, capsys):
+    # The whole point of the re-raise: `_dispatch` owns the exit, and docs/audits/ gains nothing.
+    from interview_coach import cli
+    from interview_coach.usage import ProviderQuotaExhausted
+
+    client, _ = make_client([ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")])
+    monkeypatch.setattr(cli, "load_settings", _cli_settings)
+    monkeypatch.setattr(cli, "build_client", lambda settings: client)
+    out = tmp_path / "calibration-bench.md"
+
+    rc = cli.main(["bench", "--out", str(out)])
+
+    assert not out.exists(), out.read_text(encoding="utf-8")[:200]
+    assert rc == 2
+    assert "insufficient_quota" in capsys.readouterr().err
+
+
+# --- NEW-10: the bench is a batch job with a budget rail, not a warning -------------------------
+
+
+@pytest.fixture
+def spent_day(tmp_path, monkeypatch, make_client):
+    client, _ = make_client([])
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(tmp_path / "usage-ledger.jsonl"))
+    for name in ("LLM_SESSION_TOKEN_BUDGET", "COACH_DAILY_QUESTION_CAP"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "1000")
+    usage.record_usage("groq", "test-model", prompt_tokens=900, completion_tokens=50)
+    monkeypatch.setattr(cli, "load_settings", _cli_settings)
+    monkeypatch.setattr(cli, "build_client", lambda settings: client)
+    return client
+
+
+def test_bench_refuses_a_sweep_the_day_cannot_fund(spent_day, tmp_path, monkeypatch, capsys):
+    # THE finding: `coach bench --k 3` is ~210,000 tokens — about 8 default Sessions of the shared
+    # daily allowance — and it used to WARN and then spend it under a live interview (ADR 0005).
+    def _never(*args, **kwargs):
+        raise AssertionError("the bench must refuse BEFORE the first sweep")
+
+    monkeypatch.setattr(cli, "run_bench", _never)
+    out = tmp_path / "report.md"
+
+    rc = cli.main(["bench", "--k", "3", "--out", str(out)])
+
+    err = capsys.readouterr().err
+    assert rc == 2  # neither the gate's green (0) nor its red (1)
+    assert not out.exists()  # ...and no ADR 0009 artifact that could be read as a judge verdict
+    assert f"~{cli.BENCH_MIN_BUDGET_TOKENS_PER_PASS * 3:,}" in err
+    assert "--ignore-budget" in err  # the refusal names its own override
+
+
+def test_ignore_budget_lets_an_operator_re_bench_the_judge(spent_day, tmp_path, monkeypatch, capsys):
+    # ADR 0009 needs the bench re-runnable: the daily budget is OUR count, not the provider's, so a
+    # rail with no deliberate override would make a judge change impossible to measure.
+    sweeps: list[int] = []
+    monkeypatch.setattr(cli, "run_bench", lambda judge, cases, *, k=1: sweeps.append(k) or [])
+    out = tmp_path / "report.md"
+
+    rc = cli.main(["bench", "--k", "1", "--ignore-budget", "--out", str(out)])
+
+    assert sweeps == [1]  # it RAN
+    assert rc == 1  # bench_passed([]) is False — unchanged, the gate still decides the verdict
+    assert out.exists()
+    assert "WARNING (--ignore-budget)" in capsys.readouterr().err  # loud, never silent
+
+
+def test_ignore_budget_cannot_override_a_broken_ledger(tmp_path, monkeypatch, make_client, capsys):
+    # --ignore-budget buys tokens the operator believes they have; it cannot buy a working counter.
+    client, _ = make_client([])
+    ledger = tmp_path / "usage-ledger.jsonl"
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
+    ledger.mkdir()  # appends now fail
+    usage.reset_accounting_state()
+    monkeypatch.setattr(cli, "load_settings", _cli_settings)
+    monkeypatch.setattr(cli, "build_client", lambda settings: client)
+    monkeypatch.setattr(cli, "run_bench", lambda *a, **kw: pytest.fail("must not spend"))
+
+    assert cli.main(["bench", "--k", "1", "--ignore-budget", "--out", str(tmp_path / "r.md")]) == 2

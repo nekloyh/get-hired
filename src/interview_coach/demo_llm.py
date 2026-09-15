@@ -30,7 +30,6 @@ class DemoLLMClient(LLMClient):
         messages: Sequence[Message],
         *,
         response_format: ResponseFormat | None = None,
-        disable_thinking: bool = False,
     ) -> str:
         return json.dumps({"demo": True})
 
@@ -41,7 +40,6 @@ class DemoLLMClient(LLMClient):
         *,
         validators: Sequence[Validator] = (),
         max_retries: int = 1,
-        disable_thinking: bool = False,
         json_schema: Mapping[str, Any] | None = None,  # accepted for interface parity; demo ignores it
     ) -> T:
         payload = self._payload_for(response_model, messages)

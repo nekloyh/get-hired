@@ -4,6 +4,9 @@ A multi-agent system that runs an adaptive mock technical interview. Built prima
 agentic patterns** — see `CLAUDE.md` for the authoritative design and `CONTEXT.md` for the domain
 glossary.
 
+Development sequencing and acceptance gates live in **[the implementation plan](docs/issues/README.md)**.
+It links the existing slices and separates personal/trusted-pilot milestones from public-launch requirements.
+
 ## Quickstart (live) — clone to a real interview in ~10 minutes
 
 You need [uv](https://docs.astral.sh/uv/), Node 18+, and **one OpenAI API key**. Nothing else: no
@@ -142,7 +145,7 @@ ranges regress.
 Earlier slices: **0006–0009** added Self-critique, RAG Follow-ups, and Diagnostic priors.
 Low-confidence Evaluator judgments get exactly one Self-critique pass. The Interviewer is the only
 tool-using agent: Follow-up generation first calls `lookup_concept`, then asks a grounded question
-using the retrieved note, with MiMo thinking disabled for that tool loop. The concept store can run
+using the retrieved note. The concept store can run
 in-memory for tests/demos or against a Chroma `concepts` collection using `BAAI/bge-small-en-v1.5`.
 The Diagnostic reads the Candidate profile and produces a Topic Plan plus weak Beta priors with
 prior-only correlations and Role criticality metadata. The single-shot LLM agent is the primary
@@ -151,7 +154,7 @@ Topic Plan path whenever a provider is configured; a deterministic ordering is t
 
 Earlier slices: **0004–0005** added the provider router + within-question micro-loop. LLM calls go
 through an
-`LLMRouter`: `PRIMARY_PROVIDER=mimo|groq` selects the primary OpenAI-compatible provider and falls
+`LLMRouter`: `PRIMARY_PROVIDER=openai|groq|zenmux` selects the primary OpenAI-compatible provider and falls
 back to the other configured provider on primary call failure. The judgment path is also a loop that
 owns one question end-to-end (ADR 0001): the **Interviewer** asks → the fixture **Candidate** answers
 → the **Evaluator** scores the turn and flags `follow_up_recommended` → if a **Follow-up** is flagged
@@ -175,8 +178,8 @@ cp .env.example .env    # then set PRIMARY_PROVIDER=openai and OPENAI_API_KEY (s
 cd web && npm install   # install the React UI toolchain
 ```
 
-`.env` keys: set `PRIMARY_PROVIDER` to `openai`, `groq`, or `mimo`, then fill that provider's
-`*_API_KEY` and `*_MODEL` (plus `*_BASE_URL` for mimo). Any other configured provider is used as
+`.env` keys: set `PRIMARY_PROVIDER` to `openai`, `groq`, or `zenmux`, then fill that provider's
+`*_API_KEY` and `*_MODEL` (plus `*_BASE_URL` for zenmux). Any other configured provider is used as
 fallback. **The validated judge is `openai` / `gpt-5.4-mini`** — the configuration that passes
 `coach bench` 20/20 (issue 0031) and runs inside OpenAI's free daily tier; `gpt-4o-mini` and Groq
 `llama-3.3-70b` each leave one borderline Vietnamese case out of band (a small-model capability limit).
@@ -184,10 +187,7 @@ fallback. **The validated judge is `openai` / `gpt-5.4-mini`** — the configura
 ## Run
 
 ```bash
-uv run python -m interview_coach                          # run the micro-loop over the seed questions
-uv run python -m interview_coach interview --max-turns 6  # raise the per-question safety cap
-uv run python -m interview_coach interview --concept-store chroma --concept-persist-dir .chroma
-uv run python -m interview_coach evaluate --answer weak   # slices 0001–0002: evaluate one fixture answer
+uv run python -m interview_coach                          # prints the subcommand help and exits 2
 uv run python -m interview_coach diagnose --target-role "machine learning engineer" --claim mlops=4             # LLM agent when configured, else deterministic
 uv run python -m interview_coach diagnose --offline --target-role "machine learning engineer" --claim mlops=4   # force the deterministic offline path
 uv run python -m interview_coach session --max-questions 3 --export-markdown exports/session.md                 # interactive Candidate answers
@@ -198,7 +198,6 @@ uv run python -m interview_coach session --pack data/packs/fpt --scripted --max-
 uv run python -m interview_coach eval-harness        # issue 0012: golden-answer Evaluator harness
 uv run python -m interview_coach ingest-concepts --persist-dir .chroma
 uv run python -m interview_coach ingest-resources --persist-dir .chroma
-uv run python scripts/smoke_issue_0007.py
 uv run python scripts/smoke_issue_0009.py   # live: validate the Diagnostic agent against the real provider
 ```
 
@@ -281,9 +280,9 @@ cd web && npm run test:e2e  # optional: requires the backend API running and Pla
 
 ## Layout
 
-- `src/interview_coach/llm.py` — `LLMClient`, `MimoClient`, `GroqClient`, and `LLMRouter`: structured
-  output + one self-correcting retry, primary-provider selection, fallback, and MiMo's
-  `reasoning_content` handling quarantined inside `MimoClient` (ADR 0003).
+- `src/interview_coach/llm.py` — `LLMClient`, `OpenAIClient`, `GroqClient`, `ZenMuxClient`, and
+  `LLMRouter`: structured output + one self-correcting retry, primary-provider selection, and typed
+  failover with a per-provider circuit breaker.
 - `src/interview_coach/evaluator.py` — the `Evaluation` schema + `evaluate()`, plus the slice-0003
   `weighted_score` cross-check and slice-0006 Self-critique. The Evaluator is the *only* component
   that judges (ADR 0001).
@@ -314,8 +313,7 @@ cd web && npm run test:e2e  # optional: requires the backend API running and Pla
 - `src/interview_coach/fixtures.py` — the slice-0001 hard-coded question + strong/weak fixture answers.
 - `src/interview_coach/skill.py` — the Beta-distributed `SkillState` (`mastery`/`confidence` from
   α/β) and its pure-Python updater `apply_evaluation()`. No LLM by design (ADR 0002).
-- `src/interview_coach/cli.py` — `interview` runs the micro-loop over the seed questions; `evaluate`
-  runs the slices 0001–0002 demo (judgment → before→after Skill state); `session` is the live
-  terminal UI; `api` runs the web backend; `eval-harness` runs the Evaluator regression checks.
+- `src/interview_coach/cli.py` — `session` is the live terminal UI; `api` runs the web backend;
+  `eval-harness` runs the Evaluator regression checks.
 - `web/` — Vite React + TypeScript local UI with typed WebSocket events, setup controls, interview
   workspace, live Skill/Topic Plan sidebars, final report, unit tests, and a Playwright demo-flow spec.

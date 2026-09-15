@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from interview_coach import cli
+from interview_coach import cli, usage
 from interview_coach.bank import validate_question
 from interview_coach.concepts import ConceptNote
 from interview_coach.config import load_settings
@@ -254,9 +254,7 @@ def test_novelty_threshold_boundary():
 
 def test_novelty_gate_accepts_a_custom_similarity_fn():
     # The embedding seam: any callable scoring [0, 1] can replace the Jaccard default.
-    rejection, nearest, similarity = novelty_gate(
-        "anything", ["unrelated"], similarity_fn=lambda a, b: 0.99
-    )
+    rejection, nearest, similarity = novelty_gate("anything", ["unrelated"], similarity_fn=lambda a, b: 0.99)
     assert rejection is not None and rejection.gate == GATE_NOVELTY
     assert similarity == pytest.approx(0.99)
 
@@ -311,7 +309,7 @@ def test_admission_gate_turns_answer_generation_failure_into_rejection(make_clie
 
 def test_zero_drafts_surviving_to_gate_3_is_not_reported_as_success(make_client):
     # Both drafts die at gate 1 → gate 3 must spend nothing and the report must say so explicitly
-    # (harness_passed([]) is vacuously True; the report guard is the defense).
+    # (admission_gate never calls harness_passed, so the report guard is the defense).
     client, fake = make_client(
         [
             _draft_set_json(
@@ -323,7 +321,7 @@ def test_zero_drafts_surviving_to_gate_3_is_not_reported_as_success(make_client)
     run = run_forge(client, SKILL, 2, concepts=[_NOTE], existing_prompts=[])
     assert fake.call_count == 1  # the Writer call only — the expensive gate never ran
     assert all(o.rejection is not None for o in run.outcomes)
-    report = render_forge_report(run, provider="mimo", model="test-model", date="2026-07-11")
+    report = render_forge_report(run, provider="groq", model="test-model", date="2026-07-11")
     assert "no draft reached the admission gate; nothing was admitted" in report
     assert "admitted: 0/2" in report
 
@@ -348,7 +346,7 @@ def test_full_pipeline_orders_gates_cheap_to_expensive(make_client):
     gates = [o.rejection.gate if o.rejection else None for o in run.outcomes]
     assert gates == [GATE_CONTRACT, GATE_NOVELTY, None]
     assert run.outcomes[1].nearest_similarity == pytest.approx(1.0)
-    report = render_forge_report(run, provider="mimo", model="test-model", date="2026-07-11")
+    report = render_forge_report(run, provider="groq", model="test-model", date="2026-07-11")
     assert "- drafted: 3" in report
     assert "- gate 1 (contract): 3 -> 2" in report
     assert "- gate 2 (novelty): 2 -> 1" in report
@@ -393,7 +391,7 @@ def test_review_queue_round_trips_through_the_bank_validator(make_client, tmp_pa
     )
     run = run_forge(client, SKILL, 1, concepts=[_NOTE], existing_prompts=[])
     queue, report = write_forge_outputs(
-        run, queue_path=tmp_path / "review-queue-test.yaml", provider="mimo", model="test-model", date="2026-07-11"
+        run, queue_path=tmp_path / "review-queue-test.yaml", provider="groq", model="test-model", date="2026-07-11"
     )
     assert report.name == "review-queue-test-report.md"
     text = queue.read_text(encoding="utf-8")
@@ -402,9 +400,7 @@ def test_review_queue_round_trips_through_the_bank_validator(make_client, tmp_pa
     assert set(data) == {SKILL}
     seen: set[str] = set()
     for i, raw in enumerate(data[SKILL]):
-        parsed = validate_question(
-            raw, skill=SKILL, concept_ids={_NOTE.id}, seen_questions=seen, where=f"queue[{i}]"
-        )
+        parsed = validate_question(raw, skill=SKILL, concept_ids={_NOTE.id}, seen_questions=seen, where=f"queue[{i}]")
         assert isinstance(parsed, SeedQuestion)
         # answers[0] is the admitted strong answer per the bank contract (answers[0] answers the seed)
         assert parsed.answers[0].startswith("Weight decay penalizes")
@@ -421,9 +417,7 @@ def test_forge_never_touches_the_shipped_bank_files(make_client, tmp_path):
         [_draft_set_json(_draft_dict()), _answer_pair_json(), _eval_json(4.2, 4), _eval_json(2.0, 2)]
     )
     run = run_forge(client, SKILL, 1, concepts=[_NOTE], existing_prompts=[])
-    write_forge_outputs(
-        run, queue_path=tmp_path / "q.yaml", provider="mimo", model="test-model", date="2026-07-11"
-    )
+    write_forge_outputs(run, queue_path=tmp_path / "q.yaml", provider="groq", model="test-model", date="2026-07-11")
     assert (bank_path.read_bytes(), concepts_path.read_bytes()) == before
 
 
@@ -440,7 +434,7 @@ def test_run_forge_rejects_out_of_budget_n(make_client):
 def _cli_settings() -> SimpleNamespace:
     return SimpleNamespace(
         configured=True,
-        primary_provider="mimo",
+        primary_provider="groq",
         primary_config=SimpleNamespace(model="test-model"),
     )
 
@@ -529,3 +523,79 @@ def test_live_forge_pipeline_completes_and_writes_a_queue(tmp_path):
     # every draft got a definite outcome: admitted or a gate-attributed rejection (never a crash)
     for outcome in run.outcomes:
         assert outcome.admitted or outcome.rejection.gate in {GATE_CONTRACT, GATE_NOVELTY, GATE_ADMISSION}
+
+
+# --- typed operator stops (QA-14) ----------------------------------------------------------------
+
+
+def test_a_dead_quota_in_answer_generation_stops_the_forge_instead_of_rejecting_the_draft(make_client):
+    # QA-14 / GH #119: recorded as an `admission` rejection, a dead quota writes a review-queue
+    # report saying the JUDGE turned the draft down — a claim about content quality nothing measured.
+    from interview_coach.usage import ProviderQuotaExhausted
+
+    client, _ = make_client([ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")])
+
+    with pytest.raises(ProviderQuotaExhausted):
+        admission_gate(client, _validated())
+
+
+def test_a_dead_quota_on_the_judging_call_stops_the_forge_too(make_client):
+    # The second net: the pair was generated, then the quota died inside run_golden_answer_harness.
+    from interview_coach.usage import ProviderQuotaExhausted
+
+    dead = ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")
+    client, _ = make_client([_answer_pair_json(), dead])
+
+    with pytest.raises(ProviderQuotaExhausted):
+        admission_gate(client, _validated())
+
+
+def test_broken_accounting_stops_the_forge_rather_than_rejecting_the_draft(make_client):
+    # M0a / F1: no call was made, so no gate verdict was earned.
+    from interview_coach.usage import AccountingUnavailable
+
+    client, _ = make_client([AccountingUnavailable("Usage accounting is UNRECONCILED: 1 provider call(s) were billed")])
+
+    with pytest.raises(AccountingUnavailable):
+        admission_gate(client, _validated())
+
+
+def test_cli_forge_writes_no_queue_or_report_when_the_quota_dies_mid_run(monkeypatch, make_client, tmp_path, capsys):
+    # `_dispatch` owns the exit; a half-judged batch must not leave a review queue behind.
+    from interview_coach.usage import ProviderQuotaExhausted
+
+    client, _ = make_client(
+        [
+            _draft_set_json(_draft_dict(concepts=["ml_fundamentals_bias_variance"])),
+            ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)"),
+        ]
+    )
+    monkeypatch.setattr(cli, "load_settings", _cli_settings)
+    monkeypatch.setattr(cli, "build_client", lambda settings: client)
+    out = tmp_path / "review-queue.yaml"
+
+    rc = cli.main(["forge", "--skill", SKILL, "--n", "1", "--out", str(out)])
+
+    assert not out.exists()
+    assert not (tmp_path / "review-queue-report.md").exists()
+    assert rc == 2
+    assert "insufficient_quota" in capsys.readouterr().err
+
+
+def test_cli_forge_refuses_a_batch_the_day_cannot_fund(monkeypatch, make_client, tmp_path, capsys):
+    # NEW-10: a forge batch is a batch job on the same shared allowance a live interview spends.
+    client, fake = make_client([])
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(tmp_path / "usage-ledger.jsonl"))
+    monkeypatch.delenv("COACH_DAILY_QUESTION_CAP", raising=False)
+    monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "1000")
+    usage.record_usage("groq", "test-model", prompt_tokens=900, completion_tokens=50)
+    monkeypatch.setattr(cli, "load_settings", _cli_settings)
+    monkeypatch.setattr(cli, "build_client", lambda settings: client)
+    out = tmp_path / "queue.yaml"
+
+    rc = cli.main(["forge", "--skill", SKILL, "--n", "5", "--out", str(out)])
+
+    assert rc == 2
+    assert fake.call_count == 0  # refused before the Writer call, not mid-queue
+    assert not out.exists()  # no half-written review file
+    assert "Refusing to run `coach forge`" in capsys.readouterr().err

@@ -2,7 +2,7 @@ import { CalendarDays, Download, ExternalLink, FileText, Trophy } from 'lucide-r
 import { useState } from 'react'
 import { fetchExportMarkdown } from '../lib/api'
 import { pct } from '../lib/skillMetrics'
-import type { SessionState } from '../lib/types'
+import type { PanelTrace, SessionState } from '../lib/types'
 
 export function ReportView({ state }: { state: SessionState | null }) {
   const [exportError, setExportError] = useState<string | null>(null)
@@ -115,8 +115,19 @@ export function ReportView({ state }: { state: SessionState | null }) {
         {state.transcript.map((item, index) => (
           <details key={`${item.skill}-${index}`}>
             <summary>
-              Q{index + 1} {item.skill} · {item.resolved_weighted_score.toFixed(2)}/5 · {item.stop_reason}
+              Q{index + 1} {item.skill} ·{' '}
+              {item.stop_reason === 'failed' ? 'not scored' : `${item.resolved_weighted_score.toFixed(2)}/5`} ·{' '}
+              {item.stop_reason}
             </summary>
+            {/* ADR 0005: a crashed question is infrastructure noise, never evidence. The stored
+                sentinel is 0.0, and printing it as `0.00/5` reads as "the Candidate scored zero"
+                for a question that never produced an answer. Show the recorded error instead. */}
+            {item.stop_reason === 'failed' ? (
+              <div className="turn-detail">
+                <strong>Question failed — no evidence recorded</strong>
+                <p>{item.error ?? 'unknown error'}</p>
+              </div>
+            ) : null}
             {item.turns.map((turn, turnIndex) => (
               <div className="turn-detail" key={`${turn.question}-${turnIndex}`}>
                 <strong>{turn.is_follow_up ? 'Follow-up' : 'Question'}</strong>
@@ -130,6 +141,12 @@ export function ReportView({ state }: { state: SessionState | null }) {
                     </span>
                   ))}
                 </div>
+                {turn.evaluation.evidence_degraded ? (
+                  <span className="evidence-badge">citations unverifiable — confidence capped</span>
+                ) : null}
+                {turn.evaluation.panel ? (
+                  <CommitteeVerdict panel={turn.evaluation.panel} verdict={turn.evaluation.weighted_score} />
+                ) : null}
                 {turn.evaluation.delivery_fixes?.length ? (
                   <div className="delivery-fixes">
                     <strong>English delivery fixes</strong>
@@ -147,5 +164,22 @@ export function ReportView({ state }: { state: SessionState | null }) {
         ))}
       </div>
     </section>
+  )
+}
+
+/** The Panel Verdict the export already prints (issue 0027): who advised what, and how split they were. */
+function CommitteeVerdict({ panel, verdict }: { panel: PanelTrace; verdict: number }) {
+  return (
+    <div className="panel-verdict" aria-label="Committee verdict">
+      <strong>Committee verdict</strong>
+      <span>Escalated on {panel.triggers.join(', ')}</span>
+      <span>
+        First pass {panel.initial_score.toFixed(2)}/5 → verdict {verdict.toFixed(2)}/5 · disagreement{' '}
+        {panel.disagreement.toFixed(2)} points
+      </span>
+      <span>
+        Skeptic {panel.skeptic.recommended_score}/5 · Advocate {panel.advocate.recommended_score}/5
+      </span>
+    </div>
   )
 }

@@ -63,7 +63,6 @@ class _PersonaTextClient(LLMClient):
         messages: Sequence[Message],
         *,
         response_format: ResponseFormat | None = None,
-        disable_thinking: bool = False,
     ) -> str:
         text = " ".join(m["content"] for m in messages)
         match = re.search(r"ability on this topic \(\w+\) is (\w+)", text)
@@ -81,12 +80,6 @@ def _persona_final_state() -> dict:
         max_questions=3,
         now=lambda: 1.0,
     )
-
-
-def _skill_state(raw) -> SkillState:
-    # Spelled out rather than via SkillState.from_dict so this script runs identically on the
-    # pre-refactor tree (where that classmethod does not exist yet) and after it.
-    return SkillState(skill=str(raw["skill"]), alpha=float(raw["alpha"]), beta=float(raw["beta"]))
 
 
 def _capture(fn, *args) -> str:
@@ -117,9 +110,16 @@ def dump(outdir: Path) -> list[Path]:
     planner_lines = [_transcript_evidence(drifted), ""]
     for skill, raw in sorted(drifted.get("skill_states", {}).items()):
         planner_lines.append(f"--- {skill} gap_query ---")
-        planner_lines.append(_gap_query(drifted, skill, SkillState.from_dict(raw) if hasattr(SkillState, "from_dict")
-                                        else SkillState(skill=str(raw["skill"]), alpha=float(raw["alpha"]),
-                                                        beta=float(raw["beta"])), "must_have"))
+        planner_lines.append(
+            _gap_query(
+                drifted,
+                skill,
+                SkillState.from_dict(raw)
+                if hasattr(SkillState, "from_dict")
+                else SkillState(skill=str(raw["skill"]), alpha=float(raw["alpha"]), beta=float(raw["beta"])),
+                "must_have",
+            )
+        )
     written.append(_write(outdir / "study-plan-prompts.txt", "\n".join(planner_lines)))
     return written
 

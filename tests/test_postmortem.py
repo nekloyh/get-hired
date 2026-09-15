@@ -34,6 +34,7 @@ from interview_coach.postmortem import (
     run_postmortem,
 )
 from interview_coach.skill import (
+    NEUTRAL_ALPHA,
     POSTMORTEM_WEIGHT_RATIO,
     SkillState,
     apply_evaluation,
@@ -90,7 +91,7 @@ def _transcript() -> tuple[RecollectionTurn, ...]:
 
 
 def _settings() -> SimpleNamespace:
-    return SimpleNamespace(configured=True, primary_provider="mimo")
+    return SimpleNamespace(configured=True, primary_provider="groq")
 
 
 # --- end-to-end: recollection -> typed evidence -> ledger fusion (THE acceptance criterion) ------
@@ -378,3 +379,50 @@ def test_cli_postmortem_end_to_end_with_markdown_export(tmp_path, monkeypatch, m
     # The ledger genuinely moved: score 2.0 at conf 0.4 adds ~0.41 to beta at the reduced weight.
     reloaded = load_states(path, "alice", now=time.time())
     assert reloaded["mlops"].beta > 2.3
+
+
+def test_an_accounting_fault_in_the_replan_stops_the_command_and_keeps_the_fusion(
+    tmp_path, make_client, monkeypatch
+):
+    # QA-05 / M0-6, third net. The re-plan's `except Exception` re-raised CandidateIntent but not the
+    # two typed operator stops, so a refused call was filed as `study_plan_error` and `coach
+    # postmortem` exited 0 — an operator stop rendered as a degraded planner. It must reach
+    # `cli._dispatch`, which exits 2 with the remedy. The ledger fusion happens BEFORE this call, so
+    # re-raising loses nothing durable: the fused posteriors are on disk either way.
+    from interview_coach import postmortem
+    from interview_coach.usage import AccountingUnavailable
+
+    path = tmp_path / "ledger.json"
+    save_posteriors(path, "alice", {"mlops": SkillState("mlops", alpha=8.0, beta=2.0)}, now=NOW)
+
+    def _refusing_plan(*args, **kwargs):
+        raise AccountingUnavailable("Usage accounting is UNRECONCILED: 1 provider call(s) were billed")
+
+    monkeypatch.setattr(postmortem, "plan_study", _refusing_plan)
+    score, conf = 2.0, 0.4
+    client, _ = make_client([*_elicitation_replies(), _scorecard(_entry(score=score, confidence=conf))])
+
+    with pytest.raises(AccountingUnavailable):
+        run_postmortem(client, ScriptedCandidate(_answers()), candidate_id="alice", ledger_db=path, now=NOW)
+
+    # The fusion that already landed is durable — the stop is about the end-matter call, not the ledger.
+    weight = POSTMORTEM_WEIGHT_RATIO * confidence_weight(conf)
+    reloaded = load_states(path, "alice", now=NOW)
+    assert reloaded["mlops"].alpha == pytest.approx(8.0 + weight * score_to_quality(score))
+
+
+def test_the_postmortem_persists_evidence_for_a_skill_with_no_transcript_item_at_all(tmp_path, make_client):
+    # The guard for NEW-17's blast radius. A post-mortem has NO transcript — `_synthesized_session_state`
+    # carries an empty one — so routing it through the Session's transcript-shaped predicate would make
+    # it persist nothing at all, silently. Its evidence is the reconstructed scorecard, which is real
+    # (second-hand, at half weight) for Skills that were never probed in any Session.
+    path = tmp_path / "ledger.json"
+    score, conf = 2.0, 0.4
+    client, _ = make_client([*_elicitation_replies(), _scorecard(_entry(score=score, confidence=conf))])
+
+    run_postmortem(client, ScriptedCandidate(_answers()), candidate_id="alice", ledger_db=path, now=NOW)
+
+    states = load_states(path, "alice", now=NOW)
+    assert states is not None and "mlops" in states
+    weight = POSTMORTEM_WEIGHT_RATIO * confidence_weight(conf)
+    assert states["mlops"].alpha == pytest.approx(NEUTRAL_ALPHA + weight * score_to_quality(score))

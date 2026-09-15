@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 
@@ -9,6 +10,9 @@ from .evaluator import Evaluation, evaluate
 from .fixtures import QUESTION, STRONG_ANSWER, WEAK_ANSWER
 from .llm import LLMClient
 from .rubric import Rubric
+from .usage import AccountingUnavailable, ProviderQuotaExhausted
+
+logger = logging.getLogger(__name__)
 
 EXCELLENT_ANSWER = (
     "Bias is the systematic error introduced by assumptions that are too simple for the true data "
@@ -113,7 +117,13 @@ def run_golden_answer_harness(
     for case in cases:
         try:
             evaluation = evaluate(client, case.question, case.answer, case.rubric)
+        except (AccountingUnavailable, ProviderQuotaExhausted):
+            # QA-14: "we ran out of quota" is not a range regression. Recorded as a case error it
+            # reds the gate — and, through forge's admission gate, rejects a draft — on evidence
+            # nobody gathered.
+            raise
         except Exception as err:  # noqa: BLE001 - harness should report provider/schema failures as failed cases
+            logger.warning("harness case %s errored (%s: %s)", case.case_id, type(err).__name__, err)
             results.append(GoldenAnswerResult(case=case, error=f"{type(err).__name__}: {err}"))
         else:
             results.append(GoldenAnswerResult(case=case, evaluation=evaluation))
@@ -121,7 +131,8 @@ def run_golden_answer_harness(
 
 
 def harness_passed(results: Sequence[GoldenAnswerResult]) -> bool:
-    return all(result.passed for result in results)
+    """At least one case ran and every case landed in band — ``all([])`` must never read as green."""
+    return bool(results) and all(result.passed for result in results)
 
 
 def render_golden_answer_report(results: Sequence[GoldenAnswerResult]) -> str:
@@ -133,9 +144,7 @@ def render_golden_answer_report(results: Sequence[GoldenAnswerResult]) -> str:
         score = "ERR" if result.score is None else f"{result.score:.2f}"
         confidence = "ERR" if result.confidence is None else f"{result.confidence:.2f}"
         status = "PASS" if result.passed else "FAIL"
-        lines.append(
-            f"{result.case.case_id:<18} {result.case.expected_range:<10} {score:>5} {confidence:>5}  {status}"
-        )
+        lines.append(f"{result.case.case_id:<18} {result.case.expected_range:<10} {score:>5} {confidence:>5}  {status}")
         if result.error:
             lines.append(f"  error: {result.error}")
     failed = sum(1 for result in results if not result.passed)

@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import unicodedata
 
+import httpx
+import openai as openai_sdk
 import pytest
 
-from interview_coach import telemetry
+from interview_coach import llm as llm_module
+from interview_coach import telemetry, usage
 from interview_coach.config import load_settings
 from interview_coach.evaluator import (
     DIVERGENCE_CONFIDENCE_CEILING,
@@ -852,6 +856,70 @@ def test_flatten_fold_counts_as_noise_and_caps(make_client):
     assert "sanitizer.judgment_flattened_in_dimensions" in ev.trust.noise_events
 
 
+# --- counters are per-Session, not per-process (QA-03) -------------------------------------------
+
+_GATE_SECONDS = 10.0
+
+
+def _hold_open(fake, entered: threading.Event, release: threading.Event):
+    """Hold this fake's provider call open so another Session's judge call can interleave inside it."""
+    inner = fake.chat.completions.create
+
+    def create(**kwargs):
+        entered.set()
+        assert release.wait(_GATE_SECONDS), "the interleaved Session never finished"
+        return inner(**kwargs)
+
+    fake.chat.completions.create = create
+    return fake
+
+
+def test_another_sessions_fold_must_not_haircut_this_sessions_confidence(make_client):
+    # ADR 0005: one Candidate's provider hiccup must never become evidence about another Candidate.
+    # The web API runs one thread per Session, so two judge calls are genuinely in flight at once.
+    # Session B's reply needs one sanitizer fold; Session A's is spotless — and A's confidence (which
+    # sets its Beta evidence weight) must not feel B's fold. The gate sits INSIDE
+    # `chat.completions.create`, i.e. inside Session A's own chat_json window, which is exactly where
+    # the process-wide Counter was read as "did THIS judgment fold anything".
+    from interview_coach.evaluator import NOISE_CONFIDENCE_CEILING
+
+    clean = _eval_json(_good_dimensions(), confidence=0.95)
+    flattened = json.loads(clean)
+    flattened["dimensions"]["weighted_score"] = flattened.pop("weighted_score")
+
+    entered, release = threading.Event(), threading.Event()
+    client_a, fake_a = make_client([clean])
+    _hold_open(fake_a, entered, release)
+    client_b, _ = make_client([json.dumps(flattened)])
+    kept: dict[str, Evaluation] = {}
+
+    def run_a() -> None:
+        with usage.session_scope("sess-a"):
+            kept["a"] = evaluate(client_a, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+
+    def run_b() -> None:
+        assert entered.wait(_GATE_SECONDS), "Session A never reached its judge call"
+        try:
+            with usage.session_scope("sess-b"):
+                kept["b"] = evaluate(client_b, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+        finally:
+            release.set()
+
+    threads = [threading.Thread(target=run_a), threading.Thread(target=run_b)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(2 * _GATE_SECONDS)
+        assert not thread.is_alive()
+
+    # B keeps its own haircut: the signal must survive the isolation, not be thrown away with it.
+    assert kept["b"].trust.noise_events == ("sanitizer.judgment_flattened_in_dimensions",)
+    assert kept["b"].confidence == pytest.approx(NOISE_CONFIDENCE_CEILING)
+    # A never folded anything, so A's judgment is clean and full-confidence.
+    assert kept["a"].trust.noise_events == ()
+    assert kept["a"].confidence == pytest.approx(0.95)
+
+
 def test_panel_budget_exhausted_keeps_guarded_first_pass(make_client):
     from interview_coach.evaluator import PanelBudget
 
@@ -871,6 +939,27 @@ def test_panel_budget_exhausted_keeps_guarded_first_pass(make_client):
     # The rationing is recorded on the judgment itself — a suppressed escalation must never read
     # as a confident pass in transcripts and reports.
     assert ev.trust is not None and ev.trust.panel_suppressed is True
+
+
+def test_a_dead_panel_voice_keeps_the_guarded_first_pass(monkeypatch, make_client):
+    # QA-06 / ADR 0005: the panel is ADVISORY over an ALREADY-VALID first pass. A Skeptic that dies
+    # on transport must not destroy that judgment — question_node's net would record a zero-evidence
+    # `failed` question for an answer the Candidate actually gave, the question would be spent, and
+    # the Supervisor would later be shown that item as `score=0.00`.
+    monkeypatch.setattr(llm_module, "_sleep", lambda _wait: None)
+    outage = openai_sdk.APIConnectionError(request=httpx.Request("POST", "http://test/v1/chat/completions"))
+    # The fake repeats its LAST scripted reply, so every transport attempt of the Skeptic call dies.
+    client, fake = make_client([_eval_json(_good_dimensions(), weighted=4.0, confidence=0.3), outage])
+
+    ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+
+    assert ev.weighted_score == pytest.approx(4.0)  # the valid first pass survives
+    assert ev.confidence == pytest.approx(0.3)
+    assert ev.panel is None  # no verdict was ever reached
+    assert ev.trust is not None and ev.trust.panel_suppressed is True
+    assert telemetry.snapshot()["evaluator.panel_unavailable"] == 1
+    # first pass + the Skeptic's bounded transport attempts; the Advocate and verdict are never paid.
+    assert fake.call_count == 1 + llm_module._TRANSPORT_ATTEMPTS
 
 
 def test_panel_budget_allows_one_escalation_then_stops(make_client):

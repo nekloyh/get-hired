@@ -15,6 +15,11 @@ services:
       COACH_LEDGER_DB: /app/state/skill-ledger.json
       COACH_EXPORTS_DIR: /app/state/exports
       COACH_STATIC_DIR: /app/web/dist
+      # The token ledger, and the same override for the same reason as COACH_LOG_FILE below: .env's
+      # copy of this key is a host path for a local checkout. Unlike the log, losing this one is not
+      # cosmetic — it is the free-tier budget balance, and an unwritable path now REFUSES metered
+      # calls instead of silently reporting a full budget all day (M0a / F1).
+      COACH_USAGE_LEDGER: /app/state/usage-ledger.jsonl
       # Same reason, and load-bearing: /app is root-owned 755 and the app runs as uid 10001, so any
       # relative path inherited from .env would fail `mkdir` and degrade to stderr-only — losing the
       # `llm-call` trace across the restart it exists to survive. Only the state volume is writable.
@@ -40,6 +45,11 @@ services:
     volumes:
       - ./deploy/nginx/conf.d:/etc/nginx/conf.d:ro
       - ./deploy/nginx/certs:/etc/nginx/certs:ro
+      # The ACME http-01 webroot, shared with the host's certbot. conf.d/coach.conf already serves
+      # /.well-known/acme-challenge/ from /var/www/certbot, but nothing was mounted there, so the
+      # challenge 404'd and the only authenticator left was `--standalone` — which needs :80, and
+      # this container holds :80 for the life of the deployment. Renewal therefore could not work.
+      - ./deploy/certbot-webroot:/var/www/certbot:ro
 
 volumes:
   coach-state:

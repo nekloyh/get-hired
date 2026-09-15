@@ -18,6 +18,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any, TypeVar
 
 import openai
@@ -25,8 +26,15 @@ from openai import OpenAI
 from pydantic import BaseModel, ValidationError
 
 from . import telemetry
-from .config import ProviderName, ProviderSettings, RoleName, Settings
-from .usage import record_quota_exhausted, record_usage
+from .config import PROVIDER_NAMES, ProviderName, ProviderSettings, RoleName, Settings
+from .usage import (
+    AccountingUnavailable,
+    ProviderQuotaExhausted,
+    accounting_gate,
+    record_quota_exhausted,
+    record_unmeasured_call,
+    record_usage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -133,9 +141,10 @@ def is_provider_failure(err: BaseException) -> bool:
     from a bad call site, an :class:`LLMConfigurationError` from a half-configured provider, a
     :class:`StructuredOutputError` the model earned. Those used to be indistinguishable from an
     outage, so a code bug would silently spend a second provider's tokens and return *something* —
-    hiding the defect behind a plausible answer. They now propagate.
+    hiding the defect behind a plausible answer. They now propagate. A dead quota is the provider
+    failing too: routed roles fail over and the breaker counts it; the pinned judge propagates it.
     """
-    return isinstance(err, (openai.APIError, EmptyCompletionError))
+    return isinstance(err, (openai.APIError, EmptyCompletionError, ProviderQuotaExhausted))
 
 
 # Per-provider circuit breaker (R-09). A provider that failed this many times in a row is not going
@@ -164,15 +173,35 @@ BREAKER_COOLDOWN_SECONDS = 60.0
 
 @dataclass
 class _Breaker:
-    """One provider's consecutive-failure state.
-
-    Deliberately unlocked: the rest of this codebase's shared counters (telemetry, the usage ledger)
-    are unsynchronised too, and the worst a torn update can do here is miscount a single failure —
-    which delays or advances an open by one call and self-corrects on the next success.
-    """
+    """One provider's consecutive-failure state."""
 
     failures: int = 0
     opened_at: float | None = None
+
+
+# PROCESS-level, not per-router (NEW-08). A router is built per Session and runs inside that
+# Session's own thread, so per-instance state protected exactly one Session: the next one re-paid the
+# whole discovery cost — BREAKER_FAILURE_THRESHOLD failures, each up to `_TRANSPORT_ATTEMPTS` HTTP
+# attempts — against a provider already known to be dead. Hoisting it is what makes this module's
+# own promise ("stops costing a wasted round-trip on every call") true.
+#
+# Shared by every Session thread, so it is lock-guarded. Unlike telemetry's counters — which QA-03
+# had to scope PER-Session because sharing them let one Candidate's provider hiccup cap another
+# Candidate's confidence — nothing here is evidence: it is a routing hint about a provider's
+# liveness, which genuinely IS process-wide, it is not a noise event, and the worst a stale entry can
+# do is send one call to the configured fallback for up to one cooldown.
+#
+# Keyed by provider NAME, not (provider, base_url): one process holds one base_url per provider (the
+# router's clients all come from a single `<P>_BASE_URL`), and ROLE_* overrides become PINNED clients
+# that bypass the router and never touch a breaker at all.
+_BREAKER_LOCK = Lock()
+_BREAKERS: dict[ProviderName, _Breaker] = {}
+
+
+def reset_breakers() -> None:
+    """Forget every provider's breaker state (test isolation only)."""
+    with _BREAKER_LOCK:
+        _BREAKERS.clear()
 
 
 # --- per-call trace (R-26) ----------------------------------------------------------------------
@@ -214,13 +243,17 @@ def call_counts(before: Mapping[str, int], after: Mapping[str, int]) -> tuple[in
 class LLMClient(ABC):
     """The abstract interface every agent depends on."""
 
+    # Stamped True by ``build_role_clients`` when COACH_ALLOW_UNVALIDATED_JUDGE seated this client as
+    # the judge. Read by the micro-loop into every TurnTrace, and by the exporter (ADR 0009 /
+    # NEW-25): a reader of one score must be able to tell it is not bench-comparable.
+    judge_unvalidated: bool = False
+
     @abstractmethod
     def chat(
         self,
         messages: Sequence[Message],
         *,
         response_format: ResponseFormat | None = None,
-        disable_thinking: bool = False,
     ) -> str:
         """Return raw assistant content for ``messages``."""
 
@@ -241,7 +274,6 @@ class LLMClient(ABC):
         *,
         validators: Sequence[Validator] = (),
         max_retries: int = 1,
-        disable_thinking: bool = False,
         json_schema: Mapping[str, Any] | None = None,
     ) -> T:
         """Get a schema-valid ``response_model`` from the model.
@@ -271,11 +303,7 @@ class LLMClient(ABC):
         for attempt in range(max_retries + 1):
             raw = ""
             try:
-                raw = self.chat(
-                    convo,
-                    response_format=response_format,
-                    disable_thinking=disable_thinking,
-                )
+                raw = self.chat(convo, response_format=response_format)
                 parsed = response_model.model_validate_json(_extract_json(raw))
                 for validate in validators:
                     validate(parsed)
@@ -331,7 +359,6 @@ class LLMClient(ABC):
         validators: Sequence[Validator] = (),
         tool_choice: Any = "auto",
         max_retries: int = 1,
-        disable_thinking: bool = True,
     ) -> T:
         """Run one native tool round-trip, then return a schema-valid ``response_model``.
 
@@ -343,6 +370,24 @@ class LLMClient(ABC):
         the caller can fall back to a non-tool path.
         """
         raise ToolCallingUnsupported(f"{type(self).__name__} does not support native tool-calling")
+
+
+def _token_count(used: object, *names: str) -> int | None:
+    """One side of a call's token count under any of ``names``, or None if the response states none.
+
+    ``input_tokens``/``output_tokens`` is the same number under the name several OpenAI-compatible
+    gateways use; reading it is the difference between a counted call and a held fault. A value that
+    is present but is not a number is no count at all — it must not be rounded down to zero.
+    """
+    for name in names:
+        raw = used.get(name) if isinstance(used, Mapping) else getattr(used, name, None)
+        if raw is None:
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _extract_json(content: str) -> str:
@@ -406,7 +451,6 @@ class _OpenAICompatibleClient(LLMClient):
         response_format: ResponseFormat | None = None,
         tools: Sequence[ToolSpec] | None = None,
         tool_choice: Any = None,
-        disable_thinking: bool = False,
     ) -> Any:
         """Issue one completion and return the raw assistant message (content and/or tool_calls)."""
         kwargs: dict[str, Any] = {
@@ -420,8 +464,13 @@ class _OpenAICompatibleClient(LLMClient):
             kwargs["tools"] = list(tools)
             if tool_choice is not None:
                 kwargs["tool_choice"] = tool_choice
-        if extra_body := self._thinking_extra_body(disable_thinking):
-            kwargs["extra_body"] = extra_body
+        # The last point at which this call can still be NOT made (M0a / F1). Every client here is a
+        # metered one by construction — demo mode is a different class and never reaches this — so
+        # "accounting is broken" and "make a paid call anyway" must not both be true. Checked per
+        # call rather than per Session because a fault can latch mid-question, and the whole promise
+        # is that the call after the unrecorded one does not happen.
+        if blocked := accounting_gate():
+            raise AccountingUnavailable(blocked)
         for attempt in range(_TRANSPORT_ATTEMPTS):
             started = _now()
             try:
@@ -439,14 +488,12 @@ class _OpenAICompatibleClient(LLMClient):
                         self.provider_name,
                         "logs/usage-ledger.jsonl",
                     )
-                    # ADR 0005's addendum names insufficient_quota as the DETECTION half of budget
-                    # exhaustion and GH #80 as the session-behaviour half. Latching it here is what
-                    # joins them: this exception is about to be swallowed by question_node's
-                    # failure-isolation net, so the fact that the quota is dead has to outlive it —
-                    # otherwise the Session cascades into zero-evidence `failed` questions and exits
-                    # 0 with a Study Plan built from nothing.
+                    # ADR 0005: the latch outlives this process (the start gate reads it); the typed
+                    # raise is what question_node re-raises instead of recording a `failed` (GH #119).
                     record_quota_exhausted(self.provider_name)
-                    raise
+                    raise ProviderQuotaExhausted(
+                        f"{self.provider_name} daily quota exhausted (insufficient_quota)"
+                    ) from err
                 if not will_retry:
                     raise
                 wait = _retry_wait(err, attempt)
@@ -487,16 +534,40 @@ class _OpenAICompatibleClient(LLMClient):
             outcome,
         )
 
+    def _is_billed(self) -> bool:
+        """Whether the completion just returned came from a real provider, and so cost money.
+
+        The class cannot answer this: every test double in this suite IS a real provider client, with
+        a scripted transport injected at construction. The transport is the only thing that differs —
+        a billed call goes out through the ``openai.OpenAI`` instance ``_openai()`` builds — so it is
+        what the question has to be asked of. Erring permissive (latching for fakes) refuses the next
+        call in every test that scripts a reply without a ``usage`` block; erring strict loses real
+        spend, which is the failure this whole path exists to prevent.
+        """
+        return isinstance(self._client, OpenAI)
+
     def _record_usage(self, completion: Any) -> None:
-        """Append this call's token usage to the daily ledger (fakes without ``usage`` are skipped)."""
+        """Append this call's token usage to the daily ledger, or latch what it could not count.
+
+        A billed call whose token count cannot be read is NOT a zero-token call. Recording it as zero
+        — what a missing ``usage`` block, or a gateway naming the fields
+        ``input_tokens``/``output_tokens``, used to produce — makes real spend invisible to every rail
+        that counts this ledger, which is the exact outcome the accounting slice exists to prevent. So
+        it becomes an accounting fault instead: unknown spend, said out loud, refusing the next
+        metered call until someone reconciles it.
+        """
         used = getattr(completion, "usage", None)
-        if used is None:
+        prompt = _token_count(used, "prompt_tokens", "input_tokens")
+        completion_count = _token_count(used, "completion_tokens", "output_tokens")
+        if prompt is None or completion_count is None:
+            if self._is_billed():
+                record_unmeasured_call(self.provider_name, self._settings.model, detail=f"usage={used!r}")
             return
         record_usage(
             self.provider_name,
             self._settings.model,
-            prompt_tokens=getattr(used, "prompt_tokens", 0) or 0,
-            completion_tokens=getattr(used, "completion_tokens", 0) or 0,
+            prompt_tokens=prompt,
+            completion_tokens=completion_count,
         )
 
     def chat(
@@ -504,9 +575,8 @@ class _OpenAICompatibleClient(LLMClient):
         messages: Sequence[Message],
         *,
         response_format: ResponseFormat | None = None,
-        disable_thinking: bool = False,
     ) -> str:
-        message = self._create(messages, response_format=response_format, disable_thinking=disable_thinking)
+        message = self._create(messages, response_format=response_format)
         content = self._extract_content(message)
         if not content.strip():
             raise EmptyCompletionError(f"{self.provider_name} returned empty content")
@@ -527,18 +597,12 @@ class _OpenAICompatibleClient(LLMClient):
         validators: Sequence[Validator] = (),
         tool_choice: Any = "auto",
         max_retries: int = 1,
-        disable_thinking: bool = True,
     ) -> T:
         if not self._supports_tools:
             raise ToolCallingUnsupported(f"{self.provider_name} has native tool-calling disabled")
 
         convo: list[Message] = list(messages)
-        first = self._create(
-            convo,
-            tools=tools,
-            tool_choice=tool_choice,
-            disable_thinking=disable_thinking,
-        )
+        first = self._create(convo, tools=tools, tool_choice=tool_choice)
         tool_calls = list(getattr(first, "tool_calls", None) or [])
         if not tool_calls:
             # Forced a tool call but the provider answered with prose — treat as unsupported so the
@@ -557,20 +621,10 @@ class _OpenAICompatibleClient(LLMClient):
 
         # The final answer reuses the exact structured-output contract (parse + validators + retry).
         convo.append({"role": "user", "content": final_instruction})
-        return self.chat_json(
-            convo,
-            response_model,
-            validators=validators,
-            max_retries=max_retries,
-            disable_thinking=disable_thinking,
-        )
+        return self.chat_json(convo, response_model, validators=validators, max_retries=max_retries)
 
     def _assistant_tool_message(self, message: Any, tool_calls: Sequence[Any]) -> Message:
-        """Rebuild the assistant turn for replay, carrying only content + tool_calls.
-
-        Crucially this never copies ``reasoning_content`` back into the history (ADR 0003): the
-        thinking quirk must not be replayed across a multi-turn tool conversation.
-        """
+        """Rebuild the assistant turn for replay, carrying only content + tool_calls (never provider extras)."""
         return {
             "role": "assistant",
             "content": message.content or "",
@@ -584,43 +638,14 @@ class _OpenAICompatibleClient(LLMClient):
             ],
         }
 
-    def _thinking_extra_body(self, disable_thinking: bool) -> dict[str, Any] | None:
-        return None
-
     def _extract_content(self, message: Any) -> str:
         return message.content or ""
-
-
-class MimoClient(_OpenAICompatibleClient):
-    """OpenAI-compatible client for MiMo.
-
-    The thinking-mode ``reasoning_content`` quirk is quarantined here, per ADR 0003: the answer is
-    read from ``message.content`` and ``reasoning_content`` is never fed to the JSON parser. Keeping
-    that handling inside this client is exactly what issue 0004 requires when the router lands.
-    """
-
-    provider_name: ProviderName = "mimo"
-    _supports_tools: bool = True
-
-    def _thinking_extra_body(self, disable_thinking: bool) -> dict[str, Any] | None:
-        if not disable_thinking:
-            return None
-        return {"thinking": {"type": "disabled"}}
-
-    def _extract_content(self, message: Any) -> str:
-        reasoning = getattr(message, "reasoning_content", None)
-        if reasoning is None and getattr(message, "model_extra", None):
-            reasoning = message.model_extra.get("reasoning_content")
-        if reasoning:
-            logger.debug("MiMo reasoning_content (%d chars) ignored for parsing", len(reasoning))
-        return super()._extract_content(message)
 
 
 class GroqClient(_OpenAICompatibleClient):
     """OpenAI-compatible client for Groq, with native function-calling enabled.
 
-    Groq is the 2026-06-03 cutover target and shares the same OpenAI-compatible tool-call path as
-    MiMo. The Interviewer remains the only caller of this API (ADR 0003).
+    The Interviewer remains the only caller of the tool-call API (ADR 0003).
     """
 
     provider_name: ProviderName = "groq"
@@ -637,7 +662,7 @@ class OpenAIClient(_OpenAICompatibleClient):
     provider_name: ProviderName = "openai"
     _supports_tools: bool = True
     # Live-probed on gpt-5.4-mini (2026-07-11): strict grammars accepted, including nested
-    # objects, arrays, and minimum/maximum bounds. Groq/MiMo stay opted out until verified;
+    # objects, arrays, and minimum/maximum bounds. Groq stays opted out until verified;
     # a per-model env override (<PROVIDER>_SUPPORTS_JSON_SCHEMA) can flip any of them.
     _default_supports_json_schema: bool = True
 
@@ -680,11 +705,14 @@ class LLMRouter(LLMClient):
         fallback_provider: ProviderName | None = None,
     ) -> None:
         self._primary_provider = primary_provider
-        self._fallback_provider: ProviderName = fallback_provider or ("groq" if primary_provider == "mimo" else "mimo")
+        self._fallback_provider: ProviderName = (
+            fallback_provider
+            if fallback_provider is not None
+            else next(name for name in PROVIDER_NAMES if name != primary_provider)
+        )
         self._clients = dict(clients)
         if self._primary_provider not in self._clients:
             raise LLMConfigurationError(f"primary provider {self._primary_provider!r} is not configured")
-        self._breakers: dict[ProviderName, _Breaker] = {}
 
     # --- circuit breaker ------------------------------------------------------------------------
 
@@ -696,37 +724,45 @@ class LLMRouter(LLMClient):
         (:meth:`_record_success` / :meth:`_record_failure`) then closes or re-opens the breaker, so
         only one probe per cooldown window ever reaches a provider that is still down.
         """
-        breaker = self._breakers.get(provider)
-        if breaker is None or breaker.opened_at is None:
+        with _BREAKER_LOCK:
+            breaker = _BREAKERS.get(provider)
+            opened_at = None if breaker is None else breaker.opened_at
+        if opened_at is None:
             return False
-        return (_now() - breaker.opened_at) < BREAKER_COOLDOWN_SECONDS
+        return (_now() - opened_at) < BREAKER_COOLDOWN_SECONDS
 
     def _record_success(self, provider: ProviderName) -> None:
-        breaker = self._breakers.get(provider)
-        if breaker is None or (breaker.failures == 0 and breaker.opened_at is None):
-            return
-        if breaker.opened_at is not None:
+        with _BREAKER_LOCK:
+            breaker = _BREAKERS.get(provider)
+            if breaker is None or (breaker.failures == 0 and breaker.opened_at is None):
+                return
+            closing = breaker.opened_at is not None
+            breaker.failures = 0
+            breaker.opened_at = None
+        # Outside the lock: a logging handler must never run while it is held.
+        if closing:
             telemetry.incr(f"router.breaker_close.{provider}")
             logger.info("provider %s answered again; closing its circuit breaker", provider)
-        breaker.failures = 0
-        breaker.opened_at = None
 
     def _record_failure(self, provider: ProviderName) -> None:
-        breaker = self._breakers.setdefault(provider, _Breaker())
-        breaker.failures += 1
-        if breaker.failures < BREAKER_FAILURE_THRESHOLD:
-            return
-        already_open = breaker.opened_at is not None
-        # Re-stamped on every failure at or past the threshold, so a failed half-open probe starts a
-        # fresh cooldown instead of letting every subsequent call through.
-        breaker.opened_at = _now()
+        with _BREAKER_LOCK:
+            breaker = _BREAKERS.setdefault(provider, _Breaker())
+            breaker.failures += 1
+            if breaker.failures < BREAKER_FAILURE_THRESHOLD:
+                return
+            already_open = breaker.opened_at is not None
+            # Re-stamped on every failure at or past the threshold, so a failed half-open probe
+            # starts a fresh cooldown instead of letting every subsequent call through.
+            breaker.opened_at = _now()
+            failures = breaker.failures
+        # Outside the lock: a logging handler must never run while it is held.
         if not already_open:
             telemetry.incr(f"router.breaker_open.{provider}")
             logger.warning(
                 "provider %s failed %d consecutive times; opening its circuit breaker for %.0fs "
                 "(calls route straight to the fallback until a probe succeeds)",
                 provider,
-                breaker.failures,
+                failures,
                 BREAKER_COOLDOWN_SECONDS,
             )
 
@@ -793,16 +829,11 @@ class LLMRouter(LLMClient):
         messages: Sequence[Message],
         *,
         response_format: ResponseFormat | None = None,
-        disable_thinking: bool = False,
     ) -> str:
         fallback = self._usable_fallback()
 
         def on_fallback(client: LLMClient) -> str:
-            return client.chat(
-                messages,
-                response_format=self._downgraded_format(response_format, client),
-                disable_thinking=disable_thinking,
-            )
+            return client.chat(messages, response_format=self._downgraded_format(response_format, client))
 
         if self._skip_primary_for(fallback):
             telemetry.incr(f"router.breaker_skip.{self._primary_provider}")
@@ -815,12 +846,7 @@ class LLMRouter(LLMClient):
 
         try:
             return self._call(
-                self._primary_provider,
-                lambda client: client.chat(
-                    messages,
-                    response_format=response_format,
-                    disable_thinking=disable_thinking,
-                ),
+                self._primary_provider, lambda client: client.chat(messages, response_format=response_format)
             )
         except Exception as err:
             if not is_provider_failure(err):
@@ -888,7 +914,6 @@ class LLMRouter(LLMClient):
 
 
 _CLIENT_CLASSES: dict[ProviderName, type[_OpenAICompatibleClient]] = {
-    "mimo": MimoClient,
     "groq": GroqClient,
     "openai": OpenAIClient,
     "zenmux": ZenMuxClient,
@@ -956,6 +981,27 @@ def _pinned_role_client(settings: Settings, role: RoleName) -> LLMClient:
     return _CLIENT_CLASSES[config.name](config)
 
 
+def _checked_judge(settings: Settings, client: LLMClient) -> LLMClient:
+    """Gate whatever is about to BE the judge, wherever it came from (ADR 0009).
+
+    The guard used to live only on the ``settings.role_config`` path, which a caller that passes a
+    concrete provider client skips entirely — the bench gate and the judge pin both dropped, silently.
+    Gating the client instead means a new caller (a script, a replay tool, a future web mode that
+    builds one client to avoid failover) cannot route around it.
+
+    Demo brains and test fakes are exempt because they are not a provider at all: they never call one,
+    spend nobody's allowance, and produce no score anyone compares to a bench artifact.
+    """
+    if not isinstance(client, _OpenAICompatibleClient) or not hasattr(settings, "role_config"):
+        return client
+    settings._require_bench_validated_judge(
+        client.provider_name, "", client._settings.model, client._settings.base_url
+    )
+    if getattr(settings, "allow_unvalidated_judge", False):
+        client.judge_unvalidated = True
+    return client
+
+
 def build_role_clients(settings: Settings, default_client: LLMClient | None = None) -> RoleClients:
     """Build the ADR 0010 role bundle.
 
@@ -971,8 +1017,8 @@ def build_role_clients(settings: Settings, default_client: LLMClient | None = No
         # No router = nothing to pin or route (fakes, demo mode). No ``role_config`` = a partial
         # settings double (several CLI tests fake Settings with a SimpleNamespace) — role routing
         # only applies to the real Settings contract.
-        return RoleClients.single(default)
+        return RoleClients.single(_checked_judge(settings, default))
     non_judge: dict[str, LLMClient] = {}
     for role in ("interviewer", "supervisor", "diagnostic", "planner"):
         non_judge[role] = _pinned_role_client(settings, role) if settings.role_overridden(role) else default
-    return RoleClients(judge=_pinned_role_client(settings, "judge"), **non_judge)
+    return RoleClients(judge=_checked_judge(settings, _pinned_role_client(settings, "judge")), **non_judge)

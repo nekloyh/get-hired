@@ -8,16 +8,21 @@ on:
 jobs:
   python:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - run: uv sync --dev
+      # --locked, not plain --dev: `uv sync --dev` silently re-resolves and rewrites uv.lock, so a
+      # PR that adds a dependency without running `uv lock` goes green here and then fails the
+      # image build, where Dockerfile:37 uses --frozen. This job now fails on that drift instead.
+      - run: uv sync --locked --dev
       - run: uv run ruff check
       - run: uv run mypy
       - run: uv run pytest -q
 
   web:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: web
@@ -32,3 +37,19 @@ jobs:
       - run: npm run lint
       - run: npm test
       - run: npm run build
+
+  # The deployment artifact this milestone is about was ungated: nothing in CI built the image or
+  # validated the compose file, so a broken Dockerfile or compose stanza was only discovered on the
+  # server. Both are cheap (~1 min) and binary.
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      # docker-compose.yml declares `env_file: .env` at service level and .env is gitignored, so on
+      # a fresh checkout `config` exits 1 with "env file ... not found". `--env-file .env.example`
+      # does not substitute for a service-level env_file; copying the template is the same bootstrap
+      # docs/deploy.md gives the operator.
+      - run: cp .env.example .env
+      - run: docker compose config -q
+      - run: docker build .

@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from .llm import LLMClient, Message, Validator
 from .skill import SkillState
+from .usage import AccountingUnavailable, ProviderQuotaExhausted
 
 logger = logging.getLogger(__name__)
 
@@ -196,10 +197,7 @@ def diagnose(
     """
     criticality = role_criticality(profile.target_role, profile.target_companies)
     means = _initial_mastery_means(profile, ledger_priors)
-    priors = {
-        skill: _seed_prior(skill, means[skill], criticality[skill])
-        for skill in SKILLS
-    }
+    priors = {skill: _seed_prior(skill, means[skill], criticality[skill]) for skill in SKILLS}
     if client is None:
         plan = tuple(_topic_plan_entry(skill, priors[skill], means[skill]) for skill in _ordered_skills(priors))
         source = TopicPlanSource.DETERMINISTIC
@@ -231,6 +229,11 @@ def diagnose_or_degrade(
     """
     try:
         return diagnose(profile, client, ledger_priors=ledger_priors)
+    except (AccountingUnavailable, ProviderQuotaExhausted):
+        # M0a / F1 and GH #119: not failures to degrade around. Degrading would start a Session
+        # whose every subsequent call is refused or dead anyway, and would report a broken ledger or
+        # a spent quota as a deterministic Topic Plan — a stop the operator can act on, disguised.
+        raise
     except Exception as err:  # noqa: BLE001 — pre-graph call site; degrade instead of crash (ADR 0005)
         if client is None:
             raise
@@ -283,10 +286,7 @@ def _build_diagnostic_messages(
     profile: CandidateProfile,
     priors: Mapping[str, SeededSkillPrior],
 ) -> list[Message]:
-    claims = "\n".join(
-        f"- {skill}: {score:g}/5"
-        for skill, score in sorted(profile.claimed_skills.items())
-    ) or "- none"
+    claims = "\n".join(f"- {skill}: {score:g}/5" for skill, score in sorted(profile.claimed_skills.items())) or "- none"
     prior_lines = "\n".join(
         (
             f"- {skill}: mastery={prior.state.mastery:.3f}, "
@@ -372,10 +372,24 @@ def _clamp_mean(value: float) -> float:
     return max(0.05, min(0.95, value))
 
 
+# A Beta with mean m has variance m(1-m)/(S+1), so m(1-m) is the *supremum* of its variance as the
+# pseudo-count S -> 0. The criticality's target variance is not attainable at an extreme mean: a
+# returning Candidate's carried prior reaches 0.95 (`_clamp_mean`), where the widest possible Beta
+# still has variance 0.0475 < MUST_HAVE's target 0.0833. Inverting an unattainable target returns a
+# non-positive strength, and alpha and beta go non-positive with it — an illegal Beta that raises out
+# of `SkillState` and kills the Diagnostic. Floor the STRENGTH, not the mean: clamping the mean to a
+# representable interval would make that interval criticality-derived, so the same Candidate's carried
+# evidence would seed a different prior mean purely because of the job description — exactly what
+# ADR 0002 forbids. The floor is what one real answer can ever weigh at its weakest
+# (CONFIDENCE_WEIGHT_FLOOR * EVIDENCE_WEIGHT), so the seeded prior is never worth more than the
+# weakest single judgment and ADR 0002's "direct evidence dominates within an answer or two" holds.
+_MIN_PRIOR_STRENGTH = 0.5
+
+
 def _seed_prior(skill: str, mean: float, criticality: RoleCriticality) -> SeededSkillPrior:
     setting = CRITICALITY_SETTINGS[criticality]
     target_variance = SkillState.neutral(skill).variance * (1.0 - setting.target_confidence)
-    prior_strength = mean * (1.0 - mean) / target_variance - 1.0
+    prior_strength = max(_MIN_PRIOR_STRENGTH, mean * (1.0 - mean) / target_variance - 1.0)
     alpha = mean * prior_strength
     beta = (1.0 - mean) * prior_strength
     return SeededSkillPrior(

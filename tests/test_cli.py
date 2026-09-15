@@ -20,9 +20,8 @@ from interview_coach.diagnostic import CandidateProfile, DiagnosticResult, Topic
 from interview_coach.eval_harness import GoldenAnswerCase, GoldenAnswerResult
 from interview_coach.evaluator import DimensionScore, Evaluation
 from interview_coach.fixtures import QUESTION
-from interview_coach.microloop import DEFAULT_MAX_TURNS, MicroLoopResult, StopReason, Turn
+from interview_coach.microloop import DEFAULT_MAX_TURNS
 from interview_coach.rubric import DIMENSIONS
-from interview_coach.skill import SkillState
 from interview_coach.supervisor import build_session_graph, initial_session_state, session_config
 
 
@@ -41,7 +40,7 @@ def spy_diagnose(monkeypatch):
 
 
 def _settings(*, configured: bool) -> SimpleNamespace:
-    return SimpleNamespace(configured=configured, primary_provider="mimo")
+    return SimpleNamespace(configured=configured, primary_provider="groq")
 
 
 def test_diagnose_uses_llm_agent_by_default_when_configured(monkeypatch, spy_diagnose):
@@ -84,7 +83,16 @@ def test_diagnose_offline_flag_forces_deterministic_even_when_configured(monkeyp
 def test_required_llm_command_still_errors_when_unconfigured(monkeypatch):
     monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=False))
 
-    assert cli.main(["evaluate"]) == 2
+    assert cli.main(["eval-harness"]) == 2
+
+
+def test_bare_coach_prints_help_and_exits_2(capsys):
+    # The slice demos that used to run on a bare `coach` are gone; nothing runs by default.
+    assert cli.main([]) == 2
+
+    err = capsys.readouterr().err
+    assert "usage:" in err
+    assert "session" in err
 
 
 def _harness_result(score: float, *, expected_min: float = 1.0, expected_max: float = 5.0) -> GoldenAnswerResult:
@@ -351,8 +359,11 @@ def test_session_rejects_unknown_language_flag(tmp_path, capsys):
     assert "--language" in capsys.readouterr().err
 
 
-def test_session_starts_fresh_when_prior_checkpoint_is_complete(tmp_path, monkeypatch, capsys):
-    # The in-flight guard is scoped to non-complete Sessions: a completed checkpoint may be started over.
+def test_session_refuses_to_restart_over_a_completed_checkpoint(tmp_path, monkeypatch, capsys):
+    # QA-01, and a deliberate inversion of what this test used to pin. The in-flight guard was scoped
+    # to non-complete Sessions, so a FINISHED interview on the same id was silently restarted over
+    # and its export overwritten. `--session-id` defaults to one constant, so that was the default
+    # CLI path, not an edge case.
     from interview_coach.demo_llm import DemoLLMClient
 
     monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
@@ -373,8 +384,10 @@ def test_session_starts_fresh_when_prior_checkpoint_is_complete(tmp_path, monkey
         ]
     )
 
-    assert rc == 0
-    assert "already in progress" not in capsys.readouterr().err
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "has already finished" in err
+    assert "--resume" in err
 
 
 def test_cmd_session_resume_resets_clock_via_cli(tmp_path, monkeypatch, capsys):
@@ -401,35 +414,6 @@ def test_cmd_session_resume_resets_clock_via_cli(tmp_path, monkeypatch, capsys):
     assert rc == 0
     assert "RESUMING SESSION gap-cli" in output  # the recap is printed instead of replaying history
     assert "stop_reason: max_elapsed_seconds" not in output  # the clock was reset; no stale force-complete
-
-
-def test_cli_prints_follow_up_unavailable_as_degrade(capsys):
-    ev = Evaluation(
-        dimensions={"correctness": DimensionScore(score=2, evidence="no evidence")},
-        weighted_score=2.0,
-        confidence=0.8,
-        follow_up_recommended=True,
-        follow_up_rationale="needs a probe",
-    )
-    result = MicroLoopResult(
-        skill="ml_fundamentals",
-        turns=(
-            Turn(
-                question="Explain L2 regularization.",
-                answer="It makes weights smaller.",
-                evaluation=ev,
-                is_follow_up=False,
-            ),
-        ),
-        stop_reason=StopReason.FOLLOW_UP_UNAVAILABLE,
-        skill_state=SkillState.neutral("ml_fundamentals"),
-    )
-
-    cli._print_micro_loop(result)
-
-    output = capsys.readouterr().out
-    assert "degraded because a Follow-up was unavailable" in output
-    assert "halted by SAFETY CAP" not in output
 
 
 # --- R-12: `coach api` refuses to fork workers ---------------------------------------------------
@@ -483,6 +467,8 @@ def test_the_exported_log_file_does_not_outlive_the_test_that_exported_it():
     # tmp_path pytest deletes on the way out. conftest's autouse teardown is what sweeps it, and
     # deleting that fixture left the whole suite green until this assertion existed.
     assert "COACH_LOG_FILE" not in os.environ
+
+
 # --- R-25: the free-tier budget rail on the CLI surface ------------------------------------------
 
 
@@ -495,7 +481,7 @@ class _ProviderDemoClient(DemoLLMClient):
     subject to the rail while still running a Session deterministically and offline.
     """
 
-    provider_name = "mimo"
+    provider_name = "groq"
 
 
 def _tmp_ledger(monkeypatch, tmp_path):
@@ -541,7 +527,7 @@ def test_session_refuses_to_start_into_a_spent_daily_budget(tmp_path, monkeypatc
     # _cmd_session makes this return 0 and spend a real Diagnostic call.
     _tmp_ledger(monkeypatch, tmp_path)
     monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "1000")
-    usage.record_usage("mimo", "test-model", prompt_tokens=900, completion_tokens=50)
+    usage.record_usage("groq", "test-model", prompt_tokens=900, completion_tokens=50)
     monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
     monkeypatch.setattr(cli, "build_client", lambda settings: _ProviderDemoClient())
 
@@ -595,6 +581,185 @@ def test_session_starts_when_the_day_can_fund_it(tmp_path, monkeypatch, capsys):
     assert "00:00 UTC" not in capsys.readouterr().err
 
 
+# --- NEW-10: the same rail on every OTHER metered command ---------------------------------------
+
+
+def _spend_the_day(monkeypatch, tmp_path):
+    """A day with 50 tokens left — enough for nothing, and the rails read it from the ledger."""
+    _tmp_ledger(monkeypatch, tmp_path)
+    monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "1000")
+    usage.record_usage("groq", "test-model", prompt_tokens=900, completion_tokens=50)
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: _ProviderDemoClient())
+
+
+def _never(*args, **kwargs):
+    raise AssertionError("the budget rail must refuse BEFORE any token is spent")
+
+
+def test_diagnose_refuses_into_a_spent_day(tmp_path, monkeypatch, capsys):
+    # `coach diagnose` is one Diagnostic call — the cheapest metered command there is — and it had
+    # no rail at all. The spy makes the test fail if the gate is ever deleted.
+    _spend_the_day(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "diagnose_or_degrade", _never)
+
+    rc = cli.main(["diagnose", "--target-role", "machine learning engineer"])
+
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "Refusing to run `coach diagnose`" in err
+    assert "00:00 UTC" in err  # the remedy is named, not just the refusal
+
+
+def test_eval_harness_refuses_into_a_spent_day(tmp_path, monkeypatch, capsys):
+    _spend_the_day(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "run_golden_answer_harness", _never)
+
+    rc = cli.main(["eval-harness"])
+
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert f"~{cli.HARNESS_MIN_BUDGET_TOKENS:,}" in err  # the estimate it was refused against
+
+
+def test_postmortem_refuses_into_a_spent_day(tmp_path, monkeypatch, capsys):
+    _spend_the_day(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "run_postmortem", _never)
+
+    rc = cli.main(
+        [
+            "postmortem",
+            "--candidate",
+            "cand-1",
+            "--scripted-recollection",
+            "I was asked about overfitting.",
+            "--ledger-db",
+            str(tmp_path / "ledger.json"),
+        ]
+    )
+
+    assert rc == 2
+    assert "Refusing to run `coach postmortem`" in capsys.readouterr().err
+
+
+def test_a_metered_command_names_what_it_would_cost_a_candidate(tmp_path, monkeypatch, capsys):
+    # The refusal has to be actionable by the operator standing between a batch job and a live
+    # interview, so it states the spend in the unit that matters: Sessions, not raw tokens.
+    _spend_the_day(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "run_golden_answer_harness", _never)
+
+    cli.main(["eval-harness"])
+
+    assert "Session(s) of the same allowance" in capsys.readouterr().err
+
+
+def test_the_harness_attributes_its_spend_instead_of_leaving_it_loose(tmp_path, monkeypatch, capsys):
+    # Without session_scope every row a batch command writes lands in the "" bucket, where
+    # `coach usage` files it under "unattributed" and nobody can tell which command spent it.
+    _tmp_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: _ProviderDemoClient())
+
+    def _harness(client):
+        usage.record_usage("groq", "test-model", prompt_tokens=10, completion_tokens=5)
+        return []
+
+    monkeypatch.setattr(cli, "run_golden_answer_harness", _harness)
+
+    assert cli.main(["eval-harness"]) == 1  # harness_passed([]) is False; the point is the ledger
+    assert usage.sessions_for_day() == {"eval-harness": 15}
+
+
+def test_demo_diagnose_is_still_exempt_from_the_new_rail(tmp_path, monkeypatch, capsys, spy_diagnose):
+    # The UNKNOWN_PROVIDER exemption is what keeps the rest of the suite (and demo mode) untouched.
+    _tmp_ledger(monkeypatch, tmp_path)
+    monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "1")
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: DemoLLMClient())
+
+    assert cli.main(["diagnose", "--target-role", "machine learning engineer"]) == 0
+    assert "Refusing" not in capsys.readouterr().err
+
+
+# --- M0a / F1: accounting health on the CLI surface ----------------------------------------------
+
+
+def test_session_refuses_to_start_when_the_ledger_cannot_be_written(tmp_path, monkeypatch, capsys):
+    # AC 3. The same gate shape as the spent-budget refusal above, for the opposite input: there the
+    # ledger said "nothing left", here it says nothing at all — which every rail reads as a FULL
+    # budget. Refused before the Diagnostic, so not one token is spent under a broken counter.
+    ledger = _tmp_ledger(monkeypatch, tmp_path)
+    ledger.mkdir()  # appends now fail; the directory around it still holds the fault sidecar
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: _ProviderDemoClient())
+
+    def _never(*args, **kwargs):
+        raise AssertionError("the accounting gate must refuse BEFORE any token is spent")
+
+    monkeypatch.setattr(cli, "diagnose_or_degrade", _never)
+
+    rc = cli.main(
+        [
+            "session",
+            "--scripted",
+            "--no-live",
+            "--max-questions",
+            "1",
+            "--session-id",
+            "no-ledger",
+            "--checkpoint-db",
+            str(tmp_path / "c.sqlite"),
+        ]
+    )
+
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "Usage accounting is unavailable" in err
+    assert "COACH_USAGE_LEDGER" in err  # the remedy is named
+    assert "00:00 UTC" not in err  # this is not scarcity; the daily reset fixes nothing
+
+
+def test_coach_usage_leads_with_the_accounting_condition(tmp_path, monkeypatch, capsys):
+    # `coach usage` prints numbers derived entirely from this file. A reader who is not told the
+    # file is broken reads a full budget off an empty ledger — which is how the container shipped.
+    ledger = _tmp_ledger(monkeypatch, tmp_path)
+    ledger.mkdir()
+
+    assert cli.main(["usage"]) == 0
+
+    captured = capsys.readouterr()
+    assert "ACCOUNTING:" in captured.err
+    assert "Usage accounting is unavailable" in captured.err
+
+
+def test_coach_usage_reconcile_replays_the_held_row(tmp_path, monkeypatch, capsys):
+    # The operator-facing half of AC 4: the held tokens go back INTO the ledger. Reconciliation that
+    # merely cleared the flag would be "count the unrecorded call as zero" with a friendlier name.
+    ledger = _tmp_ledger(monkeypatch, tmp_path)
+    ledger.mkdir()
+    usage.record_usage("groq", "test-model", prompt_tokens=100, completion_tokens=20)
+    ledger.rmdir()  # the operator fixes the path first
+
+    assert cli.main(["usage", "--reconcile"]) == 0
+
+    captured = capsys.readouterr()
+    assert "Reconciled 1 held ledger row(s)" in captured.out
+    assert "ACCOUNTING:" not in captured.err
+    assert usage.usage_for_day()["groq"]["total"] == 120
+
+
+def test_reconcile_fails_loudly_while_the_path_is_still_broken(tmp_path, monkeypatch, capsys):
+    ledger = _tmp_ledger(monkeypatch, tmp_path)
+    ledger.mkdir()
+    usage.record_usage("groq", "test-model", prompt_tokens=100, completion_tokens=20)
+
+    assert cli.main(["usage", "--reconcile"]) == 2
+
+    err = capsys.readouterr().err
+    assert "Could not reconcile" in err
+    assert usage.accounting_block_reason() is not None  # still refusing metered work
+
+
 def test_demo_mode_is_exempt_from_every_budget_rail(tmp_path, monkeypatch, capsys):
     # THE exemption predicate. DemoLLMClient carries no provider identity, so it spends nobody's
     # allowance and every rail must be inert for it — that is what keeps demo mode free and the rest
@@ -630,7 +795,7 @@ def test_the_rail_counts_only_the_questions_actually_left(tmp_path, monkeypatch,
     # that can comfortably afford the rest of itself.
     class _Metered(_ProviderDemoClient):
         def chat_json(self, *args, **kwargs):
-            usage.record_usage("mimo", "test-model", prompt_tokens=500, completion_tokens=0)
+            usage.record_usage("groq", "test-model", prompt_tokens=500, completion_tokens=0)
             return super().chat_json(*args, **kwargs)
 
     _tmp_ledger(monkeypatch, tmp_path)
@@ -682,7 +847,7 @@ def test_budget_breach_suspends_and_never_records_a_failed_question(tmp_path, mo
 
     # The day is spent: resuming cannot fund the remaining questions.
     monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "10")
-    usage.record_usage("mimo", "test-model", prompt_tokens=10, completion_tokens=0)
+    usage.record_usage("groq", "test-model", prompt_tokens=10, completion_tokens=0)
 
     rc = cli.main(
         [
@@ -745,7 +910,7 @@ def test_session_ledger_rows_carry_the_session_id(tmp_path, monkeypatch):
 
     class _Recording(_ProviderDemoClient):
         def chat_json(self, *args, **kwargs):
-            usage.record_usage("mimo", "test-model", prompt_tokens=3, completion_tokens=1)
+            usage.record_usage("groq", "test-model", prompt_tokens=3, completion_tokens=1)
             return super().chat_json(*args, **kwargs)
 
     monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
@@ -775,8 +940,8 @@ def test_usage_command_shows_per_session_rows(tmp_path, monkeypatch, capsys):
     _tmp_ledger(monkeypatch, tmp_path)
     monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
     with usage.session_scope("interview-42"):
-        usage.record_usage("mimo", "test-model", prompt_tokens=1200, completion_tokens=300)
-    usage.record_usage("mimo", "test-model", prompt_tokens=40, completion_tokens=10)
+        usage.record_usage("groq", "test-model", prompt_tokens=1200, completion_tokens=300)
+    usage.record_usage("groq", "test-model", prompt_tokens=40, completion_tokens=10)
 
     assert cli.main(["usage"]) == 0
 
@@ -802,7 +967,7 @@ class _MeteredDemoClient(_ProviderDemoClient):
     tokens_per_call = 100
 
     def chat_json(self, *args, **kwargs):
-        usage.record_usage("mimo", "test-model", prompt_tokens=self.tokens_per_call, completion_tokens=0)
+        usage.record_usage("groq", "test-model", prompt_tokens=self.tokens_per_call, completion_tokens=0)
         return super().chat_json(*args, **kwargs)
 
 
@@ -841,6 +1006,14 @@ def test_every_interview_on_a_reused_session_id_gets_its_own_budget(tmp_path, mo
     monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
     monkeypatch.setattr(cli, "build_client", lambda settings: _MeteredDemoClient())
 
+    # Since QA-01 a fresh start over an existing checkpoint is refused, so the way one id runs a
+    # second interview is the checkpoint being gone — the server's 7-day TTL sweep, an operator
+    # clearing the db, a fresh container on an empty volume — while the usage ledger, which has no
+    # TTL, keeps every row. That is the shape reproduced here: the checkpoint db is dropped between
+    # runs, the spend is not.
+    def sweep_checkpoints() -> None:
+        db_path.unlink(missing_ok=True)
+
     # Run 1 with the rail effectively off, to measure what one of these Sessions actually costs.
     monkeypatch.setenv("LLM_SESSION_TOKEN_BUDGET", "10000000")
     assert cli.main(_session_argv("local-session", db_path)) == 0
@@ -850,7 +1023,9 @@ def test_every_interview_on_a_reused_session_id_gets_its_own_budget(tmp_path, mo
     # Now size the rail at 2.5x one Session: comfortably more than any single run needs, and
     # comfortably LESS than three of them summed.
     monkeypatch.setenv("LLM_SESSION_TOKEN_BUDGET", str(int(one_session * 2.5)))
+    sweep_checkpoints()
     assert cli.main(_session_argv("local-session", db_path)) == 0
+    sweep_checkpoints()
     assert cli.main(_session_argv("local-session", db_path)) == 0
 
     out, err = capsys.readouterr()
@@ -868,7 +1043,7 @@ def test_a_session_that_crosses_the_ceiling_on_its_last_call_keeps_its_evidence(
     class _PlannerHeavy(_ProviderDemoClient):
         def chat_json(self, messages, response_model, *args, **kwargs):
             cost = 10_000 if response_model.__name__ == "StudyPlanDraft" else 10
-            usage.record_usage("mimo", "test-model", prompt_tokens=cost, completion_tokens=0)
+            usage.record_usage("groq", "test-model", prompt_tokens=cost, completion_tokens=0)
             return super().chat_json(messages, response_model, *args, **kwargs)
 
     _tmp_ledger(monkeypatch, tmp_path)
@@ -953,7 +1128,7 @@ def test_a_daily_exhaustion_suspend_says_the_wait_and_does_not_pretend_otherwise
     capsys.readouterr()
 
     monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "10")
-    usage.record_usage("mimo", "test-model", prompt_tokens=10, completion_tokens=0)
+    usage.record_usage("groq", "test-model", prompt_tokens=10, completion_tokens=0)
     rc = cli.main(
         ["session", "--resume", "--scripted", "--no-live", "--session-id", "dry", "--checkpoint-db", str(db_path)]
     )
@@ -975,7 +1150,7 @@ def test_a_dead_quota_suspends_before_the_first_question(tmp_path, monkeypatch, 
     # nothing — verbatim the corruption the ADR's Why section describes.
     class _QuotaDead(_ProviderDemoClient):
         def chat_json(self, *args, **kwargs):
-            usage.record_quota_exhausted("mimo")  # what llm.py latches on a real RateLimitError
+            usage.record_quota_exhausted("groq")  # what llm.py latches on a real RateLimitError
             raise RuntimeError("Error code: 429 - insufficient_quota")
 
     _tmp_ledger(monkeypatch, tmp_path)
@@ -996,34 +1171,88 @@ def test_a_dead_quota_suspends_before_the_first_question(tmp_path, monkeypatch, 
 
 
 def test_a_dead_quota_mid_question_suspends_instead_of_cascading(tmp_path, monkeypatch, capsys):
-    # The harder half: the quota dies once the graph is already running, so the exception DOES land
-    # in question_node's `except Exception` net and one `failed` question is unavoidable without
-    # editing supervisor.py. What the latch buys is that it stops there — one, not one per remaining
-    # question, and exit 2 with no Study Plan instead of exit 0 with a fabricated one.
-    class _QuotaAfterDiagnostic(_ProviderDemoClient):
-        calls = 0
+    # GH #119: the quota dies once the graph is already running. The typed stop must propagate past
+    # question_node's net — no zero-evidence `failed` item, no advance — and the CLI suspends with
+    # the resume command instead of printing a "(complete)" summary built on nothing.
+    from interview_coach import supervisor
+    from interview_coach.usage import ProviderQuotaExhausted
 
-        def chat_json(self, *args, **kwargs):
-            type(self).calls += 1
-            if type(self).calls > 1:
-                usage.record_quota_exhausted("mimo")
-                raise RuntimeError("Error code: 429 - insufficient_quota")
-            return super().chat_json(*args, **kwargs)
+    real_micro_loop = supervisor.run_micro_loop
+    calls = {"n": 0}
 
+    def _quota_dies_on_the_second_question(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")
+        return real_micro_loop(*args, **kwargs)
+
+    monkeypatch.setattr(supervisor, "run_micro_loop", _quota_dies_on_the_second_question)
     _tmp_ledger(monkeypatch, tmp_path)
     monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
-    monkeypatch.setattr(cli, "build_client", lambda settings: _QuotaAfterDiagnostic())
+    monkeypatch.setattr(cli, "build_client", lambda settings: _ProviderDemoClient())
     db_path = tmp_path / "mid-quota.sqlite"
 
     rc = cli.main(_session_argv("mid-quota", db_path, questions="3"))
+    out, err = capsys.readouterr()
+
+    assert rc == 2
+    assert "SESSION SUSPENDED" in err
+    assert "insufficient_quota" in err
+    assert "--resume" in err
+    assert "SESSION mid-quota (complete)" not in out
+    state = _checkpoint_state("mid-quota", db_path)
+    assert [item["stop_reason"] for item in state["transcript"]] == ["resolved"]
+    assert state["question_count"] == 1
+    assert state["status"] == "active"
+    assert not state.get("study_plan")
+
+
+def test_a_dead_quota_on_the_diagnostic_offers_no_resume_because_nothing_was_checkpointed(
+    tmp_path, monkeypatch, capsys
+):
+    # The first call of the day is the one the start gate cannot predict: the latch is written by the
+    # call that dies. Dying on the Diagnostic leaves no graph checkpoint, so the suspend banner must
+    # not point at `--resume` (that path answers with an unknown-id error).
+    from interview_coach.usage import ProviderQuotaExhausted
+
+    def _quota_dies_on_the_diagnostic(*args, **kwargs):
+        raise ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")
+
+    monkeypatch.setattr(cli, "diagnose_or_degrade", _quota_dies_on_the_diagnostic)
+    _tmp_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: _ProviderDemoClient())
+    db_path = tmp_path / "diag-quota.sqlite"
+
+    rc = cli.main(_session_argv("diag-quota", db_path))
+    out, err = capsys.readouterr()
+
+    assert rc == 2
+    assert "SESSION SUSPENDED" in err
+    assert "Nothing was checkpointed yet" in err
+    assert "--resume" not in err
+    assert _checkpoint_state("diag-quota", db_path) is None
+    assert "SESSION diag-quota" not in out
+
+
+def test_diagnose_on_a_dead_quota_exits_2_with_the_reason_not_a_traceback(monkeypatch, capsys):
+    # `diagnose_or_degrade` re-raises the typed stop (it must not disguise a dead quota as a
+    # deterministic plan), so the dispatcher owns the exit for every non-session command.
+    from interview_coach.usage import ProviderQuotaExhausted
+
+    def _quota_dies(*args, **kwargs):
+        raise ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")
+
+    monkeypatch.setattr(cli, "diagnose_or_degrade", _quota_dies)
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: object())
+
+    rc = cli.main(["diagnose", "--target-role", "machine learning engineer"])
     err = capsys.readouterr().err
 
     assert rc == 2
     assert "insufficient_quota" in err
-    state = _checkpoint_state("mid-quota", db_path)
-    assert [item["stop_reason"] for item in state["transcript"]] == ["failed"]
-    assert state["status"] != "complete"
-    assert not state.get("study_plan")
+    assert "resets at 00:00 UTC" in err
 
 
 def test_a_resume_retries_the_provider_once_and_re_suspends_if_it_is_still_dead(tmp_path, monkeypatch, capsys):
@@ -1035,10 +1264,10 @@ def test_a_resume_retries_the_provider_once_and_re_suspends_if_it_is_still_dead(
     db_path = tmp_path / "retry.sqlite"
     _suspend_after_first_question(_MeteredDemoClient(), db_path, "retry")
     usage.begin_session_run("retry")
-    usage.record_quota_exhausted("mimo")
+    usage.record_quota_exhausted("groq")
     capsys.readouterr()
 
-    assert usage.quota_exhausted_today("mimo")
+    assert usage.quota_exhausted_today("groq")
     rc = cli.main(
         ["session", "--resume", "--scripted", "--no-live", "--session-id", "retry", "--checkpoint-db", str(db_path)]
     )
@@ -1046,8 +1275,8 @@ def test_a_resume_retries_the_provider_once_and_re_suspends_if_it_is_still_dead(
 
     # The provider is healthy again in this run, so the retry succeeds and the Session finishes.
     assert rc == 0
-    assert "retrying mimo after an insufficient_quota stop" in err
-    assert not usage.quota_exhausted_today("mimo")
+    assert "retrying groq after an insufficient_quota stop" in err
+    assert not usage.quota_exhausted_today("groq")
 
 
 def test_the_derived_ceiling_is_silent_on_a_worst_case_session_and_still_stops_a_runaway(tmp_path, monkeypatch, capsys):
@@ -1059,7 +1288,7 @@ def test_the_derived_ceiling_is_silent_on_a_worst_case_session_and_still_stops_a
     def brain(tokens_per_call):
         class _Billing(_ProviderDemoClient):
             def chat_json(self, *args, **kwargs):
-                usage.record_usage("mimo", "test-model", prompt_tokens=tokens_per_call, completion_tokens=0)
+                usage.record_usage("groq", "test-model", prompt_tokens=tokens_per_call, completion_tokens=0)
                 return super().chat_json(*args, **kwargs)
 
         return _Billing()
@@ -1082,3 +1311,102 @@ def test_the_derived_ceiling_is_silent_on_a_worst_case_session_and_still_stops_a
     # And it was stopped well short of eating the day, which is what "nothing bounds a single
     # session" asked for.
     assert usage.session_run_spend("berserk") < usage.DEFAULT_DAILY_TOKEN_BUDGET // 2
+
+
+def test_session_refuses_an_unsafe_candidate_id_before_the_interview(tmp_path, monkeypatch, capsys):
+    # QA-02. `save_posteriors` is silent by contract — it warns and returns — so without a guard here
+    # a bad --candidate ran the whole interview and then persisted none of its Skill evidence, which
+    # is the failure the cross-session memory exists to prevent.
+    from interview_coach.demo_llm import DemoLLMClient
+
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: DemoLLMClient())
+
+    rc = cli.main(
+        [
+            "session",
+            "--scripted",
+            "--no-live",
+            "--max-questions",
+            "1",
+            "--candidate",
+            "minh minh",
+            "--session-id",
+            "unsafe-candidate",
+            "--checkpoint-db",
+            str(tmp_path / "c.sqlite"),
+        ]
+    )
+
+    assert rc == 2
+    assert "not a valid Skill ledger key" in capsys.readouterr().err
+
+
+# --- NEW-19 / NEW-20: one writer per checkpoint thread, and a finished Session is not resumable ---
+
+
+def test_resume_refuses_a_session_that_already_finished(tmp_path, monkeypatch, capsys):
+    # NEW-19. A finished interview has no next node, so `graph.stream(None, config)` yields the
+    # stored values once and hands them straight back: exit 0 and a full "(complete)" report for THAT
+    # interview, printed under a "RESUMING SESSION" banner as if it were this run's result.
+    # `--session-id` defaults to the constant "local-session", so the week's second interview is the
+    # default path into it. M0-2 closed the fresh-start half of QA-01; this is the resume half.
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: DemoLLMClient())
+    db_path = tmp_path / "finished.sqlite"
+    assert cli.main(_session_argv("finished", db_path)) == 0
+    finished_at = _checkpoint_state("finished", db_path)["started_at"]
+    capsys.readouterr()
+
+    rc = cli.main(
+        [
+            "session", "--resume", "--scripted", "--no-live",
+            "--session-id", "finished", "--checkpoint-db", str(db_path),
+        ]
+    )
+    out, err = capsys.readouterr()
+
+    assert rc == 2
+    assert "already finished" in err
+    assert "SESSION finished (complete)" not in out  # never re-served as this run's result
+    assert "RESUMING SESSION finished" not in out
+    # Refused above `graph.update_state`, so the finished record is not re-stamped either.
+    assert _checkpoint_state("finished", db_path)["started_at"] == finished_at
+
+
+def test_a_second_driver_is_refused_while_another_process_holds_the_session(tmp_path, monkeypatch, capsys):
+    # NEW-20. The server's in-process registry serialises drives inside the SERVER; nothing stopped a
+    # shell `coach session --resume` from streaming into the same thread_id from another process —
+    # two writers, one checkpoint. flock is held per OPEN FILE DESCRIPTION, so a second `open()` here
+    # is exactly the second process the guard has to refuse.
+    import fcntl
+
+    from interview_coach.filelock import lock_path_for
+
+    demo = DemoLLMClient()
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: demo)
+    db_path = tmp_path / "shared.sqlite"
+    _suspend_after_first_question(demo, db_path, "shared")
+    capsys.readouterr()
+
+    sidecar = lock_path_for(cli._checkpoint_lock_target(str(db_path), "shared"))
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    holder = sidecar.open("a+", encoding="utf-8")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        rc = cli.main(
+            [
+                "session", "--resume", "--scripted", "--no-live",
+                "--session-id", "shared", "--checkpoint-db", str(db_path),
+            ]
+        )
+    finally:
+        holder.close()
+    err = capsys.readouterr().err
+
+    assert rc == 2
+    assert "another process" in err
+    state = _checkpoint_state("shared", db_path)
+    assert state["question_count"] == 1  # refused before it drove anything
+    assert state["status"] == "active"

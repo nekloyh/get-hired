@@ -13,6 +13,7 @@ run needs a live provider.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib import resources
@@ -25,6 +26,9 @@ from .evaluator import Evaluation, evaluate
 from .language import validate_language_mode
 from .llm import LLMClient
 from .rubric import Rubric
+from .usage import AccountingUnavailable, ProviderQuotaExhausted
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -184,7 +188,15 @@ def _evaluate_case(client: LLMClient, case: BenchCase) -> tuple[Evaluation | Non
     """One judgment attempt: the evaluation, or the provider/schema failure that replaced it."""
     try:
         evaluation = evaluate(client, case.question, case.answer, case.rubric, language_mode=case.language_mode)
+    except (AccountingUnavailable, ProviderQuotaExhausted):
+        # QA-14 / M0a / F1 / GH #119: a dead quota or refused accounting is a fact about the provider
+        # or our bookkeeping, never a measurement of the judge. Caught here it became an error ROW in
+        # the report written into docs/audits/ — and under ADR 0009 that report IS the judge gate's
+        # artifact, so infrastructure read as a judge regression. `_dispatch` turns the raise into
+        # exit 2 with the remedy, and no report is written at all.
+        raise
     except Exception as err:  # noqa: BLE001 - the bench reports provider/schema failures as cases
+        logger.warning("bench case %s errored (%s: %s)", case.case_id, type(err).__name__, err)
         return None, f"{type(err).__name__}: {err}"
     return evaluation, None
 

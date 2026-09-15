@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
+import multiprocessing as mp
+import threading
+import time
 from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
 
 from interview_coach import telemetry, usage
 from interview_coach.usage import (
@@ -27,9 +34,11 @@ from interview_coach.usage import (
     questions_today,
     quota_exhausted_today,
     record_questions,
+    record_questions_released,
     record_quota_exhausted,
     record_usage,
     remaining_today,
+    reserve_questions,
     session_baseline,
     session_budget_guard,
     session_lifetime_spend,
@@ -71,6 +80,20 @@ def test_remaining_today_subtracts_spend_from_budget(tmp_path, monkeypatch):
     assert remaining_today("openai") == 0
 
 
+def test_the_daily_rail_counts_what_a_failover_billed_on_the_other_provider(tmp_path, monkeypatch):
+    # LLMRouter bills the primary inside _create() and only THEN raises EmptyCompletionError, which
+    # is_provider_failure() treats as an outage, so the fallback answers and bills the same logical
+    # request; once the primary's breaker opens, only the fallback is billed at all. Either way the
+    # spend is real, and a rail that reads one provider's bucket hands out a budget already spent.
+    ledger = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
+    monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", str(estimated_session_tokens(1)))
+    record_usage("groq", "llama-3.3-70b-versatile", prompt_tokens=SESSION_TOKENS_PER_QUESTION, completion_tokens=0)
+
+    assert remaining_today("openai") == SESSION_SETUP_TOKENS
+    assert start_refusal_reason("openai", questions=1) is not None
+
+
 def test_other_days_do_not_count(tmp_path, monkeypatch):
     ledger = tmp_path / "ledger.jsonl"
     monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
@@ -108,13 +131,6 @@ def test_a_half_written_token_row_is_skipped_whole(tmp_path, monkeypatch):
 
     assert usage_for_day() == {}
     assert sessions_for_day() == {}
-
-
-def test_record_usage_never_raises_on_io_failure(tmp_path):
-    # A ledger line lost to IO is noise; a crashed live judgment is not.
-    unwritable = tmp_path / "dir-as-file"
-    unwritable.write_text("occupied", encoding="utf-8")
-    record_usage("openai", "m", prompt_tokens=1, completion_tokens=1, path=unwritable / "ledger.jsonl")
 
 
 def test_missing_ledger_is_empty(tmp_path, monkeypatch):
@@ -192,14 +208,28 @@ def test_the_call_model_matches_the_constants_it_restates(monkeypatch):
 def test_the_worst_case_arithmetic_is_pinned():
     # Written out so the next person cannot quietly shave the ceiling: every term is a count of
     # PROVIDER calls, and a schema retry is a provider call that bills tokens.
-    #   per question (max_turns=4): 2 seed-render + 4x6 evaluations + 10 one panel
-    #                               + 3x6 follow-ups + 2 supervisor            = 56
-    #   per Session (max_questions=5): 2 Diagnostic + 5x56 + 2 Study Plan       = 284
+    # NEW-06: the routed roles are doubled, because a failover bills a SECOND provider for the same
+    # logical call. The judge is not — it is seated on a pinned client and cannot fail over (ADR
+    # 0009a), so doubling it would loosen the rail for a case that cannot happen.
+    #   per question (max_turns=4): 2x(2 seed-render + 3x6 follow-ups + 2 supervisor)
+    #                               + 4x6 evaluations + 10 one panel            = 78
+    #   per Session (max_questions=5): 2x2 Diagnostic + 5x78 + 2x2 Study Plan    = 394
     assert (usage.EVALUATION_CALLS, usage.PANEL_CALLS, usage.FOLLOW_UP_CALLS) == (6, 10, 6)
-    assert worst_case_question_calls(4) == 56
-    assert worst_case_session_calls(5, 4) == 284
-    assert worst_case_session_tokens(5, 4) == 284 * WORST_CASE_TOKENS_PER_CALL
-    assert worst_case_session_tokens(5, 4) == 766_800
+    assert worst_case_question_calls(4) == 78
+    assert worst_case_session_calls(5, 4) == 394
+    assert worst_case_session_tokens(5, 4) == 394 * WORST_CASE_TOKENS_PER_CALL
+    assert worst_case_session_tokens(5, 4) == 1_063_800
+
+
+def test_the_ceiling_counts_the_second_provider_a_failover_bills():
+    # Routed roles (seed render, follow-ups, Supervisor) ride LLMRouter and can bill two providers
+    # for one logical call; the judge is a pinned client (ADR 0009a) and never fails over, so
+    # doubling its calls would loosen the runaway rail for a case that cannot happen. Splitting the
+    # two is what stops a blanket 2x from being pinned by accident.
+    routed = usage.SEED_RENDER_CALLS + 3 * usage.FOLLOW_UP_CALLS + usage.SUPERVISOR_CALLS
+    pinned = 4 * usage.EVALUATION_CALLS + usage.PANEL_ESCALATIONS_PER_QUESTION * usage.PANEL_CALLS
+    assert worst_case_question_calls(4) == 2 * routed + pinned
+    assert usage.FAILOVER_PROVIDERS_PER_CALL == 2
 
 
 def test_every_sizing_constant_still_follows_from_its_measurement():
@@ -222,9 +252,10 @@ def test_the_ceiling_is_bracketed_by_what_the_ledger_measured():
     # Above: a ceiling a real Session can reach fires on compliant behaviour, so the whole ceiling
     # must dwarf the heaviest Session ever measured.
     assert worst_case_session_tokens(5, 4) > 20 * HEAVIEST_MEASURED_SESSION_TOKENS
-    # Below: a ceiling one Session cannot fit under three times over is not bounding anything, which
-    # is the thing the issue asked for ("nothing bounds a single session").
-    assert worst_case_session_tokens(5, 4) < DEFAULT_DAILY_TOKEN_BUDGET // 3
+    # Below: a ceiling one Session cannot fit under twice over is not bounding anything, which is the
+    # thing the issue asked for ("nothing bounds a single session"). Was `// 3` before NEW-06 added
+    # the failover multiplier — the bracket loosens by exactly that factor and no more.
+    assert worst_case_session_tokens(5, 4) < DEFAULT_DAILY_TOKEN_BUDGET // 2
 
 
 def test_the_ceiling_scales_with_the_rails_the_session_declared():
@@ -239,11 +270,61 @@ def test_the_ceiling_scales_with_the_rails_the_session_declared():
     assert worst_case_question_calls(0) == worst_case_question_calls(1)
 
 
+def test_the_runaway_rail_is_sized_on_the_estimate_the_session_was_admitted_on(monkeypatch):
+    # NEW-09: the start gate admits a Session on estimated_session_tokens(); the rail that calls it a
+    # runaway must price it with the SAME cost model, not with one an order of magnitude larger. The
+    # gap was measured at ~29x before the failover multiplier (NEW-06) and ~40x after it, which put a
+    # single 10-question web Candidate's ceiling at 85% of the whole day.
+    monkeypatch.delenv("LLM_SESSION_TOKEN_BUDGET", raising=False)
+    for questions in (1, 3, 10):
+        admitted = estimated_session_tokens(questions)
+        ceiling = session_token_budget(max_questions=questions, max_turns=4)
+        assert ceiling <= usage.session_ceiling_multiple(4) * admitted, (
+            f"{questions}q: admitted at ~{admitted:,}, runaway rail at ~{ceiling:,} "
+            f"({ceiling / admitted:.1f}x the estimate it was admitted on)"
+        )
+    # And no single Candidate is handed a majority of the day (the web caps max_questions at 10).
+    assert session_token_budget(max_questions=10, max_turns=4) < DEFAULT_DAILY_TOKEN_BUDGET // 4
+
+
+def test_the_ceiling_multiple_is_derived_from_the_measured_constants_not_chosen():
+    # Both factors are measurements, so the number moves when the measurements do — and a future
+    # tuner has to change a constant with a ledger behind it rather than a magic multiplier.
+    assert usage.compliant_question_calls(4) == 15  # 1 seed + 4 judgments + 3x2 follow-ups + 3 panel + 1 supervisor
+    assert usage.CALL_SIZE_INFLATION == pytest.approx(2_700 * 16 / 26_866)
+    assert usage.session_ceiling_multiple(4) == 9
+    # Proportional to the rails the Session declared, which is what the worst-case model argues for.
+    assert [usage.session_ceiling_multiple(t) for t in (1, 2, 4, 8)] == [4, 5, 9, 15]
+
+
+def test_the_default_rail_suspends_a_session_spending_ten_times_its_admitted_estimate(tmp_path, monkeypatch):
+    # No LLM_SESSION_TOKEN_BUDGET: the ceiling that SHIPS, not a test-shrunk stand-in. Every other
+    # runaway test opts out of the default, so nothing in the suite exercised the real one.
+    _ledger(tmp_path, monkeypatch)
+    monkeypatch.delenv("LLM_SESSION_TOKEN_BUDGET", raising=False)
+    spent = 10 * estimated_session_tokens(5)  # 270,000 on a Session admitted at ~27,000
+    begin_session_run("sess-a")
+    with session_scope("sess-a"):
+        record_usage("openai", "m", prompt_tokens=spent, completion_tokens=0)
+
+    reason = _stop(session_id="sess-a")
+
+    assert reason is not None
+    assert "runaway, not a long interview" in reason
+    # ADR 0005's third category: suspend-and-resume, never a failed question, and the remedy is one
+    # a web Candidate can perform.
+    assert "Suspending with 1 question(s) resolved" in reason
+    assert "Resume this Session to continue" in reason
+
+
 def test_session_budget_env_override(monkeypatch):
     monkeypatch.setenv("LLM_SESSION_TOKEN_BUDGET", "77")
     assert session_token_budget(max_questions=5, max_turns=4) == 77
     monkeypatch.setenv("LLM_SESSION_TOKEN_BUDGET", "not-a-number")
-    assert session_token_budget(max_questions=5, max_turns=4) == worst_case_session_tokens(5, 4)
+    # NEW-09: the default the override falls back to is the ceiling sized on the admitted estimate,
+    # not the retry-storm worst case — which was ~40x it and 85% of the day at max_questions=10.
+    default = usage.session_ceiling_multiple(4) * estimated_session_tokens(5)
+    assert session_token_budget(max_questions=5, max_turns=4) == default
 
 
 def test_daily_question_cap_env_override(monkeypatch):
@@ -555,8 +636,11 @@ def test_start_refusal_fires_only_when_the_day_cannot_fund_the_session(tmp_path,
     reason = start_refusal_reason("openai", questions=2)
     assert reason is not None
     assert "00:00 UTC" in reason  # the remedy, not just the refusal
-    # Another provider's spend is not this provider's problem.
-    assert start_refusal_reason("groq", questions=2) is None
+    # NEW-06 inverts what this used to pin. LLM_DAILY_TOKEN_BUDGET is ONE scalar and a failover bills
+    # a second provider for the same logical call, so another provider's spend IS this provider's
+    # problem — and once the primary's breaker opens, only the fallback is billed at all, which a
+    # per-provider rail would never see.
+    assert start_refusal_reason("groq", questions=2) is not None
 
 
 def test_question_cap_reason_names_the_env_var(tmp_path, monkeypatch):
@@ -678,6 +762,41 @@ def test_a_resume_also_retries_a_dead_quota_and_says_which(tmp_path, monkeypatch
     assert clear_run_rails_for_resume("s", "openai", max_questions=5, max_turns=4) is None
 
 
+def test_a_resume_grants_its_own_session_one_retry_and_nobody_else(tmp_path, monkeypatch):
+    # NEW-05. The grant is one human saying "try again" about their own interview, not a fact about
+    # the account. Global, it converted a clean refusal into broken interviews: A resumes, B/C/D sail
+    # through the start gate, each burns a Diagnostic to rediscover the same dead quota — and the
+    # first of them re-latches it, cancelling A's attempt too.
+    _ledger(tmp_path, monkeypatch)
+    record_quota_exhausted("openai")
+
+    note = clear_run_rails_for_resume("sess-a", "openai", max_questions=5, max_turns=4)
+
+    assert note is not None and "retrying openai" in note
+    assert _stop(session_id="sess-a") is None  # A still gets its one real attempt
+    assert _stop(session_id="sess-b") is not None  # B's suspend is untouched
+    assert start_refusal_reason("openai", questions=1) is not None  # and a fresh start stays refused
+    assert quota_exhausted_today("openai")
+    assert not quota_exhausted_today("openai", session="sess-a")
+
+
+def test_the_granted_retry_is_one_attempt_and_a_billed_call_revives_everyone(tmp_path, monkeypatch):
+    # The two halves the scoping must not break: the grant is spent by the attempt that re-latches,
+    # and a call that actually billed tokens IS a fact about the account, so it clears for everybody.
+    _ledger(tmp_path, monkeypatch)
+    record_quota_exhausted("openai")
+    clear_run_rails_for_resume("sess-a", "openai", max_questions=5, max_turns=4)
+
+    record_quota_exhausted("openai")  # what llm.py latches when the granted attempt dies again
+    assert _stop(session_id="sess-a") is not None
+
+    clear_run_rails_for_resume("sess-a", "openai", max_questions=5, max_turns=4)
+    with session_scope("sess-a"):
+        record_usage("openai", "m", prompt_tokens=1, completion_tokens=0)
+    assert _stop(session_id="sess-b") is None
+    assert start_refusal_reason("openai", questions=1) is None
+
+
 def test_a_resume_does_not_clear_the_daily_rail(tmp_path, monkeypatch):
     # The daily ledger rail is arithmetic over the day, not a latch on this run — it clears at
     # 00:00 UTC whether anyone resumes or not. Forgiving it here would let a resume loop spend the
@@ -721,3 +840,560 @@ def test_telemetry_incr_snapshot_delta_reset():
     assert telemetry.delta(after, after) == {}
     telemetry.reset()
     assert telemetry.snapshot() == {}
+
+
+# --- M0a / F1: accounting health ------------------------------------------------------------------
+#
+# The rails above are arithmetic over the ledger file. Every test in this section exists because
+# arithmetic over a file nobody is writing reads as "spent nothing" — the most permissive answer
+# there is, from the least reliable input. Two fault shapes, deliberately kept apart:
+#
+#   ledger path is a DIRECTORY  -> the ledger cannot be appended, its sidecar (a sibling file) can.
+#                                  This is the realistic container shape: writes fail, the directory
+#                                  around them does not.
+#   ledger parent is a FILE     -> neither the ledger nor the sidecar can be written. The worst case,
+#                                  pinned separately because it is the one the latch cannot outlive.
+
+
+def _broken_ledger(tmp_path, monkeypatch):
+    """A ledger path that cannot be appended to, in a directory that can still hold the sidecar."""
+    ledger = tmp_path / "usage-ledger.jsonl"
+    ledger.mkdir()
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
+    return ledger
+
+
+def test_a_healthy_ledger_blocks_nothing(tmp_path, monkeypatch):
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(tmp_path / "usage-ledger.jsonl"))
+    assert usage.check_ledger_writable() is None
+    assert usage.accounting_fault() is None
+    assert usage.accounting_block_reason() is None
+    assert usage.accounting_gate() is None
+
+
+def test_the_probe_creates_the_ledger_rather_than_asserting_the_mode_bits(tmp_path, monkeypatch):
+    # `os.access` answers a question about permissions; the rail's question is "will the next append
+    # work", which only an append answers. Creating the file is the honest side effect of asking.
+    ledger = tmp_path / "nested" / "usage-ledger.jsonl"
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
+    assert usage.check_ledger_writable() is None
+    assert ledger.exists()
+    assert ledger.read_text(encoding="utf-8") == ""
+
+
+def test_an_unwritable_path_blocks_before_anything_is_spent(tmp_path, monkeypatch):
+    # AC 3. The pre-call half: the condition is visible, it names the remedy, and it says out loud
+    # that nothing is unaccounted for — which is the whole reason it is a different state from the
+    # post-call one below.
+    _broken_ledger(tmp_path, monkeypatch)
+
+    reason = usage.check_ledger_writable()
+    assert reason is not None
+    assert "cannot be written" in reason
+    assert "COACH_USAGE_LEDGER" in reason
+    assert "Nothing is unaccounted for yet" in reason
+    # ...and it reaches both rails, so neither surface can start or continue a metered Session.
+    assert usage.start_refusal_reason("openai", questions=1) == reason
+    assert _stop(questions_left=1) == reason
+
+
+def test_the_start_gate_refuses_an_unwritable_ledger_before_the_quota_and_budget_rails(tmp_path, monkeypatch):
+    # Precedence matters: with the ledger broken, `remaining_today` reports a FULL budget, so the
+    # two rails below would both wave the Session through on a number they cannot know.
+    _broken_ledger(tmp_path, monkeypatch)
+    monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "1")  # would refuse on its own, with other wording
+
+    refusal = usage.start_refusal_reason("openai", questions=1)
+    assert refusal is not None
+    assert "Usage accounting is unavailable" in refusal
+    assert "00:00 UTC" not in refusal  # not a scarcity story; waiting for the reset fixes nothing
+
+
+def test_a_running_session_suspends_on_an_unwritable_ledger(tmp_path, monkeypatch):
+    _broken_ledger(tmp_path, monkeypatch)
+    guard = session_budget_guard("s", "openai", max_turns=4, complete_status="complete")
+
+    reason = guard({"max_questions": 3, "question_count": 1, "status": "active"})
+    assert reason is not None
+    assert "Usage accounting is unavailable" in reason
+
+
+def test_a_completed_session_is_not_suspended_by_a_broken_ledger(tmp_path, monkeypatch):
+    # The same carve-out the budget rail already has, and for a stronger reason here: at COMPLETE the
+    # only spend left is one Study Plan call, which the call-boundary gate refuses on its own. Firing
+    # here would discard a whole interview's evidence to prevent a call already prevented.
+    _broken_ledger(tmp_path, monkeypatch)
+    guard = session_budget_guard("s", "openai", max_turns=4, complete_status="complete")
+
+    assert guard({"max_questions": 3, "question_count": 3, "status": "complete"}) is None
+
+
+def test_a_billed_call_whose_row_cannot_be_written_is_never_counted_as_zero(tmp_path, monkeypatch):
+    # AC 4, the core of this slice. The provider answered and charged us; only the bookkeeping
+    # failed. The tokens are parked, the condition says UNRECONCILED, and it names what it holds.
+    ledger = _broken_ledger(tmp_path, monkeypatch)
+
+    record_usage("openai", "gpt-5.4-mini", prompt_tokens=1000, completion_tokens=200)  # must not raise
+
+    fault = usage.accounting_fault()
+    assert fault is not None
+    assert "UNRECONCILED" in fault
+    assert "1 provider call" in fault
+    assert "~1,200 token(s)" in fault  # the spend is stated, not rounded away
+    parked = usage.ledger_fault_path(ledger)
+    assert parked.exists()
+    held = json.loads(parked.read_text(encoding="utf-8").splitlines()[0])
+    assert held["billed"] is True
+    assert held["entry"]["prompt_tokens"] == 1000
+
+
+def test_a_bookkeeping_row_that_cannot_be_written_says_no_spend_is_unaccounted(tmp_path, monkeypatch):
+    # The other side of the pre/post distinction. A `questions` reservation is written BEFORE any
+    # call, so losing it costs a rail its input but leaves nothing unpaid-for. Blocked all the same —
+    # the rails are reading an incomplete ledger — but never described as unreconciled spend.
+    _broken_ledger(tmp_path, monkeypatch)
+
+    record_questions("identity", 3)
+
+    fault = usage.accounting_fault()
+    assert fault is not None
+    assert "UNRECONCILED" not in fault
+    assert "No provider call is unaccounted for" in fault
+
+
+def test_a_latched_fault_outlives_the_process_that_raised_it(tmp_path, monkeypatch):
+    # The CLI is one process per invocation, so an in-memory latch alone would forget every fault
+    # between commands. `reset_accounting_state` is exactly what a fresh process starts from.
+    _broken_ledger(tmp_path, monkeypatch)
+    record_usage("openai", "gpt-5.4-mini", prompt_tokens=10, completion_tokens=5)
+
+    usage.reset_accounting_state()
+
+    assert "UNRECONCILED" in (usage.accounting_fault() or "")
+
+
+def test_repairing_the_path_does_not_by_itself_forgive_the_unrecorded_call(tmp_path, monkeypatch):
+    # A writable path is not a reconciled ledger: the row whose write failed is still missing, so the
+    # day total is still wrong. Clearing on repair alone would be "treat the unknown spend as zero"
+    # with extra steps.
+    ledger = _broken_ledger(tmp_path, monkeypatch)
+    record_usage("openai", "gpt-5.4-mini", prompt_tokens=1000, completion_tokens=200)
+
+    ledger.rmdir()  # the operator fixes the path
+
+    assert usage.check_ledger_writable() is None
+    assert "UNRECONCILED" in (usage.accounting_block_reason() or "")
+
+
+def test_reconcile_replays_the_held_row_instead_of_forgiving_it(tmp_path, monkeypatch):
+    ledger = _broken_ledger(tmp_path, monkeypatch)
+    record_usage("openai", "gpt-5.4-mini", prompt_tokens=1000, completion_tokens=200)
+    ledger.rmdir()
+
+    note = usage.reconcile_accounting()
+
+    assert "Reconciled 1 held ledger row(s)" in note
+    assert usage.accounting_block_reason() is None
+    assert not usage.ledger_fault_path(ledger).exists()
+    # The point of replaying rather than clearing: the day's total is right again afterwards.
+    assert usage_for_day()["openai"]["total"] == 1200
+
+
+def test_a_failed_reconcile_neither_loses_the_held_row_nor_replays_it_twice(tmp_path, monkeypatch):
+    # Running --reconcile before fixing the path is the obvious operator mistake, so the failed
+    # attempt must be a no-op: the row stays held, and the reconcile that eventually succeeds counts
+    # it exactly once. Losing it would forgive real spend; replaying it twice would invent spend.
+    ledger = _broken_ledger(tmp_path, monkeypatch)
+    record_usage("openai", "gpt-5.4-mini", prompt_tokens=100, completion_tokens=20)
+
+    with pytest.raises(OSError):
+        usage.reconcile_accounting()
+
+    assert "UNRECONCILED" in (usage.accounting_fault() or "")
+    assert usage.ledger_fault_path(ledger).exists()
+
+    ledger.rmdir()
+    usage.reconcile_accounting()
+
+    assert usage.usage_for_day()["openai"] == {"prompt": 100, "completion": 20, "total": 120, "calls": 1}
+    assert usage.accounting_block_reason() is None
+
+
+def test_reconcile_says_so_when_a_fault_carries_no_replayable_row(tmp_path, monkeypatch):
+    # The residual this design cannot repair: a fault raised when even the sidecar was unwritable,
+    # whose process has since exited. We know a call went unrecorded but not what it cost — and the
+    # one thing that must never happen is calling that zero.
+    ledger = tmp_path / "usage-ledger.jsonl"
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
+    usage.ledger_fault_path(ledger).write_text(
+        json.dumps({"ts": utc_date() + "T00:00:00+00:00", "kind": "accounting_fault", "billed": True}) + "\n",
+        encoding="utf-8",
+    )
+
+    note = usage.reconcile_accounting()
+
+    assert "stays unknown, not zero" in note
+    assert usage.accounting_block_reason() is None
+
+
+def test_a_fault_that_cannot_even_be_parked_still_blocks_this_process(tmp_path, monkeypatch):
+    # Worst case: the ledger's whole directory is unusable, so the sidecar fails too. The in-process
+    # latch is the only thing left — and it is enough, because the path is still unwritable, so the
+    # pre-call probe blocks the NEXT process on its own.
+    occupied = tmp_path / "not-a-directory"
+    occupied.write_text("occupied", encoding="utf-8")
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(occupied / "usage-ledger.jsonl"))
+
+    record_usage("openai", "gpt-5.4-mini", prompt_tokens=10, completion_tokens=5)
+
+    assert "UNRECONCILED" in (usage.accounting_fault() or "")
+    usage.reset_accounting_state()  # a fresh process: the fault itself is gone...
+    assert usage.accounting_fault() is None
+    assert usage.accounting_block_reason() is not None  # ...but metered work is still refused
+
+
+def test_record_usage_never_raises_on_io_failure(tmp_path):
+    # Unchanged invariant: a ledger write happens mid-judgment, after the provider has answered, so
+    # it must not be the thing that crashes the judgment. What changed is what happens next — the
+    # loss is latched and blocks the following call instead of being written off as noise.
+    unwritable = tmp_path / "dir-as-file"
+    unwritable.write_text("occupied", encoding="utf-8")
+    record_usage("openai", "m", prompt_tokens=1, completion_tokens=1, path=unwritable / "ledger.jsonl")
+    assert usage.accounting_fault(path=unwritable / "ledger.jsonl") is not None
+
+
+def test_the_call_gate_remembers_a_good_path_but_re_probes_a_bad_one(tmp_path, monkeypatch):
+    # Memoizing a failure would leave an operator who fixes the path refused until they restart the
+    # server — the one remedy a Candidate on the web cannot apply.
+    ledger = _broken_ledger(tmp_path, monkeypatch)
+    assert usage.accounting_gate() is not None
+
+    ledger.rmdir()
+
+    assert usage.accounting_gate() is None
+
+
+def test_a_sidecar_we_cannot_read_blocks_instead_of_reading_as_no_faults(tmp_path, monkeypatch, caplog):
+    # QA-04. The realistic shape: an older root container left the sidecar 0600 root:root, then the
+    # ledger path itself was fixed. "Cannot read the parked rows" must never collapse into "nothing
+    # was parked" — that is the same forgiveness as counting an unrecorded call as zero, one file at
+    # a time, and it is the only place in this module where the money path fails OPEN.
+    ledger = _broken_ledger(tmp_path, monkeypatch)
+    record_usage("openai", "gpt-5.4-mini", prompt_tokens=1000, completion_tokens=200)
+    sidecar = usage.ledger_fault_path(ledger)
+    ledger.rmdir()  # the operator fixes the ledger path...
+    sidecar.chmod(0o000)  # ...but not the file holding the billed row
+    usage.reset_accounting_state()  # a fresh process: only the sidecar remembers
+
+    with caplog.at_level(logging.ERROR, logger="interview_coach.usage"):
+        reason = usage.accounting_gate()
+
+    assert reason is not None
+    assert "UNRECONCILED" in reason
+    assert str(sidecar) in reason
+    # Logged the way an unreadable *ledger* already is (`_all_rows`): a fault nobody can see is a
+    # fault nobody fixes.
+    assert any(str(sidecar) in record.getMessage() for record in caplog.records)
+
+
+def test_reconcile_never_clears_a_sidecar_it_could_not_read(tmp_path, monkeypatch):
+    # Reconciliation ends by rewriting the sidecar to hold exactly what it could not replay — which,
+    # for a file it never read, is nothing. Clearing it here would delete a billed row AND report
+    # success, which is strictly worse than the fault it was called to fix.
+    ledger = _broken_ledger(tmp_path, monkeypatch)
+    record_usage("openai", "gpt-5.4-mini", prompt_tokens=1000, completion_tokens=200)
+    sidecar = usage.ledger_fault_path(ledger)
+    ledger.rmdir()
+    sidecar.chmod(0o000)
+    usage.reset_accounting_state()
+
+    with pytest.raises(OSError):
+        usage.reconcile_accounting()
+
+    assert sidecar.exists()
+    assert usage.accounting_block_reason() is not None
+
+    sidecar.chmod(0o600)  # readable again: the held row was there all along
+
+    assert "Reconciled 1 held ledger row(s)" in usage.reconcile_accounting()
+    assert usage.usage_for_day()["openai"]["total"] == 1200
+
+
+def test_a_torn_row_in_the_sidecar_is_held_as_unknown_spend_not_dropped(tmp_path, monkeypatch):
+    # A process killed mid-append leaves a half-written last line. Skipping it on the decode error is
+    # the same forgiveness one row at a time: the fault clears, the tokens never come back, and
+    # nobody is told. It has to count as a fault carrying no replayable row instead.
+    ledger = tmp_path / "usage-ledger.jsonl"
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
+    good = {
+        "ts": utc_date() + "T00:00:00+00:00",
+        "kind": "accounting_fault",
+        "billed": True,
+        "entry": {
+            "ts": utc_date() + "T00:00:00+00:00",
+            "provider": "openai",
+            "model": "m",
+            "prompt_tokens": 1000,
+            "completion_tokens": 200,
+        },
+    }
+    usage.ledger_fault_path(ledger).write_text(
+        json.dumps(good) + "\n" + '{"ts": "2026-09-15T00:00:00+00:00", "kind": "accounting_fau',
+        encoding="utf-8",
+    )
+
+    note = usage.reconcile_accounting()
+
+    assert "Reconciled 1 held ledger row(s)" in note  # the intact row still replays
+    assert "stays unknown, not zero" in note  # ...and the torn one is said out loud, not dropped
+
+
+def test_a_sidecar_that_is_not_valid_utf8_does_not_crash_the_call_gate(tmp_path, monkeypatch):
+    # `read_text` raises UnicodeDecodeError, which is a ValueError, so it escapes the OSError catch
+    # entirely — and `chat_json` RETRIES ValueError. An accounting gate the caller retries is not a
+    # gate, and the StructuredOutputError it finally becomes is indistinguishable from a bad model
+    # reply. It has to block, like every other unreadable-sidecar shape.
+    ledger = tmp_path / "usage-ledger.jsonl"
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
+    usage.ledger_fault_path(ledger).write_bytes(b'{"kind": "accounting_fault", "billed": true}\n\xff\xfe')
+
+    reason = usage.accounting_gate()
+
+    assert reason is not None
+    assert "UNRECONCILED" in reason
+
+def _held_in_memory(tmp_path):
+    """Latch a billed fault the sidecar could not take, then make its directory usable again.
+
+    The realistic shape behind QA-12: the parent was a file, so `_flush_faults` failed and the fault
+    survives only in `_FAULTS`, unparked. Every later `accounting_fault()` — i.e. every metered call
+    — retries the park, so two Sessions retry it at the same time.
+    """
+    occupied = tmp_path / "state"
+    occupied.write_text("occupied", encoding="utf-8")
+    ledger = occupied / "usage-ledger.jsonl"
+    record_usage("openai", "gpt-5.4-mini", prompt_tokens=1000, completion_tokens=200, path=ledger)
+    occupied.unlink()
+    occupied.mkdir()
+    return ledger
+
+
+def _concurrent_flush(tmp_path, monkeypatch):
+    """Two threads retry the park at once, with the sidecar append slowed to make the overlap real."""
+    ledger = _held_in_memory(tmp_path)
+    real_write_row = usage._write_row
+
+    def slow_write_row(entry, target):
+        time.sleep(0.05)
+        real_write_row(entry, target)
+
+    monkeypatch.setattr(usage, "_write_row", slow_write_row)
+    start = threading.Barrier(2)
+
+    def flush() -> None:
+        start.wait()
+        usage.accounting_fault(path=ledger)
+
+    threads = [threading.Thread(target=flush) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    monkeypatch.setattr(usage, "_write_row", real_write_row)
+    return ledger
+
+
+def test_two_sessions_flushing_at_once_park_one_row_not_two(tmp_path, monkeypatch):
+    # QA-12. Snapshot-then-write-then-mark in three separate holds of the lock let both threads see
+    # the same unparked fault. A sidecar row duplicated here is a billed call the reconcile below
+    # will charge twice — and the money ledger has no way back from that.
+    ledger = _concurrent_flush(tmp_path, monkeypatch)
+
+    rows = usage.ledger_fault_path(ledger).read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 1, rows
+
+
+def test_a_fault_parked_twice_is_still_billed_once(tmp_path, monkeypatch):
+    # The consequence, stated in the unit that matters. Even if a duplicate reaches the sidecar
+    # anyway — two PROCESSES can do it, and no in-process lock can stop them — replay must fold the
+    # call in once. Over-counting the day is as wrong as forgiving it, just in the other direction.
+    ledger = _concurrent_flush(tmp_path, monkeypatch)
+
+    usage.reconcile_accounting(path=ledger)
+
+    assert usage_for_day(path=ledger)["openai"]["total"] == 1200
+    assert usage.accounting_block_reason(path=ledger) is None
+
+
+def test_reconciling_twice_does_not_bill_the_held_row_twice(tmp_path, monkeypatch):
+    # QA-13. `--reconcile` replays every held row and only THEN rewrites the sidecar, so any path
+    # that leaves those rows on disk — the rewrite failing, the process dying, the server appending
+    # underneath the CLI — hands the operator a retry that invents the spend a second time. The
+    # restore below is exactly that on-disk state, written by hand so the test names the state and
+    # not the mechanism.
+    ledger = tmp_path / "usage-ledger.jsonl"
+    sidecar = usage.ledger_fault_path(ledger)
+    occupied = tmp_path / "broken"
+    occupied.write_text("occupied", encoding="utf-8")
+    record_usage("openai", "gpt-5.4-mini", prompt_tokens=1000, completion_tokens=200, path=occupied / "l.jsonl")
+    held = [dict(fault["record"], ledger=str(ledger)) for fault in usage._FAULTS]
+    usage.reset_accounting_state()
+    sidecar.write_text("".join(json.dumps(row) + "\n" for row in held), encoding="utf-8")
+    still_held = sidecar.read_text(encoding="utf-8")
+
+    first = usage.reconcile_accounting(path=ledger)
+    sidecar.write_text(still_held, encoding="utf-8")  # the rewrite never landed; the operator retries
+    second = usage.reconcile_accounting(path=ledger)
+
+    assert "Reconciled 1 held ledger row(s)" in first
+    assert usage_for_day(path=ledger)["openai"]["total"] == 1200
+    assert "already in the ledger" in second
+    assert usage.accounting_block_reason(path=ledger) is None
+
+
+def test_a_held_row_written_before_the_fault_id_still_replays_exactly_once(tmp_path):
+    # Backward compatibility, pinned: a sidecar row parked by an older build carries no id, so there
+    # is nothing to dedupe on and it must behave exactly as it did — replayed once, then cleared.
+    # Inventing a key for it from its contents would collapse two same-second calls into one and
+    # forgive a real charge, which is the one direction this module may never err in.
+    ledger = tmp_path / "usage-ledger.jsonl"
+    entry = {
+        "ts": utc_date() + "T00:00:00+00:00",
+        "provider": "openai",
+        "model": "gpt-5.4-mini",
+        "prompt_tokens": 7,
+        "completion_tokens": 3,
+    }
+    usage.ledger_fault_path(ledger).write_text(
+        json.dumps(
+            {
+                "ts": utc_date() + "T00:00:00+00:00",
+                "kind": "accounting_fault",
+                "row": "tokens",
+                "billed": True,
+                "ledger": str(ledger),
+                "error": "IsADirectoryError: legacy",
+                "entry": entry,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    note = usage.reconcile_accounting(path=ledger)
+
+    assert "Reconciled 1 held ledger row(s)" in note
+    assert usage_for_day(path=ledger)["openai"]["total"] == 10
+
+
+# --- AUDIT §3.2 row 3: the question-cap check and the reservation are one atomic step -------------
+
+
+def test_two_simultaneous_starts_cannot_both_pass_the_question_cap(tmp_path, monkeypatch):
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(tmp_path / "ledger.jsonl"))
+    monkeypatch.setenv("COACH_DAILY_QUESTION_CAP", "3")
+    barrier = threading.Barrier(2)
+    outcomes: list[str | None] = []
+
+    def reserve() -> None:
+        barrier.wait()
+        outcomes.append(reserve_questions("id-1", questions=3))
+
+    threads = [threading.Thread(target=reserve) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert outcomes.count(None) == 1, outcomes
+    assert sum("COACH_DAILY_QUESTION_CAP" in (reason or "") for reason in outcomes) == 1
+    assert questions_today("id-1") == 3
+
+
+
+def _reserve_and_park(read_flag, release, outcome: str) -> None:
+    """Child process: enter reserve_questions' check->append window and park inside it.
+
+    The widening is test-only and lives entirely in the child, so production ships no sleep: the
+    child swaps in its own `_rows_for_day`, which signals after the read and waits before returning.
+    The parent then knows the child is mid-reservation rather than hoping it is.
+    """
+    real_rows_for_day = usage._rows_for_day
+
+    def parked(day, path):
+        rows = list(real_rows_for_day(day, path))
+        read_flag.set()
+        release.wait(10)
+        return iter(rows)
+
+    usage._rows_for_day = parked
+    reason = reserve_questions("id-1", questions=10)
+    Path(outcome).write_text(reason or "", encoding="utf-8")
+
+
+def test_a_second_process_cannot_pass_the_cap_the_first_is_already_taking(tmp_path, monkeypatch):
+    # QA-09. `_RESERVATION_LOCK` is an object inside one interpreter; the ledger is a file every
+    # process that can write it shares — two `coach api` processes on one state volume, a CLI beside
+    # the server. A cap enforced only within one interpreter is not a cap: measured, both processes
+    # read the same pre-reservation count of 0 and both reserved 10 against a cap of 10, and the day
+    # closed on `questions_today() == 20`.
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(tmp_path / "ledger.jsonl"))
+    monkeypatch.setenv("COACH_DAILY_QUESTION_CAP", "10")
+    child_outcome = tmp_path / "child-outcome.txt"
+
+    # Forked before this process starts a thread of its own (3.12 deprecates fork from a
+    # multi-threaded process), and forked rather than spawned so the child inherits the environment
+    # this test just set and pays no interpreter start-up.
+    ctx = mp.get_context("fork")
+    child_read, release = ctx.Event(), ctx.Event()
+    child = ctx.Process(target=_reserve_and_park, args=(child_read, release, str(child_outcome)))
+    child.start()
+    assert child_read.wait(10), "the child never reached its reservation"
+
+    outcomes: list[str | None] = []
+
+    def reserve() -> None:
+        outcomes.append(reserve_questions("id-1", questions=10))
+
+    thread = threading.Thread(target=reserve)
+    thread.start()
+    # Unlocked this returns instantly with None — the bug. Locked, it is parked in flock() until the
+    # child releases, so the join times out and the release below is what lets either finish.
+    thread.join(0.5)
+    release.set()
+    child.join(10)
+    thread.join(10)
+
+    assert child.exitcode == 0
+    assert questions_today("id-1") == 10  # the cap holds across the process boundary
+    assert child_outcome.read_text(encoding="utf-8") == ""  # the child won the race and reserved
+    assert outcomes and "COACH_DAILY_QUESTION_CAP" in (outcomes[0] or "")  # this process was refused
+
+
+def test_a_released_reservation_gives_the_cap_back_without_rewriting_a_row(tmp_path, monkeypatch):
+    # QA-08's ledger half. The ledger is append-only, so a refund is a compensating ROW of its own
+    # kind — the same shape `quota_retry` already uses to answer `quota_exhausted` — never a mutation
+    # and never a negative count smuggled onto a reservation row, which a torn line would be
+    # indistinguishable from.
+    ledger = _ledger(tmp_path, monkeypatch)
+    monkeypatch.setenv("COACH_DAILY_QUESTION_CAP", "10")
+
+    assert reserve_questions("id-1", questions=10) is None
+    assert questions_today("id-1") == 10
+    assert question_cap_reason("id-1", questions=1) is not None  # the cap really is full
+
+    record_questions_released("id-1", 7, session="s-1")
+
+    assert questions_today("id-1") == 3
+    assert question_cap_reason("id-1", questions=7) is None
+    assert questions_today("id-2") == 0  # per identity, like the reservation it answers
+    rows = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+    assert [row["kind"] for row in rows] == ["questions", "questions_released"]
+    assert rows[0]["questions"] == 10  # the reservation row is untouched
+    # A fifth row kind in the same file, and it must be as invisible to the token readers as the four
+    # before it — a refund read as spend would corrupt the budget rail it sits next to.
+    assert usage_for_day() == {}
+    assert sessions_for_day() == {}
+    # A release with no reservation behind it is floored at 0, never banked against the next start.
+    record_questions_released("id-2", 5)
+    assert questions_today("id-2") == 0

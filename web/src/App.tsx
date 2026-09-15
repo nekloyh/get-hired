@@ -15,7 +15,7 @@ import {
   reduceSessionEvent,
   validateSetup,
 } from './lib/sessionReducer'
-import { SKILLS, type Health, type SessionEvent, type SetupForm } from './lib/types'
+import { MAX_ANSWER_CHARS, SKILLS, type Health, type SessionEvent, type SetupForm } from './lib/types'
 
 const defaultForm: SetupForm = {
   mode: 'auto',
@@ -47,6 +47,10 @@ export function App() {
   const socketRef = useRef<WebSocket | null>(null)
   // Set right before a close we initiate (cancel, back-to-setup, unmount) so `onclose` does not
   // mistake a deliberate close for a dropped connection.
+  // QA-15: the answer currently in flight, so a `recoverable` refusal can put it back in the
+  // composer. A ref, not state: it is not rendered, and it must be readable from the socket's own
+  // message handler without re-subscribing it on every keystroke.
+  const inFlightAnswerRef = useRef<string | null>(null)
   const closingRef = useRef(false)
   const errors = useMemo(() => setupErrors, [setupErrors])
 
@@ -99,6 +103,13 @@ export function App() {
     }
     socket.onmessage = (message) => {
       const event = JSON.parse(message.data) as SessionEvent
+      // QA-15: the server refused the frame and kept the Session, so the answer it rejected comes
+      // back to the composer instead of being destroyed. Restored here rather than from the reducer
+      // because the draft is composer state, and here rather than in an effect because this is the
+      // event that actually happened — an effect would be setState-in-effect for no added truth.
+      if (event.type === 'session_error' && event.recoverable && inFlightAnswerRef.current !== null) {
+        setDraft(inFlightAnswerRef.current)
+      }
       setSession((current) => reduceSessionEvent(current, event))
     }
     socket.onerror = () => {
@@ -160,8 +171,10 @@ export function App() {
     const socket = socketRef.current
     // Never send into a stale/closed socket: a CLOSED socket silently discards the payload (the
     // answer is lost) yet the optimistic state flip would hide the disconnected/error banner (0016).
-    if (!answer || !canAnswer || !socket || socket.readyState !== WebSocket.OPEN) return
-    socket.send(JSON.stringify({ type: 'candidate_answer', answer }))
+    if (!answer || !canAnswer || session.currentTurnId === null || !socket || socket.readyState !== WebSocket.OPEN)
+      return
+    socket.send(JSON.stringify({ type: 'candidate_answer', answer, turn_id: session.currentTurnId }))
+    inFlightAnswerRef.current = answer  // QA-15: what to hand back if the server refuses this frame
     setSession((current) => addCandidateAnswer(current, answer))
     setDraft('')
   }
@@ -312,6 +325,7 @@ export function App() {
             <div className="composer">
               <textarea
                 disabled={!canAnswer}
+                maxLength={MAX_ANSWER_CHARS}
                 onChange={(event) => setDraft(event.target.value)}
                 onKeyDown={(event) => {
                   if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') sendAnswer()
@@ -319,6 +333,14 @@ export function App() {
                 placeholder={canAnswer ? 'Answer as the Candidate...' : 'Waiting for the Interviewer'}
                 value={draft}
               />
+              <div className="composer-meta">
+                <span
+                  aria-label="Answer length"
+                  className={draft.length >= MAX_ANSWER_CHARS ? 'composer-count at-cap' : 'composer-count'}
+                >
+                  {draft.length.toLocaleString('en-US')} / {MAX_ANSWER_CHARS.toLocaleString('en-US')}
+                </span>
+              </div>
               <div className="composer-actions">
                 <button className="icon-button" onClick={cancel} title="Cancel Session" type="button">
                   <Square size={17} aria-hidden />

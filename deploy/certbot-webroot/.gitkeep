@@ -1,0 +1,4 @@
+The ACME http-01 webroot. nginx serves /.well-known/acme-challenge/ from here (conf.d/coach.conf)
+and the host's certbot writes the challenge token into it — see docs/deploy.md §3. The directory has
+to exist in the checkout because docker-compose bind-mounts it; keeping it empty and tracked is what
+makes `certbot --webroot` work on a fresh clone instead of 404ing.

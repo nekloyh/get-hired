@@ -1,8 +1,6 @@
 """Runtime configuration, loaded from the environment / `.env`.
 
-Issue 0004 makes the MiMo -> Groq cutover a ``PRIMARY_PROVIDER`` switch. Both providers are
-OpenAI-compatible, but each has its own credentials/model so the cutover does not require editing
-agent code.
+``PRIMARY_PROVIDER`` selects the primary OpenAI-compatible provider; ``ROLE_*`` overrides route roles elsewhere.
 
 Per-role routing (ADR 0010, issue R-18): each agent role — ``judge``, ``interviewer``,
 ``supervisor``, ``diagnostic``, ``planner`` — may override its provider, model, and temperature via
@@ -13,27 +11,39 @@ judge change and is gated by ``coach bench`` (ADR 0009).
 
 from __future__ import annotations
 
+import logging
 from typing import Literal, get_args
 
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-type ProviderName = Literal["mimo", "groq", "openai", "zenmux"]
+logger = logging.getLogger(__name__)
+
+type ProviderName = Literal["groq", "openai", "zenmux"]
 
 type RoleName = Literal["judge", "interviewer", "supervisor", "diagnostic", "planner"]
 
 ROLE_NAMES: tuple[RoleName, ...] = get_args(RoleName.__value__)
 PROVIDER_NAMES: tuple[ProviderName, ...] = get_args(ProviderName.__value__)
 
-# Providers with a green `coach bench` artifact in docs/audits/ — the only ones allowed to hold the
-# judge role (ADR 0009 addendum a). Everything else is an *availability* tier: fine for the
-# Interviewer, the Supervisor, or a planner, and disqualified from scoring.
+# (provider, model, base_url) triples with a green `coach bench` artifact in docs/audits/ — the only
+# judges allowed to score (ADR 0009 addendum a). Everything else is an *availability* tier: fine for
+# the Interviewer, the Supervisor or a planner, and disqualified from scoring.
 #
-# Groq is the worked example of why this is a set and not a comment: `llama-3.3-70b` scores 18/20
-# with a VN over-scoring delta of 2.00, so a Session that quietly judged on it would produce numbers
-# that look exactly like the validated ones. ZenMux joins on the same terms — a bench artifact, not
-# a plausible-sounding model name.
-BENCH_VALIDATED_JUDGE_PROVIDERS: frozenset[str] = frozenset({"openai"})
+# A PROVIDER allowlist was the bug. `openai` passed while OPENAI_MODEL or ROLE_JUDGE_MODEL moved the
+# judge onto `gpt-4o-mini`, or onto a model that never existed, silently — and every Evaluation from
+# that moment flowed into the Beta states and the Skill ledger looking exactly like a measured one.
+# The bench measures a MODEL at an ENDPOINT, so that is what the gate names.
+#
+# Green today: openai/gpt-5.4-mini — 35/35 under the median-of-k (k=3) gate, four invocations, zero
+# straddling cases (docs/audits/calibration-bench-2026-07-27.md, ADR 0009 addendum d).
+# Deliberately absent: openai/gpt-4o-mini (18-19/20) and groq/llama-3.3-70b-versatile (18/20, VN
+# over-scoring delta 2.00) — both benched, both RED. A plausible-sounding model name is not a triple.
+BENCH_VALIDATED_JUDGES: frozenset[tuple[str, str, str]] = frozenset(
+    {("openai", "gpt-5.4-mini", "https://api.openai.com/v1")}
+)
+# Kept as a derived view: the provider check still fires first, with its original message.
+BENCH_VALIDATED_JUDGE_PROVIDERS: frozenset[str] = frozenset(name for name, _model, _url in BENCH_VALIDATED_JUDGES)
 
 
 class ProviderSettings(BaseModel):
@@ -66,11 +76,7 @@ class Settings(BaseSettings):
         populate_by_name=True,
     )
 
-    primary_provider: ProviderName = Field("mimo", validation_alias="PRIMARY_PROVIDER")
-
-    mimo_api_key: str = Field("", validation_alias="MIMO_API_KEY")
-    mimo_base_url: str = Field("", validation_alias="MIMO_BASE_URL")
-    mimo_model: str = Field("", validation_alias="MIMO_MODEL")
+    primary_provider: ProviderName = Field("openai", validation_alias="PRIMARY_PROVIDER")
 
     groq_api_key: str = Field("", validation_alias="GROQ_API_KEY")
     groq_base_url: str = Field("https://api.groq.com/openai/v1", validation_alias="GROQ_BASE_URL")
@@ -88,7 +94,6 @@ class Settings(BaseSettings):
 
     # Per-provider capability override (per-model in effect — a provider entry binds one model).
     # None = defer to the client class's live-verified default.
-    mimo_supports_json_schema: bool | None = Field(None, validation_alias="MIMO_SUPPORTS_JSON_SCHEMA")
     groq_supports_json_schema: bool | None = Field(None, validation_alias="GROQ_SUPPORTS_JSON_SCHEMA")
     openai_supports_json_schema: bool | None = Field(None, validation_alias="OPENAI_SUPPORTS_JSON_SCHEMA")
     zenmux_supports_json_schema: bool | None = Field(None, validation_alias="ZENMUX_SUPPORTS_JSON_SCHEMA")
@@ -156,27 +161,19 @@ class Settings(BaseSettings):
 
     @property
     def fallback_provider(self) -> ProviderName:
-        """The first other provider in preference order is the fallback for this MVP router.
-
-        ``zenmux`` sits last on purpose: one of the first three is always different from the primary,
-        so appending it cannot change the fallback any existing configuration resolves to.
-        """
-        for candidate in ("groq", "mimo", "openai", "zenmux"):
-            if candidate != self.primary_provider:
-                return candidate
-        return "mimo"
+        """The first other provider in preference order; ``zenmux`` (an aggregator) is deliberately last."""
+        order: tuple[ProviderName, ...] = ("groq", "openai", "zenmux")
+        return next(candidate for candidate in order if candidate != self.primary_provider)
 
     def provider_config(self, provider: ProviderName) -> ProviderSettings:
         """Return the normalized config for ``provider``."""
         creds: dict[ProviderName, tuple[str, str, str]] = {
-            "mimo": (self.mimo_api_key, self.mimo_base_url, self.mimo_model),
             "groq": (self.groq_api_key, self.groq_base_url, self.groq_model),
             "openai": (self.openai_api_key, self.openai_base_url, self.openai_model),
             "zenmux": (self.zenmux_api_key, self.zenmux_base_url, self.zenmux_model),
         }
         api_key, base_url, model = creds[provider]
         json_schema_overrides: dict[ProviderName, bool | None] = {
-            "mimo": self.mimo_supports_json_schema,
             "groq": self.groq_supports_json_schema,
             "openai": self.openai_supports_json_schema,
             "zenmux": self.zenmux_supports_json_schema,
@@ -209,18 +206,28 @@ class Settings(BaseSettings):
                 f"ROLE_{role.upper()}_PROVIDER={provider_raw!r} is not a known provider; "
                 f"expected one of {PROVIDER_NAMES}"
             )
-        if role == "judge":
-            self._require_bench_validated_judge(provider, provider_raw)
         config = self.provider_config(provider)
-        return config.model_copy(
+        resolved = config.model_copy(
             update={
                 "model": model or config.model,
                 "temperature": temperature if temperature is not None else config.temperature,
             }
         )
+        if role == "judge":
+            # AFTER the override is applied, not before. ROLE_JUDGE_MODEL / OPENAI_MODEL are what
+            # actually decide which model scores, and on the old ordering the override did not exist
+            # yet when the check ran — so it bypassed the gate structurally, not by omission.
+            self._require_bench_validated_judge(provider, provider_raw, resolved.model, resolved.base_url)
+        return resolved
 
-    def _require_bench_validated_judge(self, provider: str, provider_raw: str) -> None:
-        """Refuse to seat the judge on a provider with no green bench artifact (ADR 0009a).
+    def _require_bench_validated_judge(
+        self, provider: str, provider_raw: str, model: str = "", base_url: str = ""
+    ) -> None:
+        """Refuse to seat the judge on a provider/model/base_url with no green bench artifact (0009a).
+
+        The gate is the (provider, model, base_url) triple, not the provider alone: the bench measures
+        a model at an endpoint, and the same model id behind a proxy or a compatible gateway is not
+        the thing that was measured.
 
         The ADR pins the judge because every score flows into the Beta state, the Supervisor's
         deviation calls, and the Study Plan — a judge nobody measured produces numbers indistinguishable
@@ -230,18 +237,45 @@ class Settings(BaseSettings):
         (which stops failover from swapping the judge mid-Session). Both are needed: one closes the
         env-var path, the other the outage path.
         """
-        if provider in BENCH_VALIDATED_JUDGE_PROVIDERS or self.allow_unvalidated_judge:
-            return
         source = f"ROLE_JUDGE_PROVIDER={provider_raw!r}" if provider_raw.strip() else f"PRIMARY_PROVIDER={provider!r}"
-        raise ValueError(
-            f"{source} would put the judge role on a provider with no green `coach bench` artifact. "
-            f"ADR 0009 pins the judge to a bench-validated model; validated today: "
-            f"{sorted(BENCH_VALIDATED_JUDGE_PROVIDERS)}. Either set ROLE_JUDGE_PROVIDER to one of "
-            f"those, or bench the new provider (`uv run coach bench --k 3`), commit the report to "
-            f"docs/audits/ and add it to BENCH_VALIDATED_JUDGE_PROVIDERS. To run knowingly on an "
-            f"unvalidated judge — scores are NOT comparable to bench-validated ones — set "
-            f"COACH_ALLOW_UNVALIDATED_JUDGE=1."
-        )
+        if self.allow_unvalidated_judge:
+            # ADR 0009 grants no exemption, so this one is audited rather than silent: loud at
+            # startup, and stamped into every TurnTrace and every export (see llm.build_role_clients).
+            # The flag stays because `coach bench` needs it — you cannot measure a candidate model if
+            # config refuses to seat it — but its silence was the defect, not its existence.
+            logger.warning(
+                "UNVALIDATED JUDGE: COACH_ALLOW_UNVALIDATED_JUDGE is set — the judge role will run on "
+                "provider=%s model=%s base_url=%s, which has no green `coach bench` artifact. Scores "
+                "from this deployment are NOT comparable to bench-validated ones (ADR 0009) and every "
+                "export and turn trace is stamped as unvalidated.",
+                provider,
+                model or "<unset>",
+                base_url or "<unset>",
+            )
+            return
+        if provider not in BENCH_VALIDATED_JUDGE_PROVIDERS:
+            raise ValueError(
+                f"{source} would put the judge role on a provider with no green `coach bench` artifact. "
+                f"ADR 0009 pins the judge to a bench-validated model; validated today: "
+                f"{sorted(BENCH_VALIDATED_JUDGES)}. Either set ROLE_JUDGE_PROVIDER to one of "
+                f"those, or bench the new provider (`uv run coach bench --k 3`), commit the report to "
+                f"docs/audits/ and add it to BENCH_VALIDATED_JUDGES. To run knowingly on an "
+                f"unvalidated judge — scores are NOT comparable to bench-validated ones — set "
+                f"COACH_ALLOW_UNVALIDATED_JUDGE=1."
+            )
+        # An empty model is an UNCONFIGURED provider, not an unvalidated judge: leave it to
+        # `_pinned_role_client`'s LLMConfigurationError, whose message names the actual remedy.
+        if model and (provider, model, base_url.rstrip("/")) not in BENCH_VALIDATED_JUDGES:
+            raise ValueError(
+                f"{source} resolves the judge role to provider={provider!r} model={model!r} "
+                f"base_url={base_url!r}, which has no green `coach bench` artifact. ADR 0009 pins the "
+                f"judge to a bench-validated (provider, model, base_url); validated today: "
+                f"{sorted(BENCH_VALIDATED_JUDGES)}. Set OPENAI_MODEL / ROLE_JUDGE_MODEL (and the base "
+                f"URL) back to a validated triple, or bench this one (`uv run coach bench --k 3`), "
+                f"commit the report to docs/audits/ and add the triple to BENCH_VALIDATED_JUDGES. To "
+                f"run knowingly on an unvalidated judge — scores are NOT comparable to bench-validated "
+                f"ones and every export is stamped — set COACH_ALLOW_UNVALIDATED_JUDGE=1."
+            )
 
     def _role_fields(self, role: RoleName) -> tuple[str, str, float | None]:
         return (

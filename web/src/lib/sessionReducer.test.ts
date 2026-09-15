@@ -6,7 +6,8 @@ import {
   reduceSessionEvent,
   validateSetup,
 } from './sessionReducer'
-import type { SessionState, SetupForm } from './types'
+import type { SetupForm } from './types'
+import { stateFixture } from '../test/fixtures'
 
 const form: SetupForm = {
   mode: 'demo',
@@ -39,6 +40,20 @@ describe('setup validation', () => {
 })
 
 describe('session event reducer', () => {
+  it('binds the pending turn id and releases it once answered', () => {
+    // NEW-01: the id the server minted with the question rides back with the answer, and stops being
+    // sendable the moment the question stops being answerable — otherwise a stale id could re-arm a
+    // turn the server has already closed.
+    const asked = reduceSessionEvent(initialSession, {
+      type: 'question',
+      question: 'Explain drift monitoring.',
+      turn_id: 7,
+    })
+    expect(asked.currentTurnId).toBe(7)
+    expect(addCandidateAnswer(asked, 'Track input distributions.').currentTurnId).toBeNull()
+    expect(reduceConnectionClosed(asked).currentTurnId).toBeNull()
+  })
+
   it('adds interviewer and candidate chat messages around a question', () => {
     const started = reduceSessionEvent(initialSession, {
       type: 'session_started',
@@ -46,11 +61,26 @@ describe('session event reducer', () => {
       mode: 'demo',
       resumed: false,
     })
-    const asked = reduceSessionEvent(started, { type: 'question', question: 'Explain drift monitoring.' })
+    const asked = reduceSessionEvent(started, { type: 'question', question: 'Explain drift monitoring.', turn_id: 1 })
     const answered = addCandidateAnswer(asked, 'Track input distributions and delayed labels.')
 
     expect(answered.status).toBe('evaluating')
     expect(answered.messages.map((message) => message.role)).toEqual(['system', 'interviewer', 'candidate'])
+  })
+
+  it('keeps the Session open while the planner runs after the last state_update', () => {
+    // NEW-15: the Supervisor stamps `complete` one graph node before the Study Plan exists, so the
+    // server streams a state_update reading complete with `study_plan: null` and only then spends
+    // 5-30s in the planner. Ending the Session on that frame rendered the report early — "N/A %
+    // readiness", "Study Plan was not produced." Only `session_completed` is the end.
+    const planning = { ...stateFixture, status: 'complete', study_plan: null, study_plan_error: null }
+
+    const streaming = reduceSessionEvent(initialSession, { type: 'state_update', state: planning })
+    expect(streaming.status).toBe('evaluating')
+
+    const finished = reduceSessionEvent(streaming, { type: 'session_completed', state: stateFixture })
+    expect(finished.status).toBe('complete')
+    expect(finished.state?.study_plan?.readiness_estimate).toBe(0.62)
   })
 
   it('stores final state and error events', () => {
@@ -72,13 +102,22 @@ describe('connection lifecycle', () => {
       mode: 'demo',
       resumed: false,
     })
-    const asked = reduceSessionEvent(started, { type: 'question', question: 'Explain drift monitoring.' })
+    const asked = reduceSessionEvent(started, { type: 'question', question: 'Explain drift monitoring.', turn_id: 1 })
 
     const dropped = reduceConnectionClosed(asked)
 
     expect(dropped.status).toBe('disconnected')
     expect(dropped.currentQuestion).toBe('')
     expect(dropped.messages.at(-1)?.content).toMatch(/Connection to the interviewer was lost/)
+  })
+
+  it('treats a drop inside the planner window as a recoverable disconnect (NEW-15)', () => {
+    // The report is not ready yet, so the close is a fault with a resume path — not a finished
+    // Session. Resuming re-enters the graph at the study_plan node.
+    const planning = { ...stateFixture, status: 'complete', study_plan: null, study_plan_error: null }
+    const streaming = reduceSessionEvent(initialSession, { type: 'state_update', state: planning })
+
+    expect(reduceConnectionClosed(streaming).status).toBe('disconnected')
   })
 
   it('ignores a close after completion (a clean shutdown is not a fault)', () => {
@@ -92,87 +131,63 @@ describe('connection lifecycle', () => {
   })
 })
 
-export const stateFixture: SessionState = {
-  session_id: 's1',
-  topic_plan: [{ skill: 'mlops', target_difficulty: 4, rationale: 'Role-critical production Skill.' }],
-  skill_states: { mlops: { skill: 'mlops', alpha: 3, beta: 2 } },
-  skill_metadata: { mlops: { role_criticality: 'must_have', evidence_bar: 4 } },
-  current_plan_index: 0,
-  next_skill: null,
-  question_count: 1,
-  max_questions: 1,
-  status: 'complete',
-  stop_reason: 'max_questions',
-  transcript: [
-    {
-      skill: 'mlops',
-      plan_index: 0,
-      stop_reason: 'resolved',
-      resolved_weighted_score: 3.5,
-      resolved_confidence: 0.8,
-      skill_state: { skill: 'mlops', alpha: 3, beta: 2 },
-      turns: [
-        {
-          question: 'How do you monitor drift?',
-          answer: 'Track drift, delayed labels, and rollback risk.',
-          is_follow_up: false,
-          evaluation: {
-            dimensions: { correctness: { score: 4, evidence: 'Track drift' } },
-            weighted_score: 3.5,
-            confidence: 0.8,
-            follow_up_recommended: false,
-            follow_up_rationale: 'Enough evidence for demo.',
-          },
-          trace: {},
-        },
-      ],
-    },
-  ],
-  supervisor_decisions: [
-    {
-      action: 'end_early',
-      reasoning: 'max questions',
-      after_question: 1,
-      from_plan_index: 0,
-      to_plan_index: 0,
-      deviation: true,
-      llm_reasoning: 'Hard cap reached.',
-    },
-  ],
-  study_plan: {
-    session_id: 's1',
-    readiness_estimate: 0.62,
-    readiness_rationale: 'Close, with MLOps gaps.',
-    prioritized_topics: [
-      {
-        priority: 1,
-        skill: 'mlops',
-        title: 'Sharpen MLOps',
-        rationale: 'Monitoring evidence was thin.',
-        target_mastery: 'Explain drift and rollback.',
-        mastery: 0.6,
-        confidence: 0.4,
-        role_criticality: 'must_have',
-        resources: [
-          {
-            id: 'mlops_google_rules',
-            skill: 'mlops',
-            title: 'Google Rules of ML',
-            url: 'https://example.test/ml',
-            summary: 'Production ML guidance.',
-            resource_type: 'guide',
-            effort_minutes: 45,
-          },
-        ],
-      },
-    ],
-    schedule: Array.from({ length: 14 }, (_, index) => ({
-      day: index + 1,
-      focus: `Day ${index + 1} focus`,
-      outcome: 'Write a concise answer.',
-      resources: [],
-    })),
-    milestones: [{ week: 1, description: 'Record an answer.', evidence: 'Rubric notes.' }],
-  },
-  study_plan_error: null,
-}
+describe('a refused frame is not a dead Session (QA-15)', () => {
+  const OVERSIZE = 'x'.repeat(20_001)
+  const PYDANTIC_REFUSAL =
+    '1 validation error for CandidateAnswerPayload\nanswer\n  String should have at most 20000 characters'
+
+  const asked = () =>
+    reduceSessionEvent(initialSession, { type: 'question', question: 'Explain drift monitoring.', turn_id: 4 })
+
+  it('puts the question, the turn and the text back when the server refuses the frame', () => {
+    const sent = addCandidateAnswer(asked(), OVERSIZE)
+    const refused = reduceSessionEvent(sent, {
+      type: 'session_error',
+      error: PYDANTIC_REFUSAL,
+      recoverable: true,
+    })
+
+    expect(refused.status).toBe('active')
+    expect(refused.currentQuestion).toBe('Explain drift monitoring.')
+    expect(refused.currentTurnId).toBe(4)
+    expect(refused.error).toBeNull()
+    expect(refused.messages.filter((message) => message.role === 'candidate')).toHaveLength(0)
+    expect(refused.messages.at(-1)?.content).toBe(PYDANTIC_REFUSAL)
+  })
+
+  it('still ends the Session on a fault the server did not mark recoverable', () => {
+    const sent = addCandidateAnswer(asked(), 'Track input distributions.')
+    const dead = reduceSessionEvent(sent, { type: 'session_error', error: 'Session suspended: quota' })
+
+    expect(dead.status).toBe('error')
+    expect(dead.currentQuestion).toBe('')
+    expect(dead.currentTurnId).toBeNull()
+    expect(dead.error).toBe('Session suspended: quota')
+  })
+
+  it('still ends the Session when a recoverable refusal answers nothing in flight', () => {
+    const refused = reduceSessionEvent(asked(), {
+      type: 'session_error',
+      error: 'unknown WebSocket payload type: None',
+      recoverable: true,
+    })
+
+    expect(refused.status).toBe('error')
+    expect(refused.currentQuestion).toBe('')
+  })
+
+  it('drops the rollback record once the answer is provably in the graph', () => {
+    // Otherwise a provider crash DURING the evaluation of an accepted answer would re-arm a turn the
+    // server has already closed and hide the real fault behind a refuse/re-send loop.
+    const sent = addCandidateAnswer(asked(), 'Track input distributions.')
+    const next = reduceSessionEvent(sent, { type: 'question', question: 'And rollback?', turn_id: 5 })
+    const thenDead = reduceSessionEvent(next, {
+      type: 'session_error',
+      error: 'RuntimeError: provider died',
+      recoverable: true,
+    })
+
+    expect(next.pendingAnswer).toBeNull()
+    expect(thenDead.status).toBe('error')
+  })
+})

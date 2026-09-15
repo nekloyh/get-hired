@@ -30,6 +30,7 @@ dev = [
     "mypy>=1.11",
     "pytest>=8.0",
     "pytest-cov>=5.0",
+    "pytest-timeout>=2.3",
     "ruff>=0.6",
 ]
 
@@ -44,7 +45,16 @@ packages = ["src/interview_coach"]
 testpaths = ["tests"]
 # Default run is offline/lightweight: provider-hitting tests and optional Chroma/BGE tests are
 # deselected unless explicitly requested with `-m live` or `-m rag`.
-addopts = "-m 'not live and not rag'"
+# `--timeout` is a hang guard, not a performance budget. This suite has 49 unbounded blocking sites
+# — 42 `ws.receive_json()` calls, 5 `subprocess.run` calls with no `timeout=`, and 2 `thread.join()`
+# behind a `threading.Barrier(2)` — so a regression in the bounded answer queue, the reconnect
+# handshake or either ledger's concurrency merge wedges the run forever instead of failing it, and
+# on CI that is a billed six-hour hang with no verdict. The slowest test here is 2.6s, so 60s can
+# only fire on a real deadlock. Left on SIGALRM (the POSIX default) deliberately: it fails the one
+# hung test and lets the rest of the suite report, where `timeout_method = thread` would kill the
+# process. A `-m live` or `-m rag` run is NOT bounded by this — a real provider call and a cold
+# sentence-transformers download both exceed it — so pass `--timeout=0` there; a CLI flag wins.
+addopts = "-m 'not live and not rag' --timeout=60"
 markers = [
     "live: hits a real LLM provider; deselected by default — select explicitly with `-m live`",
     "rag: requires optional Chroma + sentence-transformers extras; deselected by default",

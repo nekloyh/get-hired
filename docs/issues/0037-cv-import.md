@@ -1,4 +1,4 @@
-# CV/JD import → Diagnostic priors
+# JD text first; CV import deferred → Diagnostic setup
 
 **Type:** Slice
 **Kind:** enhancement
@@ -6,36 +6,53 @@
 
 ## What to build
 
-Resume/JD import personalizing the interview is table-stakes across every 2026 competitor
-(Final Round, Verve, Sensei, Yoodli — panel report Phần 3). In this architecture it is an *input
-adapter*, not a new subsystem: the Diagnostic already consumes claims + `target_role` +
-`target_companies`.
+This slice is split under the [implementation plan M3](README.md#m3--finish-the-repeat-practice-loop-personaltrusted-pilot).
+Keep #86 as the tracker: a bounded text input adapter first, document upload only after evidence
+of demand. The existing Diagnostic already consumes claims + `target_role` + `target_companies`.
 
-- Upload CV (pdf/text) → **one single-shot extraction call** producing a validated schema of
-  claims + suggested `target_role`/companies. Per ADR 0003 this is NOT a new tool-using agent —
-  single-shot with the document injected into the prompt.
-- The Candidate **confirms/edits** the prefilled setup form before the Session starts — extraction
-  output is a draft, never silently trusted.
-- The confirmed values flow through the **existing Diagnostic seam**. ADR 0002 invariant stated in
-  the UI copy and enforced by the existing prior tests: a CV claim is a *claim* — priors stay
-  weak, the claim sets starting difficulty, never our confidence.
+### First increment: JD text
 
-## Acceptance criteria
+- Paste bounded JD text → one single-shot extraction call producing a validated draft of
+  role/company/requirements mapped to the existing taxonomy. Treat document instructions as
+  untrusted input, not instructions to the agent. No new tool grant (ADR 0003).
+- Candidate confirms/edits the setup before starting. A JD describes the employer's requirements,
+  **not the Candidate's competence**: never convert JD requirements into claimed mastery or stronger
+  confidence. Personal claims remain separately entered; use the existing Diagnostic seam.
+- Unknown roles/requirements are visible as unmapped; no silent promise of new Skill support.
+  Preserve manual setup when extraction fails. Use M0 input/budget rails.
 
-- [ ] e2e: upload a fixture CV → setup form prefilled → Candidate edits one claim → Session runs.
-- [ ] Extraction schema unit tests (malformed pdf/text degrade to an empty form + visible notice,
-      never a crash — ADR 0005 classification: infrastructure degrade).
-- [ ] Prior-weakness invariant test: a maxed-out CV ("expert in everything") produces the same
-      weak-prior strength as manual claims of 5 — no new prior-inflation path.
-- [ ] No new tool grant (ADR 0003 addendum): the extraction call is single-shot, verified by the
-      absence of any tools param in its request construction.
+### Deferred increment: CV upload
+
+The original PDF/text CV extraction remains follow-on scope: extract draft personal claims and
+suggested role/company, confirm/edit before diagnosis, preserve weak-prior semantics. Resume only
+when JD utility is established and file validation, retention/delete, and the relevant access
+boundary are specified. This plan does not authorize PDF parsing, audio or CV storage in M3.
+
+## Acceptance criteria — JD text increment
+
+- [ ] E2E: paste fixture JD → confirm/edit draft → text Session runs using the existing Diagnostic.
+- [ ] Invalid/oversized/instruction-injection fixtures cannot bypass limits, modify scoring policy,
+      or silently invent Candidate claims; schema failure shows a notice and retains manual setup.
+- [ ] Identical personal claims with/without a demanding JD preserve weak-prior invariants; role
+      criticality may change sanctioned prior strength/coverage, never personal prior mean.
+- [ ] No new tool grant: extraction call is single-shot, with no tools parameter.
+- [ ] Unsupported role/Skill requirements are shown for correction instead of silently treated as
+      a supported pack. Resume preserves confirmed setup and pack.
+- [ ] Log/eval artifacts omit private JD text; retention/delete follows M3 (and M4 before public).
+
+## Deferred CV acceptance criteria
+
+When resumed: fixture PDF/text upload → editable claims; malformed files fail visibly; maximum
+CV claims have the same weak priors as equivalent manual claims; no tool grant. Add file-specific
+limits, sensitive-data retention and applicable ownership tests before accepting uploads.
 
 ## Blocked by
 
-- Wave 1 security (R-06/#61, R-07/#62) — uploads are user data; do not accept them on an
-  unauthenticated surface.
+- M2 quality/trace gates and M0 input/budget limits; no accounts/Postgres prerequisite for a
+  personal/trusted-pilot JD text form under the documented shared trust boundary.
+- M4 ownership and data controls before public exposure. CV upload requires its own later gate.
 
 ## Status
 
-**Open.** Spec'd 2026-07-19 from the panel review market table-stakes + remediation R-31;
-scheduled Later (Wave 3).
+**Open in the local plan; remote status not refreshed.** Reordered 2026-09-13: JD text is P1/M3;
+CV upload is P2/deferred. #86 remains the tracker; no duplicate issue is created.

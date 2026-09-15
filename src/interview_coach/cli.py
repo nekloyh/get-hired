@@ -1,10 +1,5 @@
-"""Entry point demos for the slices built so far.
+"""The ``coach`` command line.
 
-- ``coach evaluate`` (slices 0001–0002): evaluate a fixture answer, then fold that judgment into the
-  Skill's Beta state.
-- ``coach interview`` (slice 0005): run the within-question micro-loop over the seed questions — the
-  Interviewer asks, the fixture Candidate answers, the Evaluator scores every turn and a Follow-up is
-  asked when flagged, until the question resolves; then the Skill state is updated.
 - ``coach diagnose`` (slice 0009): turn a Candidate profile into a Topic Plan and seeded priors.
 - ``coach session`` (slice 0010): run/resume a multi-question Session through LangGraph + SqliteSaver.
 - ``coach eval-harness`` (slice 0012): run held-out golden answers through the Evaluator.
@@ -14,12 +9,13 @@
 - ``coach forge`` (issue 0028): Writer + three ordered gates that queue new bank questions for
   human review under ``data/forge/``.
 
-``interview`` is the default so the bare command shows the newest slice.
+A bare ``coach`` prints the help and exits 2.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
 import sys
@@ -53,13 +49,17 @@ from .concepts import (
 )
 from .config import load_settings
 from .diagnostic import SKILLS, CandidateProfile, diagnose_or_degrade
-from .eval_harness import harness_passed, render_golden_answer_report, run_golden_answer_harness
-from .evaluator import Evaluation, evaluate
+from .eval_harness import (
+    GOLDEN_ANSWER_CASES,
+    harness_passed,
+    render_golden_answer_report,
+    run_golden_answer_harness,
+)
 from .exporter import export_session_markdown
-from .fixtures import QUESTION, STRONG_ANSWER, WEAK_ANSWER
+from .filelock import claimed
 from .forge import MAX_DRAFTS, ForgeError, render_forge_report, run_forge, write_forge_outputs
 from .language import DEFAULT_LANGUAGE_MODE, LANGUAGE_MODES
-from .ledger import load_priors, save_posteriors
+from .ledger import SAFE_CANDIDATE_ID, is_safe_candidate_id, load_priors, save_measured_posteriors
 from .llm import (
     UNKNOWN_PROVIDER,
     LLMClient,
@@ -73,15 +73,19 @@ from .microloop import (
     DEFAULT_MAX_TURNS,
     CandidateIntent,
     InteractiveCandidate,
-    MicroLoopResult,
     ScriptedCandidate,
-    StopReason,
-    run_micro_loop,
+    display_stop_reason,
 )
-from .postmortem import PostmortemResult, export_postmortem_markdown, run_postmortem
+from .postmortem import (
+    MAX_ELICITATION_QUESTIONS,
+    PostmortemResult,
+    export_postmortem_markdown,
+    run_postmortem,
+)
 from .resources import SEED_RESOURCES, ChromaResourceStore, build_resource_store
-from .seeds import QUESTION_BANK, SEED_QUESTIONS
-from .skill import POSTMORTEM_WEIGHT_RATIO, SkillState, apply_evaluation, confidence_weight
+from .seeds import QUESTION_BANK
+from .session_serde import measured_skill_states
+from .skill import POSTMORTEM_WEIGHT_RATIO, SkillState, confidence_weight
 from .supervisor import (
     DEFAULT_MAX_ELAPSED_SECONDS,
     DEFAULT_MAX_QUESTIONS,
@@ -91,19 +95,26 @@ from .supervisor import (
     initial_session_state,
     resumable_session_state,
     session_config,
-    skill_states_from_state,
 )
 from .ui import render_skill_state_rows
 from .usage import (
     WORST_CASE_TOKENS_PER_CALL,
+    AccountingUnavailable,
+    ProviderQuotaExhausted,
     SessionBudgetSuspended,
+    accounting_block_reason,
     begin_session_run,
     clear_run_rails_for_resume,
     daily_question_cap,
+    daily_reset_hint,
     daily_token_budget,
     estimated_session_tokens,
+    ledger_path,
+    metered_command_refusal_reason,
+    reconcile_accounting,
     remaining_today,
     session_budget_guard,
+    session_ceiling_multiple,
     session_scope,
     session_token_budget,
     sessions_for_day,
@@ -111,9 +122,8 @@ from .usage import (
     usage_for_day,
     utc_date,
     worst_case_session_calls,
+    worst_case_session_tokens,
 )
-
-ANSWERS = {"strong": STRONG_ANSWER, "weak": WEAK_ANSWER}
 
 # What every subcommand receives (ADR 0010): the per-role bundle from main(), a bare client when a
 # test drives a command directly, or None on the offline path. ``ensure_role_clients`` normalizes.
@@ -138,126 +148,6 @@ _CONCEPT_EMBEDDER_HELP = (
 )
 
 
-def _display_stop_reason(stop_reason: str | None) -> str:
-    if stop_reason == StopReason.SAFETY_CAP.value:
-        return "unresolved_by_safety_cap"
-    if stop_reason == StopReason.FOLLOW_UP_UNAVAILABLE.value:
-        return "degraded_follow_up_unavailable"
-    if stop_reason == StopReason.FAILED.value:
-        return "failed_recorded_and_skipped"
-    return str(stop_reason)
-
-
-def _print_evaluation(label: str, answer: str, ev: Evaluation) -> None:
-    print(f"\n=== {label.upper()} ANSWER ===")
-    print(answer)
-    print("\n--- EVALUATION ---")
-    for dim, ds in ev.dimensions.items():
-        print(f"  {dim:<18} {ds.score}/5   evidence: {ds.evidence!r}")
-    print(f"  {'weighted_score':<18} {ev.weighted_score:.2f}/5")
-    print(f"  {'confidence':<18} {ev.confidence:.2f}")
-    print(f"  {'follow_up':<18} {ev.follow_up_recommended} — {ev.follow_up_rationale}")
-    print("\n  JSON:")
-    print(ev.model_dump_json(indent=2))
-
-
-def _print_skill_update(before: SkillState, after: SkillState) -> None:
-    print(f"\n--- SKILL STATE ({before.skill}) — no LLM, pure Beta update ---")
-    print(
-        f"  before   mastery {before.mastery:.3f}   confidence {before.confidence:.3f}   "
-        f"Beta(α={before.alpha:.2f}, β={before.beta:.2f})"
-    )
-    print(
-        f"  after    mastery {after.mastery:.3f}   confidence {after.confidence:.3f}   "
-        f"Beta(α={after.alpha:.2f}, β={after.beta:.2f})"
-    )
-    print(
-        f"  Δ        mastery {after.mastery - before.mastery:+.3f}   "
-        f"confidence {after.confidence - before.confidence:+.3f}"
-    )
-
-
-def _cmd_evaluate(client: ClientArg, args: argparse.Namespace) -> int:
-    roles = ensure_role_clients(client)
-    if roles is None:
-        raise RuntimeError("evaluate requires an LLM client")
-    print(f"QUESTION (skill: {QUESTION.skill}):\n{QUESTION.question}")
-    labels = list(ANSWERS) if args.answer == "both" else [args.answer]
-    for label in labels:
-        ev = evaluate(roles.judge, QUESTION.question, ANSWERS[label], QUESTION.rubric)
-        _print_evaluation(label, ANSWERS[label], ev)
-        # Each answer starts from a neutral prior, so strong vs. weak visibly move mastery in
-        # opposite directions while both shrink variance (confidence rises).
-        before = SkillState.neutral(QUESTION.skill)
-        _print_skill_update(before, apply_evaluation(before, ev))
-    return 0
-
-
-def _print_micro_loop(result: MicroLoopResult) -> None:
-    for i, turn in enumerate(result.turns, start=1):
-        kind = "FOLLOW-UP" if turn.is_follow_up else "QUESTION"
-        ev = turn.evaluation
-        print(f"\n--- TURN {i} ({kind}) ---")
-        print(f"  Q: {turn.question}")
-        if turn.grounding_concept_id:
-            print(f"  grounded_by: {turn.grounding_concept_id} ({turn.grounding_concept_title})")
-        print(f"  A: {turn.answer}")
-        scores = "  ".join(f"{d}={ds.score}" for d, ds in ev.dimensions.items())
-        print(f"  scored: {scores}")
-        print(
-            f"  weighted_score {ev.weighted_score:.2f}/5   confidence {ev.confidence:.2f}   "
-            f"follow_up_recommended={ev.follow_up_recommended}"
-        )
-        if turn.trace.evaluator_self_critique_triggers:
-            print(f"  self_critique_triggers: {', '.join(turn.trace.evaluator_self_critique_triggers)}")
-        if turn.trace.concept_lookup_query:
-            hit = turn.trace.concept_hit_id or "none"
-            print(f"  follow_up_lookup: {turn.trace.concept_lookup_query!r} -> {hit}")
-        if turn.trace.llm_calls:
-            split = ", ".join(f"{name} {n}" for name, n in turn.trace.llm_calls_by_provider)
-            print(f"  llm_calls: {turn.trace.llm_calls}" + (f" ({split})" if split else ""))
-        if turn.trace.stop_reason:
-            print(f"  turn_stop_reason: {turn.trace.stop_reason.value}")
-    verdict_by_reason = {
-        StopReason.RESOLVED: "resolved normally",
-        StopReason.SAFETY_CAP: "halted by SAFETY CAP",
-        StopReason.FOLLOW_UP_UNAVAILABLE: "degraded because a Follow-up was unavailable",
-        StopReason.FAILED: "failed and was recorded by the Session",
-    }
-    verdict = verdict_by_reason[result.stop_reason]
-    print(f"\n  stop: {result.stop_reason.value} ({verdict}) after {len(result.turns)} turn(s)")
-    print(
-        f"  resolved skill state ({result.skill_state.skill}): "
-        f"mastery {result.skill_state.mastery:.3f}   confidence {result.skill_state.confidence:.3f}"
-    )
-
-
-def _cmd_interview(client: ClientArg, args: argparse.Namespace) -> int:
-    roles = ensure_role_clients(client)
-    if roles is None:
-        raise RuntimeError("interview requires an LLM client")
-    concept_store = build_concept_store(
-        args.concept_store,
-        persist_dir=args.concept_persist_dir,
-        seed=not args.no_seed_concepts,
-        embedding_model=args.concept_embedder,
-    )
-    for n, seed in enumerate(SEED_QUESTIONS, start=1):
-        print(f"\n========== SEED QUESTION {n}/{len(SEED_QUESTIONS)} (skill: {seed.skill}) ==========")
-        print(seed.question)
-        result = run_micro_loop(
-            roles.judge,
-            seed,
-            ScriptedCandidate(seed.answers),
-            max_turns=args.max_turns,
-            concept_store=concept_store,
-            language_mode=args.language,
-            interviewer_client=roles.interviewer,
-        )
-        _print_micro_loop(result)
-    return 0
-
-
 def _parse_claim(raw: str) -> tuple[str, float]:
     if "=" not in raw:
         raise argparse.ArgumentTypeError("claims must be formatted as skill=score, e.g. mlops=4")
@@ -269,6 +159,48 @@ def _parse_claim(raw: str) -> tuple[str, float]:
     return skill.strip(), score
 
 
+# What a "Session's worth" is for a batch command, in the ledger's own measured units. Each is a
+# FLOOR on what the day must be able to fund, never a ceiling on what the run can spend — a
+# ceiling-sized start gate refuses runs the day could have paid for.
+#   eval-harness : one judgment per golden case at the largest call ever measured.
+#   postmortem   : MAX_ELICITATION_QUESTIONS turns + reconstruction + study plan.
+#   forge        : ~4 live calls per draft that survives to the admission gate, x --n.
+HARNESS_MIN_BUDGET_TOKENS = len(GOLDEN_ANSWER_CASES) * WORST_CASE_TOKENS_PER_CALL
+POSTMORTEM_MIN_BUDGET_TOKENS = (MAX_ELICITATION_QUESTIONS + 2) * WORST_CASE_TOKENS_PER_CALL
+FORGE_MIN_BUDGET_TOKENS_PER_DRAFT = 4 * WORST_CASE_TOKENS_PER_CALL
+
+
+def _refuse_metered_start(
+    client: LLMClient, *, work: str, needed: int, allow_overspend: bool = False, hint: str = ""
+) -> str | None:
+    """The start gate every metered command shares (NEW-10): the refusal to print, or None.
+
+    `coach session` has had one since R-25; the batch commands had none, so `coach bench --k 3` —
+    ~210,000 tokens, about 8 default Sessions of the shared allowance, and the two heaviest sweeps in
+    the ledger are 455 and 778 calls — could drain the daily allowance out from under a Candidate
+    mid-interview and suspend their Session (ADR 0005).
+
+    A client with no provider identity (demo, test fakes) spends nobody's allowance, so the rail is
+    inert for it: the same UNKNOWN_PROVIDER exemption `_cmd_session` grants.
+
+    ``allow_overspend`` (the `--ignore-budget` flag) zeroes only the ARITHMETIC comparison, because
+    that number is our own count and can be wrong — an operator who knows their real allowance is
+    larger must always be able to re-bench a judge (ADR 0009). It deliberately cannot buy a working
+    ledger or a live quota: the accounting-fault and dead-quota refusals still fire.
+    """
+    provider = provider_label(client)
+    if provider == UNKNOWN_PROVIDER:
+        return None
+    reason = metered_command_refusal_reason(provider, work=work, needed=0 if allow_overspend else needed)
+    if reason is None:
+        return None
+    sessions = max(1, round(needed / estimated_session_tokens(DEFAULT_MAX_QUESTIONS)))
+    return (
+        f"{reason} At ~{needed:,} tokens this run is worth about {sessions} default "
+        f"{DEFAULT_MAX_QUESTIONS}-question Session(s) of the same allowance.{hint}"
+    )
+
+
 def _cmd_diagnose(client: ClientArg, args: argparse.Namespace) -> int:
     profile = CandidateProfile(
         target_role=args.target_role,
@@ -276,7 +208,13 @@ def _cmd_diagnose(client: ClientArg, args: argparse.Namespace) -> int:
         claimed_skills=dict(args.claim),
     )
     roles = ensure_role_clients(client)
-    result = diagnose_or_degrade(profile, roles.diagnostic if roles is not None else None)
+    if roles is not None and (
+        refusal := _refuse_metered_start(roles.diagnostic, work="a Diagnostic", needed=estimated_session_tokens(0))
+    ):
+        print(f"Refusing to run `coach diagnose`: {refusal}", file=sys.stderr)
+        return 2
+    with session_scope("diagnose"):
+        result = diagnose_or_degrade(profile, roles.diagnostic if roles is not None else None)
     print(f"=== TOPIC PLAN (source: {result.topic_plan_source.value}) ===")
     for i, entry in enumerate(result.topic_plan, start=1):
         print(f"{i}. {entry.skill}  difficulty={entry.target_difficulty}  {entry.rationale}")
@@ -315,7 +253,7 @@ def _print_session_summary(state: Mapping[str, Any]) -> None:
         print(
             f"\n--- QUESTION {i} ({item['skill']}) ---\n"
             f"score={item['resolved_weighted_score']:.2f}/5   "
-            f"confidence={item['resolved_confidence']:.2f}   stop={_display_stop_reason(item['stop_reason'])}"
+            f"confidence={item['resolved_confidence']:.2f}   stop={display_stop_reason(item['stop_reason'])}"
         )
         if error := item.get("error"):
             # A genuinely failed question (issue 0014) carries the recorded error; surface the reason
@@ -331,7 +269,7 @@ def _print_session_summary(state: Mapping[str, Any]) -> None:
                 split = ", ".join(f"{name} {n}" for name, n in trace.get("llm_calls_by_provider") or ())
                 print(f"     llm_calls: {trace['llm_calls']}" + (f" ({split})" if split else ""))
             if trace.get("stop_reason"):
-                print(f"     turn_stop_reason: {_display_stop_reason(trace['stop_reason'])}")
+                print(f"     turn_stop_reason: {display_stop_reason(trace['stop_reason'])}")
     if state.get("supervisor_decisions"):
         print("\n=== SUPERVISOR DECISIONS ===")
         for decision in state["supervisor_decisions"]:
@@ -339,8 +277,13 @@ def _print_session_summary(state: Mapping[str, Any]) -> None:
                 f"- after Q{decision['after_question']}: {decision['action']} "
                 f"(deviation={decision['deviation']}) — {decision['llm_reasoning']}"
             )
-    if plan := state.get("study_plan"):
-        print("\n=== STUDY PLAN ===")
+    _print_study_plan(state.get("study_plan"), state.get("study_plan_error"))
+
+
+def _print_study_plan(plan: Mapping[str, Any] | None, error: str | None, *, title: str = "STUDY PLAN") -> None:
+    """The plan when there is one; otherwise the planner error — the interview itself still stands."""
+    if plan:
+        print(f"\n=== {title} ===")
         print(f"readiness_estimate={plan['readiness_estimate']:.0%} — {plan['readiness_rationale']}")
         for topic in plan.get("prioritized_topics", []):
             resources = ", ".join(resource["id"] for resource in topic.get("resources", []))
@@ -348,16 +291,15 @@ def _print_session_summary(state: Mapping[str, Any]) -> None:
                 f"{topic['priority']}. {topic['skill']} "
                 f"(mastery={topic['mastery']:.0%}, criticality={topic['role_criticality']}): {resources}"
             )
-    elif error := state.get("study_plan_error"):
-        # The interview still completed; only the optional end-of-session plan was unavailable.
-        print(f"\n=== STUDY PLAN ===\n(planner unavailable: {error})")
+    elif error:
+        print(f"\n=== {title} ===\n(planner unavailable: {error})")
 
 
 def _print_live_question_update(state: dict, item: dict, question_number: int) -> None:
     print(f"\n=== LIVE UPDATE: QUESTION {question_number} RESOLVED ({item['skill']}) ===")
     print(
         f"score={item['resolved_weighted_score']:.2f}/5   "
-        f"confidence={item['resolved_confidence']:.2f}   stop={_display_stop_reason(item['stop_reason'])}"
+        f"confidence={item['resolved_confidence']:.2f}   stop={display_stop_reason(item['stop_reason'])}"
     )
     print("--- SKILL STATES ---")
     for row in render_skill_state_rows(state):
@@ -402,7 +344,10 @@ def _run_session_graph(
         # before the suspend banner — it IS in the checkpoint, and a suspend that looks like it ate
         # the last answer is indistinguishable from a crash.
         if budget_stop is not None and (reason := budget_stop(final)):
-            print(f"\n=== SESSION SUSPENDED (budget) ===\n{reason}", file=sys.stderr)
+            # The banner names no cause: this one rail now carries two of them (budget exhaustion
+            # and a broken usage ledger), and the reason below states which. Labelling an accounting
+            # fault "(budget)" would send the operator to wait for 00:00 UTC for a file permission.
+            print(f"\n=== SESSION SUSPENDED ===\n{reason}", file=sys.stderr)
             raise SessionBudgetSuspended(reason)
     if final is None:
         raise RuntimeError("Session graph produced no final state")
@@ -434,6 +379,40 @@ def _inflight_session_message(session_id: str) -> str:
     )
 
 
+def _completed_session_message(session_id: str) -> str:
+    return (
+        f"A Session with id {session_id!r} has already finished. Choose a different --session-id — "
+        "starting fresh would overwrite its report, and --resume cannot re-open a finished Session."
+    )
+
+
+def _finished_session_message(session_id: str) -> str:
+    return (
+        f"Session {session_id!r} already finished; there is nothing to resume. Re-opening it would "
+        "print that earlier interview's report as this run's result. Start a new interview with a "
+        "different --session-id."
+    )
+
+
+def _busy_session_message(session_id: str) -> str:
+    return (
+        f"Session {session_id!r} is already being driven by another process (the server, or a second "
+        "shell). One checkpoint thread takes one writer — wait for that run to finish, or choose a "
+        "different --session-id."
+    )
+
+
+def _checkpoint_lock_target(checkpoint_db: str, session_id: str) -> Path:
+    """The per-Session inter-process lock target beside the checkpoint DB.
+
+    Keyed by Session id, not by the DB: one file holds every thread, so a DB-wide lock would refuse
+    unrelated Sessions. The id is hashed rather than spelled into the name because it is unvalidated
+    input — a ``--session-id`` carrying a path separator would otherwise pick the lock's directory.
+    """
+    db = Path(checkpoint_db).resolve()  # so a relative and an absolute --checkpoint-db agree
+    return db.with_name(f"{db.name}.{hashlib.sha256(session_id.encode('utf-8')).hexdigest()[:16]}")
+
+
 def _print_resume_recap(state: Mapping[str, Any]) -> None:
     """Compact recap of what a resumed Session already resolved, instead of replaying history."""
     transcript = state.get("transcript", [])
@@ -442,7 +421,7 @@ def _print_resume_recap(state: Mapping[str, Any]) -> None:
     for i, item in enumerate(transcript, start=1):
         print(
             f"  Q{i} {item['skill']}: {item['resolved_weighted_score']:.2f}/5 "
-            f"({_display_stop_reason(item['stop_reason'])})"
+            f"({display_stop_reason(item['stop_reason'])})"
         )
 
 
@@ -454,6 +433,15 @@ def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
         path = export_architecture_diagram(args.diagram, roles)
         print(f"Exported architecture diagram to {path}")
         return 0
+    if args.candidate and not is_safe_candidate_id(args.candidate):
+        # Refuse BEFORE the interview: save_posteriors is silent by contract, so a bad --candidate
+        # would otherwise run the whole Session and then persist none of its Skill evidence.
+        print(
+            f"Refusing to start this Session: --candidate {args.candidate!r} is not a valid Skill "
+            f"ledger key (expected {SAFE_CANDIDATE_ID.pattern}).",
+            file=sys.stderr,
+        )
+        return 2
 
     question_bank = None
     if args.pack:
@@ -506,7 +494,17 @@ def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
     )
 
     # The scope covers the Diagnostic call too, so every token this Session spends is attributed.
-    with SqliteSaver.from_conn_string(args.checkpoint_db) as checkpointer, session_scope(args.session_id):
+    with (
+        # NEW-20: one writer per checkpoint thread, across processes. Non-blocking on purpose — a
+        # drive lasts as long as the interview, so a second one is refused with a message instead of
+        # being parked for half an hour on a lock it cannot see.
+        claimed(_checkpoint_lock_target(args.checkpoint_db, args.session_id)) as sole_driver,
+        SqliteSaver.from_conn_string(args.checkpoint_db) as checkpointer,
+        session_scope(args.session_id),
+    ):
+        if not sole_driver:
+            print(_busy_session_message(args.session_id), file=sys.stderr)
+            return 2
         candidate_factory = None if args.scripted else lambda seed: InteractiveCandidate()
         graph = build_session_graph(
             roles,
@@ -525,6 +523,12 @@ def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
                     # An unknown --resume id would otherwise surface langgraph's EmptyInputError as a
                     # bare traceback; fail with a friendly one-liner that points at valid ids (0019).
                     print(_unknown_session_message(args.session_id, checkpointer, args.checkpoint_db), file=sys.stderr)
+                    return 2
+                if resumed.get("status") == SessionStatus.COMPLETE.value:
+                    # NEW-19: a finished interview has no next node, so the stream yields its stored
+                    # values once and hands them back — exit 0 and a full "(complete)" report for the
+                    # EARLIER interview, under a "RESUMING SESSION" banner, as if it were this run's.
+                    print(_finished_session_message(args.session_id), file=sys.stderr)
                     return 2
                 # The max_elapsed_seconds rail bounds a single sitting, so resuming after a gap
                 # restarts the time budget rather than force-completing on wall-clock since creation.
@@ -563,9 +567,16 @@ def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
                 )
             else:
                 existing = resumable_session_state(graph, args.session_id)
-                if existing is not None and existing.get("status") != SessionStatus.COMPLETE.value:
-                    # Don't silently restart over an in-flight Session on the same id (0019).
-                    print(_inflight_session_message(args.session_id), file=sys.stderr)
+                if existing is not None:
+                    # Don't silently restart over a Session on this id (0019) — in-flight OR
+                    # finished. QA-01: a completed checkpoint is an interview whose report a fresh
+                    # start would overwrite, so it is refused too, with its own remedy.
+                    print(
+                        _completed_session_message(args.session_id)
+                        if existing.get("status") == SessionStatus.COMPLETE.value
+                        else _inflight_session_message(args.session_id),
+                        file=sys.stderr,
+                    )
                     return 2
                 profile = CandidateProfile(
                     target_role=args.target_role,
@@ -604,6 +615,33 @@ def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
+        except ProviderQuotaExhausted as err:
+            # GH #119: the daily quota died mid-Session. The typed raise carried it past the
+            # per-question net, so the checkpoint holds only real evidence; the remedy is time.
+            print(f"\n=== SESSION SUSPENDED ===\n{err} {daily_reset_hint()}", file=sys.stderr)
+            if resumable_session_state(graph, args.session_id) is None:
+                # It died on the Diagnostic, before the graph wrote anything: there is no
+                # checkpoint to resume, and saying otherwise would send the user to an unknown-id error.
+                print("Nothing was checkpointed yet; start the Session again after the reset.", file=sys.stderr)
+            else:
+                print(
+                    f"Resume it with: coach session --resume --session-id {args.session_id} "
+                    f"--checkpoint-db {args.checkpoint_db}",
+                    file=sys.stderr,
+                )
+            return 2
+        except AccountingUnavailable as err:
+            # M0a / F1: a call was refused because usage accounting is broken. Not intent, and not
+            # the per-question failure net's business — the questions resolved so far are in the
+            # checkpoint and nothing was recorded as `failed`. The remedy is bookkeeping, not time,
+            # so the resume line is printed under the reason rather than instead of it.
+            print(f"\n=== SESSION STOPPED (accounting) ===\n{err}", file=sys.stderr)
+            print(
+                f"Once accounting is healthy, resume it with: coach session --resume --session-id "
+                f"{args.session_id} --checkpoint-db {args.checkpoint_db}",
+                file=sys.stderr,
+            )
+            return 2
         except CandidateIntent as err:
             # ADR 0005 / issue 0018: the Candidate asked to stop (EOF/Ctrl-D, or a scripted Candidate
             # with nothing left). Abort cleanly with the designed exit code — no partial "complete"
@@ -612,7 +650,8 @@ def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
             return 2
     if args.candidate and final.get("status") == SessionStatus.COMPLETE.value:
         # Persist the final posteriors so the next Session for this Candidate starts warm (0023).
-        save_posteriors(args.ledger_db, args.candidate, skill_states_from_state(final), now=time.time())
+        # NEW-17: only Skills this Session actually measured — see `measured_skill_states`.
+        save_measured_posteriors(args.ledger_db, args.candidate, measured_skill_states(final), now=time.time())
     _print_session_summary(final)
     if args.export_markdown:
         path = export_session_markdown(final, args.export_markdown)
@@ -646,24 +685,18 @@ def _print_postmortem(result: PostmortemResult) -> None:
             f"({target.mastery - before.mastery:+.2f})   "
             f"priority #{rank_before.get(target.skill, '—')} -> #{rank}"
         )
-    if plan := result.study_plan:
-        print("\n=== REGENERATED STUDY PLAN ===")
-        print(f"readiness_estimate={plan['readiness_estimate']:.0%} — {plan['readiness_rationale']}")
-        for topic in plan.get("prioritized_topics", []):
-            resources = ", ".join(resource["id"] for resource in topic.get("resources", []))
-            print(
-                f"{topic['priority']}. {topic['skill']} "
-                f"(mastery={topic['mastery']:.0%}, criticality={topic['role_criticality']}): {resources}"
-            )
-    elif error := result.study_plan_error:
-        # The fusion still stands; only the optional regenerated plan was unavailable.
-        print(f"\n=== REGENERATED STUDY PLAN ===\n(planner unavailable: {error})")
+    _print_study_plan(result.study_plan, result.study_plan_error, title="REGENERATED STUDY PLAN")
 
 
 def _cmd_postmortem(client: ClientArg, args: argparse.Namespace) -> int:
     roles = ensure_role_clients(client)
     if roles is None:
         raise RuntimeError("postmortem requires an LLM client")
+    if refusal := _refuse_metered_start(
+        roles.diagnostic, work="a post-mortem debrief", needed=POSTMORTEM_MIN_BUDGET_TOKENS
+    ):
+        print(f"Refusing to run `coach postmortem`: {refusal}", file=sys.stderr)
+        return 2
     resource_store = build_resource_store(
         args.resource_store,
         persist_dir=args.resource_persist_dir,
@@ -721,15 +754,17 @@ def _cmd_eval_harness(client: ClientArg, args: argparse.Namespace) -> int:
     roles = ensure_role_clients(client)
     if roles is None:
         raise RuntimeError("eval-harness requires an LLM client")
-    results = run_golden_answer_harness(roles.judge)
+    if refusal := _refuse_metered_start(
+        roles.judge,
+        work=f"the {len(GOLDEN_ANSWER_CASES)}-case golden-answer harness",
+        needed=HARNESS_MIN_BUDGET_TOKENS,
+    ):
+        print(f"Refusing to run `coach eval-harness`: {refusal}", file=sys.stderr)
+        return 2
+    with session_scope("eval-harness"):
+        results = run_golden_answer_harness(roles.judge)
     print(render_golden_answer_report(results))
     return 0 if harness_passed(results) else 1
-
-
-def _utc_date() -> str:
-    # Delegates to the ledger's day key so the report date can never desynchronize from the
-    # daily-budget bucketing.
-    return utc_date()
 
 
 # One full sweep of the case list measures ~50–70k tokens including retries; the gate runs k of
@@ -768,10 +803,25 @@ def _cmd_bench(client: ClientArg, args: argparse.Namespace) -> int:
     left = max(0, budget - usage_before.get(provider, {}).get("total", 0))
     needed = BENCH_MIN_BUDGET_TOKENS_PER_PASS * k
     print(f"Daily budget check ({provider}): ~{left:,} of {budget:,} tokens left by our count.")
-    if left < needed:
+    if refusal := _refuse_metered_start(
+        judge,
+        work=f"a {k}-sweep calibration bench",
+        needed=needed,
+        allow_overspend=args.ignore_budget,
+        hint=(
+            " Pass --ignore-budget to spend it deliberately (that cannot override a broken ledger "
+            "or a dead quota)."
+        ),
+    ):
+        # Refused, not warned (NEW-10): the warning let a `--k 3` sweep drain the day under a live
+        # Session. Exit 2 is neither the gate's green (0) nor its red (1), and NO report is written,
+        # so a refusal can never be mistaken for a judge verdict (ADR 0009).
+        print(f"Refusing to run `coach bench`: {refusal}", file=sys.stderr)
+        return 2
+    if args.ignore_budget and left < needed:
         print(
-            f"WARNING: under {needed:,} tokens left (k={k} sweeps) — a full bench run may die "
-            "mid-run on insufficient_quota. Consider waiting for the daily reset (00:00 UTC).",
+            f"WARNING (--ignore-budget): under {needed:,} tokens left (k={k} sweeps) — a full bench "
+            "run may die mid-run on insufficient_quota, and any Session running now may suspend.",
             file=sys.stderr,
         )
     telemetry_before = telemetry.snapshot()
@@ -787,11 +837,11 @@ def _cmd_bench(client: ClientArg, args: argparse.Namespace) -> int:
         anchors=data.anchors,
         provider=provider,
         model=_model_label(judge),
-        date=_utc_date(),
+        date=utc_date(),
         telemetry_delta=telemetry.delta(telemetry_before, telemetry_after),
         token_usage=run_usage,
     )
-    out = Path(args.out) if args.out else Path("docs/audits") / f"calibration-bench-{_utc_date()}.md"
+    out = Path(args.out) if args.out else Path("docs/audits") / f"calibration-bench-{utc_date()}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(report, encoding="utf-8")
     within = sum(1 for r in results if r.within_band)
@@ -814,9 +864,29 @@ def _cmd_bench(client: ClientArg, args: argparse.Namespace) -> int:
 
 def _cmd_usage(client: ClientArg, args: argparse.Namespace) -> int:
     """Today's client-side token ledger — the daily free-tier budget is invisible to the API."""
+    ledger = ledger_path()
+    if getattr(args, "reconcile", False):
+        # M0a / F1: replay the rows a failed write parked, then clear the fault. Explicitly an
+        # operator action: the rail refuses metered work until someone has looked, precisely because
+        # the alternative — clearing itself — is indistinguishable from counting the lost spend as 0.
+        try:
+            print(reconcile_accounting())
+        except OSError as err:
+            print(
+                f"Could not reconcile: {type(err).__name__}: {err}. Nothing was replayed for the ledger "
+                f"at {ledger}, so the held rows stay held and metered calls stay refused.",
+                file=sys.stderr,
+            )
+            return 2
+    # Printed before the totals, not after: every number below is arithmetic over this file, so a
+    # reader who does not know the file is broken would read a full budget off an empty ledger.
+    if blocked := accounting_block_reason():
+        print(f"ACCOUNTING: {blocked}\n", file=sys.stderr)
+    else:
+        print(f"Accounting healthy (ledger: {ledger}).")
     totals = usage_for_day()
     if not totals:
-        print("No recorded usage today (ledger: logs/usage-ledger.jsonl).")
+        print(f"No recorded usage today (ledger: {ledger}).")
     for provider, stats in sorted(totals.items()):
         print(
             f"{provider}: {stats['total']:,} tokens across {stats['calls']} call(s) "
@@ -841,8 +911,10 @@ def _cmd_usage(client: ClientArg, args: argparse.Namespace) -> int:
     print(
         f"Per-run budget for a default {DEFAULT_MAX_QUESTIONS}x{DEFAULT_MAX_TURNS} Session: "
         f"{session_token_budget(max_questions=DEFAULT_MAX_QUESTIONS, max_turns=DEFAULT_MAX_TURNS):,} tokens "
-        f"({default_calls} worst-case provider calls x {WORST_CASE_TOKENS_PER_CALL:,}); "
-        f"measured Sessions run ~{estimated_session_tokens(DEFAULT_MAX_QUESTIONS):,}."
+        f"({session_ceiling_multiple(DEFAULT_MAX_TURNS)}x the "
+        f"~{estimated_session_tokens(DEFAULT_MAX_QUESTIONS):,} a measured Session runs; a full retry "
+        f"storm would be {worst_case_session_tokens(DEFAULT_MAX_QUESTIONS, DEFAULT_MAX_TURNS):,} "
+        f"over {default_calls} worst-case provider calls)."
     )
     print(f"Daily question cap: {daily_question_cap()} question(s) per token identity.")
     return 0
@@ -862,6 +934,15 @@ def _cmd_forge(client: ClientArg, args: argparse.Namespace) -> int:
         f"Daily budget check ({provider}): ~{remaining_today(provider):,} of "
         f"{daily_token_budget():,} tokens left by our count."
     )
+    if refusal := _refuse_metered_start(
+        judge,
+        work=f"a {args.n}-draft forge batch",
+        needed=args.n * FORGE_MIN_BUDGET_TOKENS_PER_DRAFT,
+        allow_overspend=args.ignore_budget,
+        hint=" Pass --ignore-budget to spend it deliberately.",
+    ):
+        print(f"Refusing to run `coach forge`: {refusal}", file=sys.stderr)
+        return 2
     # Gate 2 must dedup across everything the merged install would serve: the built-in bank plus,
     # when the drafts target a pack, that pack's questions. The pack's concept notes then also
     # become valid Writer grounding / expected_concepts targets.
@@ -879,7 +960,7 @@ def _cmd_forge(client: ClientArg, args: argparse.Namespace) -> int:
         print(f"Forge FAILED: {err}", file=sys.stderr)
         return 1
     model = _model_label(judge)
-    date = _utc_date()
+    date = utc_date()
     queue_path = Path(args.out) if args.out else Path(args.queue_dir) / f"review-queue-{date}.yaml"
     queue, report = write_forge_outputs(run, queue_path=queue_path, provider=str(provider), model=model, date=date)
     print(render_forge_report(run, provider=str(provider), model=model, date=date))
@@ -958,62 +1039,13 @@ def _cmd_api(client: ClientArg, args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Adaptive Interview Coach — slice demos.")
+    parser = argparse.ArgumentParser(description="Adaptive Interview Coach.")
     parser.add_argument(
         "--verbose",
         action="store_true",
         help="Show provider and internal INFO logs. By default the CLI hides noisy demo logs.",
     )
     sub = parser.add_subparsers(dest="command")
-
-    ev_parser = sub.add_parser("evaluate", help="Slices 0001–0002: evaluate fixture answers + skill update")
-    ev_parser.add_argument(
-        "--answer",
-        choices=[*ANSWERS, "both"],
-        default="both",
-        help="Which fixture answer to evaluate (default: both).",
-    )
-    ev_parser.set_defaults(func=_cmd_evaluate, requires_llm=True)
-
-    iv_parser = sub.add_parser("interview", help="Slice 0005: run the within-question micro-loop")
-    iv_parser.add_argument(
-        "--max-turns",
-        type=int,
-        default=DEFAULT_MAX_TURNS,
-        help=f"Safety cap on turns per question (default: {DEFAULT_MAX_TURNS}).",
-    )
-    iv_parser.add_argument(
-        "--concept-store",
-        choices=["auto", "memory", "chroma"],
-        default="auto",
-        help=(
-            "Concept store used by lookup_concept during Follow-up generation. 'auto' (default) "
-            "uses Chroma wherever the rag extras are installed and warns loudly when falling back "
-            "to the keyword ranker, so the measured retrieval path is also the default one."
-        ),
-    )
-    iv_parser.add_argument(
-        "--concept-persist-dir",
-        default=".chroma",
-        help="Chroma persistence directory when --concept-store=chroma.",
-    )
-    iv_parser.add_argument(
-        "--no-seed-concepts",
-        action="store_true",
-        help="Do not upsert the built-in seed concept notes before the interview.",
-    )
-    iv_parser.add_argument(
-        "--language",
-        choices=list(LANGUAGE_MODES),
-        default=DEFAULT_LANGUAGE_MODE,
-        help="language_mode for the demo micro-loop (0024): en, vn, or mixed.",
-    )
-    iv_parser.add_argument(
-        "--concept-embedder",
-        default=None,
-        help=_CONCEPT_EMBEDDER_HELP,
-    )
-    iv_parser.set_defaults(func=_cmd_interview, requires_llm=True)
 
     diag_parser = sub.add_parser("diagnose", help="Slice 0009: produce Topic Plan + seeded Skill priors")
     diag_parser.add_argument("--target-role", required=True, help="Target role, e.g. 'machine learning engineer'.")
@@ -1232,6 +1264,14 @@ def main(argv: list[str] | None = None) -> int:
     harness_parser.set_defaults(func=_cmd_eval_harness, requires_llm=True)
 
     usage_parser = sub.add_parser("usage", help="Show today's token spend per provider (client-side daily ledger)")
+    usage_parser.add_argument(
+        "--reconcile",
+        action="store_true",
+        help=(
+            "Replay the ledger rows a failed write parked beside the ledger, then clear the "
+            "accounting fault that is refusing metered calls (M0a). Fix the path first."
+        ),
+    )
     usage_parser.set_defaults(func=_cmd_usage, requires_llm=False)
 
     bench_parser = sub.add_parser("bench", help="Issue 0022: bilingual Judge calibration bench")
@@ -1248,6 +1288,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     bench_parser.add_argument(
         "--out", default="", help="Report output path (default: docs/audits/calibration-bench-<date>.md)."
+    )
+    bench_parser.add_argument(
+        "--ignore-budget",
+        action="store_true",
+        help=(
+            "Run even when today's budget cannot fund the sweep. The daily budget is OUR count, not "
+            "the provider's, so an operator re-benching a judge must always be able to spend "
+            "deliberately (ADR 0009). Loud, never silent; it cannot override a broken ledger or a "
+            "dead quota."
+        ),
     )
     bench_parser.set_defaults(func=_cmd_bench, requires_llm=True)
 
@@ -1280,6 +1330,14 @@ def main(argv: list[str] | None = None) -> int:
         "--out",
         default="",
         help="Explicit review-queue YAML path (default: <queue-dir>/review-queue-<date>.yaml).",
+    )
+    forge_parser.add_argument(
+        "--ignore-budget",
+        action="store_true",
+        help=(
+            "Run even when today's budget cannot fund the batch. Loud, never silent; it cannot "
+            "override a broken ledger or a dead quota."
+        ),
     )
     forge_parser.set_defaults(func=_cmd_forge, requires_llm=True)
 
@@ -1317,18 +1375,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     api_parser.set_defaults(func=_cmd_api, requires_llm=False)
 
-    # Default to the newest slice when no subcommand is given.
-    parser.set_defaults(
-        func=_cmd_interview,
-        max_turns=DEFAULT_MAX_TURNS,
-        concept_store="memory",
-        concept_persist_dir=".chroma",
-        no_seed_concepts=False,
-        language=DEFAULT_LANGUAGE_MODE,
-        concept_embedder=BGE_SMALL_EN,
-        requires_llm=True,
-    )
     args = parser.parse_args(argv)
+    if args.command is None:
+        parser.print_help(sys.stderr)
+        return 2
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",
@@ -1340,7 +1390,7 @@ def main(argv: list[str] | None = None) -> int:
     # offline deterministic fallback), or none. ``--offline`` downgrades a preferred command to none.
     prefers_llm = getattr(args, "prefers_llm", False) and not getattr(args, "offline", False)
     if not args.requires_llm and not prefers_llm:
-        return args.func(None, args)
+        return _dispatch(args, None)
 
     settings = load_settings()
     if not settings.configured:
@@ -1358,10 +1408,26 @@ def main(argv: list[str] | None = None) -> int:
             "deterministic offline path.",
             file=sys.stderr,
         )
-        return args.func(None, args)
+        return _dispatch(args, None)
 
     client = build_client(settings)
     # ADR 0010: commands receive the per-role bundle. With no ROLE_* overrides this is the same
     # router object for every role except the judge, which is pinned to its provider client
     # (ADR 0009a — judge failover must never swap the model mid-run).
-    return args.func(build_role_clients(settings, client), args)
+    return _dispatch(args, build_role_clients(settings, client))
+
+
+def _dispatch(args: argparse.Namespace, client: ClientArg) -> int:
+    """Run the subcommand; the two typed operator stops exit 2 with their remedy, never a traceback.
+
+    ``session`` handles both with richer, resume-aware text before they reach here; every other
+    command (diagnose, postmortem, bench, forge, eval-harness) gets the same honest stop.
+    """
+    try:
+        return args.func(client, args)
+    except ProviderQuotaExhausted as err:
+        print(f"{err} {daily_reset_hint()}", file=sys.stderr)
+        return 2
+    except AccountingUnavailable as err:
+        print(str(err), file=sys.stderr)
+        return 2

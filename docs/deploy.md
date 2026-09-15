@@ -45,25 +45,47 @@ baked at build time is readable by anyone who can fetch the app it is supposed t
 
 ## 3. Certificates
 
-For a real hostname, issue once on the host with certbot and point the mount at the result:
+**Bootstrap first, then issue.** nginx refuses to start without a certificate file (`cannot load
+certificate "/etc/nginx/certs/fullchain.pem"`), and certbot's http-01 challenge is served *by*
+nginx — so the self-signed pair is not just the staging path, it is step one of the real one:
 
 ```bash
-sudo certbot certonly --standalone -d coach.example.com
-sudo mkdir -p deploy/nginx/certs
-sudo cp /etc/letsencrypt/live/coach.example.com/{fullchain.pem,privkey.pem} deploy/nginx/certs/
-```
-
-For a staging box or a local smoke test, a self-signed pair is enough (browsers will warn):
-
-```bash
-mkdir -p deploy/nginx/certs && cd deploy/nginx/certs
+mkdir -p deploy/nginx/certs deploy/certbot-webroot && cd deploy/nginx/certs
 openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
   -keyout privkey.pem -out fullchain.pem \
   -subj "/CN=coach.example.com" -addext "subjectAltName=DNS:coach.example.com"
+cd -
 ```
 
-Then replace `server_name _;` in `deploy/nginx/conf.d/coach.conf` with your hostname. Renewal is a
-host-side certbot timer plus `docker compose restart nginx`; nothing in the image expires.
+Replace `server_name _;` in `deploy/nginx/conf.d/coach.conf` with your hostname, bring the stack up
+(§4), and only then issue the real certificate — over the webroot nginx already serves, **not**
+`--standalone`:
+
+```bash
+# /srv/coach is this checkout's absolute path; substitute yours in all three places. The
+# --deploy-hook value must stay on one line.
+sudo certbot certonly --webroot -w /srv/coach/deploy/certbot-webroot \
+  -d coach.example.com \
+  --deploy-hook 'cp "$RENEWED_LINEAGE/fullchain.pem" "$RENEWED_LINEAGE/privkey.pem" /srv/coach/deploy/nginx/certs/ && docker compose -f /srv/coach/docker-compose.yml restart nginx'
+```
+
+`--standalone` cannot work here and must not be used: it binds :80 itself, and the nginx container
+holds :80 for the life of the deployment. It would fail at issuance and — worse — `certbot renew`
+replays whatever authenticator issuance recorded, so a certificate issued with `--standalone`
+renews with `--standalone`: failing from ~day 60 and hard-expiring at day 90, taking `wss://` down
+with `https://`, because the UI's WebSocket inherits the page scheme.
+
+The hook is what makes renewal actually land: nginx serves *copies* under `deploy/nginx/certs/`, so
+a renewal that only rewrites `/etc/letsencrypt/live/…` and restarts nginx re-serves the expired
+copy. Certbot saves `--deploy-hook` into `/etc/letsencrypt/renewal/coach.example.com.conf`, so the
+packaged `certbot.timer` needs no further configuration. Two details are load-bearing: the hook runs
+with no useful cwd, so every path in it is absolute; and both `.pem` files are named, because
+certbot runs hooks through `/bin/sh`, which does not expand `{a,b}`.
+
+Verify before you depend on it: `sudo certbot renew --dry-run` with the stack **up**. It exercises
+the webroot for real; it does *not* run deploy hooks, so also confirm the ACME location is
+reachable: `curl -si -H 'Host: coach.example.com' http://<host>/.well-known/acme-challenge/probe` —
+a 404 from *nginx* is correct, a 301 to `https://` means the location is not matching.
 
 ## 4. Run
 
@@ -87,13 +109,28 @@ The `coach-state` volume holds everything that must outlive the process:
 | `/app/state/session-checkpoints.sqlite` | LangGraph checkpoints | Every in-flight interview; resume stops working |
 | `/app/state/exports/` | Completed-Session Markdown (R-08) | Every report not already downloaded |
 | `/app/state/skill-ledger.json` | Cross-session Beta priors | Returning Candidates cold-start again |
+| `/app/state/usage-ledger.jsonl` | The token ledger — i.e. the free-tier budget balance | The day's spend resets to zero and every budget rail over-reports |
 
 A `docker restart` mid-question is recoverable: the browser shows *Connection lost*, **Reconnect**
 resumes from the checkpoint, and the pending question is re-emitted. This is verified from a real
 browser against a real container — see §8.
 
-Back it up with `docker run --rm -v coach-state:/state -v "$PWD:/backup" alpine tar czf
-/backup/coach-state.tgz -C /state .`
+Back it up **outside the checkout**:
+
+```bash
+sudo install -d -m 700 /var/backups/coach
+docker compose run --rm --no-deps --user root -v /var/backups/coach:/backup app \
+  tar czf "/backup/coach-state-$(date +%F).tgz" -C /app/state .
+```
+
+`docker compose run` is what makes this correct: Compose names the volume `<project>_coach-state`,
+so a hand-written `docker run` that mounts `coach-state` by its bare key mounts a *different*
+volume — one Docker silently creates, empty — and tars nothing. Running it as the `app` service
+borrows the mount that service already has. The destination is off the checkout on purpose: `$PWD`
+is the git working tree and the Docker build context, and the archive is every Candidate's
+transcript plus both ledgers — no `.gitignore` rule covers it, so `git add -A` on the deploy host
+would publish it. A dated name keeps one bad run from overwriting the only copy; copy it to another
+host to make it a backup.
 
 ## 6. The single-worker constraint
 
@@ -123,9 +160,32 @@ Scaling past one host means R-29 (Postgres checkpointer + real accounts), not mo
 
 ```bash
 docker compose logs -f app          # session lifecycle + the per-call `llm-call` trace
-docker compose exec app coach usage # today's token spend against the daily budget
+docker compose exec app coach usage # today's token spend + the accounting health line
+docker compose exec app coach usage --reconcile  # replay rows a failed ledger write parked
 docker compose up -d --build        # redeploy; the state volume is untouched
 ```
+
+`coach usage` leads with an **ACCOUNTING:** line whenever the token ledger cannot be written or is
+holding rows a failed write could not land. Take it seriously: every number that command prints —
+and every budget rail in the app — is arithmetic over `/app/state/usage-ledger.jsonl`, so a ledger
+nobody can write reads as a *full* budget rather than an unknown one. That is not theoretical: until
+M0a the image left `COACH_USAGE_LEDGER` at its repo-anchored default, which resolves to
+`/app/logs/usage-ledger.jsonl` inside the container, and `/app` is `root:root` 755 while the process
+is uid 10001 — so every append failed, every token row was dropped with a warning, and the
+deployment reported a pristine 2,500,000-token allowance for as long as it ran.
+
+Two conditions, with different remedies, and the message says which:
+
+- **unavailable** — the path cannot be written. Nothing is unaccounted for, because metered calls
+  are refused while it holds; point `COACH_USAGE_LEDGER` at the state volume and it clears itself.
+- **UNRECONCILED** — a provider call was billed and its usage row would not write. The day's spend
+  is now *undetermined*, which is not zero. The unwritten rows are parked in
+  `/app/state/usage-ledger.jsonl.unreconciled`; fix the path, then
+  `docker compose exec app coach usage --reconcile` replays them into the ledger and clears it.
+
+Either way metered work stops and demo mode keeps working, so a misconfigured deployment is
+demonstrable rather than dead. Suspended Sessions keep their resolved questions in the checkpoint
+and record nothing as `failed` (ADR 0005).
 
 The `llm-call provider=… model=… ms=… outcome=…` line (R-26) is the one that makes a silent judge
 failover visible after the fact. If you ever see the judge role on a provider it is not pinned to,
@@ -173,3 +233,27 @@ Every claim above was executed against real containers on 2026-07-27:
 - `docker compose config` with that same `COACH_LOG_FILE=logs/coach-api.log` in `.env` →
   `COACH_LOG_FILE: /app/state/logs/coach-api.log`: the `environment:` block overrides `env_file`.
 - gunicorn is **not** verified and not covered — see §6.
+
+The usage-accounting path (M0a / F1) was executed on 2026-09-13 against the real image, as uid
+10001, on disposable volumes. Fakes are limited to the HTTP transport: the real `OpenAIClient`, its
+real call path and the real `record_usage` run, so no paid API is contacted. Full report and
+commands: [`docs/audits/m0a-usage-ledger-2026-09-13.md`](audits/m0a-usage-ledger-2026-09-13.md).
+
+- **The defect, reproduced:** pre-fix `usage.py`/`llm.py` mounted over the image with
+  `COACH_USAGE_LEDGER` unset → 3 fake metered calls made, **0** ledger rows,
+  `remaining_today = 2,500,000`, exit 0, three `usage ledger write failed … dropping entry`
+  warnings. `mkdir /app/logs` as uid 10001 → `PermissionError`.
+- **Fixed image, stock config:** one fake metered call → exactly one row in
+  `/app/state/usage-ledger.jsonl`, balance 2,500,000 → 2,499,880.
+- **Survives restart and container replacement:** 5 calls / 600 tokens, then `docker restart`, then
+  `docker rm` + a fresh container from the image on the same volume → same 600 tokens both times.
+- **Unwritable path:** `/app/logs/usage-ledger.jsonl` (the old default) → `AccountingUnavailable`,
+  **zero** provider calls made, `coach session` refuses with exit 2 and names the remedy.
+- **Failure after a billed call:** ledger replaced by a directory mid-run → the billed call's row is
+  parked in `usage-ledger.jsonl.unreconciled`, the next call is refused, repairing the path alone
+  does **not** clear it, and `--reconcile` replays the 120 tokens back into the ledger.
+- **Unchanged:** the daily-budget start rail still refuses with its own wording, and a demo Session
+  completes with no provider configured *and* a deliberately unwritable ledger.
+- `docker compose config` with `COACH_USAGE_LEDGER=logs/usage-ledger.jsonl` in `.env` →
+  `/app/state/usage-ledger.jsonl`: the `environment:` block overrides `env_file`, and the container
+  reads the winning value.

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from interview_coach.eval_harness import (
     GoldenAnswerCase,
     GoldenAnswerResult,
@@ -16,10 +18,7 @@ from interview_coach.fixtures import QUESTION
 def _eval_json(score: int) -> str:
     return json.dumps(
         {
-            "dimensions": {
-                dim: {"score": score, "evidence": "no evidence"}
-                for dim in QUESTION.rubric.active
-            },
+            "dimensions": {dim: {"score": score, "evidence": "no evidence"} for dim in QUESTION.rubric.active},
             "weighted_score": float(score),
             "confidence": 0.8,
             "follow_up_recommended": False,
@@ -36,10 +35,7 @@ def _result(case_id: str, score: float, *, expected_min: float = 1.0, expected_m
         expected_max=expected_max,
     )
     evaluation = Evaluation(
-        dimensions={
-            dim: DimensionScore(score=round(score), evidence="no evidence")
-            for dim in QUESTION.rubric.active
-        },
+        dimensions={dim: DimensionScore(score=round(score), evidence="no evidence") for dim in QUESTION.rubric.active},
         weighted_score=score,
         confidence=0.7,
         follow_up_recommended=False,
@@ -83,15 +79,23 @@ def test_prompt_injection_case_fails_when_score_is_high(make_client):
     assert "FAIL" in render_golden_answer_report(results)
 
 
-def test_harness_marks_provider_or_schema_error_as_failure(make_client):
+def test_harness_marks_provider_or_schema_error_as_failure(make_client, caplog):
     case = GoldenAnswerCase("broken_case", "answer", 1.0, 5.0)
     client, _ = make_client(['{"bad": 1}', '{"bad": 1}'])
 
-    results = run_golden_answer_harness(client, (case,))
+    with caplog.at_level("WARNING", logger="interview_coach.eval_harness"):
+        results = run_golden_answer_harness(client, (case,))
 
     assert not results[0].passed
     assert results[0].error is not None
     assert "StructuredOutputError" in results[0].error
+    # The failure is visible in the log, not only in the report row.
+    assert any("broken_case" in r.getMessage() and "StructuredOutputError" in r.getMessage() for r in caplog.records)
+
+
+def test_an_empty_harness_does_not_pass_vacuously():
+    # ``all([])`` is True; an empty result list must read as red, exactly like bench_passed.
+    assert harness_passed([]) is False
 
 
 def test_report_summary_counts_failures():
@@ -105,3 +109,29 @@ def test_report_summary_counts_failures():
     assert "ok" in report
     assert "regressed" in report
     assert "summary: 1/2 passed" in report
+
+
+# --- typed operator stops (QA-14) ----------------------------------------------------------------
+
+
+def test_a_dead_quota_stops_the_harness_instead_of_becoming_a_failed_case(make_client):
+    # QA-14 / GH #119: "the judge could not be reached because we ran out of money" is not a judge
+    # regression. Recorded as a case error it reds the gate and prints a FAIL row that reads like one.
+    from interview_coach.usage import ProviderQuotaExhausted
+
+    case = GoldenAnswerCase("weak_answer", "answer", 1.0, 5.0)
+    client, _ = make_client([ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")])
+
+    with pytest.raises(ProviderQuotaExhausted):
+        run_golden_answer_harness(client, (case,))
+
+
+def test_broken_accounting_stops_the_harness_rather_than_scoring_a_refused_call(make_client):
+    # M0a / F1: the call was never made, so there is nothing to report about the Evaluator.
+    from interview_coach.usage import AccountingUnavailable
+
+    case = GoldenAnswerCase("weak_answer", "answer", 1.0, 5.0)
+    client, _ = make_client([AccountingUnavailable("Usage accounting is UNRECONCILED: 1 provider call(s) were billed")])
+
+    with pytest.raises(AccountingUnavailable):
+        run_golden_answer_harness(client, (case,))

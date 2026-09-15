@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
+import multiprocessing as mp
 import os
 import stat
 import tempfile
@@ -15,12 +17,16 @@ from interview_coach.diagnostic import CandidateProfile, diagnose
 from interview_coach.evaluator import Evaluation
 from interview_coach.ledger import (
     LEDGER_HALF_LIFE_DAYS,
+    LEDGER_SCHEMA_VERSION,
     SECONDS_PER_DAY,
     decay_beta,
+    is_safe_candidate_id,
     load_priors,
     load_states,
+    save_measured_posteriors,
     save_posteriors,
 )
+from interview_coach.session_serde import measured_skill_states
 from interview_coach.skill import NEUTRAL_ALPHA, NEUTRAL_BETA, SkillState, apply_evaluation
 
 DAY = SECONDS_PER_DAY
@@ -232,9 +238,149 @@ def test_concurrent_saves_for_different_candidates_both_persist(tmp_path, monkey
 
     # Both new records AND the pre-existing one survive the merge — losing "carol" would mean the
     # winning writer had merged into a stale read.
-    assert sorted(json.loads(path.read_text(encoding="utf-8"))) == ["alice", "bob", "carol"]
+    candidates = [key for key in json.loads(path.read_text(encoding="utf-8")) if key != "_meta"]
+    assert sorted(candidates) == ["alice", "bob", "carol"]
     assert load_priors(path, "alice", now=0.0).raw_mastery["mlops"] == pytest.approx(0.9)
     assert load_priors(path, "bob", now=0.0).raw_mastery["mlops"] == pytest.approx(2.0 / 3.0)
+
+
+def _merge_and_park(path: str, read_flag, release) -> None:
+    """Child process: enter save_posteriors' load->merge->publish window and park inside it."""
+    target = Path(path)
+    real_read_text = Path.read_text
+
+    def parked(self, *args, **kwargs):
+        raw = real_read_text(self, *args, **kwargs)
+        if self == target:
+            read_flag.set()
+            release.wait(10)
+        return raw
+
+    Path.read_text = parked
+    save_posteriors(target, "alice", {"mlops": SkillState("mlops", alpha=9.0, beta=1.0)}, now=0.0)
+
+
+def test_a_candidate_id_cannot_collide_with_the_ledgers_own_metadata_key(tmp_path):
+    # NEW-28: `_meta` matched the id rule, so a Candidate (or a harness) using it persisted and
+    # warm-started correctly — and then the next Candidate to finish overwrote data["_meta"] with the
+    # schema marker and destroyed that record silently. The whole `_` prefix is reserved rather than
+    # the one literal, because the next metadata key would reopen it, and because the rule has to
+    # stay a character class: web_api feeds SAFE_CANDIDATE_ID.pattern straight into a pydantic
+    # Field(pattern=...), and pydantic's rust-regex engine has no look-around at all.
+    assert not is_safe_candidate_id("_meta")
+    assert not is_safe_candidate_id("_anything")
+    assert is_safe_candidate_id("alice") and is_safe_candidate_id("a-b_c") and is_safe_candidate_id("a" * 64)
+
+    path = tmp_path / "ledger.json"
+    save_posteriors(path, "_meta", {"mlops": SkillState("mlops", alpha=8.0, beta=2.0)}, now=0.0)
+
+    assert not path.exists()  # refused at the ledger too, not merely at the boundary
+
+
+def test_a_ledger_that_is_not_valid_utf8_degrades_instead_of_aborting_the_session(tmp_path, caplog):
+    # NEW-29: both loaders promise they never raise, and UnicodeDecodeError is a ValueError, not an
+    # OSError, so it walked straight out of the guard. A ledger that acquires invalid UTF-8 from
+    # outside the writer — volume corruption, a restore by another tool, a hand edit — then aborted
+    # the next Session start on a file that is supposed to degrade to "no priors".
+    path = tmp_path / "ledger.json"
+    path.write_bytes(b'{"alice": {"completed_at": 0.0, "skills": {}}}\xff\xfe')
+
+    with caplog.at_level(logging.WARNING, logger="interview_coach.ledger"):
+        assert load_priors(path, "alice", now=0.0) is None
+        assert load_states(path, "alice", now=0.0) is None
+        # The writer must survive it too, or a finished Session dies on its memory write.
+        save_posteriors(path, "bob", {"mlops": SkillState("mlops", alpha=2.0, beta=1.0)}, now=0.0)
+
+    assert "unreadable" in caplog.text
+    assert json.loads(path.read_text(encoding="utf-8"))["bob"]["skills"]["mlops"]["alpha"] == 2.0
+
+
+def test_a_ledger_from_a_newer_build_is_neither_read_nor_overwritten(tmp_path, caplog):
+    # QA-11's ledger half. LEDGER_SCHEMA_VERSION was write-only too, so an old build handed a v2
+    # ledger read it as if it understood it and — far worse — rewrote it on the next completion,
+    # stamping _meta back down to v1 and clobbering whatever the newer shape held. Both loaders and
+    # the writer are contractually forbidden to raise, so this degrades loudly instead of refusing.
+    path = tmp_path / "ledger.json"
+    path.write_text(
+        json.dumps(
+            {
+                "_meta": {"schema_version": 99},
+                "alice": {"completed_at": 0.0, "skills": {"mlops": {"alpha": 8.0, "beta": 2.0}}},
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    before = path.read_bytes()
+
+    with caplog.at_level(logging.ERROR, logger="interview_coach.ledger"):
+        carried = load_priors(path, "alice", now=0.0)
+        save_posteriors(path, "bob", {"mlops": SkillState("mlops", alpha=2.0, beta=1.0)}, now=0.0)
+
+    assert carried is None  # a cold start, not a guess at a shape we do not know
+    assert "schema_version 99" in caplog.text
+    assert path.read_bytes() == before  # and above all: not downgraded, not clobbered
+
+
+def test_a_concurrent_second_process_cannot_erase_this_processs_record(tmp_path):
+    # QA-09. `_SAVE_LOCK` only serialises threads of ONE interpreter, and `coach postmortem` and
+    # `coach session` call save_posteriors from a second OS process against the same
+    # COACH_LEDGER_DB. Measured: the loser merges into a read taken before the winner's rename and
+    # the winner's Candidate simply vanishes — and save_posteriors never raises, so nothing anywhere
+    # reports it. Infrastructure noise erasing Skill evidence is exactly what ADR 0005 forbids.
+    # "carol" is seeded first because an absent file is never read, so the child's hook would never
+    # fire — the same reason the thread-level sibling above seeds her.
+    path = tmp_path / "ledger.json"
+    save_posteriors(path, "carol", {"mlops": SkillState("mlops", alpha=4.0, beta=4.0)}, now=0.0)
+
+    ctx = mp.get_context("fork")
+    child_read, release = ctx.Event(), ctx.Event()
+    child = ctx.Process(target=_merge_and_park, args=(str(path), child_read, release))
+    child.start()
+    assert child_read.wait(10), "the child never reached the merge"
+
+    def save() -> None:
+        save_posteriors(path, "bob", {"mlops": SkillState("mlops", alpha=2.0, beta=1.0)}, now=0.0)
+
+    thread = threading.Thread(target=save)
+    thread.start()
+    thread.join(0.5)
+    release.set()
+    child.join(10)
+    thread.join(10)
+
+    assert child.exitcode == 0
+    candidates = sorted(key for key in json.loads(path.read_text(encoding="utf-8")) if key != "_meta")
+    assert candidates == ["alice", "bob", "carol"]
+
+
+@pytest.mark.parametrize("bad", ["minh/../../etc/passwd", "a" * 65, "minh\nINFO forged", " ", "minh minh", "Nguyễn"])
+def test_an_unsafe_candidate_id_is_never_written_as_a_ledger_key(tmp_path, bad, caplog):
+    # Defence in depth behind the web payload guard, and the rule the CLI shares: the key is one
+    # shared JSON file that every Session and both CLI commands rewrite. Honours the module contract —
+    # never raises, warns, and leaves the file untouched rather than half-written.
+    path = tmp_path / "ledger.json"
+
+    save_posteriors(path, bad, {"mlops": SkillState("mlops", alpha=8.0, beta=2.0)}, now=0.0)
+
+    assert not path.exists(), f"an unvalidated id was written into the shared ledger: {bad!r}"
+    assert load_priors(path, bad, now=0.0) is None
+    assert load_states(path, bad, now=0.0) is None
+    assert "not a valid Skill ledger key" in caplog.text
+
+
+def test_the_ledger_carries_a_schema_version_that_is_never_read_as_a_candidate(tmp_path):
+    path = tmp_path / "ledger.json"
+    save_posteriors(path, "alice", {"mlops": SkillState("mlops", alpha=8.0, beta=2.0)}, now=0.0)
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["_meta"] == {"schema_version": LEDGER_SCHEMA_VERSION}
+    assert load_priors(path, "alice", now=0.0).raw_mastery["mlops"] == pytest.approx(0.8)
+    assert load_states(path, "alice", now=0.0)["mlops"].alpha == pytest.approx(8.0)
+    # The meta record is not a Candidate: asking for it is a cold start, not a crash.
+    assert load_priors(path, "_meta", now=0.0) is None
+    assert load_states(path, "_meta", now=0.0) is None
 
 
 def test_failed_publish_keeps_the_old_ledger_and_leaves_no_temp_file(tmp_path, monkeypatch, caplog):
@@ -256,7 +402,9 @@ def test_failed_publish_keeps_the_old_ledger_and_leaves_no_temp_file(tmp_path, m
     save_posteriors(path, "bob", {"mlops": SkillState("mlops", alpha=2.0, beta=8.0)}, now=0.0)
 
     assert path.read_bytes() == before
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["ledger.json"]
+    # The `.lock` sidecar is a permanent fixture of the directory (the inter-process lock target,
+    # never replaced or unlinked), so the claim is about STAGED files, not about the directory.
+    assert sorted(p.name for p in tmp_path.iterdir() if not p.name.endswith(".lock")) == ["ledger.json"]
     assert "not persisted" in caplog.text
     # The staged file has to be a sibling of the target, not somewhere under the system temp dir:
     # os.replace is only atomic within a single filesystem and raises EXDEV across a mount boundary,
@@ -325,7 +473,7 @@ def test_a_write_that_dies_mid_flight_leaves_no_tempfile_behind(tmp_path, monkey
     for _ in range(3):  # repeated, because the leak is one file *per* failed Session
         save_posteriors(path, "bob", {"mlops": SkillState("mlops", alpha=2.0, beta=8.0)}, now=0.0)
 
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["ledger.json"]
+    assert sorted(p.name for p in tmp_path.iterdir() if not p.name.endswith(".lock")) == ["ledger.json"]
     assert path.read_bytes() == before  # a half-written save is a no-op, not a truncation
     assert "not persisted" in caplog.text
 
@@ -344,7 +492,9 @@ def test_a_tempfile_that_never_opens_still_never_raises(tmp_path, monkeypatch, c
     save_posteriors(path, "alice", {"mlops": SkillState("mlops", alpha=8.0, beta=2.0)}, now=0.0)
 
     assert "not persisted" in caplog.text
-    assert list(tmp_path.iterdir()) == []
+    # Nothing was STAGED. The lock sidecar is created before the write is attempted at all, so it is
+    # not a leak; excluding it keeps the assertion about the tempfile this test is named for.
+    assert [p.name for p in tmp_path.iterdir() if not p.name.endswith(".lock")] == []
 
 
 def test_cleanup_that_itself_fails_still_never_raises(tmp_path, caplog, monkeypatch):
@@ -477,3 +627,85 @@ def test_export_shows_llm_calls_per_turn_with_the_provider_split():
 
     assert "LLM calls: **5**" in report
     assert "openai 4" in report and "groq 1" in report
+
+
+# --- NEW-17: only Skills this Session measured may enter the ledger -------------------------------
+
+
+def _measured_state():
+    """Three seeded beliefs; one Skill resolved, one crashed, one never probed at all."""
+    return {
+        "skill_states": {
+            "mlops": {"skill": "mlops", "alpha": 6.0, "beta": 2.0},
+            "system_design": {"skill": "system_design", "alpha": 3.0, "beta": 3.0},
+            "vietnamese_nlp": {"skill": "vietnamese_nlp", "alpha": 4.0, "beta": 1.0},
+        },
+        "transcript": [
+            {
+                "skill": "mlops",
+                "plan_index": 0,
+                "stop_reason": "resolved",
+                "resolved_weighted_score": 4.0,
+                "resolved_confidence": 0.8,
+                "evidence_weight": 1.8,
+                "skill_state": {"skill": "mlops", "alpha": 6.0, "beta": 2.0},
+                "turns": [],
+            },
+            {
+                "skill": "system_design",
+                "plan_index": 1,
+                "stop_reason": "failed",
+                "resolved_weighted_score": 0.0,
+                "resolved_confidence": 0.0,
+                "evidence_weight": 0.0,
+                "skill_state": {"skill": "system_design", "alpha": 3.0, "beta": 3.0},
+                "turns": [],
+                "error": "ConnectionError: provider timed out",
+            },
+        ],
+    }
+
+
+def test_only_skills_with_evidence_bearing_transcript_items_are_persisted(tmp_path):
+    # NEW-17 / ADR 0005. `skill_states` holds a belief for every canonical Skill from the moment the
+    # Diagnostic seeds it from the Candidate's own claim, so persisting it wholesale wrote an
+    # unprobed 5/5 self-claim into cross-session memory as a measured posterior — which the next
+    # Session then lets override that Candidate's honest self-assessment. `vietnamese_nlp` was never
+    # asked about; `system_design` crashed, and a crash is not evidence either (its evidence_weight
+    # is 0.0 by design), so the belief standing for it IS the self-claim seed.
+    path = tmp_path / "ledger.json"
+
+    save_measured_posteriors(path, "minh", measured_skill_states(_measured_state()), now=0.0)
+
+    persisted = json.loads(path.read_text(encoding="utf-8"))["minh"]["skills"]
+    assert sorted(persisted) == ["mlops"]
+
+
+def test_a_skill_measured_in_an_earlier_session_survives_a_session_that_never_probes_it(tmp_path):
+    # The regression the filter itself creates, and the reason the naive version must not ship:
+    # save_posteriors REPLACES a Candidate's whole record, so handing it only this Session's probed
+    # Skills would trade a fake-evidence bug for a lost-evidence bug. Carried params are decayed to
+    # `now` before the save restamps the decay clock, so nothing is silently un-decayed.
+    path = tmp_path / "ledger.json"
+    save_posteriors(path, "alice", {"mlops": SkillState("mlops", alpha=9.0, beta=1.0)}, now=0.0)
+    state = {
+        "skill_states": {"ml_fundamentals": {"skill": "ml_fundamentals", "alpha": 5.0, "beta": 2.0}},
+        "transcript": [
+            {
+                "skill": "ml_fundamentals",
+                "plan_index": 0,
+                "stop_reason": "resolved",
+                "resolved_weighted_score": 4.0,
+                "resolved_confidence": 0.8,
+                "evidence_weight": 1.8,
+                "skill_state": {"skill": "ml_fundamentals", "alpha": 5.0, "beta": 2.0},
+                "turns": [],
+            }
+        ],
+    }
+
+    save_measured_posteriors(path, "alice", measured_skill_states(state), now=0.0)
+
+    record = json.loads(path.read_text(encoding="utf-8"))["alice"]["skills"]
+    assert sorted(record) == ["ml_fundamentals", "mlops"]
+    assert record["mlops"]["alpha"] + record["mlops"]["beta"] == pytest.approx(10.0)  # carried, not re-seeded

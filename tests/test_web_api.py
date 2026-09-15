@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import importlib
+import json
 import logging
 import os
 import subprocess
 import sys
+import threading
+import time
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.status import WS_1008_POLICY_VIOLATION
 from starlette.websockets import WebSocketDisconnect
@@ -18,6 +23,7 @@ from interview_coach import usage, web_api
 from interview_coach.config import Settings
 from interview_coach.demo_llm import DemoLLMClient
 from interview_coach.llm import RoleClients
+from interview_coach.microloop import CandidateInputUnavailable
 from interview_coach.web_api import (
     ResumeSessionPayload,
     configure_session_logging,
@@ -30,10 +36,7 @@ from interview_coach.web_api import (
 def _app(tmp_path):
     settings = Settings(
         _env_file=None,
-        primary_provider="mimo",
-        mimo_api_key="",
-        mimo_base_url="",
-        mimo_model="",
+        primary_provider="groq",
         groq_api_key="",
         groq_model="",
         concept_store="memory",
@@ -59,7 +62,7 @@ def test_health_reports_provider_config_and_demo_availability(tmp_path):
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "ok"
-    assert data["primary_provider"] == "mimo"
+    assert data["primary_provider"] == "groq"
     assert data["primary_configured"] is False
     assert data["demo_available"] is True
 
@@ -86,14 +89,10 @@ def test_demo_websocket_start_answer_flow_and_export(tmp_path):
         question = _receive_until(ws, "question")
         assert "question" in question["question"].lower() or question["question"]
 
-        ws.send_json(
-            {
-                "type": "candidate_answer",
-                "answer": (
-                    "I would compare training and validation behavior, watch for leakage and drift, "
-                    "and explain the trade-off before choosing the model."
-                ),
-            }
+        _answer(
+            ws,
+            "I would compare training and validation behavior, watch for leakage and drift, "
+            "and explain the trade-off before choosing the model.",
         )
 
         update = _receive_until(ws, "state_update")
@@ -122,7 +121,7 @@ def test_web_session_threads_language_mode_into_state(tmp_path):
     with client.websocket_connect("/api/sessions/mixed-session") as ws:
         ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1, "language_mode": "mixed"})
         _receive_until(ws, "question")
-        ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+        _answer(ws, "A short demo answer about drift.")
         completed = _receive_until(ws, "session_completed")
         assert completed["state"]["language_mode"] == "mixed"
 
@@ -179,14 +178,108 @@ def test_resume_after_cancel_preserves_the_in_flight_question(tmp_path):
         ws.send_json({"type": "resume_session", "mode": "demo"})
         _receive_until(ws, "session_started")
         _receive_until(ws, "question")
-        ws.send_json(
-            {"type": "candidate_answer", "answer": "A real answer about the bias-variance tradeoff and regularization."}
-        )
+        _answer(ws, "A real answer about the bias-variance tradeoff and regularization.")
         completed = _receive_until(ws, "session_completed")
 
     state = completed["state"]
     assert state["status"] == "complete"
     assert state["transcript"][0]["turns"][0]["answer"].startswith("A real answer")
+
+
+# --- NEW-01: an answer is bound to the turn it answers -------------------------------------------
+
+
+def _receive_both(ws, first_type: str, second_type: str, *, limit: int = 60) -> tuple[dict, dict]:
+    """Wait for one frame of each type, in either order.
+
+    Two different threads emit these — the socket loop refuses the answer, the graph thread asks the
+    next question — so a `_receive_until(a)` followed by `_receive_until(b)` silently discards b when
+    b arrives first and then blocks forever waiting for it.
+    """
+    found: dict[str, dict] = {}
+    for _ in range(limit):
+        event = _remember_question(ws, ws.receive_json())
+        if event["type"] in (first_type, second_type):
+            found.setdefault(event["type"], event)
+        if len(found) == 2:
+            return found[first_type], found[second_type]
+    raise AssertionError(f"did not receive both {first_type!r} and {second_type!r}; got {sorted(found)}")
+
+
+
+def test_an_answer_is_bound_to_the_turn_it_answers(tmp_path):
+    # NEW-01 / ADR 0005. The queue used to be a bare FIFO, so a second answer sent while only the
+    # first question was pending was held and consumed by the NEXT question — the answer typed for
+    # Q1 became `deep_learning` evidence, and the Session completed with no error at all, with the
+    # shifted scores written to the Skill ledger.
+    client = _test_client(tmp_path)
+
+    with client.websocket_connect("/api/sessions/queue-jump") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 2})
+        first = _receive_until(ws, "question")
+        assert isinstance(first.get("turn_id"), int), f"the question frame carries no turn id: {first}"
+        ws.send_json(
+            {"type": "candidate_answer", "answer": "REAL: bias and variance trade off.", "turn_id": first["turn_id"]}
+        )
+        ws.send_json(
+            {"type": "candidate_answer", "answer": "STOLEN: typed for the first question.", "turn_id": first["turn_id"]}
+        )
+        # The refusal comes from the socket loop and Q2 from the graph thread, so their order on the
+        # wire is genuinely racy — wait for BOTH rather than for one and then the other, or whichever
+        # arrives first gets swallowed by the wait for the second.
+        refusal, second = _receive_both(ws, "session_error", "question")
+        assert "does not answer" in refusal["error"]
+        # The queue-jump is refused, so Q2 is now genuinely unanswered — answer it properly, which is
+        # also the proof the refusal did not wedge the Session.
+        assert second["turn_id"] != first["turn_id"]
+        ws.send_json(
+            {
+                "type": "candidate_answer",
+                "answer": "REAL: an answer for the second question.",
+                "turn_id": second["turn_id"],
+            }
+        )
+        completed = _receive_until(ws, "session_completed", limit=60)
+
+    answers = [turn["answer"] for item in completed["state"]["transcript"] for turn in item["turns"]]
+    assert not any(answer.startswith("STOLEN") for answer in answers), answers
+    assert any(answer.startswith("REAL: an answer for the second") for answer in answers), answers
+
+
+def test_an_id_less_answer_is_refused_outright(tmp_path):
+    # An answer with no turn_id is refused ALWAYS, not only when nothing is pending. "Nothing is
+    # pending" is not a state the client can rely on: the socket loop and the graph thread run
+    # concurrently, so a stray id-less answer that arrives just after the NEXT question is armed
+    # matches it and is scored against the wrong question — the exact misattribution NEW-01 is about.
+    # Measured before this: the Session completed with the stolen text scored as Q2's evidence, about
+    # one run in eight. The server has minted a turn id for every question it asked, so an answer
+    # that names none cannot be bound to anything, and refusing is the only safe reading.
+    client = _test_client(tmp_path)
+
+    with client.websocket_connect("/api/sessions/queue-jump-legacy") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 2})
+        first = _receive_until(ws, "question")
+        ws.send_json({"type": "candidate_answer", "answer": "STOLEN: sent with no turn id."})
+        refusal = _receive_until(ws, "session_error", limit=40)
+        assert "does not answer" in refusal["error"]
+
+        # The Session is not wedged: the same question still accepts a properly bound answer.
+        ws.send_json(
+            {"type": "candidate_answer", "answer": "REAL: bias and variance.", "turn_id": first["turn_id"]}
+        )
+        second = _receive_until(ws, "question", limit=40)
+        ws.send_json(
+            {
+                "type": "candidate_answer",
+                "answer": "REAL: an answer for the second question.",
+                "turn_id": second["turn_id"],
+            }
+        )
+        completed = _receive_until(ws, "session_completed", limit=60)
+
+    answers = [turn["answer"] for item in completed["state"]["transcript"] for turn in item["turns"]]
+    assert not any(answer.startswith("STOLEN") for answer in answers), answers
+    assert second["turn_id"] > first["turn_id"]
 
 
 def test_start_cancel_start_on_one_socket_clears_stale_state(tmp_path):
@@ -232,9 +325,7 @@ def test_returning_candidate_seeds_priors_and_carries_a_delta(tmp_path):
             ws.send_json({"type": "start_session", "mode": "demo", "candidate_id": "demo", "max_questions": 1})
             _receive_until(ws, "session_started")
             _receive_until(ws, "question")
-            ws.send_json(
-                {"type": "candidate_answer", "answer": "A solid answer about bias, variance, leakage, and drift."}
-            )
+            _answer(ws, "A solid answer about bias, variance, leakage, and drift.")
             return _receive_until(ws, "session_completed")["state"]
 
     first = _run_one("s1")
@@ -244,9 +335,26 @@ def test_returning_candidate_seeds_priors_and_carries_a_delta(tmp_path):
     assert second["ledger_prior_mastery"]  # returning candidate: priors carried from the ledger
 
 
+# NEW-01: every question carries a turn id and every answer must echo it, so the receive helpers
+# remember the last question each socket saw and `_answer` sends the bound frame. Keyed by id(ws)
+# because a TestClient websocket is not hashable; entries are per-test and die with the process.
+_LAST_QUESTION: dict[int, int] = {}
+
+
+def _remember_question(ws, event):
+    if event.get("type") == "question" and isinstance(event.get("turn_id"), int):
+        _LAST_QUESTION[id(ws)] = event["turn_id"]
+    return event
+
+
+def _answer(ws, text: str) -> None:
+    """Answer the question this socket last received, echoing its turn id (NEW-01)."""
+    ws.send_json({"type": "candidate_answer", "answer": text, "turn_id": _LAST_QUESTION[id(ws)]})
+
+
 def _receive_until(ws, event_type: str, *, limit: int = 20):
     for _ in range(limit):
-        event = ws.receive_json()
+        event = _remember_question(ws, ws.receive_json())
         if event["type"] == event_type:
             return event
     raise AssertionError(f"did not receive event type {event_type!r}")
@@ -260,10 +368,7 @@ _TOKEN = "s3cret-shared-token"
 def _gated_client(tmp_path, *, token: str = _TOKEN, origins: str = ""):
     settings = Settings(
         _env_file=None,
-        primary_provider="mimo",
-        mimo_api_key="",
-        mimo_base_url="",
-        mimo_model="",
+        primary_provider="groq",
         groq_api_key="",
         groq_model="",
         auth_token=token,
@@ -456,6 +561,53 @@ def test_a_non_ascii_configured_token_refuses_to_start(tmp_path):
         _gated_client(tmp_path, token="mật-khẩu-chung")
 
 
+@pytest.mark.parametrize(
+    "origins",
+    ["*", " * ", "https://coach.example.com, *"],
+    ids=["bare", "padded", "buried-in-a-list"],
+)
+def test_a_wildcard_allowlist_refuses_to_start(tmp_path, origins):
+    # NEW-11. `*` fails OPEN on one surface and CLOSED on the other, which is why it must never
+    # start. CORS reads it as every origin and — allow_credentials being on — echoes the caller's own
+    # Origin back with a credentialed allow, so any page can read a transcript export; the WebSocket
+    # check compares it literally and rejects the deployed UI regardless. The operator who reached
+    # for it was chasing that very rejection, so they debug the socket and never look at CORS.
+    with pytest.raises(ValueError, match="must not contain") as caught:
+        _gated_client(tmp_path, origins=origins)
+
+    # The refusal has to name the value that works, or the next guess is wrong too.
+    assert "COACH_ALLOWED_ORIGINS=https://coach.example.com" in str(caught.value)
+
+
+def test_a_refused_frame_is_marked_recoverable_and_a_dead_session_is_not(tmp_path):
+    # QA-15. The socket loop keeps looping after a bad frame; the run thread does not come back. The
+    # client cannot tell those apart by timing — after an answer is queued the graph emits NO frame
+    # until the node finishes, so a provider crash while evaluating the answer just sent looks exactly
+    # like the socket refusing that same answer. So the server states which it is, and the client
+    # rolls its optimistic send back only on a refusal.
+    client = _test_client(tmp_path)
+
+    with client.websocket_connect("/api/sessions/recoverable") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+        _receive_until(ws, "question")
+        # Oversize: rejected by the payload model, so the Session never sees it.
+        ws.send_json({"type": "candidate_answer", "answer": "x" * (web_api.MAX_ANSWER_CHARS + 1)})
+        refusal = _receive_until(ws, "session_error", limit=40)
+        assert refusal.get("recoverable") is True, refusal
+
+        # ...and the Session is genuinely still there: the same question still takes an answer.
+        _answer(ws, "A reasonable answer about batching.")
+        _receive_until(ws, "session_completed", limit=60)
+
+    # A refused START is terminal — the run thread has returned, so there is nothing to retry.
+    with client.websocket_connect("/api/sessions/recoverable") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+        terminal = _receive_until(ws, "session_error", limit=40)
+
+    assert "already has saved progress" in terminal["error"]
+    assert "recoverable" not in terminal, terminal
+
+
 def test_a_binary_frame_during_auth_closes_cleanly(tmp_path):
     # `receive_json` assumes a text frame; a binary one raises KeyError('text'), which is neither a
     # disconnect nor a validation error, so before the fix it escaped the endpoint as a traceback
@@ -524,7 +676,7 @@ def _complete_a_demo_session(client, session_id: str) -> None:
         ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
         _receive_until(ws, "question")
         while True:
-            ws.send_json({"type": "candidate_answer", "answer": "A reasonable answer about batching."})
+            _answer(ws, "A reasonable answer about batching.")
             event = _receive_until_any(ws, {"question", "session_completed"}, limit=60)
             if event["type"] == "session_completed":
                 return
@@ -532,7 +684,7 @@ def _complete_a_demo_session(client, session_id: str) -> None:
 
 def _receive_until_any(ws, event_types: set[str], *, limit: int = 40):
     for _ in range(limit):
-        event = ws.receive_json()
+        event = _remember_question(ws, ws.receive_json())
         if event["type"] in event_types:
             return event
     raise AssertionError(f"did not receive any of {event_types}")
@@ -561,8 +713,98 @@ def test_the_export_lands_in_the_configured_directory(tmp_path):
     assert (tmp_path / "exports" / "on-disk.md").read_text(encoding="utf-8").startswith("# Interview Session:")
 
 
+def test_a_fresh_start_over_an_existing_checkpoint_is_refused(tmp_path):
+    # QA-01: the browser keeps ONE Session id in localStorage and the id field is readOnly, so a
+    # returning Candidate pressing Start lands on yesterday's id. Without a guard the graph restarts
+    # over the checkpoint and _persist_export overwrites exports/<id>.md — and the export endpoint
+    # reads RAM then that file, never the checkpoint, so the report is simply gone.
+    client = _test_client(tmp_path)
+    _complete_a_demo_session(client, "returning")
+    first_export = client.get("/api/sessions/returning/export.md").text
+
+    with client.websocket_connect("/api/sessions/returning") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+        event = _receive_until_any(ws, {"session_started", "session_error"})
+
+    assert event["type"] == "session_error", f"a fresh start restarted over a saved Session: {event}"
+    assert "resume" in event["error"].lower()  # the refusal has to name the remedy the UI can perform
+    assert client.get("/api/sessions/returning/export.md").text == first_export
+
+
+def test_a_never_probed_self_claim_is_never_persisted_as_a_posterior(tmp_path):
+    # NEW-17 / ADR 0005: intent is never evidence. `skill_states` carries a belief for every Skill
+    # from the Diagnostic's seed onward, so the completion write persisted a 5/5 self-claim the
+    # Session never asked about as a measured posterior — and the next Session's seeding then lets
+    # that stale claim outrank the same Candidate's honest self-assessment and reports it as progress.
+    client = _test_client(tmp_path)
+    with client.websocket_connect("/api/sessions/claims") as ws:
+        ws.send_json(
+            {
+                "type": "start_session",
+                "mode": "demo",
+                "max_questions": 1,
+                "candidate_id": "minh",
+                "claimed_skills": {"vietnamese_nlp": 5, "mlops": 5, "system_design": 5},
+            }
+        )
+        _receive_until(ws, "question")
+        _answer(ws, "A reasonable answer about batching.")
+        completed = _receive_until(ws, "session_completed", limit=60)
+
+    probed = {item["skill"] for item in completed["state"]["transcript"] if item["evidence_weight"] > 0}
+    record = json.loads((tmp_path / "ledger.json").read_text(encoding="utf-8"))["minh"]
+
+    assert probed, "the Session measured nothing, so this test proves nothing"
+    assert set(record["skills"]) == probed
+    assert "vietnamese_nlp" not in record["skills"]  # a 5/5 claim, never asked about
+
+
 def test_an_unknown_session_is_still_a_404_after_the_disk_fallback(tmp_path):
     assert _test_client(tmp_path).get("/api/sessions/never-existed/export.md").status_code == 404
+
+
+def test_a_torn_export_file_falls_back_to_the_checkpoint(tmp_path):
+    # NEW-04: `write_text` truncates before it writes, so a volume that fills as the Session ends
+    # leaves 0 bytes under the real name — which reads back with no error at all. Once the id is
+    # evicted from `completed_sessions`, the endpoint hands the Candidate that empty file at 200 OK.
+    client = _test_client(tmp_path)
+    _complete_a_demo_session(client, "torn-export")
+    export_path(tmp_path / "exports", "torn-export").write_text("", encoding="utf-8")
+
+    restarted = _test_client(tmp_path)
+    response = restarted.get("/api/sessions/torn-export/export.md")
+
+    assert response.status_code == 200
+    assert "# Interview Session: torn-export" in response.text
+    assert "## Study Plan" in response.text
+
+
+def test_an_export_the_disk_never_took_falls_back_to_the_checkpoint(tmp_path):
+    # The other half: `_persist_export` swallows OSError, so a read-only or full mount means no file
+    # at all. The checkpoint still holds the finished state — a 404 there is a report thrown away.
+    client = _test_client(tmp_path)
+    _complete_a_demo_session(client, "lost-export")
+    export_path(tmp_path / "exports", "lost-export").unlink()
+
+    restarted = _test_client(tmp_path)
+    response = restarted.get("/api/sessions/lost-export/export.md")
+
+    assert response.status_code == 200
+    assert "# Interview Session: lost-export" in response.text
+
+
+def test_an_unfinished_checkpoint_is_never_served_as_a_report(tmp_path):
+    # The fallback must not turn a cancelled run into a finished report: a checkpoint exists from the
+    # first node onward, and rendering it would present a Session that never completed as evidence
+    # (ADR 0005). Only `status == complete` is served.
+    client = _test_client(tmp_path)
+    with client.websocket_connect("/api/sessions/cancelled-run") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+        _receive_until(ws, "question")
+        ws.send_json({"type": "cancel_session"})
+        _receive_until(ws, "session_error")
+
+    assert _test_client(tmp_path).get("/api/sessions/cancelled-run/export.md").status_code == 404
 
 
 def test_a_restored_export_is_still_gated_by_the_token(tmp_path):
@@ -620,10 +862,7 @@ def test_a_failed_disk_write_does_not_fail_the_session(tmp_path, monkeypatch):
 def _ui_client(tmp_path, *, static_dir):
     settings = Settings(
         _env_file=None,
-        primary_provider="mimo",
-        mimo_api_key="",
-        mimo_base_url="",
-        mimo_model="",
+        primary_provider="groq",
         groq_api_key="",
         groq_model="",
         concept_store="memory",
@@ -687,10 +926,7 @@ def test_state_paths_come_from_the_environment_when_not_passed(tmp_path):
     # R-11: a container points all three at one mounted volume without a code change.
     settings = Settings(
         _env_file=None,
-        primary_provider="mimo",
-        mimo_api_key="",
-        mimo_base_url="",
-        mimo_model="",
+        primary_provider="groq",
         groq_api_key="",
         groq_model="",
         checkpoint_db=str(tmp_path / "state" / "checkpoints.sqlite"),
@@ -709,10 +945,7 @@ def test_default_state_paths_are_unchanged(tmp_path):
     # Zero-change rollout for a local checkout: the historical CWD-relative names still apply.
     settings = Settings(
         _env_file=None,
-        primary_provider="mimo",
-        mimo_api_key="",
-        mimo_base_url="",
-        mimo_model="",
+        primary_provider="groq",
         groq_api_key="",
         groq_model="",
     )
@@ -767,6 +1000,28 @@ def test_a_just_finished_session_is_still_resumable(tmp_path):
         assert _receive_until(ws, "session_completed", limit=40)["state"]["status"] == "complete"
 
 
+def test_resuming_a_swept_session_id_is_refused_before_the_graph_runs(tmp_path):
+    # The complement of the test above, and the reason the sweep needs one: localStorage keeps a
+    # Session id forever while checkpoints expire on a 7-day TTL, so a Candidate returning after the
+    # sweep clicks the UI's own "Reconnect & Resume" on an id that no longer has a checkpoint.
+    # Before this the graph was streamed anyway and langgraph answered with
+    # `session_error: EmptyInputError: Received no input for __start__` — after a `session_started`
+    # that claimed `resumed: true`, so the UI had already said "Session resumed from checkpoint."
+    # The CLI has refused this since 0019; the web must agree, and must refuse BEFORE session_started.
+    # `receive_json()` rather than `_receive_until` is the assertion: the first frame on the socket
+    # has to be the refusal.
+    client = _test_client(tmp_path)
+
+    with client.websocket_connect("/api/sessions/swept-away") as ws:
+        ws.send_json({"type": "resume_session", "mode": "demo"})
+        first = ws.receive_json()
+
+        assert first["type"] == "session_error", f"first event was {first!r}"
+        assert "No saved Session found" in first["error"]
+        assert "swept-away" in first["error"]
+        assert "EmptyInputError" not in first["error"]
+
+
 def test_an_unreadable_timestamp_is_left_alone_rather_than_guessed(tmp_path):
     from langgraph.checkpoint.sqlite import SqliteSaver
 
@@ -783,10 +1038,7 @@ def test_a_ttl_of_zero_disables_the_sweep(tmp_path):
     # The knob has to be able to turn the reaper off for a deployment that wants every checkpoint.
     settings = Settings(
         _env_file=None,
-        primary_provider="mimo",
-        mimo_api_key="",
-        mimo_base_url="",
-        mimo_model="",
+        primary_provider="groq",
         groq_api_key="",
         groq_model="",
         checkpoint_ttl_seconds=0,
@@ -823,7 +1075,7 @@ def test_a_resumed_session_keeps_its_language_for_retrieval(tmp_path):
     with client.websocket_connect("/api/sessions/vn-session") as ws:
         ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1, "language_mode": "vn"})
         _receive_until(ws, "question")
-        ws.send_json({"type": "candidate_answer", "answer": "Câu trả lời demo về drift."})
+        _answer(ws, "Câu trả lời demo về drift.")
         _receive_until(ws, "session_completed", limit=40)
 
     values = _checkpoint_values(app.state.web_api, "vn-session")
@@ -857,10 +1109,7 @@ def test_the_startup_sweep_actually_runs(tmp_path):
 
     settings = Settings(
         _env_file=None,
-        primary_provider="mimo",
-        mimo_api_key="",
-        mimo_base_url="",
-        mimo_model="",
+        primary_provider="groq",
         groq_api_key="",
         groq_model="",
         concept_store="memory",
@@ -1128,12 +1377,7 @@ def _complete_a_demo_session(client, session_id: str) -> None:
         )
         _receive_until(ws, "session_started")
         _receive_until(ws, "question")
-        ws.send_json(
-            {
-                "type": "candidate_answer",
-                "answer": "I would compare training and validation behavior and watch for leakage.",
-            }
-        )
+        _answer(ws, "I would compare training and validation behavior and watch for leakage.")
         _receive_until(ws, "session_completed", limit=40)
 
 
@@ -1296,7 +1540,7 @@ def test_the_suite_never_writes_into_the_operators_own_log_file(tmp_path):
     # so `set -a; . .env` with the path `.env.example` documents turned `uv run pytest` into a suite
     # that reddened `test_the_log_file_is_bounded` (two RotatingFileHandlers on the process-global
     # logger) and, far worse, appended 1,939 lines into the operator's real server log, 415 of them
-    # counterfeit `llm-call provider=mimo ... outcome=ok` records. That is the trace ADR 0009
+    # counterfeit `llm-call ... model=test-model ... outcome=ok` records. That is the trace ADR 0009
     # addendum a reads to find a silent judge failover, so those are fabricated evidence. The
     # conftest pop is the fix, and only a subprocess can observe it: by the time any in-process test
     # runs, this process's collection is long over and the damage would already be done.
@@ -1315,6 +1559,8 @@ def test_the_suite_never_writes_into_the_operators_own_log_file(tmp_path):
 
     assert proc.returncode == 0, proc.stdout[-4000:]
     assert not log_file.exists(), f"collection wrote to COACH_LOG_FILE:\n{log_file.read_text(encoding='utf-8')[:2000]}"
+
+
 # --- R-25: the free-tier budget rail on the web surface ------------------------------------------
 
 
@@ -1325,7 +1571,7 @@ class _ProviderDemoClient(DemoLLMClient):
     every demo-mode test above untouched.
     """
 
-    provider_name = "mimo"
+    provider_name = "groq"
 
 
 class _MeteredDemoClient(_ProviderDemoClient):
@@ -1334,7 +1580,7 @@ class _MeteredDemoClient(_ProviderDemoClient):
     tokens_per_call = 100
 
     def chat_json(self, *args, **kwargs):
-        usage.record_usage("mimo", "test-model", prompt_tokens=self.tokens_per_call, completion_tokens=0)
+        usage.record_usage("groq", "test-model", prompt_tokens=self.tokens_per_call, completion_tokens=0)
         return super().chat_json(*args, **kwargs)
 
 
@@ -1354,10 +1600,10 @@ def _live_client(tmp_path, monkeypatch, *, token: str = "", brain=None):
     monkeypatch.setattr(web_api, "build_role_clients", lambda settings, client: RoleClients.single(client))
     settings = Settings(
         _env_file=None,
-        primary_provider="mimo",
-        mimo_api_key="test",
-        mimo_base_url="http://test",
-        mimo_model="test-model",
+        primary_provider="groq",
+        groq_api_key="test",
+        groq_base_url="http://test",
+        groq_model="test-model",
         auth_token=token,
         concept_store="memory",
     )
@@ -1390,7 +1636,7 @@ def test_live_session_refuses_to_start_when_the_day_is_spent(tmp_path, monkeypat
     # see an interview begin that cannot be paid for.
     client = _live_client(tmp_path, monkeypatch)
     monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "10")
-    usage.record_usage("mimo", "test-model", prompt_tokens=10, completion_tokens=0)
+    usage.record_usage("groq", "test-model", prompt_tokens=10, completion_tokens=0)
 
     with client.websocket_connect("/api/sessions/spent") as ws:
         _start_live(ws)
@@ -1409,13 +1655,79 @@ def test_a_funded_live_session_still_starts(tmp_path, monkeypatch):
         started = ws.receive_json()
         assert started["type"] == "session_started"
         _expect_question(ws)
-        ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+        _answer(ws, "A short demo answer about drift.")
         completed = _receive_until(ws, "session_completed")
 
     assert completed["state"]["status"] == "complete"
     # Every token it spent — Diagnostic through Study Plan — is attributed to the Session id, which
     # is what `coach usage` reads. Nothing escaped into the unattributed "" bucket.
     assert set(usage.sessions_for_day()) == {"funded"}
+
+
+# --- M0a / F1: accounting health on the web surface ----------------------------------------------
+
+
+def _break_the_ledger(tmp_path):
+    """Replace the ledger with a directory: appends fail, the sidecar beside it still writes."""
+    ledger = tmp_path / "usage-ledger.jsonl"
+    ledger.unlink(missing_ok=True)
+    ledger.mkdir(exist_ok=True)
+    return ledger
+
+
+def test_a_live_session_refuses_to_start_when_the_ledger_cannot_be_written(tmp_path, monkeypatch):
+    # AC 3 on the web surface. Same shape as the spent-budget refusal above — session_error, no
+    # session_started — but for the opposite reason: there the ledger said "no budget left", here it
+    # says nothing at all, and an unwritten ledger reads to every rail as a FULL budget. The
+    # Candidate must not watch an interview begin whose cost nobody can count.
+    client = _live_client(tmp_path, monkeypatch, brain=_MeteredDemoClient)
+    _break_the_ledger(tmp_path)
+
+    with client.websocket_connect("/api/sessions/no-ledger") as ws:
+        _start_live(ws)
+        event = ws.receive_json()
+
+    assert event["type"] == "session_error"
+    assert "Usage accounting is unavailable" in event["error"]
+    assert "COACH_USAGE_LEDGER" in event["error"]  # the remedy, not just the refusal
+    assert "00:00 UTC" not in event["error"]  # waiting for the daily reset fixes nothing here
+
+
+def test_a_running_session_suspends_when_a_billed_call_cannot_be_recorded(tmp_path, monkeypatch):
+    # AC 4 on the web surface. The Session starts healthy, the ledger breaks under it, and the very
+    # next node boundary suspends with the unreconciled condition rather than quietly interviewing
+    # on against a spend total that stopped moving. Nothing is persisted as complete.
+    client = _live_client(tmp_path, monkeypatch, brain=_MeteredDemoClient)
+
+    with client.websocket_connect("/api/sessions/mid-run") as ws:
+        _start_live(ws, max_questions=3)
+        assert ws.receive_json()["type"] == "session_started"
+        _expect_question(ws)
+        _break_the_ledger(tmp_path)
+        _answer(ws, "A short demo answer about drift.")
+        event = _receive_until_any(ws, {"session_error", "session_completed"})
+
+    assert event["type"] == "session_error"
+    assert "UNRECONCILED" in event["error"]
+    assert "--reconcile" in event["error"]
+
+
+def test_demo_mode_runs_even_with_an_unwritable_ledger(tmp_path, monkeypatch):
+    # Demo mode spends nobody's allowance, so it has nothing to account for and must stay usable
+    # while accounting is broken — that is what keeps a misconfigured deployment demonstrable
+    # instead of dead. Same exemption predicate as the budget rails, checked against a new rail.
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(tmp_path / "usage-ledger.jsonl"))
+    _break_the_ledger(tmp_path)
+    client = _test_client(tmp_path)
+
+    with client.websocket_connect("/api/sessions/demo-no-ledger") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+        assert ws.receive_json()["type"] == "session_started"
+        _expect_question(ws)
+        _answer(ws, "A short demo answer about drift.")
+        completed = _receive_until(ws, "session_completed")
+
+    assert completed["state"]["status"] == "complete"
 
 
 def test_demo_mode_is_exempt_from_every_budget_rail(tmp_path, monkeypatch):
@@ -1431,7 +1743,7 @@ def test_demo_mode_is_exempt_from_every_budget_rail(tmp_path, monkeypatch):
         ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
         assert ws.receive_json()["type"] == "session_started"
         _expect_question(ws)
-        ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+        _answer(ws, "A short demo answer about drift.")
         completed = _receive_until(ws, "session_completed")
 
     assert completed["state"]["status"] == "complete"
@@ -1495,6 +1807,54 @@ def test_resuming_a_live_session_does_not_recharge_the_question_cap(tmp_path, mo
     assert usage.questions_today(usage.token_identity("")) == 1
 
 
+def test_a_semantically_invalid_start_never_consumes_the_daily_question_cap(tmp_path, monkeypatch):
+    # QA-08. `claimed_skills` is validated by CandidateProfile, which the start handler used to build
+    # long AFTER it took the cap reservation — so a frame that dies before any provider call had
+    # already appended `questions: 10`. 48 of them filled a 480-question cap for the whole UTC day at
+    # zero provider cost, and a client that crashes in that window did the same by accident.
+    client = _live_client(tmp_path, monkeypatch)
+    monkeypatch.setenv("COACH_DAILY_QUESTION_CAP", "20")
+
+    for n in range(3):
+        with client.websocket_connect(f"/api/sessions/junk-{n}") as ws:
+            _start_live(ws, max_questions=10, claimed_skills={"not_a_real_skill": 3})
+            event = _receive_until(ws, "session_error")
+        # The third frame must still be rejected for being nonsense, not for a cap two frames of
+        # nonsense filled.
+        assert "unknown Skill claim" in event["error"], event
+
+    assert usage.questions_today(usage.token_identity("")) == 0
+
+
+def test_a_start_that_dies_before_anything_is_checkpointed_gives_the_questions_back(tmp_path, monkeypatch):
+    # The other half of QA-08: reordering only covers the payloads we can validate up front. A start
+    # that reserves 10 and then dies with NOTHING checkpointed can never be resumed to ask them, so
+    # holding them locks the identity out for the UTC day at zero provider cost — the same denial of
+    # service reached by a crash instead of a malformed frame. `build_resource_store` stands in for
+    # any failure between the reservation and the first checkpoint write.
+    def _explode(*args, **kwargs):
+        raise RuntimeError("store exploded")
+
+    client = _live_client(tmp_path, monkeypatch)
+    monkeypatch.setenv("COACH_DAILY_QUESTION_CAP", "10")
+    monkeypatch.setattr(web_api, "build_resource_store", _explode)
+
+    with client.websocket_connect("/api/sessions/crashed") as ws:
+        _start_live(ws, max_questions=10)
+        event = _receive_until(ws, "session_error")
+        # The refund is written in the run thread's `finally`, which runs AFTER the error frame the
+        # Candidate sees — the release is server-side bookkeeping, not part of the socket contract.
+        # Join the thread rather than sleeping, or this assertion is a coin toss.
+        run_thread = client.app.state.web_api.runtimes["crashed"].thread
+
+    assert run_thread is not None
+    run_thread.join(10)
+    assert not run_thread.is_alive()
+    assert "RuntimeError" in event["error"], event
+    assert web_api._checkpoint_values(client.app.state.web_api, "crashed") == {}  # nothing to resume
+    assert usage.questions_today(usage.token_identity("")) == 0
+
+
 def test_a_mid_session_breach_suspends_instead_of_completing(tmp_path, monkeypatch, caplog):
     # AC (c) on the web surface: a visible session_error, no session_completed — never a
     # `failed`-and-advance (ADR 0005) and never a silent stall.
@@ -1508,7 +1868,7 @@ def test_a_mid_session_breach_suspends_instead_of_completing(tmp_path, monkeypat
         _start_live(ws, max_questions=2)
         assert ws.receive_json()["type"] == "session_started"
         _expect_question(ws)  # Q1 really was asked before the rail fired
-        ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+        _answer(ws, "A short demo answer about drift.")
         for _ in range(40):
             # "question" ends the loop only so a rail that fails to fire reddens this test instead
             # of blocking forever on a Q2 nobody is going to answer.
@@ -1537,6 +1897,66 @@ def test_a_mid_session_breach_suspends_instead_of_completing(tmp_path, monkeypat
     assert any("suspended on a budget rail" in r.getMessage() for r in caplog.records)
 
 
+def test_a_dead_quota_mid_session_suspends_the_web_session(tmp_path, monkeypatch):
+    # GH #119 on the web surface: the typed quota stop propagates out of the graph and lands in its
+    # own branch — a session_error saying "suspended", never session_completed, nothing persisted.
+    from interview_coach import supervisor
+    from interview_coach.usage import ProviderQuotaExhausted
+
+    real_micro_loop = supervisor.run_micro_loop
+    calls = {"n": 0}
+
+    def _quota_dies_on_the_second_question(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")
+        return real_micro_loop(*args, **kwargs)
+
+    monkeypatch.setattr(supervisor, "run_micro_loop", _quota_dies_on_the_second_question)
+    client = _live_client(tmp_path, monkeypatch)
+
+    seen: list[dict] = []
+    with client.websocket_connect("/api/sessions/quota-dead") as ws:
+        _start_live(ws, max_questions=2)
+        assert ws.receive_json()["type"] == "session_started"
+        _expect_question(ws)
+        _answer(ws, "A short demo answer about drift.")
+        for _ in range(40):
+            seen.append(ws.receive_json())
+            if seen[-1]["type"] in {"session_error", "session_completed", "question"}:
+                break
+
+    event = seen[-1]
+    assert event["type"] == "session_error", f"the quota stop did not suspend after Q1: {event}"
+    assert "suspended" in event["error"].lower()
+    assert "insufficient_quota" in event["error"]
+    assert not [item for item in seen if item["type"] == "session_completed"]
+    assert client.app.state.web_api.completed_sessions == {}
+    assert client.get("/api/sessions/quota-dead/export.md").status_code == 404
+
+
+def test_a_dead_quota_on_the_diagnostic_tells_the_web_candidate_to_start_over(tmp_path, monkeypatch):
+    # Same first-call-of-the-day case on the web surface: no checkpoint exists, so the message must
+    # not promise that "Resume" re-tries anything.
+    from interview_coach.usage import ProviderQuotaExhausted
+
+    def _quota_dies(*args, **kwargs):
+        raise ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")
+
+    monkeypatch.setattr(web_api, "diagnose_or_degrade", _quota_dies)
+    client = _live_client(tmp_path, monkeypatch)
+
+    with client.websocket_connect("/api/sessions/quota-diag") as ws:
+        _start_live(ws, max_questions=1)
+        event = ws.receive_json()
+
+    assert event["type"] == "session_error", event
+    assert "suspended" in event["error"].lower()
+    assert "Nothing was checkpointed yet" in event["error"]
+    assert "Resuming" not in event["error"]
+    assert client.app.state.web_api.completed_sessions == {}
+
+
 def test_a_refused_live_session_never_starts_the_interview(tmp_path, monkeypatch):
     # The refusal must RETURN, not just emit. Dropping the `return` still puts session_error first on
     # the wire — every socket-level assertion keeps passing — while the interview runs anyway on a
@@ -1546,16 +1966,16 @@ def test_a_refused_live_session_never_starts_the_interview(tmp_path, monkeypatch
     monkeypatch.setenv("LLM_DAILY_TOKEN_BUDGET", "10")
     monkeypatch.delenv("LLM_SESSION_TOKEN_BUDGET", raising=False)
     monkeypatch.delenv("COACH_DAILY_QUESTION_CAP", raising=False)
-    usage.record_usage("mimo", "test-model", prompt_tokens=10, completion_tokens=0)
+    usage.record_usage("groq", "test-model", prompt_tokens=10, completion_tokens=0)
     monkeypatch.setattr(web_api, "build_client", lambda settings: _ProviderDemoClient())
     monkeypatch.setattr(web_api, "build_role_clients", lambda settings, client: RoleClients.single(client))
 
     settings = Settings(
         _env_file=None,
-        primary_provider="mimo",
-        mimo_api_key="test",
-        mimo_base_url="http://test",
-        mimo_model="test-model",
+        primary_provider="groq",
+        groq_api_key="test",
+        groq_base_url="http://test",
+        groq_model="test-model",
         concept_store="memory",
     )
     api_state = web_api.WebApiState(
@@ -1593,7 +2013,7 @@ def test_the_web_rail_counts_only_the_questions_actually_left(tmp_path, monkeypa
         assert ws.receive_json()["type"] == "session_started"
         for _ in range(2):
             _expect_question(ws)
-            ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+            _answer(ws, "A short demo answer about drift.")
         event = _receive_until_any(ws, {"session_completed", "session_error"}, limit=60)
 
     assert event["type"] == "session_completed", f"a fundable Session was suspended: {event}"
@@ -1601,17 +2021,25 @@ def test_the_web_rail_counts_only_the_questions_actually_left(tmp_path, monkeypa
 
 
 def test_a_new_interview_on_the_same_browser_id_is_not_suspended(tmp_path, monkeypatch):
-    # web/src/lib/sessionId.ts persists ONE id per browser, and connect(false) — the fresh-start
-    # path — reuses it verbatim. While the rail measured the id, the next brand-new interview never
-    # received a question at all, and each bricked attempt still burned a real Diagnostic call.
+    # web/src/lib/sessionId.ts persists ONE id per browser. While the rail measured the id, the next
+    # brand-new interview never received a question at all, and each bricked attempt still burned a
+    # real Diagnostic call.
+    # Since QA-01 a fresh start is refused while a checkpoint for the id still exists, so the way an
+    # id comes back round is the startup TTL sweep (COACH_CHECKPOINT_TTL_SECONDS, 7 days by default)
+    # dropping the thread — while the usage ledger, which has no TTL, keeps every row. That is the
+    # shape reproduced here: the checkpoint is swept between interviews, the spend is not.
     client = _live_client(tmp_path, monkeypatch, brain=_MeteredDemoClient)
 
+    def sweep_checkpoints() -> None:
+        (tmp_path / "checkpoints.sqlite").unlink(missing_ok=True)
+
     def one_interview(expect: str) -> dict:
+        sweep_checkpoints()
         with client.websocket_connect("/api/sessions/same-browser") as ws:
             _start_live(ws, max_questions=1)
             assert ws.receive_json()["type"] == "session_started"
             _expect_question(ws)
-            ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+            _answer(ws, "A short demo answer about drift.")
             event = _receive_until_any(ws, {"session_completed", "session_error"}, limit=60)
         assert event["type"] == expect, f"{event}"
         return event
@@ -1640,7 +2068,7 @@ def test_a_suspended_web_session_can_actually_be_resumed(tmp_path, monkeypatch):
         _start_live(ws, max_questions=2)
         assert ws.receive_json()["type"] == "session_started"
         _expect_question(ws)
-        ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+        _answer(ws, "A short demo answer about drift.")
         event = _receive_until_any(ws, {"session_error", "session_completed", "question"})
     assert event["type"] == "session_error", f"the rail did not suspend after Q1: {event}"
 
@@ -1652,3 +2080,401 @@ def test_a_suspended_web_session_can_actually_be_resumed(tmp_path, monkeypatch):
         resumed = _expect_question(ws)
 
     assert resumed["type"] == "question"
+
+
+# --- AUDIT §3.2 row 1: a reconnect must wait for the previous run's thread -----------------------
+
+
+class _BlockedRun:
+    """Run 1 asks its question, takes the answer, then sits in a "provider call" until released."""
+
+    def __init__(self, monkeypatch) -> None:
+        from interview_coach import supervisor
+
+        self.runs: list[float] = []
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        real_micro_loop = supervisor.run_micro_loop
+
+        def _gated(client, seed, candidate, *args, **kwargs):
+            self.runs.append(time.monotonic())
+            if len(self.runs) > 1:
+                return real_micro_loop(client, seed, candidate, *args, **kwargs)
+            candidate.answer(seed.question)
+            self.entered.set()
+            self.release.wait(timeout=30)
+            raise CandidateInputUnavailable("the abandoned provider call returned")
+
+        monkeypatch.setattr(supervisor, "run_micro_loop", _gated)
+
+
+def _drop_the_socket_mid_provider_call(client, blocked: _BlockedRun, session_id: str):
+    """Start, answer Q1, and close the socket while the graph thread is still inside the call."""
+    with client.websocket_connect(f"/api/sessions/{session_id}") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+        _receive_until(ws, "session_started")
+        _receive_until(ws, "question")
+        first_run = client.app.state.web_api.runtimes[session_id]
+        _answer(ws, "An answer the Evaluator is still scoring.")
+        assert blocked.entered.wait(timeout=5), "the graph thread never took the answer"
+    return first_run
+
+
+def test_a_reconnect_waits_for_the_previous_runs_thread_before_resuming(tmp_path, monkeypatch):
+    # The daemon thread is inside a provider call when the socket drops; a reconnect + resume must
+    # not start a second graph on the same checkpoint thread while it is still there.
+    blocked = _BlockedRun(monkeypatch)
+    client = _test_client(tmp_path)
+    api_state = client.app.state.web_api
+    try:
+        first_run = _drop_the_socket_mid_provider_call(client, blocked, "reconnect")
+
+        with client.websocket_connect("/api/sessions/reconnect") as ws:
+            ws.send_json({"type": "resume_session", "mode": "demo"})
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                assert api_state.runtimes.get("reconnect") is first_run, "the stale run was evicted early"
+                assert len(blocked.runs) == 1, "a second graph started while the first was still running"
+                time.sleep(0.02)
+            blocked.release.set()
+            _receive_until(ws, "session_started")
+            _receive_until(ws, "question")
+            _answer(ws, "A real answer about the bias-variance tradeoff.")
+            completed = _receive_until(ws, "session_completed")
+    finally:
+        blocked.release.set()
+
+    assert completed["state"]["status"] == "complete"
+    assert len(blocked.runs) == 2  # exactly one graph run per start/resume
+    assert first_run.thread is not None and not first_run.thread.is_alive()
+    assert api_state.runtimes == {}
+
+
+def test_a_reconnect_gives_up_on_a_run_that_will_not_finish(tmp_path, monkeypatch):
+    monkeypatch.setattr(web_api, "STALE_RUNTIME_JOIN_SECONDS", 0.05)
+    blocked = _BlockedRun(monkeypatch)
+    client = _test_client(tmp_path)
+    try:
+        _drop_the_socket_mid_provider_call(client, blocked, "stuck")
+
+        with client.websocket_connect("/api/sessions/stuck") as ws:
+            event = ws.receive_json()
+    finally:
+        blocked.release.set()
+
+    assert event["type"] == "session_error"
+    assert "still finishing" in event["error"]
+    assert len(blocked.runs) == 1
+
+
+def test_a_non_object_frame_is_a_session_error_not_a_wedged_session_id(tmp_path):
+    # `null`, a string or a list parses as JSON but is not a payload; it used to raise AttributeError
+    # out of the socket loop. With the registration now waiting on the thread, an escaped exception
+    # that never cancelled the run would have pinned the id for the life of the process.
+    client = _test_client(tmp_path)
+    api_state = client.app.state.web_api
+
+    with client.websocket_connect("/api/sessions/odd-frame") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+        _receive_until(ws, "session_started")
+        _receive_until(ws, "question")
+        ws.send_text("null")
+        error = _receive_until(ws, "session_error")
+        _answer(ws, "A real answer about the bias-variance tradeoff.")
+        completed = _receive_until(ws, "session_completed")
+
+    assert "JSON object" in error["error"]
+    assert completed["state"]["status"] == "complete"
+    assert api_state.runtimes == {}
+
+
+def test_a_claim_that_finishes_waiting_never_overwrites_a_different_in_flight_run(tmp_path):
+    # A joins the stale run; meanwhile the stale run exits, B takes the id, and B's socket drops with
+    # B's thread still inside a provider call. A's re-check must refuse, not register over B.
+    import asyncio
+
+    api_state = _app(tmp_path).state.web_api
+    stale_done, b_done = threading.Event(), threading.Event()
+
+    def _runtime(name: str, gate: threading.Event) -> web_api.RuntimeSession:
+        runtime = web_api.RuntimeSession(session_id="x", mode="demo", emit=lambda event: None, socket_closed=True)
+        runtime.thread = threading.Thread(target=gate.wait, daemon=True)
+        runtime.thread.start()
+        return runtime
+
+    stale = _runtime("stale", stale_done)
+    b = _runtime("b", b_done)
+    a = web_api.RuntimeSession(session_id="x", mode="demo", emit=lambda event: None)
+
+    async def scenario():
+        api_state.runtimes["x"] = stale
+        claim = asyncio.create_task(web_api._claim_session_id(api_state, "x", a))
+        await asyncio.sleep(0.05)  # A is inside the join
+        assert "x" in api_state.waiting
+        with api_state.lock:
+            api_state.runtimes["x"] = b  # the stale run popped itself and B claimed the id
+        stale_done.set()
+        return await claim
+
+    try:
+        result = asyncio.run(scenario())
+    finally:
+        stale_done.set()
+        b_done.set()
+
+    assert result == web_api._STILL_FINISHING
+    assert api_state.runtimes["x"] is b
+    assert api_state.waiting == set()
+
+
+def test_only_one_reconnect_waits_on_a_stale_run_at_a_time(tmp_path):
+    import asyncio
+
+    api_state = _app(tmp_path).state.web_api
+    gate = threading.Event()
+    stale = web_api.RuntimeSession(session_id="y", mode="demo", emit=lambda event: None, socket_closed=True)
+    stale.thread = threading.Thread(target=gate.wait, daemon=True)
+    stale.thread.start()
+    first = web_api.RuntimeSession(session_id="y", mode="demo", emit=lambda event: None)
+    second = web_api.RuntimeSession(session_id="y", mode="demo", emit=lambda event: None)
+
+    async def scenario():
+        api_state.runtimes["y"] = stale
+        waiting = asyncio.create_task(web_api._claim_session_id(api_state, "y", first))
+        await asyncio.sleep(0.05)
+        refused = await web_api._claim_session_id(api_state, "y", second)
+        gate.set()
+        return refused, await waiting
+
+    try:
+        refused, granted = asyncio.run(scenario())
+    finally:
+        gate.set()
+
+    assert refused == web_api._STILL_FINISHING
+    assert granted is None
+    assert api_state.runtimes["y"] is first
+
+
+def test_a_mass_reconnect_neither_pins_the_default_executor_nor_stalls_a_new_socket(tmp_path, monkeypatch):
+    # NEW-03. The join blocks a whole thread for up to STALE_RUNTIME_JOIN_SECONDS, and on
+    # `run_in_executor(None, ...)` that thread comes out of the loop's SHARED default executor
+    # (min(32, cpu+4)). "One waiter per id" bounds waiters per id, not globally, so a mass reconnect —
+    # an nginx restart, a cohort resuming after sleep — fills it, and the next arrival queues INSIDE
+    # the executor: its socket sits silent for the length of someone else's join instead of being
+    # refused, and so does every other user of the default executor on this loop (`getaddrinfo`).
+    import asyncio
+
+    monkeypatch.setattr(web_api, "STALE_RUNTIME_JOIN_SECONDS", 5.0)
+    api_state = _app(tmp_path).state.web_api
+    gate = threading.Event()
+    ids = [f"mass-{n}" for n in range(40)]  # more than min(32, cpu+4), whatever the box
+
+    for session_id in ids:
+        stale = web_api.RuntimeSession(session_id=session_id, mode="demo", emit=lambda event: None, socket_closed=True)
+        stale.thread = threading.Thread(target=gate.wait, daemon=True)
+        stale.thread.start()
+        api_state.runtimes[session_id] = stale
+
+    async def scenario():
+        claims = [
+            asyncio.create_task(
+                web_api._claim_session_id(
+                    api_state, sid, web_api.RuntimeSession(session_id=sid, mode="demo", emit=lambda event: None)
+                )
+            )
+            for sid in ids
+        ]
+        await asyncio.sleep(0.2)  # every claim has reached its join or been refused
+        waiting, settled = len(api_state.waiting), sum(1 for claim in claims if claim.done())
+        try:
+            # Nothing to do with reconnects: just "is the loop's shared executor still usable?"
+            probe = await asyncio.wait_for(asyncio.get_running_loop().run_in_executor(None, lambda: "free"), 1.0)
+        except TimeoutError:
+            probe = "pinned"
+        gate.set()
+        return waiting, settled, probe, await asyncio.gather(*claims)
+
+    try:
+        waiting, settled, probe, outcomes = asyncio.run(scenario())
+    finally:
+        gate.set()
+
+    assert probe == "free", "the stale-run joins pinned the asyncio default executor"
+    cap = web_api.MAX_CONCURRENT_STALE_JOINS
+    assert waiting <= cap, f"{waiting} reconnects were joining at once; the cap is {cap}"
+    # Refused, not stalled: the over-cap claims answered while the joins were still in flight.
+    assert settled == len(ids) - cap
+    assert outcomes.count(web_api._TOO_MANY_JOINS) == len(ids) - cap
+    assert outcomes.count(None) == cap
+    assert api_state.waiting == set()
+
+
+# --- AUDIT §3.1 row 3: bounded inputs --------------------------------------------------------------
+
+
+def test_an_oversize_answer_is_refused_as_a_session_error(tmp_path):
+    client = _test_client(tmp_path)
+
+    with client.websocket_connect("/api/sessions/oversize") as ws:
+        ws.send_json({"type": "candidate_answer", "answer": "x" * (web_api.MAX_ANSWER_CHARS + 1)})
+        event = ws.receive_json()
+
+    assert event["type"] == "session_error"
+    assert "at most" in event["error"]
+
+
+def test_an_oversize_time_budget_is_refused(tmp_path):
+    client = _test_client(tmp_path)
+
+    with client.websocket_connect("/api/sessions/too-long") as ws:
+        ws.send_json(
+            {"type": "start_session", "mode": "demo", "max_elapsed_seconds": web_api.MAX_ELAPSED_SECONDS_CEILING + 1}
+        )
+        event = ws.receive_json()
+
+    assert event["type"] == "session_error"
+    assert "less than or equal to" in event["error"]
+
+
+# --- QA-02: the Skill ledger key is a constrained key, not free text ------------------------------
+
+_UNSAFE_CANDIDATE_IDS = ["minh/../../etc/passwd", "a" * 65, "minh\nINFO forged log line", " ", "minh minh", "Nguyễn"]
+
+
+@pytest.mark.parametrize("bad", _UNSAFE_CANDIDATE_IDS)
+def test_a_free_text_candidate_id_is_refused_before_a_session_starts(tmp_path, bad):
+    # QA-02: candidate_id is the ONLY key into the shared cross-session Skill ledger — read on start
+    # (load_priors) and destructively REPLACED on completion (save_posteriors). It must be a
+    # constrained key: unbounded, arbitrary-charset text lands verbatim in a JSON file every pilot
+    # Session rewrites, and in a %r-formatted log line. And it must be refused LOUDLY here, not
+    # degraded downstream: a silent cold start that then silently never saves is the ADR 0005 failure.
+    # This does NOT isolate two pilot users sharing one token — one shared secret is one principal,
+    # so no derivation available today separates them; per-user identity is R-29.
+    client = _test_client(tmp_path)
+
+    with client.websocket_connect("/api/sessions/bad-candidate-id") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "candidate_id": bad, "max_questions": 1})
+        event = ws.receive_json()
+
+    assert event["type"] == "session_error", event
+    assert "String should match pattern" in event["error"]
+    assert not (tmp_path / "ledger.json").exists()
+
+
+def test_a_flood_of_answers_with_no_pending_question_is_refused_not_buffered(tmp_path, monkeypatch):
+    # The graph never consumes here — `run_micro_loop` is stubbed, so no QueueCandidate is ever built
+    # and no question frame is ever emitted. Since NEW-01 that means nothing is pending, so every one
+    # of these frames is refused at the binding rather than buffered against the queue bound, and the
+    # socket loop must still answer the next frame instead of blocking. The bound itself is now a
+    # backstop, pinned directly by `test_a_cancel_is_never_dropped_by_a_full_answer_queue`, which
+    # fills the queue by hand.
+    from interview_coach import supervisor
+
+    release = threading.Event()
+
+    def _stuck(*args, **kwargs):
+        release.wait(timeout=30)
+        raise CandidateInputUnavailable("released")
+
+    monkeypatch.setattr(supervisor, "run_micro_loop", _stuck)
+    client = _test_client(tmp_path)
+    try:
+        with client.websocket_connect("/api/sessions/flood") as ws:
+            ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+            _receive_until(ws, "session_started")
+            for _ in range(web_api.ANSWER_QUEUE_MAXSIZE + 1):
+                ws.send_json({"type": "candidate_answer", "answer": "flood"})
+            ws.send_json({"type": "bogus"})
+            seen: list[dict] = []
+            for _ in range(40):
+                seen.append(ws.receive_json())
+                if seen[-1]["type"] == "session_error" and "unknown WebSocket payload type" in seen[-1]["error"]:
+                    break
+    finally:
+        release.set()
+
+    errors = [event["error"] for event in seen if event["type"] == "session_error"]
+    assert len([e for e in errors if "does not answer" in e]) == web_api.ANSWER_QUEUE_MAXSIZE + 1, errors
+    assert "unknown WebSocket payload type" in errors[-1]
+
+
+def test_a_cancel_is_never_dropped_by_a_full_answer_queue():
+    runtime = web_api.RuntimeSession(session_id="full", mode="demo", emit=lambda event: None)
+    for _ in range(web_api.ANSWER_QUEUE_MAXSIZE):
+        runtime.answers.put_nowait("queued")
+
+    runtime.cancel()
+
+    assert runtime.cancelled.is_set()
+    assert runtime.answers.get_nowait() is web_api._CANCEL
+    assert runtime.answers.empty()
+
+
+# --- AUDIT §3.2 row 7: completed Sessions are bounded in RAM --------------------------------------
+
+
+def test_completed_sessions_are_bounded_in_memory(tmp_path):
+    client = _test_client(tmp_path)
+    api_state = client.app.state.web_api
+    cap = web_api.MAX_COMPLETED_SESSIONS_IN_MEMORY
+
+    for index in range(cap + 1):
+        web_api._remember_completed(api_state, f"done-{index}", {"status": "complete"})
+
+    assert len(api_state.completed_sessions) == cap
+    assert "done-0" not in api_state.completed_sessions
+    assert {"done-1", f"done-{cap}"} <= set(api_state.completed_sessions)
+    # Evicted with nothing on disk: 404. Evicted but persisted: served from the file.
+    assert client.get("/api/sessions/done-0/export.md").status_code == 404
+    stored = export_path(api_state.exports_dir, "done-0")
+    stored.parent.mkdir(parents=True, exist_ok=True)
+    stored.write_text("# Interview Session: done-0\n", encoding="utf-8")
+    response = client.get("/api/sessions/done-0/export.md")
+    assert response.status_code == 200
+    assert response.text.startswith("# Interview Session: done-0")
+
+
+# --- AUDIT §3.2 row 4: importing the module has no app-construction side effects ------------------
+
+
+def test_importing_the_module_does_not_open_the_checkpoint_db(tmp_path):
+    # The guard and logging still run at import (their before-the-port property depends on it);
+    # building the app — reading .env, opening and sweeping the checkpoint SQLite — waits for `app`.
+    db = tmp_path / "checkpoints.sqlite"
+    script = (
+        "import os, sys\n"
+        "import interview_coach.web_api as web_api\n"
+        "print('after-import', os.path.exists(sys.argv[1]))\n"
+        "app = web_api.app\n"
+        "print('after-app', os.path.exists(sys.argv[1]), type(app).__name__)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(db)],
+        cwd=tmp_path,
+        env=_server_env(
+            COACH_CHECKPOINT_DB=str(db),
+            COACH_LEDGER_DB=str(tmp_path / "ledger.json"),
+            COACH_EXPORTS_DIR=str(tmp_path / "exports"),
+            COACH_STATIC_DIR="",
+        ),
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "after-import False" in proc.stdout, proc.stdout
+    assert "after-app True FastAPI" in proc.stdout, proc.stdout
+
+
+def test_the_app_attribute_is_built_once_and_lazily(tmp_path, monkeypatch):
+    monkeypatch.setattr(web_api, "_lazy_app", None)
+    monkeypatch.setattr(web_api, "create_app", lambda: _app(tmp_path))
+    module = importlib.import_module("interview_coach.web_api")
+
+    first = module.app
+
+    assert isinstance(first, FastAPI)
+    assert module.app is first
+    with pytest.raises(AttributeError, match="no_such_attribute"):
+        _ = module.no_such_attribute

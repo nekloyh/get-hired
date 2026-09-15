@@ -2,30 +2,24 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from .filelock import atomic_write_text
+from .microloop import display_stop_reason
 from .session_serde import decision_records, sorted_skill_states, transcript_items
 from .skill import SkillState
-
-
-def _display_stop_reason(stop_reason: Any) -> str:
-    text = "" if stop_reason is None else str(stop_reason)
-    if text == "safety_cap":
-        return "unresolved_by_safety_cap"
-    if text == "follow_up_unavailable":
-        return "degraded_follow_up_unavailable"
-    if text == "failed":
-        return "failed_recorded_and_skipped"
-    return text
 
 
 def export_session_markdown(session_state: Mapping[str, Any], path: str | Path) -> Path:
     """Write a readable Markdown export of a completed Session."""
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(render_session_markdown(session_state), encoding="utf-8")
+    # Published by rename, never truncate-in-place: a volume that fills as the Session ends must
+    # leave the previous export intact rather than a 0-byte file the endpoint serves at 200 OK.
+    atomic_write_text(output, render_session_markdown(session_state))
     return output
 
 
@@ -39,6 +33,13 @@ def render_session_markdown(session_state: Mapping[str, Any]) -> str:
     lines.append(f"- Stop reason: `{_md(session_state.get('stop_reason', 'n/a'))}`")
     lines.append(f"- Questions: `{session_state.get('question_count', 0)}`")
     lines.append(f"- Language mode: `{_md(session_state.get('language_mode', 'en'))}`")
+    if any(turn.trace.judge_unvalidated for item in transcript_items(session_state) for turn in item.turns):
+        lines.append("")
+        lines.append(
+            "> **UNVALIDATED JUDGE** — COACH_ALLOW_UNVALIDATED_JUDGE was set, so these scores were "
+            "produced by a model with no green `coach bench` artifact. They are NOT comparable to "
+            "bench-validated scores (ADR 0009)."
+        )
     lines.append("")
     _append_skill_states(lines, session_state)
     _append_ledger_deltas(lines, session_state)
@@ -94,7 +95,8 @@ def _append_topic_plan(lines: list[str], session_state: Mapping[str, Any]) -> No
     lines.append("| ---: | --- | ---: | --- |")
     for i, item in enumerate(session_state.get("topic_plan", []), start=1):
         lines.append(
-            f"| {i} | `{_md(item.get('skill'))}` | {item.get('target_difficulty')} | {_md(item.get('rationale'))} |"
+            f"| {i} | `{_md(item.get('skill'))}` | {item.get('target_difficulty')} | "
+            f"{_md_inline(item.get('rationale'))} |"
         )
     lines.append("")
 
@@ -107,8 +109,8 @@ def _append_transcript(lines: list[str], session_state: Mapping[str, Any]) -> No
         lines.append("")
         if item.stop_reason == "failed":
             lines.append(
-                f"**Question failed and was skipped** — `{_md(item.error or 'unknown error')}`; "
-                f"stop: `{_md(_display_stop_reason(item.stop_reason))}`."
+                f"**Question failed and was skipped** — `{_md_inline(item.error or 'unknown error')}`; "
+                f"stop: `{_md(display_stop_reason(item.stop_reason))}`."
             )
         else:
             score_label = "Kept score" if item.stop_reason == "safety_cap" else "Resolved score"
@@ -116,16 +118,18 @@ def _append_transcript(lines: list[str], session_state: Mapping[str, Any]) -> No
                 f"{score_label}: **{item.resolved_weighted_score:.2f}/5**; "
                 f"confidence: **{item.resolved_confidence:.2f}**; "
                 f"evidence weight: **{item.evidence_weight:.2f}**; "
-                f"stop: `{_md(_display_stop_reason(item.stop_reason))}`."
+                f"stop: `{_md(display_stop_reason(item.stop_reason))}`."
             )
         lines.append("")
         for turn_n, turn in enumerate(item.turns, start=1):
             kind = "Follow-up" if turn.is_follow_up else "Question"
             lines.append(f"#### Turn {turn_n}: {kind}")
             lines.append("")
-            lines.append(f"**Interviewer:** {_md(turn.question)}")
+            lines.append("**Interviewer:**")
+            lines.append(_md_quote(turn.question))
             lines.append("")
-            lines.append(f"**Candidate:** {_md(turn.answer)}")
+            lines.append("**Candidate:**")
+            lines.append(_md_quote(turn.answer))
             if turn.grounding_concept_id:
                 lines.append("")
                 lines.append(f"Grounded by: `{_md(turn.grounding_concept_id)}` ({_md(turn.grounding_concept_title)})")
@@ -151,6 +155,8 @@ def _append_transcript(lines: list[str], session_state: Mapping[str, Any]) -> No
                 # and the export is where that becomes reviewable after the session is over.
                 split = ", ".join(f"{name} {n}" for name, n in trace.llm_calls_by_provider or ())
                 lines.append(f"LLM calls: **{calls}**" + (f" ({_md(split)})" if split else ""))
+            if trace.judge_unvalidated:
+                lines.append("Judge: **UNVALIDATED** — no green `coach bench` artifact (ADR 0009).")
             lines.append("")
 
 
@@ -161,7 +167,7 @@ def _append_evaluation(lines: list[str], evaluation: Mapping[str, Any]) -> None:
     for dim, score in evaluation.get("dimensions", {}).items():
         if not isinstance(score, Mapping):
             continue
-        lines.append(f"| {_md(dim)} | {score.get('score')} | {_md(score.get('evidence'))} |")
+        lines.append(f"| {_md(dim)} | {score.get('score')} | {_md_inline(score.get('evidence'))} |")
     lines.append("")
     lines.append(
         f"Weighted score: **{float(evaluation.get('weighted_score', 0)):.2f}/5**; "
@@ -169,13 +175,13 @@ def _append_evaluation(lines: list[str], evaluation: Mapping[str, Any]) -> None:
         f"follow-up recommended: `{evaluation.get('follow_up_recommended')}`."
     )
     if rationale := evaluation.get("follow_up_rationale"):
-        lines.append(f"Rationale: {_md(rationale)}")
+        lines.append(f"Rationale: {_md_inline(rationale)}")
     if fixes := evaluation.get("delivery_fixes"):
         # issue 0024: weak English delivery comes with concrete phrase-level fixes.
         lines.append("")
         lines.append("English delivery fixes:")
         for fix in fixes:
-            lines.append(f"- {_md(fix)}")
+            lines.append(f"- {_md_inline(fix)}")
     if panel := evaluation.get("panel"):
         # issue 0027: the committee packet — each voice's one-paragraph scorecard and the
         # disagreement, the artifact a real hiring-committee debrief produces.
@@ -192,12 +198,12 @@ def _append_evaluation(lines: list[str], evaluation: Mapping[str, Any]) -> None:
             f"{float(panel.get('disagreement', 0)):.2f} points."
         )
         lines.append(
-            f"- Skeptic ({float(skeptic.get('recommended_score', 0)):g}/5): {_md(skeptic.get('argument'))} "
-            f"— evidence: {_md(skeptic.get('key_evidence'))}"
+            f"- Skeptic ({float(skeptic.get('recommended_score', 0)):g}/5): {_md_inline(skeptic.get('argument'))} "
+            f"— evidence: {_md_inline(skeptic.get('key_evidence'))}"
         )
         lines.append(
-            f"- Advocate ({float(advocate.get('recommended_score', 0)):g}/5): {_md(advocate.get('argument'))} "
-            f"— evidence: {_md(advocate.get('key_evidence'))}"
+            f"- Advocate ({float(advocate.get('recommended_score', 0)):g}/5): {_md_inline(advocate.get('argument'))} "
+            f"— evidence: {_md_inline(advocate.get('key_evidence'))}"
         )
     if evaluation.get("evidence_degraded"):
         # issue 0033: every citation was unverifiable — the score stands but its audit trail does not.
@@ -215,7 +221,7 @@ def _append_supervisor_decisions(lines: list[str], session_state: Mapping[str, A
     for decision in decision_records(session_state):
         lines.append(
             f"- After Q{decision.after_question}: `{_md(decision.action)}` "
-            f"(deviation=`{decision.deviation}`) - {_md(decision.llm_reasoning)}"
+            f"(deviation=`{decision.deviation}`) - {_md_inline(decision.llm_reasoning)}"
         )
     lines.append("")
 
@@ -229,18 +235,18 @@ def _append_study_plan(lines: list[str], plan: Any) -> None:
         return
     lines.append(
         f"Readiness estimate: **{float(plan.get('readiness_estimate', 0)):.0%}**. "
-        f"{_md(plan.get('readiness_rationale'))}"
+        f"{_md_inline(plan.get('readiness_rationale'))}"
     )
     lines.append("")
     lines.append("### Prioritized Topics")
     lines.append("")
     for topic in plan.get("prioritized_topics", []):
         lines.append(
-            f"{topic.get('priority')}. **{_md(topic.get('title'))}** (`{_md(topic.get('skill'))}`) - "
-            f"{_md(topic.get('rationale'))}"
+            f"{topic.get('priority')}. **{_md_inline(topic.get('title'))}** (`{_md(topic.get('skill'))}`) - "
+            f"{_md_inline(topic.get('rationale'))}"
         )
         lines.append(
-            f"   Target: {_md(topic.get('target_mastery'))}; current mastery "
+            f"   Target: {_md_inline(topic.get('target_mastery'))}; current mastery "
             f"{float(topic.get('mastery', 0)):.0%}; criticality `{_md(topic.get('role_criticality'))}`."
         )
         for resource in topic.get("resources", []):
@@ -254,18 +260,63 @@ def _append_study_plan(lines: list[str], plan: Any) -> None:
         resources = ", ".join(
             f"[{_md(resource.get('title'))}]({resource.get('url')})" for resource in item.get("resources", [])
         )
-        lines.append(f"| {item.get('day')} | {_md(item.get('focus'))} | {resources} | {_md(item.get('outcome'))} |")
+        lines.append(
+            f"| {item.get('day')} | {_md_inline(item.get('focus'))} | {resources} | "
+            f"{_md_inline(item.get('outcome'))} |"
+        )
     lines.append("")
     lines.append("### Milestones")
     lines.append("")
     for milestone in plan.get("milestones", []):
         lines.append(
-            f"- Week {milestone.get('week')}: {_md(milestone.get('description'))} "
-            f"(evidence: {_md(milestone.get('evidence'))})"
+            f"- Week {milestone.get('week')}: {_md_inline(milestone.get('description'))} "
+            f"(evidence: {_md_inline(milestone.get('evidence'))})"
         )
     lines.append("")
 
 
+_NEWLINE = re.compile(r"\r\n|\r|\n")
+_LEADING_BLOCK_MARKER = re.compile(r"^(\s*)([#>\-+*`~])")
+
+
 def _md(value: Any) -> str:
+    """Escape an identifier or enum rendered inside one line. Pipe only, by contract.
+
+    `retrieval_eval._unescape_md` reverses exactly this, byte for byte, to replay a harvested concept
+    lookup, so this function must not grow a second escape. Model-written free text goes to
+    `_md_inline`; Candidate prose goes to `_md_quote`.
+    """
     text = "" if value is None else str(value)
     return text.replace("|", "\\|")
+
+
+def _md_inline(value: Any) -> str:
+    """Escape model-written free text interpolated *into* a line or a table cell.
+
+    A newline is the hazard the pipe escape misses: it ends the table (or the paragraph), so
+    everything after it is parsed as top-level Markdown. The judge quotes the Candidate verbatim in
+    `evidence`, so a forged `## Summary` reaches the report through the judgment even when the answer
+    itself is quoted.
+    """
+    return _NEWLINE.sub(" ", "" if value is None else str(value)).replace("|", "\\|")
+
+
+def _md_quote(value: Any) -> str:
+    """Render Candidate-authored prose as a blockquote that cannot forge report structure.
+
+    Blockquote, not a fenced block. A fence has a closing delimiter the quoted text can simply write
+    — ``` alone on a line ends it and everything after is top-level Markdown again — so a fence would
+    have to be measured against the longest backtick run in the answer. A blockquote has no closing
+    delimiter: the marker is restated on every line, so there is nothing to close. It also keeps an
+    interview answer readable as prose; a fence renders it monospace and unwrapped, which is the
+    wrong artifact for the thing a Candidate shows a recruiter.
+
+    Leading block markers are still escaped, because `> ## Summary` is a real heading *inside* the
+    quote and lands in the rendered document's outline — most of what the forgery buys.
+    """
+    text = _NEWLINE.sub("\n", "" if value is None else str(value)).strip("\n")
+    out: list[str] = []
+    for line in text.split("\n"):
+        escaped = _LEADING_BLOCK_MARKER.sub(r"\1\\\2", line.replace("|", "\\|"))
+        out.append(f"> {escaped}" if escaped else ">")
+    return "\n".join(out)
