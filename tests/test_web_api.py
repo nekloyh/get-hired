@@ -4,6 +4,7 @@ import importlib
 import json
 import logging
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -1530,6 +1531,46 @@ def test_a_newline_in_a_checkpoint_thread_id_cannot_forge_a_prune_record(caplog)
     messages = [r.getMessage() for r in caplog.records if "checkpoint thread" in r.getMessage()]
     assert messages, "the prune failure path logged nothing to check"
     assert all("\n" not in message for message in messages)
+
+
+def test_a_damaged_checkpoint_file_is_reported_as_damaged_once_not_as_n_bad_threads(caplog):
+    # Measured on this repo's own dev checkpoint file: `PRAGMA integrity_check` returned "wrong # of
+    # entries in index sqlite_autoindex_writes_1" and `coach api` started anyway, printing one full
+    # `sqlite3.DatabaseError: database disk image is malformed` traceback per stale thread under the
+    # message "could not prune checkpoint thread". Nothing in that output says the file is corrupt,
+    # and a checkpoint DB that cannot be written is also one that cannot resume a Session — the
+    # failure this server is least able to explain after the fact. One `sqlite3.DatabaseError` is a
+    # statement about the FILE, not about the thread the sweep happened to be on.
+    entries = [
+        SimpleNamespace(
+            config={"configurable": {"thread_id": f"s-{i}"}},
+            checkpoint={"ts": "2020-01-01T00:00:00+00:00"},
+        )
+        for i in range(3)
+    ]
+
+    class _Damaged:
+        def list(self, _config):
+            return entries
+
+        def delete_thread(self, thread_id):
+            raise sqlite3.DatabaseError("database disk image is malformed")
+
+    with caplog.at_level(logging.WARNING, logger="interview_coach.web_api"):
+        assert (
+            web_api.prune_checkpoints(_Damaged(), max_age_seconds=1.0, now=1e12, db_label="/app/state/cp.sqlite") == []
+        )
+
+    damaged = [r for r in caplog.records if "is damaged" in r.getMessage()]
+    assert len(damaged) == 1, "a damaged file must be reported once, not once per thread"
+    assert damaged[0].levelno == logging.ERROR
+    message = damaged[0].getMessage()
+    assert "/app/state/cp.sqlite" in message  # which file, not "the checkpoint database"
+    assert "RESUME IS NOT RELIABLE" in message  # the consequence, not just the symptom
+    assert "integrity_check" in message and "REINDEX" in message  # and what to do about it
+    # The sweep stopped: every remaining delete would raise the same thing, and three more tracebacks
+    # is exactly the noise that buried this in the first place.
+    assert not [r for r in caplog.records if "could not prune checkpoint thread" in r.getMessage()]
 
 
 def test_the_suite_never_writes_into_the_operators_own_log_file(tmp_path):
