@@ -12,9 +12,17 @@ Suite: **848 → 972** pytest, **27 → 35** vitest. Every gate green after ever
 
 ## 1. Status: tagged
 
-**Tagged `v0.1.0-pilot`, annotated, local only.** The tag sits on this branch's HEAD — the commit that
-carries this report. It is deliberately **not pushed**, because the PR is not merged and a pushed tag
-that later has to move is worse than a tag that waits.
+**Tagged `v0.1.0-pilot`, annotated, local only.** It sits on this branch's HEAD — the commit that
+carries this report. It is deliberately **not pushed**: the PR is not merged, and a pushed tag that
+later has to move is worse than a tag that waits. Push it yourself after merging:
+
+```
+git push origin v0.1.0-pilot
+```
+
+The tag message states the milestone's scope and, explicitly, the six things it does **not** include —
+no per-user auth, no per-turn ACK, no Skill-ledger history, no live judge in CI, no load/latency/cost
+SLO, no browser E2E — plus the bench red and why it was accepted.
 
 | | |
 |---|---|
@@ -23,7 +31,7 @@ that later has to move is worse than a tag that waits.
 | M-2 | not coded. Now **filed**, one GitHub issue each (§8) |
 | Stable checklist | **20 of 21 PASS, 1 FAIL** — re-run end to end, §4 |
 | Tag | `v0.1.0-pilot`, annotated, **local** — push it after you merge the PR |
-| PR | opened, CI result in §4 |
+| PR | **#133**, CI **green** — `docker pass · python pass · web pass` |
 
 ### The one FAIL: checklist item 8, accepted with recorded rationale
 
@@ -227,6 +235,18 @@ Session state exists:
   candidate_id='(empty)'                     -> session_started                                    (by design: one-shot cold start)
 ```
 
+### CI on the PR
+
+`gh pr checks 133`, all three jobs green on the pushed branch:
+
+```
+docker   pass   34s
+python   pass   37s
+web      pass   21s
+```
+
+`#119` carries `Closes #119` in the PR body, so it closes when you merge — not before.
+
 ### Two counts in the previous run of this table were wrong
 
 Reported honestly rather than reconciled: the earlier §4 recorded **9 passed** for item 16 and **21
@@ -375,6 +395,7 @@ QA findings closed                  45 of 47 fully; 2 partial (QA-02 isolation h
                                     never in the plan, GH #121)
 issues filed                        12 new (#121–#132) + 2 comments (#96, #84)
 bad citations caught before filing   36, across all 12 drafts
+PR                                  #133, CI green (docker / python / web)
 tag                                 v0.1.0-pilot — annotated, LOCAL, not pushed
 still yours                         Groq key rotation · production origin · merge · push the tag · #96
 ```
