@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from .filelock import atomic_write_text
 from .microloop import display_stop_reason
 from .session_serde import decision_records, sorted_skill_states, transcript_items
 from .skill import SkillState
@@ -15,7 +16,9 @@ def export_session_markdown(session_state: Mapping[str, Any], path: str | Path) 
     """Write a readable Markdown export of a completed Session."""
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(render_session_markdown(session_state), encoding="utf-8")
+    # Published by rename, never truncate-in-place: a volume that fills as the Session ends must
+    # leave the previous export intact rather than a 0-byte file the endpoint serves at 200 OK.
+    atomic_write_text(output, render_session_markdown(session_state))
     return output
 
 

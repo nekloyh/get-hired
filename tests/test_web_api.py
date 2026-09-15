@@ -705,6 +705,50 @@ def test_an_unknown_session_is_still_a_404_after_the_disk_fallback(tmp_path):
     assert _test_client(tmp_path).get("/api/sessions/never-existed/export.md").status_code == 404
 
 
+def test_a_torn_export_file_falls_back_to_the_checkpoint(tmp_path):
+    # NEW-04: `write_text` truncates before it writes, so a volume that fills as the Session ends
+    # leaves 0 bytes under the real name — which reads back with no error at all. Once the id is
+    # evicted from `completed_sessions`, the endpoint hands the Candidate that empty file at 200 OK.
+    client = _test_client(tmp_path)
+    _complete_a_demo_session(client, "torn-export")
+    export_path(tmp_path / "exports", "torn-export").write_text("", encoding="utf-8")
+
+    restarted = _test_client(tmp_path)
+    response = restarted.get("/api/sessions/torn-export/export.md")
+
+    assert response.status_code == 200
+    assert "# Interview Session: torn-export" in response.text
+    assert "## Study Plan" in response.text
+
+
+def test_an_export_the_disk_never_took_falls_back_to_the_checkpoint(tmp_path):
+    # The other half: `_persist_export` swallows OSError, so a read-only or full mount means no file
+    # at all. The checkpoint still holds the finished state — a 404 there is a report thrown away.
+    client = _test_client(tmp_path)
+    _complete_a_demo_session(client, "lost-export")
+    export_path(tmp_path / "exports", "lost-export").unlink()
+
+    restarted = _test_client(tmp_path)
+    response = restarted.get("/api/sessions/lost-export/export.md")
+
+    assert response.status_code == 200
+    assert "# Interview Session: lost-export" in response.text
+
+
+def test_an_unfinished_checkpoint_is_never_served_as_a_report(tmp_path):
+    # The fallback must not turn a cancelled run into a finished report: a checkpoint exists from the
+    # first node onward, and rendering it would present a Session that never completed as evidence
+    # (ADR 0005). Only `status == complete` is served.
+    client = _test_client(tmp_path)
+    with client.websocket_connect("/api/sessions/cancelled-run") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+        _receive_until(ws, "question")
+        ws.send_json({"type": "cancel_session"})
+        _receive_until(ws, "session_error")
+
+    assert _test_client(tmp_path).get("/api/sessions/cancelled-run/export.md").status_code == 404
+
+
 def test_a_restored_export_is_still_gated_by_the_token(tmp_path):
     # The disk fallback must not become an unauthenticated way around R-07.
     open_client = _test_client(tmp_path)

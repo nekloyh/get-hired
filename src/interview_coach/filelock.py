@@ -22,8 +22,11 @@ This module imports nothing from the package on purpose: ``usage`` cannot import
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import logging
+import os
+import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -73,3 +76,41 @@ def locked(target: Path) -> Iterator[None]:
     finally:
         if handle is not None:
             handle.close()  # closing the last fd on the description releases the flock
+
+
+def atomic_write_text(target: Path, text: str) -> None:
+    """Publish ``text`` at ``target`` by rename, so no reader ever sees a half-written file.
+
+    ``Path.write_text`` truncates the existing file *first*, so a volume that fills mid-write leaves
+    0 bytes or a fragment under the real name — and reading that back raises nothing at all. The
+    Skill ledger cold-starts every Candidate in it; the Markdown export serves a truncated transcript
+    at 200 OK (NEW-04). Staging a sibling and renaming makes a failed write a no-op instead.
+
+    Raises ``OSError``, having staged nothing: whether a failed write is fatal is the caller's call.
+    """
+    tmp_path: Path | None = None
+    try:
+        # The tempfile must be a sibling of the target: os.replace is only atomic within one
+        # filesystem and raises EXDEV across a mount boundary (the Docker /state volume is one).
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)  # bound first, so a failed write still gets cleaned up
+            handle.write(text)
+            handle.flush()
+            # Rename is atomic w.r.t. readers but says nothing about durability: without fsync a
+            # container restart can publish a name pointing at unflushed (zero) bytes.
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, target)
+    except OSError:
+        # The cleanup runs on the same sick disk that caused the failure, so it must not become what
+        # escapes: the caller is owed the original error, not the unlink's.
+        if tmp_path is not None:
+            with contextlib.suppress(OSError):
+                tmp_path.unlink()
+        raise

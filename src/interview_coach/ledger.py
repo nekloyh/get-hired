@@ -18,19 +18,16 @@ ledger degrades to cold start with a logged warning; it never crashes a Session.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import math
-import os
 import re
-import tempfile
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from .filelock import locked
+from .filelock import atomic_write_text, locked
 from .skill import NEUTRAL_ALPHA, NEUTRAL_BETA, SkillState
 
 logger = logging.getLogger(__name__)
@@ -224,29 +221,10 @@ def save_posteriors(
             "completed_at": now,
             "skills": {skill: {"alpha": state.alpha, "beta": state.beta} for skill, state in skill_states.items()},
         }
-        tmp_path: Path | None = None
         try:
-            # The tempfile must be a sibling of the target: os.replace is only atomic within one
-            # filesystem and raises EXDEV across a mount boundary (the Docker /state volume is one).
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=target.parent,
-                prefix=f".{target.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as handle:
-                tmp_path = Path(handle.name)  # bound first, so a failed write still gets cleaned up
-                handle.write(json.dumps(data, indent=2, sort_keys=True))
-                handle.flush()
-                # Rename is atomic w.r.t. readers but says nothing about durability: without fsync a
-                # container restart can publish a name pointing at unflushed (zero) bytes.
-                os.fsync(handle.fileno())
-            os.replace(tmp_path, target)
+            # Shared with the Markdown export (NEW-04): both live on the same /state volume and both
+            # must survive a disk that fills mid-write. This function is contractually forbidden to
+            # raise, so the OSError stops here.
+            atomic_write_text(target, json.dumps(data, indent=2, sort_keys=True))
         except OSError as err:
-            # This handler is inside a function contractually forbidden to raise, so the cleanup must
-            # not become what escapes it — hence suppress rather than a second bare unlink.
-            if tmp_path is not None:
-                with contextlib.suppress(OSError):
-                    tmp_path.unlink()
             logger.warning("Could not write Skill ledger at %s (%s); Session memory not persisted.", path, err)

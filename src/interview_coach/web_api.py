@@ -764,9 +764,24 @@ def create_app(
         # Not in this process's memory — which after any restart is every Session ever completed.
         stored = export_path(api_state.exports_dir, session_id)
         try:
-            return stored.read_text(encoding="utf-8")
+            text = stored.read_text(encoding="utf-8")
         except OSError:
-            raise HTTPException(status_code=404, detail="No completed Session found for this Session id.") from None
+            text = ""
+        if text.strip():
+            return text
+        # Nothing readable on disk: the write failed (`_persist_export` logs and swallows), or a
+        # pre-atomic-publish build left a torn file — atomicity only prevents NEW tears. The
+        # checkpoint still holds the finished state, and rendering it costs one SQLite read on a path
+        # that was about to 404 anyway. The COMPLETE guard is load-bearing: without it a cancelled or
+        # in-flight Session's checkpoint would be served as a finished report (ADR 0005 — a run that
+        # never finished must not be presented as evidence).
+        values = _checkpoint_values(api_state, session_id)
+        if str(values.get("status", "")) == SessionStatus.COMPLETE.value:
+            logger.warning(
+                "serving Session %r's export from its checkpoint: %s is missing or empty", session_id, stored
+            )
+            return render_session_markdown(values)
+        raise HTTPException(status_code=404, detail="No completed Session found for this Session id.")
 
     _sweep_checkpoints_at_startup(api_state)
     # Registered last, deliberately: a mount at "/" matches everything, so every API route above has
