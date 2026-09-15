@@ -125,9 +125,7 @@ ELICITATION_SYSTEM_PROMPT = (
     "- Respond with one JSON object only — no prose, no code fences."
 )
 
-_ELICITATION_SCHEMA_HINT = (
-    '{"done": <true|false>, "next_question": "<text>", "coverage": ["<canonical Skill>"]}'
-)
+_ELICITATION_SCHEMA_HINT = '{"done": <true|false>, "next_question": "<text>", "coverage": ["<canonical Skill>"]}'
 
 RECONSTRUCTION_SYSTEM_PROMPT = (
     "You are the Post-mortem scorecard reconstructor for an adaptive interview coach. From a "
@@ -336,9 +334,10 @@ def _interview_context(target_role: str, companies: tuple[str, ...]) -> str:
 
 
 def _render_transcript(transcript: Sequence[RecollectionTurn]) -> str:
-    return "\n".join(
-        f"Q{i}: {turn.question}\nA{i}: {turn.answer}" for i, turn in enumerate(transcript, start=1)
-    ) or "- none yet"
+    return (
+        "\n".join(f"Q{i}: {turn.question}\nA{i}: {turn.answer}" for i, turn in enumerate(transcript, start=1))
+        or "- none yet"
+    )
 
 
 def _build_elicitation_messages(

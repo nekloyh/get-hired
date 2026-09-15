@@ -26,9 +26,7 @@ def _write_pack(tmp_path, *, questions: str, concepts: str | None = None, pack: 
     (root / "concepts.yaml").write_text(
         concepts
         if concepts is not None
-        else "\n".join(
-            f"- {{id: c_{s}, skill: {s}, title: T, content: some content text}}" for s in SKILLS
-        ),
+        else "\n".join(f"- {{id: c_{s}, skill: {s}, title: T, content: some content text}}" for s in SKILLS),
         encoding="utf-8",
     )
     (root / "pack.yaml").write_text(pack if pack is not None else "name: Test Pack", encoding="utf-8")
@@ -80,9 +78,7 @@ def test_dangling_concept_reference_dies_loudly(tmp_path):
 
 def test_missing_skill_dies_loudly(tmp_path):
     # Drop vietnamese_nlp from the questions.
-    partial = "\n".join(
-        block for block in _full_bank_yaml().split("\n\n") if not block.startswith("vietnamese_nlp:")
-    )
+    partial = "\n".join(block for block in _full_bank_yaml().split("\n\n") if not block.startswith("vietnamese_nlp:"))
     root = _write_pack(tmp_path, questions=partial)
     with pytest.raises(BankError, match="no question for Skill"):
         load_pack(root)

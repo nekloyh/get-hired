@@ -63,9 +63,7 @@ def main() -> int:
     for cid in CASE_IDS:
         case = by_id[cid]
         try:
-            ev = evaluator.evaluate(
-                client, case.question, case.answer, case.rubric, language_mode=case.language_mode
-            )
+            ev = evaluator.evaluate(client, case.question, case.answer, case.rubric, language_mode=case.language_mode)
         except Exception as err:  # noqa: BLE001 - report, keep measuring the rest
             print(f"| {cid} | ERROR: {type(err).__name__}: {err} |")
             rows.append({"case": cid, "error": str(err)})

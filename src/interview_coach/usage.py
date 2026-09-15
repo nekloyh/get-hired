@@ -58,7 +58,7 @@ from typing import Any
 from uuid import uuid4
 
 from . import telemetry
-from .filelock import locked
+from .filelock import atomic_write_text, locked
 
 logger = logging.getLogger(__name__)
 
@@ -385,9 +385,7 @@ def record_questions(identity: str, questions: int, *, path: Path | None = None)
     )
 
 
-def record_questions_released(
-    identity: str, questions: int, *, session: str = "", path: Path | None = None
-) -> None:
+def record_questions_released(identity: str, questions: int, *, session: str = "", path: Path | None = None) -> None:
     """Hand ``questions`` back to ``identity``'s daily cap — the compensating row for a reservation.
 
     A compensating ROW of its own kind, not a mutation and not a negative count on a ``questions``
@@ -456,6 +454,14 @@ def clear_quota_exhausted(provider: str, *, session: str = "", path: Path | None
 # could remember it at all).
 
 _FAULT_LOCK = Lock()
+# The one thread lock that pairs with the ledger's flock. Two call sites need a read-modify-write
+# over the ledger to be a single step — `reserve_questions` (check the cap, then record against
+# it) and `reconcile_accounting` (read the held rows, replay them, then rewrite the sidecar) —
+# and they must not interleave with each other either, because a reconcile appends the very rows
+# the cap is computed from. One lock for both, taken OUTSIDE `locked(target)` at both sites:
+# flock is held per open file description, so the reverse order deadlocks two threads of this
+# process against each other. Nothing inside either block may take the file lock again.
+_LEDGER_WRITE_LOCK = Lock()
 # Faults raised by THIS process, each with whether its sidecar row made it to disk. Kept even after
 # a successful flush so a reader never has to choose between two sources of truth mid-write.
 _FAULTS: list[dict[str, Any]] = []
@@ -640,9 +646,7 @@ def _parked_faults(target: Path) -> list[dict[str, Any]]:
             # A torn last line is a parked row whose write was cut short: unparseable, but evidence
             # that something WAS parked. Skipping it is the same forgiveness as above, one row at a
             # time, so it becomes a fault carrying no replayable row instead.
-            logger.error(
-                "a row in %s could not be parsed (%s); it is held as unknown spend, not dropped", sidecar, err
-            )
+            logger.error("a row in %s could not be parsed (%s); it is held as unknown spend, not dropped", sidecar, err)
             faults.append(_unreadable_fault(target, sidecar, f"{type(err).__name__}: {err}", whole_file=False))
             continue
         if isinstance(row, dict):
@@ -777,6 +781,20 @@ def reconcile_accounting(*, path: Path | None = None) -> str:
     which is what "just clear the flag" would do — is the one outcome this slice exists to prevent.
     """
     target = path or ledger_path()
+    # Read the held rows, replay them, rewrite the sidecar: one step, across processes. Unlocked, a
+    # fault another process parks between the read and the rewrite is deleted by that rewrite — a
+    # billed call whose tokens are never folded in, while reconcile reports success and clears the
+    # fault — and two overlapping reconciles (a cron beside an operator) both take their `done`
+    # snapshot before either appends, so both replay every row and `usage_for_day`, which sums token
+    # rows without deduplicating on `fault`, counts the spend twice. Thread lock outer, file lock
+    # inner. Nothing below may take the file lock again: `_parked_faults`, `_write_row` and
+    # `_rewrite_fault_sidecar` all read, append or publish without one.
+    with _LEDGER_WRITE_LOCK, locked(target):
+        return _reconcile_held_rows(target)
+
+
+def _reconcile_held_rows(target: Path) -> str:
+    """The body of ``reconcile_accounting``, run with the ledger's write lock already held."""
     faults = _parked_faults(target)
     if not faults:
         return "No accounting fault to reconcile."
@@ -859,7 +877,10 @@ def _rewrite_fault_sidecar(target: Path, faults: list[dict[str, Any]]) -> None:
         return
     body = "".join(json.dumps(fault) + "\n" for fault in faults)
     try:
-        sidecar.write_text(body, encoding="utf-8")
+        # By rename, not in place: `Path.write_text` truncates first, so a volume that fills mid-write
+        # leaves 0 bytes under the real name — and `_parked_faults` reads 0 bytes as "nothing is
+        # parked", the most permissive answer there is drawn from the least readable input.
+        atomic_write_text(sidecar, body)
     except OSError as err:
         # The sidecar is where the unreplayed rows live, so failing to rewrite it is the one case
         # that can lose them. Loud, and re-latched in memory so this process still refuses to spend.
@@ -1143,9 +1164,7 @@ def start_refusal_reason(provider: str, *, questions: int, path: Path | None = N
     )
 
 
-def metered_command_refusal_reason(
-    provider: str, *, work: str, needed: int, path: Path | None = None
-) -> str | None:
+def metered_command_refusal_reason(provider: str, *, work: str, needed: int, path: Path | None = None) -> str | None:
     """Why a metered CLI batch command must not start, or None. Checked BEFORE the first token.
 
     ``start_refusal_reason`` is sized in questions because a Session IS questions. A bench sweep, a
@@ -1203,19 +1222,16 @@ def question_cap_reason(identity: str, *, questions: int, path: Path | None = No
 # Check-and-record is one step: two simultaneous starts must not both read the pre-reservation count.
 # One step ACROSS PROCESSES too — two `coach api` processes sharing a state volume (a compose
 # `scale`, an overlapping redeploy, a second `coach api` pointed at the same COACH_USAGE_LEDGER) are
-# two independent `_RESERVATION_LOCK`s over one file, and both would read the same pre-reservation
-# count. The flock on the ledger's `.lock` sidecar is what makes the window exclusive, and it is
-# taken INSIDE the thread lock, never outside (flock is per open file description, so the reverse
-# order deadlocks two threads of this process against each other). Nothing inside this block may take
-# the same file lock again: `record_questions` appends without it, and a nested acquisition on a
-# second descriptor would block this process on itself.
-_RESERVATION_LOCK = Lock()
+# two independent interpreters over one file, and both would read the same pre-reservation count. The
+# flock on the ledger's `.lock` sidecar is what makes the window exclusive. Nothing inside this block
+# may take the same file lock again: `record_questions` appends without it, and a nested acquisition
+# on a second descriptor would block this process on itself.
 
 
 def reserve_questions(identity: str, *, questions: int, path: Path | None = None) -> str | None:
     """Reserve ``questions`` against the daily cap atomically; returns the refusal reason, or None."""
     target = path or ledger_path()
-    with _RESERVATION_LOCK, locked(target):
+    with _LEDGER_WRITE_LOCK, locked(target):
         if reason := question_cap_reason(identity, questions=questions, path=target):
             return reason
         record_questions(identity, questions, path=target)

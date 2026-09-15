@@ -177,11 +177,7 @@ def validate_question(
         raise BankError(f"{where}: invalid rubric: {err}") from err
 
     answers = raw.get("answers")
-    if (
-        not isinstance(answers, list)
-        or not answers
-        or not all(isinstance(a, str) and a.strip() for a in answers)
-    ):
+    if not isinstance(answers, list) or not answers or not all(isinstance(a, str) and a.strip() for a in answers):
         raise BankError(f"{where}: 'answers' must be a non-empty list of non-empty strings")
 
     expected_concepts = _str_tuple(raw.get("expected_concepts"), where=where, field="expected_concepts")

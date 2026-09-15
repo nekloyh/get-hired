@@ -53,8 +53,9 @@ class _SimJudge(LLMClient):
     def chat(self, messages: Sequence[Message], *, response_format: ResponseFormat | None = None) -> str:
         text = " ".join(m["content"] for m in messages)
         if "You are the Supervisor" in text:
-            return json.dumps({"action": self.supervisor_action, "reasoning": "sim",
-                               "target_skill": None, "target_plan_index": None})
+            return json.dumps(
+                {"action": self.supervisor_action, "reasoning": "sim", "target_skill": None, "target_plan_index": None}
+            )
         if "You are the Evaluator" in text:
             # Anchor on the CANDIDATE ANSWER section: the 0024 judge system prompt itself contains
             # "A weak answer scores just as low ...", which an unanchored search matches first.
@@ -101,13 +102,23 @@ def test_persona_candidate_answers_in_character_for_the_probed_skill():
 
 
 def test_persona_session_converges_on_ground_truth_ordering():
-    persona = Persona(name="alice", mastery={
-        "deep_learning": 0.9, "ml_fundamentals": 0.5, "mlops": 0.2,
-        "system_design": 0.5, "vietnamese_nlp": 0.5,
-    })
+    persona = Persona(
+        name="alice",
+        mastery={
+            "deep_learning": 0.9,
+            "ml_fundamentals": 0.5,
+            "mlops": 0.2,
+            "system_design": 0.5,
+            "vietnamese_nlp": 0.5,
+        },
+    )
     final = run_persona_session(
-        _SimJudge(), persona, session_id="alice-traj", candidate_client=_PersonaTextClient(),
-        max_questions=3, now=lambda: 1.0,
+        _SimJudge(),
+        persona,
+        session_id="alice-traj",
+        candidate_client=_PersonaTextClient(),
+        max_questions=3,
+        now=lambda: 1.0,
     )
 
     assert final["status"] == SessionStatus.COMPLETE.value
@@ -119,12 +130,18 @@ def test_persona_session_converges_on_ground_truth_ordering():
 
 
 def test_supervisor_terminates_early_on_a_strong_persona():
-    persona = Persona(name="ace", mastery={s: 0.9 for s in [
-        "deep_learning", "ml_fundamentals", "mlops", "system_design", "vietnamese_nlp"]})
+    persona = Persona(
+        name="ace",
+        mastery={s: 0.9 for s in ["deep_learning", "ml_fundamentals", "mlops", "system_design", "vietnamese_nlp"]},
+    )
 
     final = run_persona_session(
-        _SimJudge(supervisor_action="end_early"), persona, session_id="ace-traj",
-        candidate_client=_PersonaTextClient(), max_questions=5, now=lambda: 1.0,
+        _SimJudge(supervisor_action="end_early"),
+        persona,
+        session_id="ace-traj",
+        candidate_client=_PersonaTextClient(),
+        max_questions=5,
+        now=lambda: 1.0,
     )
 
     assert final["status"] == SessionStatus.COMPLETE.value
@@ -139,8 +156,12 @@ def test_supervisor_terminates_early_on_a_strong_persona():
 def test_replay_artifact_roundtrips_and_reruns_the_decision_node(tmp_path):
     persona = Persona(name="alice", mastery={"deep_learning": 0.9, "mlops": 0.2})
     final = run_persona_session(
-        _SimJudge(), persona, session_id="alice-replay", candidate_client=_PersonaTextClient(),
-        max_questions=1, now=lambda: 1.0,
+        _SimJudge(),
+        persona,
+        session_id="alice-replay",
+        candidate_client=_PersonaTextClient(),
+        max_questions=1,
+        now=lambda: 1.0,
     )
 
     path = dump_replay_artifact(tmp_path / "trajectory.json", persona, final)

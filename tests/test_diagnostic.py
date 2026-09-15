@@ -104,12 +104,10 @@ def test_correlations_affect_only_initial_priors_not_later_evidence_updates():
 
 
 def test_must_have_gets_weaker_prior_and_higher_evidence_bar_than_peripheral():
-    mle = diagnose(
-        CandidateProfile(target_role="machine learning engineer", claimed_skills={"mlops": 4})
-    ).priors["mlops"]
-    research = diagnose(
-        CandidateProfile(target_role="research scientist", claimed_skills={"mlops": 4})
-    ).priors["mlops"]
+    mle = diagnose(CandidateProfile(target_role="machine learning engineer", claimed_skills={"mlops": 4})).priors[
+        "mlops"
+    ]
+    research = diagnose(CandidateProfile(target_role="research scientist", claimed_skills={"mlops": 4})).priors["mlops"]
 
     assert mle.role_criticality is RoleCriticality.MUST_HAVE
     assert research.role_criticality is RoleCriticality.PERIPHERAL
@@ -118,24 +116,22 @@ def test_must_have_gets_weaker_prior_and_higher_evidence_bar_than_peripheral():
 
 
 def test_role_criticality_never_shifts_prior_mean():
-    mle = diagnose(
-        CandidateProfile(target_role="machine learning engineer", claimed_skills={"mlops": 4})
-    ).priors["mlops"]
-    research = diagnose(
-        CandidateProfile(target_role="research scientist", claimed_skills={"mlops": 4})
-    ).priors["mlops"]
+    mle = diagnose(CandidateProfile(target_role="machine learning engineer", claimed_skills={"mlops": 4})).priors[
+        "mlops"
+    ]
+    research = diagnose(CandidateProfile(target_role="research scientist", claimed_skills={"mlops": 4})).priors["mlops"]
 
     assert mle.state.mastery == pytest.approx(research.state.mastery)
     assert mle.prior_strength != research.prior_strength
 
 
 def test_self_assessment_moves_mean_not_prior_confidence():
-    low_claim = diagnose(
-        CandidateProfile(target_role="research scientist", claimed_skills={"mlops": 1})
-    ).priors["mlops"]
-    high_claim = diagnose(
-        CandidateProfile(target_role="research scientist", claimed_skills={"mlops": 5})
-    ).priors["mlops"]
+    low_claim = diagnose(CandidateProfile(target_role="research scientist", claimed_skills={"mlops": 1})).priors[
+        "mlops"
+    ]
+    high_claim = diagnose(CandidateProfile(target_role="research scientist", claimed_skills={"mlops": 5})).priors[
+        "mlops"
+    ]
 
     assert low_claim.state.mastery < high_claim.state.mastery
     assert low_claim.state.confidence == pytest.approx(high_claim.state.confidence)

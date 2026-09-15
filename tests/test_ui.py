@@ -24,9 +24,7 @@ def test_render_skill_state_rows_include_mastery_confidence_and_criticality():
         width=8,
     )
 
-    assert rows == [
-        "mlops              [######--] mastery=  75% confidence=  55% criticality=must_have"
-    ]
+    assert rows == ["mlops              [######--] mastery=  75% confidence=  55% criticality=must_have"]
 
 
 # --- R-27: demo mode dispatches on class objects, not class names --------------------------------
