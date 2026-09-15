@@ -54,6 +54,7 @@ from hashlib import sha256
 from pathlib import Path
 from threading import Lock
 from typing import Any
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
@@ -368,27 +369,42 @@ def _write_row(entry: Mapping[str, object], target: Path) -> None:
         f.write(json.dumps(dict(entry)) + "\n")
 
 
+def _new_fault_id() -> str:
+    """A unique key for one latched fault, so replaying it twice can be refused.
+
+    Random rather than derived from the row: ``ts`` has one-second resolution, so two identical
+    billed calls in the same second would key the same and one real charge would be forgiven — the
+    single outcome this module exists to prevent. Module-level so a test can pin it.
+    """
+    return uuid4().hex
+
+
 def _flush_faults(target: Path) -> None:
-    """Best-effort: park every not-yet-parked fault in the sidecar beside ``target``."""
+    """Best-effort: park every not-yet-parked fault in the sidecar beside ``target``.
+
+    Write and mark under ONE hold of the lock: two Sessions flushing concurrently used to snapshot
+    the same unparked fault and both append it, and a sidecar row duplicated that way is spend the
+    reconcile then invents.
+    """
     sidecar = ledger_fault_path(target)
     with _FAULT_LOCK:
-        pending = [fault for fault in _FAULTS if not fault["parked"]]
-    for fault in pending:
-        try:
-            _write_row(fault["record"], sidecar)
-        except OSError as err:
-            # Expected whenever the ledger is unwritable because its *directory* is: the sidecar
-            # lives in that same directory. The in-process latch still blocks this process, and the
-            # writability probe still blocks the next one — see `accounting_block_reason`.
-            logger.error(
-                "accounting fault could not be parked in %s (%s: %s); it is held in memory only and "
-                "will be lost if this process exits",
-                sidecar,
-                type(err).__name__,
-                err,
-            )
-            return
-        with _FAULT_LOCK:
+        for fault in _FAULTS:
+            if fault["parked"]:
+                continue
+            try:
+                _write_row(fault["record"], sidecar)
+            except OSError as err:
+                # Expected whenever the ledger is unwritable because its *directory* is: the sidecar
+                # lives in that same directory. The in-process latch still blocks this process, and
+                # the writability probe still blocks the next one — see `accounting_block_reason`.
+                logger.error(
+                    "accounting fault could not be parked in %s (%s: %s); it is held in memory only "
+                    "and will be lost if this process exits",
+                    sidecar,
+                    type(err).__name__,
+                    err,
+                )
+                return
             fault["parked"] = True
 
 
@@ -399,6 +415,7 @@ def _latch_fault(entry: Mapping[str, object], err: OSError, target: Path) -> Non
     billed = "prompt_tokens" in entry
     record: dict[str, Any] = {
         "ts": _now_ts(),
+        "id": _new_fault_id(),
         "kind": "accounting_fault",
         "row": str(entry.get("kind", "tokens")),
         "billed": billed,
@@ -632,8 +649,13 @@ def reconcile_accounting(*, path: Path | None = None) -> str:
         )
     replayed = 0
     tokens = 0
+    skipped = 0
     unreplayed: list[dict[str, Any]] = []
     failure: OSError | None = None
+    # The idempotency key, read back from the ledger itself rather than held anywhere: a replay that
+    # landed is already stamped there, so a duplicate sidecar row — or a retry after the rewrite
+    # below failed — cannot bill the same call a second time.
+    done = _replayed_fault_ids(target)
     for fault in faults:
         row = fault.get("entry")
         if not isinstance(row, dict):
@@ -643,6 +665,15 @@ def reconcile_accounting(*, path: Path | None = None) -> str:
         if failure is not None:
             unreplayed.append(fault)
             continue
+        fault_id = fault.get("id")
+        if isinstance(fault_id, str) and fault_id:
+            if fault_id in done:
+                # Already folded in: a row two concurrent flushes parked twice, or a retry after the
+                # sidecar rewrite below failed. Replaying it again would INVENT spend.
+                skipped += 1
+                continue
+            # Copied, not mutated: `fault["entry"]` may still be the live `_FAULTS` record.
+            row = {**row, "fault": fault_id}
         try:
             _write_row(row, target)
         except OSError as err:
@@ -652,20 +683,29 @@ def reconcile_accounting(*, path: Path | None = None) -> str:
             failure = err
             unreplayed.append(fault)
             continue
+        if isinstance(fault_id, str) and fault_id:
+            done.add(fault_id)
         replayed += 1
         try:
             tokens += int(row.get("prompt_tokens", 0)) + int(row.get("completion_tokens", 0))
         except (TypeError, ValueError):
             pass
-    lost = len(faults) - replayed - len(unreplayed)
+    lost = len(faults) - replayed - skipped - len(unreplayed)
     _rewrite_fault_sidecar(target, unreplayed)
     _PROVEN_WRITABLE.discard(str(target))
     if failure is not None:
         raise failure
     note = f"Reconciled {replayed} held ledger row(s) into {target} (~{tokens:,} token(s) restored)."
+    if skipped:
+        note += f" {skipped} held row(s) were already in the ledger and were NOT replayed again."
     if lost:
         note += f" {lost} fault(s) carried no replayable row; that spend stays unknown, not zero."
     return note
+
+
+def _replayed_fault_ids(target: Path) -> set[str]:
+    """Fault ids already folded into ``target`` — what makes a second ``--reconcile`` a no-op."""
+    return {str(row["fault"]) for row in _all_rows(target) if isinstance(row.get("fault"), str)}
 
 
 def _rewrite_fault_sidecar(target: Path, faults: list[dict[str, Any]]) -> None:

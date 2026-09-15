@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from datetime import UTC, datetime
 
 import pytest
@@ -1040,6 +1041,130 @@ def test_a_sidecar_that_is_not_valid_utf8_does_not_crash_the_call_gate(tmp_path,
 
     assert reason is not None
     assert "UNRECONCILED" in reason
+
+def _held_in_memory(tmp_path):
+    """Latch a billed fault the sidecar could not take, then make its directory usable again.
+
+    The realistic shape behind QA-12: the parent was a file, so `_flush_faults` failed and the fault
+    survives only in `_FAULTS`, unparked. Every later `accounting_fault()` — i.e. every metered call
+    — retries the park, so two Sessions retry it at the same time.
+    """
+    occupied = tmp_path / "state"
+    occupied.write_text("occupied", encoding="utf-8")
+    ledger = occupied / "usage-ledger.jsonl"
+    record_usage("openai", "gpt-5.4-mini", prompt_tokens=1000, completion_tokens=200, path=ledger)
+    occupied.unlink()
+    occupied.mkdir()
+    return ledger
+
+
+def _concurrent_flush(tmp_path, monkeypatch):
+    """Two threads retry the park at once, with the sidecar append slowed to make the overlap real."""
+    ledger = _held_in_memory(tmp_path)
+    real_write_row = usage._write_row
+
+    def slow_write_row(entry, target):
+        time.sleep(0.05)
+        real_write_row(entry, target)
+
+    monkeypatch.setattr(usage, "_write_row", slow_write_row)
+    start = threading.Barrier(2)
+
+    def flush() -> None:
+        start.wait()
+        usage.accounting_fault(path=ledger)
+
+    threads = [threading.Thread(target=flush) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    monkeypatch.setattr(usage, "_write_row", real_write_row)
+    return ledger
+
+
+def test_two_sessions_flushing_at_once_park_one_row_not_two(tmp_path, monkeypatch):
+    # QA-12. Snapshot-then-write-then-mark in three separate holds of the lock let both threads see
+    # the same unparked fault. A sidecar row duplicated here is a billed call the reconcile below
+    # will charge twice — and the money ledger has no way back from that.
+    ledger = _concurrent_flush(tmp_path, monkeypatch)
+
+    rows = usage.ledger_fault_path(ledger).read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 1, rows
+
+
+def test_a_fault_parked_twice_is_still_billed_once(tmp_path, monkeypatch):
+    # The consequence, stated in the unit that matters. Even if a duplicate reaches the sidecar
+    # anyway — two PROCESSES can do it, and no in-process lock can stop them — replay must fold the
+    # call in once. Over-counting the day is as wrong as forgiving it, just in the other direction.
+    ledger = _concurrent_flush(tmp_path, monkeypatch)
+
+    usage.reconcile_accounting(path=ledger)
+
+    assert usage_for_day(path=ledger)["openai"]["total"] == 1200
+    assert usage.accounting_block_reason(path=ledger) is None
+
+
+def test_reconciling_twice_does_not_bill_the_held_row_twice(tmp_path, monkeypatch):
+    # QA-13. `--reconcile` replays every held row and only THEN rewrites the sidecar, so any path
+    # that leaves those rows on disk — the rewrite failing, the process dying, the server appending
+    # underneath the CLI — hands the operator a retry that invents the spend a second time. The
+    # restore below is exactly that on-disk state, written by hand so the test names the state and
+    # not the mechanism.
+    ledger = tmp_path / "usage-ledger.jsonl"
+    sidecar = usage.ledger_fault_path(ledger)
+    occupied = tmp_path / "broken"
+    occupied.write_text("occupied", encoding="utf-8")
+    record_usage("openai", "gpt-5.4-mini", prompt_tokens=1000, completion_tokens=200, path=occupied / "l.jsonl")
+    held = [dict(fault["record"], ledger=str(ledger)) for fault in usage._FAULTS]
+    usage.reset_accounting_state()
+    sidecar.write_text("".join(json.dumps(row) + "\n" for row in held), encoding="utf-8")
+    still_held = sidecar.read_text(encoding="utf-8")
+
+    first = usage.reconcile_accounting(path=ledger)
+    sidecar.write_text(still_held, encoding="utf-8")  # the rewrite never landed; the operator retries
+    second = usage.reconcile_accounting(path=ledger)
+
+    assert "Reconciled 1 held ledger row(s)" in first
+    assert usage_for_day(path=ledger)["openai"]["total"] == 1200
+    assert "already in the ledger" in second
+    assert usage.accounting_block_reason(path=ledger) is None
+
+
+def test_a_held_row_written_before_the_fault_id_still_replays_exactly_once(tmp_path):
+    # Backward compatibility, pinned: a sidecar row parked by an older build carries no id, so there
+    # is nothing to dedupe on and it must behave exactly as it did — replayed once, then cleared.
+    # Inventing a key for it from its contents would collapse two same-second calls into one and
+    # forgive a real charge, which is the one direction this module may never err in.
+    ledger = tmp_path / "usage-ledger.jsonl"
+    entry = {
+        "ts": utc_date() + "T00:00:00+00:00",
+        "provider": "openai",
+        "model": "gpt-5.4-mini",
+        "prompt_tokens": 7,
+        "completion_tokens": 3,
+    }
+    usage.ledger_fault_path(ledger).write_text(
+        json.dumps(
+            {
+                "ts": utc_date() + "T00:00:00+00:00",
+                "kind": "accounting_fault",
+                "row": "tokens",
+                "billed": True,
+                "ledger": str(ledger),
+                "error": "IsADirectoryError: legacy",
+                "entry": entry,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    note = usage.reconcile_accounting(path=ledger)
+
+    assert "Reconciled 1 held ledger row(s)" in note
+    assert usage_for_day(path=ledger)["openai"]["total"] == 10
+
 
 # --- AUDIT §3.2 row 3: the question-cap check and the reservation are one atomic step -------------
 
