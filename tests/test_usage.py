@@ -1397,3 +1397,132 @@ def test_a_released_reservation_gives_the_cap_back_without_rewriting_a_row(tmp_p
     # A release with no reservation behind it is floored at 0, never banked against the next start.
     record_questions_released("id-2", 5)
     assert questions_today("id-2") == 0
+
+
+def _held_row(fault_id: str, *, prompt: int, completion: int) -> dict:
+    """One row shaped exactly as `_latch_fault` parks it, written straight into the sidecar."""
+    return {
+        "ts": "2026-09-15T00:00:00+00:00",
+        "id": fault_id,
+        "kind": "accounting_fault",
+        "row": "tokens",
+        "billed": True,
+        "ledger": "unused",
+        "error": "OSError: injected",
+        "entry": {
+            "ts": "2026-09-15T00:00:00+00:00",
+            "kind": "tokens",
+            "provider": "openai",
+            "model": "gpt-5.4-mini",
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+        },
+    }
+
+
+def _reconcile_and_park(entered, release, outcome):
+    """Child: stop inside the reconcile window, between the sidecar read and the sidecar rewrite.
+
+    The widening is test-only and lives entirely in the child, so production ships no sleep: the
+    child swaps in its own `_write_row`, which signals after the first replayed row lands and waits
+    before writing the second. The parent then knows the child is mid-reconcile rather than hoping
+    it is.
+    """
+    real_write_row = usage._write_row
+    first = {"done": False}
+
+    def parked(entry, target):
+        real_write_row(entry, target)
+        if not first["done"]:
+            first["done"] = True
+            entered.set()
+            release.wait(10)
+
+    usage._write_row = parked
+    Path(outcome).write_text(usage.reconcile_accounting(), encoding="utf-8")
+
+
+def test_a_second_process_cannot_reconcile_the_rows_this_one_is_already_replaying(tmp_path, monkeypatch):
+    # #123. `reconcile_accounting` reads the held rows, appends them to the ledger, then rewrites the
+    # sidecar to hold exactly what is left — a read-modify-write across two files with no lock at
+    # all, while the same module already owns one for `reserve_questions`. Two overlapping reconciles
+    # (a cron beside an operator, or a CLI beside the server) each read the sidecar before either
+    # rewrites it, and `done = _replayed_fault_ids(target)` is a snapshot taken before the first
+    # append — so both see an empty dedup set and both bill every held row. `usage_for_day` sums
+    # every token row without deduplicating on `fault`, so that is a real double count of spend that
+    # was charged once.
+    ledger = tmp_path / "usage-ledger.jsonl"
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
+    sidecar = usage.ledger_fault_path(ledger)
+    sidecar.write_text(
+        json.dumps(_held_row("fault-a", prompt=1000, completion=200))
+        + "\n"
+        + json.dumps(_held_row("fault-b", prompt=30, completion=7))
+        + "\n",
+        encoding="utf-8",
+    )
+    child_outcome = tmp_path / "child-outcome.txt"
+
+    # Forked before this process starts a thread of its own (3.12 deprecates fork from a
+    # multi-threaded process), and forked rather than spawned so the child inherits the environment
+    # this test just set.
+    ctx = mp.get_context("fork")
+    child_entered, release = ctx.Event(), ctx.Event()
+    child = ctx.Process(target=_reconcile_and_park, args=(child_entered, release, str(child_outcome)))
+    child.start()
+    assert child_entered.wait(10), "the child never reached its replay loop"
+
+    notes: list[str] = []
+
+    def reconcile() -> None:
+        notes.append(usage.reconcile_accounting())
+
+    thread = threading.Thread(target=reconcile)
+    thread.start()
+    # Unlocked this returns instantly having replayed both rows a second time — the bug. Locked, it
+    # is parked in flock() until the child releases, so the join times out.
+    thread.join(0.5)
+    assert thread.is_alive(), "the second reconcile was not held out of the window"
+    release.set()
+    child.join(10)
+    thread.join(10)
+
+    assert child.exitcode == 0
+    assert "Reconciled 2 held ledger row(s)" in child_outcome.read_text(encoding="utf-8")
+    # The whole point: each billed call is folded in exactly once, so the day's total is the truth.
+    assert usage_for_day()["openai"] == {"prompt": 1030, "completion": 207, "total": 1237, "calls": 2}
+    rows = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+    assert sorted(row["fault"] for row in rows) == ["fault-a", "fault-b"]
+    # The loser re-read the sidecar under the lock and found it empty, rather than replaying a
+    # snapshot taken before the winner wrote.
+    assert notes == ["No accounting fault to reconcile."]
+
+
+def test_the_held_row_sidecar_is_never_published_by_truncating_it(tmp_path, monkeypatch):
+    # The sidecar IS the held rows. `Path.write_text` truncates in place, so a volume that fills
+    # between the truncate and the write leaves 0 bytes under the real name — and `_parked_faults`
+    # reads 0 bytes as "nothing is parked", which is the most permissive answer there is drawn from
+    # the least readable input. `atomic_write_text` stages a sibling and renames, so a failed publish
+    # is a no-op. This is the narrow half of #123; the lock above is the headline.
+    ledger = tmp_path / "usage-ledger.jsonl"
+    ledger.mkdir()  # unwritable as a file: every replay fails, so every row stays held
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
+    sidecar = usage.ledger_fault_path(ledger)
+    held = [_held_row("fault-a", prompt=10, completion=2), _held_row("fault-b", prompt=20, completion=4)]
+    sidecar.write_text("".join(json.dumps(row) + "\n" for row in held), encoding="utf-8")
+
+    real_write_text = Path.write_text
+
+    def refuse_truncating_publish(self, *args, **kwargs):
+        assert self != sidecar, "the sidecar was published by truncation, not by rename"
+        return real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", refuse_truncating_publish)
+
+    with pytest.raises(OSError):
+        usage.reconcile_accounting()
+
+    # Nothing was replayable, so nothing was dropped: both rows are still held and still refuse spend.
+    still_held = [json.loads(line) for line in sidecar.read_text(encoding="utf-8").splitlines()]
+    assert sorted(row["id"] for row in still_held) == ["fault-a", "fault-b"]
+    assert "UNRECONCILED" in (usage.accounting_fault() or "")
