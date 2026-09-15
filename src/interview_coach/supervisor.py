@@ -361,7 +361,12 @@ def build_session_graph(
             return {"study_plan": None, "study_plan_error": f"{type(err).__name__}: {err}"}
         return {"study_plan": plan.model_dump(mode="json"), "study_plan_error": None}
 
-    def _versioned(node: Callable[[SessionState], dict[str, Any]]) -> Callable[[SessionState], dict[str, Any]]:
+    # Returns Any, deliberately and narrowly: `add_node`'s overloads solve their node TypeVar from a
+    # concrete `def`, and cannot solve it from a `Callable[...]` value — it resolves to `Never`, so a
+    # correctly-typed wrapper is rejected. The closure BODY below is still fully checked, and the
+    # parameter type still checks that a real node is what gets wrapped; only the handoff to langgraph
+    # is untyped. (Reproduced in isolation against langgraph's own stubs.)
+    def _versioned(node: Callable[[SessionState], dict[str, Any]]) -> Any:
         """Gate the version on the way in, stamp it on the way out — on every node, every superstep.
 
         Stamping only in ``initial_session_state`` was the bug: LangGraph merges only the keys a node
