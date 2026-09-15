@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -219,7 +220,13 @@ def worst_case_session_tokens(max_questions: int, max_turns: int) -> int:
 
 def session_token_budget(*, max_questions: int, max_turns: int) -> int:
     """Tokens THIS RUN of the Session may spend. ``LLM_SESSION_TOKEN_BUDGET`` overrides (flat)."""
-    return _env_int("LLM_SESSION_TOKEN_BUDGET", worst_case_session_tokens(max_questions, max_turns))
+    ceiling = min(
+        # The `min` binds only in degenerate shapes (no questions, an absurd max_turns); it is kept so
+        # the rail can never exceed what the Session could possibly cost.
+        worst_case_session_tokens(max_questions, max_turns),
+        session_ceiling_multiple(max_turns) * estimated_session_tokens(max_questions),
+    )
+    return _env_int("LLM_SESSION_TOKEN_BUDGET", ceiling)
 
 
 def daily_question_cap() -> int:
@@ -231,13 +238,52 @@ def estimated_session_tokens(n_questions: int, *, include_setup: bool = True) ->
 
     The typical-cost estimate, not the ceiling: it answers "will this fit in what is left of the
     day?" for the start gate, where over-estimating refuses Sessions the day could have paid for.
-    ``worst_case_session_tokens`` answers the opposite question and is ~28x larger by design.
+    ``worst_case_session_tokens`` answers the opposite question and is far larger by design — it is
+    NOT the runaway ceiling; ``session_ceiling_multiple`` times this estimate is (NEW-09).
 
     ``include_setup=False`` is the *remaining* cost mid-Session: the Diagnostic already ran and is
     not paid for twice.
     """
     setup = SESSION_SETUP_TOKENS if include_setup else 0
     return setup + max(0, n_questions) * SESSION_TOKENS_PER_QUESTION
+
+
+# --- the runaway rail: the admission estimate, times what a COMPLIANT Session can add to it --------
+#
+# The worst-case model multiplies every call by its retry budget AND by the failover factor: at
+# max_questions=10 that is 2,116,800 tokens, 85% of the whole day, and ~40x the ~53,000 the SAME
+# Session was admitted on by `start_refusal_reason`. A rail 40x the model the gate admitted on is not
+# a rail — one Candidate can legitimately spend the day and nothing but the day counter notices. So
+# the ceiling is sized on the estimate itself, and the multiple is DERIVED from the same measured
+# constants, not chosen: a future tuner has to move a number with a ledger behind it.
+MEASURED_CALLS_PER_QUESTION = 3  # the measured clusters above: 1 Diagnostic + 5x3 + 1 planner
+MEASURED_SESSION_CALLS = 16  # the 26,866-token cluster above, i.e. 1,679 tokens/call
+COMMITTEE_CALLS = PANEL_CALLS - 2 * STRUCTURED_ATTEMPTS - (EVALUATION_CALLS - JUDGE_ATTEMPTS)
+# A call can be bigger than that measured mean: the largest single call in the ledger is 2,700
+# (rounded) against 26,866/16 = 1,679 per call — 1.61x.
+CALL_SIZE_INFLATION = WORST_CASE_TOKENS_PER_CALL * MEASURED_SESSION_CALLS / HEAVIEST_MEASURED_SESSION_TOKENS
+
+
+def compliant_question_calls(max_turns: int) -> int:
+    """Calls one question makes with NO retry firing — every turn used, one committee, follow-ups.
+
+    The measured clusters the estimate comes from were single-turn questions with no committee, so
+    the estimate alone would suspend a legitimately long interview. This is the same call model as
+    ``worst_case_question_calls`` with every retry multiplier set to 1.
+    """
+    turns = max(1, max_turns)
+    return (
+        1  # seed render (vn/mixed; `en` makes none)
+        + turns  # one judgment per turn
+        + PANEL_ESCALATIONS_PER_QUESTION * COMMITTEE_CALLS  # skeptic + advocate + re-judgment
+        + (turns - 1) * 2  # each follow-up: the forced lookup_concept call, then the final answer
+        + 1  # supervisor
+    )
+
+
+def session_ceiling_multiple(max_turns: int) -> int:
+    """How many times its own admitted estimate a Session may spend before it is a runaway."""
+    return math.ceil(CALL_SIZE_INFLATION * compliant_question_calls(max_turns) / MEASURED_CALLS_PER_QUESTION)
 
 
 class SessionBudgetSuspended(RuntimeError):

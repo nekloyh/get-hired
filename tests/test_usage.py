@@ -270,11 +270,61 @@ def test_the_ceiling_scales_with_the_rails_the_session_declared():
     assert worst_case_question_calls(0) == worst_case_question_calls(1)
 
 
+def test_the_runaway_rail_is_sized_on_the_estimate_the_session_was_admitted_on(monkeypatch):
+    # NEW-09: the start gate admits a Session on estimated_session_tokens(); the rail that calls it a
+    # runaway must price it with the SAME cost model, not with one an order of magnitude larger. The
+    # gap was measured at ~29x before the failover multiplier (NEW-06) and ~40x after it, which put a
+    # single 10-question web Candidate's ceiling at 85% of the whole day.
+    monkeypatch.delenv("LLM_SESSION_TOKEN_BUDGET", raising=False)
+    for questions in (1, 3, 10):
+        admitted = estimated_session_tokens(questions)
+        ceiling = session_token_budget(max_questions=questions, max_turns=4)
+        assert ceiling <= usage.session_ceiling_multiple(4) * admitted, (
+            f"{questions}q: admitted at ~{admitted:,}, runaway rail at ~{ceiling:,} "
+            f"({ceiling / admitted:.1f}x the estimate it was admitted on)"
+        )
+    # And no single Candidate is handed a majority of the day (the web caps max_questions at 10).
+    assert session_token_budget(max_questions=10, max_turns=4) < DEFAULT_DAILY_TOKEN_BUDGET // 4
+
+
+def test_the_ceiling_multiple_is_derived_from_the_measured_constants_not_chosen():
+    # Both factors are measurements, so the number moves when the measurements do — and a future
+    # tuner has to change a constant with a ledger behind it rather than a magic multiplier.
+    assert usage.compliant_question_calls(4) == 15  # 1 seed + 4 judgments + 3x2 follow-ups + 3 panel + 1 supervisor
+    assert usage.CALL_SIZE_INFLATION == pytest.approx(2_700 * 16 / 26_866)
+    assert usage.session_ceiling_multiple(4) == 9
+    # Proportional to the rails the Session declared, which is what the worst-case model argues for.
+    assert [usage.session_ceiling_multiple(t) for t in (1, 2, 4, 8)] == [4, 5, 9, 15]
+
+
+def test_the_default_rail_suspends_a_session_spending_ten_times_its_admitted_estimate(tmp_path, monkeypatch):
+    # No LLM_SESSION_TOKEN_BUDGET: the ceiling that SHIPS, not a test-shrunk stand-in. Every other
+    # runaway test opts out of the default, so nothing in the suite exercised the real one.
+    _ledger(tmp_path, monkeypatch)
+    monkeypatch.delenv("LLM_SESSION_TOKEN_BUDGET", raising=False)
+    spent = 10 * estimated_session_tokens(5)  # 270,000 on a Session admitted at ~27,000
+    begin_session_run("sess-a")
+    with session_scope("sess-a"):
+        record_usage("openai", "m", prompt_tokens=spent, completion_tokens=0)
+
+    reason = _stop(session_id="sess-a")
+
+    assert reason is not None
+    assert "runaway, not a long interview" in reason
+    # ADR 0005's third category: suspend-and-resume, never a failed question, and the remedy is one
+    # a web Candidate can perform.
+    assert "Suspending with 1 question(s) resolved" in reason
+    assert "Resume this Session to continue" in reason
+
+
 def test_session_budget_env_override(monkeypatch):
     monkeypatch.setenv("LLM_SESSION_TOKEN_BUDGET", "77")
     assert session_token_budget(max_questions=5, max_turns=4) == 77
     monkeypatch.setenv("LLM_SESSION_TOKEN_BUDGET", "not-a-number")
-    assert session_token_budget(max_questions=5, max_turns=4) == worst_case_session_tokens(5, 4)
+    # NEW-09: the default the override falls back to is the ceiling sized on the admitted estimate,
+    # not the retry-storm worst case — which was ~40x it and 85% of the day at max_questions=10.
+    default = usage.session_ceiling_multiple(4) * estimated_session_tokens(5)
+    assert session_token_budget(max_questions=5, max_turns=4) == default
 
 
 def test_daily_question_cap_env_override(monkeypatch):

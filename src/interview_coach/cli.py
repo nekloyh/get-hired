@@ -88,7 +88,6 @@ from .supervisor import (
 )
 from .ui import render_skill_state_rows
 from .usage import (
-    WORST_CASE_TOKENS_PER_CALL,
     AccountingUnavailable,
     ProviderQuotaExhausted,
     SessionBudgetSuspended,
@@ -103,6 +102,7 @@ from .usage import (
     reconcile_accounting,
     remaining_today,
     session_budget_guard,
+    session_ceiling_multiple,
     session_scope,
     session_token_budget,
     sessions_for_day,
@@ -110,6 +110,7 @@ from .usage import (
     usage_for_day,
     utc_date,
     worst_case_session_calls,
+    worst_case_session_tokens,
 )
 
 # What every subcommand receives (ADR 0010): the per-role bundle from main(), a bare client when a
@@ -822,8 +823,10 @@ def _cmd_usage(client: ClientArg, args: argparse.Namespace) -> int:
     print(
         f"Per-run budget for a default {DEFAULT_MAX_QUESTIONS}x{DEFAULT_MAX_TURNS} Session: "
         f"{session_token_budget(max_questions=DEFAULT_MAX_QUESTIONS, max_turns=DEFAULT_MAX_TURNS):,} tokens "
-        f"({default_calls} worst-case provider calls x {WORST_CASE_TOKENS_PER_CALL:,}); "
-        f"measured Sessions run ~{estimated_session_tokens(DEFAULT_MAX_QUESTIONS):,}."
+        f"({session_ceiling_multiple(DEFAULT_MAX_TURNS)}x the "
+        f"~{estimated_session_tokens(DEFAULT_MAX_QUESTIONS):,} a measured Session runs; a full retry "
+        f"storm would be {worst_case_session_tokens(DEFAULT_MAX_QUESTIONS, DEFAULT_MAX_TURNS):,} "
+        f"over {default_calls} worst-case provider calls)."
     )
     print(f"Daily question cap: {daily_question_cap()} question(s) per token identity.")
     return 0
