@@ -2256,6 +2256,60 @@ def test_only_one_reconnect_waits_on_a_stale_run_at_a_time(tmp_path):
     assert api_state.runtimes["y"] is first
 
 
+def test_a_mass_reconnect_neither_pins_the_default_executor_nor_stalls_a_new_socket(tmp_path, monkeypatch):
+    # NEW-03. The join blocks a whole thread for up to STALE_RUNTIME_JOIN_SECONDS, and on
+    # `run_in_executor(None, ...)` that thread comes out of the loop's SHARED default executor
+    # (min(32, cpu+4)). "One waiter per id" bounds waiters per id, not globally, so a mass reconnect —
+    # an nginx restart, a cohort resuming after sleep — fills it, and the next arrival queues INSIDE
+    # the executor: its socket sits silent for the length of someone else's join instead of being
+    # refused, and so does every other user of the default executor on this loop (`getaddrinfo`).
+    import asyncio
+
+    monkeypatch.setattr(web_api, "STALE_RUNTIME_JOIN_SECONDS", 5.0)
+    api_state = _app(tmp_path).state.web_api
+    gate = threading.Event()
+    ids = [f"mass-{n}" for n in range(40)]  # more than min(32, cpu+4), whatever the box
+
+    for session_id in ids:
+        stale = web_api.RuntimeSession(session_id=session_id, mode="demo", emit=lambda event: None, socket_closed=True)
+        stale.thread = threading.Thread(target=gate.wait, daemon=True)
+        stale.thread.start()
+        api_state.runtimes[session_id] = stale
+
+    async def scenario():
+        claims = [
+            asyncio.create_task(
+                web_api._claim_session_id(
+                    api_state, sid, web_api.RuntimeSession(session_id=sid, mode="demo", emit=lambda event: None)
+                )
+            )
+            for sid in ids
+        ]
+        await asyncio.sleep(0.2)  # every claim has reached its join or been refused
+        waiting, settled = len(api_state.waiting), sum(1 for claim in claims if claim.done())
+        try:
+            # Nothing to do with reconnects: just "is the loop's shared executor still usable?"
+            probe = await asyncio.wait_for(asyncio.get_running_loop().run_in_executor(None, lambda: "free"), 1.0)
+        except TimeoutError:
+            probe = "pinned"
+        gate.set()
+        return waiting, settled, probe, await asyncio.gather(*claims)
+
+    try:
+        waiting, settled, probe, outcomes = asyncio.run(scenario())
+    finally:
+        gate.set()
+
+    assert probe == "free", "the stale-run joins pinned the asyncio default executor"
+    cap = web_api.MAX_CONCURRENT_STALE_JOINS
+    assert waiting <= cap, f"{waiting} reconnects were joining at once; the cap is {cap}"
+    # Refused, not stalled: the over-cap claims answered while the joins were still in flight.
+    assert settled == len(ids) - cap
+    assert outcomes.count(web_api._TOO_MANY_JOINS) == len(ids) - cap
+    assert outcomes.count(None) == cap
+    assert api_state.waiting == set()
+
+
 # --- AUDIT §3.1 row 3: bounded inputs --------------------------------------------------------------
 
 

@@ -11,8 +11,9 @@ import secrets
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import suppress
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from hashlib import sha256
@@ -81,6 +82,15 @@ ANSWER_QUEUE_MAXSIZE = 8
 # one timed-out call plus a retry (LLM_TIMEOUT_SECONDS 60 x 2); a full 4-attempt retry storm can run
 # ~4 minutes, in which case the client is told to retry rather than the wait growing to match.
 STALE_RUNTIME_JOIN_SECONDS = 120.0
+
+# NEW-03. That join blocks a whole thread, so it gets its own bounded pool: on the loop's default
+# executor (min(32, cpu+4)) a mass reconnect — an nginx restart, a cohort resuming after sleep —
+# pins every thread the loop shares with `getaddrinfo` and every other `run_in_executor(None, ...)`,
+# and the NEXT reconnect queues inside the executor, so its socket sits silent for the length of
+# someone else's join instead of being refused. "One waiter per id" bounds waiters per id, not
+# globally, which is why the pool is paired with a global cap of the same size: with max_workers ==
+# the cap an admitted join always gets a thread, and a refused one never waits for one.
+MAX_CONCURRENT_STALE_JOINS = 8
 
 # Completed states kept in RAM; the export endpoint falls back to the Markdown `_persist_export` wrote.
 MAX_COMPLETED_SESSIONS_IN_MEMORY = 64
@@ -372,6 +382,13 @@ class WebApiState:
     runtimes: dict[str, RuntimeSession] = field(default_factory=dict)
     # Session ids with a reconnect currently waiting for the previous run's thread: one waiter per id.
     waiting: set[str] = field(default_factory=set)
+    # NEW-03: stale-run joins run here, never on the loop's shared default executor. Threads are
+    # spawned on demand, so an app that never sees a reconnect never pays for one.
+    join_pool: ThreadPoolExecutor = field(
+        default_factory=lambda: ThreadPoolExecutor(
+            max_workers=MAX_CONCURRENT_STALE_JOINS, thread_name_prefix="stale-join"
+        )
+    )
     # Guards every read/write of `runtimes`, `waiting`, and the eviction in `completed_sessions`.
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -582,7 +599,14 @@ def create_app(
         exports_dir=str(exports_dir if exports_dir is not None else resolved.exports_dir),
     )
     _validate_auth_settings(api_state.settings)
-    app = FastAPI(title="Adaptive Interview Coach API")
+
+    @asynccontextmanager
+    async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
+        yield
+        # wait=False: a shutdown must not block uvicorn for the length of a 120s join.
+        api_state.join_pool.shutdown(wait=False, cancel_futures=True)
+
+    app = FastAPI(title="Adaptive Interview Coach API", lifespan=_lifespan)
     app.state.web_api = api_state
     origins = allowed_origins(api_state.settings)
     if not api_state.settings.auth_token:
@@ -1132,6 +1156,7 @@ def _run_session_thread(
 
 _ACTIVE_ELSEWHERE = "This Session id already has an active connection."
 _STILL_FINISHING = "The previous run of this Session is still finishing; retry in a moment."
+_TOO_MANY_JOINS = "The server is already waiting on the maximum number of previous runs; retry in a moment."
 _ALREADY_CHECKPOINTED = (
     "This Session id already has saved progress. Resume it to continue where you left off, or use "
     '"New session" to get a fresh id — starting over here would overwrite the saved report.'
@@ -1150,12 +1175,24 @@ async def _claim_session_id(api_state: WebApiState, session_id: str, runtime: Ru
         if session_id in api_state.waiting:
             # One waiter per id: a second reconnect must not pin another executor thread on the join.
             return _STILL_FINISHING
+        if len(api_state.waiting) >= MAX_CONCURRENT_STALE_JOINS:
+            # NEW-03: per-id is not a global bound. Past the cap a reconnect is refused IMMEDIATELY,
+            # because the alternative is not a slower answer but no answer at all: the claim would
+            # queue inside the pool and the socket would stay silent for someone else's join.
+            logger.warning(
+                "refusing a reconnect for %r: %d stale-run joins already in flight",
+                session_id,
+                len(api_state.waiting),
+            )
+            return _TOO_MANY_JOINS
         api_state.waiting.add(session_id)
     try:
         if stale.thread is not None and stale.thread.is_alive():
             # Closed socket, thread still winding down: cancellation is already signalled, so the only
             # long wait is an in-flight provider call.
-            await asyncio.get_running_loop().run_in_executor(None, stale.thread.join, STALE_RUNTIME_JOIN_SECONDS)
+            await asyncio.get_running_loop().run_in_executor(
+                api_state.join_pool, stale.thread.join, STALE_RUNTIME_JOIN_SECONDS
+            )
             if stale.thread.is_alive():
                 return _STILL_FINISHING
         with api_state.lock:
