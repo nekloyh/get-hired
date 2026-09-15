@@ -715,8 +715,8 @@ def _cmd_usage(client: ClientArg, args: argparse.Namespace) -> int:
             print(reconcile_accounting())
         except OSError as err:
             print(
-                f"Could not reconcile: {type(err).__name__}: {err}. The ledger at {ledger} is still "
-                f"not writable, so the held rows stay held and metered calls stay refused.",
+                f"Could not reconcile: {type(err).__name__}: {err}. Nothing was replayed for the ledger "
+                f"at {ledger}, so the held rows stay held and metered calls stay refused.",
                 file=sys.stderr,
             )
             return 2

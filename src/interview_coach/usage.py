@@ -429,21 +429,69 @@ def _append(entry: dict[str, object], path: Path | None) -> None:
         _latch_fault(entry, err, target)
 
 
+def _unreadable_fault(target: Path, sidecar: Path, error: str, *, whole_file: bool) -> dict[str, Any]:
+    """A fault standing in for held rows we cannot read. Unknown spend, never forgiven spend.
+
+    ``billed`` is True on purpose: the one answer that must never be *inferred* from "cannot read" is
+    "nothing was spent". It carries no ``entry``, so :func:`reconcile_accounting` already counts it
+    exactly as it counts a fault whose row was never parked — lost, and said out loud.
+    """
+    return {
+        "ts": _now_ts(),
+        "kind": "accounting_fault",
+        "row": "unreadable_sidecar" if whole_file else "unreadable_row",
+        "billed": True,
+        "ledger": str(target),
+        "unreadable": str(sidecar),
+        "error": error,
+    }
+
+
 def _parked_faults(target: Path) -> list[dict[str, Any]]:
     """Every unresolved fault: the sidecar's rows, plus anything this process could not park."""
     faults: list[dict[str, Any]] = []
     sidecar = ledger_fault_path(target)
     try:
         text = sidecar.read_text(encoding="utf-8")
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
+        # The only two errors that mean "nothing is parked here" rather than "something may be parked
+        # here and we cannot see it": no file, or no directory that could hold one. Both are the
+        # healthy shape — on a working deployment the sidecar never exists at all.
+        text = ""
+    except (OSError, UnicodeDecodeError) as err:
+        # It is there and we cannot read it. A sidecar left 0600 root:root by an older container while
+        # the ledger itself was repaired is exactly the permission class this slice exists for.
+        # Reading that as "no faults" is the most permissive answer there is, drawn from the least
+        # readable input, and it lets metered work resume over spend that may still be unaccounted
+        # for. So the unreadable sidecar IS the unresolved fault until someone can read it.
+        logger.error(
+            "the held-row sidecar at %s exists but could not be read (%s: %s); metered calls are "
+            "refused until it can be, because what it holds may be a billed call",
+            sidecar,
+            type(err).__name__,
+            err,
+        )
+        faults.append(_unreadable_fault(target, sidecar, f"{type(err).__name__}: {err}", whole_file=True))
         text = ""
     for line in text.splitlines():
+        if not line.strip():
+            continue
         try:
             row = json.loads(line)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as err:
+            # A torn last line is a parked row whose write was cut short: unparseable, but evidence
+            # that something WAS parked. Skipping it is the same forgiveness as above, one row at a
+            # time, so it becomes a fault carrying no replayable row instead.
+            logger.error(
+                "a row in %s could not be parsed (%s); it is held as unknown spend, not dropped", sidecar, err
+            )
+            faults.append(_unreadable_fault(target, sidecar, f"{type(err).__name__}: {err}", whole_file=False))
             continue
         if isinstance(row, dict):
             faults.append(row)
+        else:
+            logger.error("a row in %s is not a JSON object (%r); it is held as unknown spend", sidecar, row)
+            faults.append(_unreadable_fault(target, sidecar, "row is not a JSON object", whole_file=False))
     with _FAULT_LOCK:
         faults.extend(fault["record"] for fault in _FAULTS if not fault["parked"])
     return faults
@@ -464,6 +512,18 @@ def accounting_fault(*, path: Path | None = None) -> str | None:
     # survived only in memory. Once it is on disk it outlives this process, which is the difference
     # between a remembered fault and a forgotten one.
     _flush_faults(target)
+    if unreadable := [fault for fault in faults if fault.get("unreadable")]:
+        # First, because it is the stronger statement: this is not a report of what the held rows say,
+        # it is a report that we cannot read them. Whether one of them is a billed call is unknown —
+        # and unknown is not zero.
+        return (
+            f"Usage accounting is UNRECONCILED: {len(unreadable)} held row(s) beside the ledger at "
+            f"{target} cannot be read ({unreadable[0].get('error')}). The sidecar "
+            f"{ledger_fault_path(target)} exists only because a ledger write failed, so its contents "
+            f"are unknown spend, not zero spend, and metered calls are refused until it can be read. "
+            f"Restore read access to that file (in the container it belongs to the same uid as the "
+            f"ledger, 10001), then run `coach usage --reconcile`."
+        )
     billed = [fault for fault in faults if fault.get("billed")]
     if billed:
         tokens = 0
@@ -562,6 +622,14 @@ def reconcile_accounting(*, path: Path | None = None) -> str:
     faults = _parked_faults(target)
     if not faults:
         return "No accounting fault to reconcile."
+    if any(fault.get("row") == "unreadable_sidecar" for fault in faults):
+        # Everything below ends by rewriting the sidecar to hold exactly what it could not replay —
+        # which, for a file we were never able to read, is nothing. That would delete the held rows
+        # and report success. Refuse instead: nothing read, nothing replayed, nothing cleared.
+        raise OSError(
+            f"the held-row sidecar at {ledger_fault_path(target)} cannot be read, so its rows cannot "
+            f"be replayed; nothing was changed and metered calls stay refused"
+        )
     replayed = 0
     tokens = 0
     unreplayed: list[dict[str, Any]] = []

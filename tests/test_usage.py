@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from datetime import UTC, datetime
 
@@ -950,6 +951,95 @@ def test_the_call_gate_remembers_a_good_path_but_re_probes_a_bad_one(tmp_path, m
 
     assert usage.accounting_gate() is None
 
+
+def test_a_sidecar_we_cannot_read_blocks_instead_of_reading_as_no_faults(tmp_path, monkeypatch, caplog):
+    # QA-04. The realistic shape: an older root container left the sidecar 0600 root:root, then the
+    # ledger path itself was fixed. "Cannot read the parked rows" must never collapse into "nothing
+    # was parked" — that is the same forgiveness as counting an unrecorded call as zero, one file at
+    # a time, and it is the only place in this module where the money path fails OPEN.
+    ledger = _broken_ledger(tmp_path, monkeypatch)
+    record_usage("openai", "gpt-5.4-mini", prompt_tokens=1000, completion_tokens=200)
+    sidecar = usage.ledger_fault_path(ledger)
+    ledger.rmdir()  # the operator fixes the ledger path...
+    sidecar.chmod(0o000)  # ...but not the file holding the billed row
+    usage.reset_accounting_state()  # a fresh process: only the sidecar remembers
+
+    with caplog.at_level(logging.ERROR, logger="interview_coach.usage"):
+        reason = usage.accounting_gate()
+
+    assert reason is not None
+    assert "UNRECONCILED" in reason
+    assert str(sidecar) in reason
+    # Logged the way an unreadable *ledger* already is (`_all_rows`): a fault nobody can see is a
+    # fault nobody fixes.
+    assert any(str(sidecar) in record.getMessage() for record in caplog.records)
+
+
+def test_reconcile_never_clears_a_sidecar_it_could_not_read(tmp_path, monkeypatch):
+    # Reconciliation ends by rewriting the sidecar to hold exactly what it could not replay — which,
+    # for a file it never read, is nothing. Clearing it here would delete a billed row AND report
+    # success, which is strictly worse than the fault it was called to fix.
+    ledger = _broken_ledger(tmp_path, monkeypatch)
+    record_usage("openai", "gpt-5.4-mini", prompt_tokens=1000, completion_tokens=200)
+    sidecar = usage.ledger_fault_path(ledger)
+    ledger.rmdir()
+    sidecar.chmod(0o000)
+    usage.reset_accounting_state()
+
+    with pytest.raises(OSError):
+        usage.reconcile_accounting()
+
+    assert sidecar.exists()
+    assert usage.accounting_block_reason() is not None
+
+    sidecar.chmod(0o600)  # readable again: the held row was there all along
+
+    assert "Reconciled 1 held ledger row(s)" in usage.reconcile_accounting()
+    assert usage.usage_for_day()["openai"]["total"] == 1200
+
+
+def test_a_torn_row_in_the_sidecar_is_held_as_unknown_spend_not_dropped(tmp_path, monkeypatch):
+    # A process killed mid-append leaves a half-written last line. Skipping it on the decode error is
+    # the same forgiveness one row at a time: the fault clears, the tokens never come back, and
+    # nobody is told. It has to count as a fault carrying no replayable row instead.
+    ledger = tmp_path / "usage-ledger.jsonl"
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
+    good = {
+        "ts": utc_date() + "T00:00:00+00:00",
+        "kind": "accounting_fault",
+        "billed": True,
+        "entry": {
+            "ts": utc_date() + "T00:00:00+00:00",
+            "provider": "openai",
+            "model": "m",
+            "prompt_tokens": 1000,
+            "completion_tokens": 200,
+        },
+    }
+    usage.ledger_fault_path(ledger).write_text(
+        json.dumps(good) + "\n" + '{"ts": "2026-09-15T00:00:00+00:00", "kind": "accounting_fau',
+        encoding="utf-8",
+    )
+
+    note = usage.reconcile_accounting()
+
+    assert "Reconciled 1 held ledger row(s)" in note  # the intact row still replays
+    assert "stays unknown, not zero" in note  # ...and the torn one is said out loud, not dropped
+
+
+def test_a_sidecar_that_is_not_valid_utf8_does_not_crash_the_call_gate(tmp_path, monkeypatch):
+    # `read_text` raises UnicodeDecodeError, which is a ValueError, so it escapes the OSError catch
+    # entirely — and `chat_json` RETRIES ValueError. An accounting gate the caller retries is not a
+    # gate, and the StructuredOutputError it finally becomes is indistinguishable from a bad model
+    # reply. It has to block, like every other unreadable-sidecar shape.
+    ledger = tmp_path / "usage-ledger.jsonl"
+    monkeypatch.setenv("COACH_USAGE_LEDGER", str(ledger))
+    usage.ledger_fault_path(ledger).write_bytes(b'{"kind": "accounting_fault", "billed": true}\n\xff\xfe')
+
+    reason = usage.accounting_gate()
+
+    assert reason is not None
+    assert "UNRECONCILED" in reason
 
 # --- AUDIT §3.2 row 3: the question-cap check and the reservation are one atomic step -------------
 
