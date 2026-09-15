@@ -269,3 +269,22 @@ def save_posteriors(
             atomic_write_text(target, json.dumps(data, indent=2, sort_keys=True))
         except OSError as err:
             logger.warning("Could not write Skill ledger at %s (%s); Session memory not persisted.", path, err)
+
+
+def save_measured_posteriors(
+    path: str | Path,
+    candidate_id: str,
+    measured: Mapping[str, SkillState],
+    *,
+    now: float,
+) -> None:
+    """Persist a Session's MEASURED posteriors without erasing what earlier Sessions measured.
+
+    ``save_posteriors`` replaces a Candidate's whole record, so handing it only this Session's probed
+    Skills would drop every Skill measured in an earlier one — trading a fake-evidence bug for a
+    lost-evidence bug. Carrying ``load_states`` forward first is the same decay-before-observe
+    composition the post-mortem already uses: the carried params are decayed to ``now`` BEFORE the
+    save restamps the record's decay clock, so nothing is silently un-decayed.
+    """
+    carried = load_states(path, candidate_id, now=now) or {}
+    save_posteriors(path, candidate_id, {**carried, **measured}, now=now)

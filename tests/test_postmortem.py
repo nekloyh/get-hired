@@ -34,6 +34,7 @@ from interview_coach.postmortem import (
     run_postmortem,
 )
 from interview_coach.skill import (
+    NEUTRAL_ALPHA,
     POSTMORTEM_WEIGHT_RATIO,
     SkillState,
     apply_evaluation,
@@ -408,3 +409,20 @@ def test_an_accounting_fault_in_the_replan_stops_the_command_and_keeps_the_fusio
     weight = POSTMORTEM_WEIGHT_RATIO * confidence_weight(conf)
     reloaded = load_states(path, "alice", now=NOW)
     assert reloaded["mlops"].alpha == pytest.approx(8.0 + weight * score_to_quality(score))
+
+
+def test_the_postmortem_persists_evidence_for_a_skill_with_no_transcript_item_at_all(tmp_path, make_client):
+    # The guard for NEW-17's blast radius. A post-mortem has NO transcript — `_synthesized_session_state`
+    # carries an empty one — so routing it through the Session's transcript-shaped predicate would make
+    # it persist nothing at all, silently. Its evidence is the reconstructed scorecard, which is real
+    # (second-hand, at half weight) for Skills that were never probed in any Session.
+    path = tmp_path / "ledger.json"
+    score, conf = 2.0, 0.4
+    client, _ = make_client([*_elicitation_replies(), _scorecard(_entry(score=score, confidence=conf))])
+
+    run_postmortem(client, ScriptedCandidate(_answers()), candidate_id="alice", ledger_db=path, now=NOW)
+
+    states = load_states(path, "alice", now=NOW)
+    assert states is not None and "mlops" in states
+    weight = POSTMORTEM_WEIGHT_RATIO * confidence_weight(conf)
+    assert states["mlops"].alpha == pytest.approx(NEUTRAL_ALPHA + weight * score_to_quality(score))

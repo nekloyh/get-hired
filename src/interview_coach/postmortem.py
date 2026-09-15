@@ -188,6 +188,12 @@ def run_postmortem(
     states_after = fuse_scorecard(states_before, scorecard)
     # save_posteriors replaces the whole record and restamps the decay clock, so the untouched
     # Skills' *decayed* states ride along — their mass is preserved, not silently un-decayed.
+    # NEW-17 deliberately does NOT apply here: `save_measured_posteriors`' predicate is the
+    # TRANSCRIPT, and a post-mortem has none — `_synthesized_session_state` carries an empty one, so
+    # a transcript-shaped filter would return {} and silently stop persisting the fused evidence.
+    # The rule the three callers share is "only evidence-bearing Skills"; each supplies its own
+    # notion of evidence, and here it is the reconstructed scorecard, which is real (second-hand,
+    # at half weight) for Skills that have no transcript item anywhere.
     save_posteriors(ledger_db, candidate_id, states_after, now=now)
 
     before_state = _synthesized_session_state(candidate_id, states_before, target_role, companies)

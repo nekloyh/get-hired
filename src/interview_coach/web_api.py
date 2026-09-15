@@ -40,10 +40,11 @@ from .demo_llm import DemoLLMClient
 from .diagnostic import CandidateProfile, diagnose_or_degrade
 from .exporter import export_session_markdown, render_session_markdown
 from .language import DEFAULT_LANGUAGE_MODE
-from .ledger import SAFE_CANDIDATE_ID, load_priors, save_posteriors
+from .ledger import SAFE_CANDIDATE_ID, load_priors, save_measured_posteriors
 from .llm import UNKNOWN_PROVIDER, LLMClient, build_client, build_role_clients, provider_label
 from .microloop import DEFAULT_MAX_TURNS, CandidateInputUnavailable, CandidateIntent
 from .resources import build_resource_store
+from .session_serde import measured_skill_states
 from .supervisor import (
     DEFAULT_MAX_ELAPSED_SECONDS,
     DEFAULT_MAX_QUESTIONS,
@@ -51,7 +52,6 @@ from .supervisor import (
     build_session_graph,
     initial_session_state,
     session_config,
-    skill_states_from_state,
 )
 from .usage import (
     AccountingUnavailable,
@@ -1061,10 +1061,13 @@ def _run_session_thread(
             # BEFORE the state enters the bounded RAM cache, so an evicted id always has its file.
             if final_state.get("status") == SessionStatus.COMPLETE.value:
                 _persist_export(api_state, runtime.session_id, final_state)
-                save_posteriors(
+                save_measured_posteriors(
                     api_state.ledger_db,
                     str(final_state.get("candidate_id", "")),
-                    skill_states_from_state(final_state),
+                    # NEW-17: only Skills this Session actually measured. `skill_states` holds a
+                    # belief for every Skill from the Diagnostic's seed onward, so the old write
+                    # persisted an unprobed self-claim as a measured posterior.
+                    measured_skill_states(final_state),
                     now=time.time(),
                 )
             _remember_completed(api_state, runtime.session_id, final_state)

@@ -54,7 +54,7 @@ from .exporter import export_session_markdown
 from .filelock import claimed
 from .forge import MAX_DRAFTS, ForgeError, render_forge_report, run_forge, write_forge_outputs
 from .language import DEFAULT_LANGUAGE_MODE, LANGUAGE_MODES
-from .ledger import SAFE_CANDIDATE_ID, is_safe_candidate_id, load_priors, save_posteriors
+from .ledger import SAFE_CANDIDATE_ID, is_safe_candidate_id, load_priors, save_measured_posteriors
 from .llm import (
     UNKNOWN_PROVIDER,
     LLMClient,
@@ -74,6 +74,7 @@ from .microloop import (
 from .postmortem import PostmortemResult, export_postmortem_markdown, run_postmortem
 from .resources import SEED_RESOURCES, ChromaResourceStore, build_resource_store
 from .seeds import QUESTION_BANK
+from .session_serde import measured_skill_states
 from .skill import POSTMORTEM_WEIGHT_RATIO, SkillState, confidence_weight
 from .supervisor import (
     DEFAULT_MAX_ELAPSED_SECONDS,
@@ -84,7 +85,6 @@ from .supervisor import (
     initial_session_state,
     resumable_session_state,
     session_config,
-    skill_states_from_state,
 )
 from .ui import render_skill_state_rows
 from .usage import (
@@ -589,7 +589,8 @@ def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
             return 2
     if args.candidate and final.get("status") == SessionStatus.COMPLETE.value:
         # Persist the final posteriors so the next Session for this Candidate starts warm (0023).
-        save_posteriors(args.ledger_db, args.candidate, skill_states_from_state(final), now=time.time())
+        # NEW-17: only Skills this Session actually measured — see `measured_skill_states`.
+        save_measured_posteriors(args.ledger_db, args.candidate, measured_skill_states(final), now=time.time())
     _print_session_summary(final)
     if args.export_markdown:
         path = export_session_markdown(final, args.export_markdown)

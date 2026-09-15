@@ -243,6 +243,23 @@ def skill_states_from_mapping(state: Mapping[str, Any]) -> dict[str, SkillState]
     return {skill: SkillState.from_dict(raw) for skill, raw in state.get("skill_states", {}).items()}
 
 
+def measured_skill_states(state: Mapping[str, Any]) -> dict[str, SkillState]:
+    """The Skills this Session actually MEASURED — the only ones that may enter the Skill ledger.
+
+    ``skill_states`` holds a belief for every canonical Skill from the moment the Diagnostic seeds it
+    from the Candidate's own claim, so persisting that mapping wholesale writes an unprobed 5/5 claim
+    into cross-session memory as a measured 0.800 posterior — where the next Session's seeding then
+    lets it OVERRIDE the same Candidate's honest self-assessment. ADR 0005: intent is never evidence.
+
+    The predicate is the TRANSCRIPT, not the belief. A `failed` item carries ``evidence_weight`` 0.0
+    by design (``TranscriptItem.failed``) and ``question_node`` never writes ``skill_states`` on that
+    path — so the belief standing for a failed-only Skill *is* the self-claim seed, and excluding it
+    keeps an infrastructure crash from laundering a claim into evidence (ADR 0005 again).
+    """
+    measured = {item.skill for item in transcript_items(state) if item.evidence_weight > 0.0}
+    return {skill: belief for skill, belief in skill_states_from_mapping(state).items() if skill in measured}
+
+
 def sorted_skill_states(state: Mapping[str, Any]) -> list[tuple[str, SkillState]]:
     """``(dict key, SkillState)`` pairs sorted by the **dict key**.
 

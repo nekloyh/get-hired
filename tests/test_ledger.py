@@ -23,8 +23,10 @@ from interview_coach.ledger import (
     is_safe_candidate_id,
     load_priors,
     load_states,
+    save_measured_posteriors,
     save_posteriors,
 )
+from interview_coach.session_serde import measured_skill_states
 from interview_coach.skill import NEUTRAL_ALPHA, NEUTRAL_BETA, SkillState, apply_evaluation
 
 DAY = SECONDS_PER_DAY
@@ -625,3 +627,85 @@ def test_export_shows_llm_calls_per_turn_with_the_provider_split():
 
     assert "LLM calls: **5**" in report
     assert "openai 4" in report and "groq 1" in report
+
+
+# --- NEW-17: only Skills this Session measured may enter the ledger -------------------------------
+
+
+def _measured_state():
+    """Three seeded beliefs; one Skill resolved, one crashed, one never probed at all."""
+    return {
+        "skill_states": {
+            "mlops": {"skill": "mlops", "alpha": 6.0, "beta": 2.0},
+            "system_design": {"skill": "system_design", "alpha": 3.0, "beta": 3.0},
+            "vietnamese_nlp": {"skill": "vietnamese_nlp", "alpha": 4.0, "beta": 1.0},
+        },
+        "transcript": [
+            {
+                "skill": "mlops",
+                "plan_index": 0,
+                "stop_reason": "resolved",
+                "resolved_weighted_score": 4.0,
+                "resolved_confidence": 0.8,
+                "evidence_weight": 1.8,
+                "skill_state": {"skill": "mlops", "alpha": 6.0, "beta": 2.0},
+                "turns": [],
+            },
+            {
+                "skill": "system_design",
+                "plan_index": 1,
+                "stop_reason": "failed",
+                "resolved_weighted_score": 0.0,
+                "resolved_confidence": 0.0,
+                "evidence_weight": 0.0,
+                "skill_state": {"skill": "system_design", "alpha": 3.0, "beta": 3.0},
+                "turns": [],
+                "error": "ConnectionError: provider timed out",
+            },
+        ],
+    }
+
+
+def test_only_skills_with_evidence_bearing_transcript_items_are_persisted(tmp_path):
+    # NEW-17 / ADR 0005. `skill_states` holds a belief for every canonical Skill from the moment the
+    # Diagnostic seeds it from the Candidate's own claim, so persisting it wholesale wrote an
+    # unprobed 5/5 self-claim into cross-session memory as a measured posterior — which the next
+    # Session then lets override that Candidate's honest self-assessment. `vietnamese_nlp` was never
+    # asked about; `system_design` crashed, and a crash is not evidence either (its evidence_weight
+    # is 0.0 by design), so the belief standing for it IS the self-claim seed.
+    path = tmp_path / "ledger.json"
+
+    save_measured_posteriors(path, "minh", measured_skill_states(_measured_state()), now=0.0)
+
+    persisted = json.loads(path.read_text(encoding="utf-8"))["minh"]["skills"]
+    assert sorted(persisted) == ["mlops"]
+
+
+def test_a_skill_measured_in_an_earlier_session_survives_a_session_that_never_probes_it(tmp_path):
+    # The regression the filter itself creates, and the reason the naive version must not ship:
+    # save_posteriors REPLACES a Candidate's whole record, so handing it only this Session's probed
+    # Skills would trade a fake-evidence bug for a lost-evidence bug. Carried params are decayed to
+    # `now` before the save restamps the decay clock, so nothing is silently un-decayed.
+    path = tmp_path / "ledger.json"
+    save_posteriors(path, "alice", {"mlops": SkillState("mlops", alpha=9.0, beta=1.0)}, now=0.0)
+    state = {
+        "skill_states": {"ml_fundamentals": {"skill": "ml_fundamentals", "alpha": 5.0, "beta": 2.0}},
+        "transcript": [
+            {
+                "skill": "ml_fundamentals",
+                "plan_index": 0,
+                "stop_reason": "resolved",
+                "resolved_weighted_score": 4.0,
+                "resolved_confidence": 0.8,
+                "evidence_weight": 1.8,
+                "skill_state": {"skill": "ml_fundamentals", "alpha": 5.0, "beta": 2.0},
+                "turns": [],
+            }
+        ],
+    }
+
+    save_measured_posteriors(path, "alice", measured_skill_states(state), now=0.0)
+
+    record = json.loads(path.read_text(encoding="utf-8"))["alice"]["skills"]
+    assert sorted(record) == ["ml_fundamentals", "mlops"]
+    assert record["mlops"]["alpha"] + record["mlops"]["beta"] == pytest.approx(10.0)  # carried, not re-seeded

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 import os
 import subprocess
@@ -699,6 +700,34 @@ def test_a_fresh_start_over_an_existing_checkpoint_is_refused(tmp_path):
     assert event["type"] == "session_error", f"a fresh start restarted over a saved Session: {event}"
     assert "resume" in event["error"].lower()  # the refusal has to name the remedy the UI can perform
     assert client.get("/api/sessions/returning/export.md").text == first_export
+
+
+def test_a_never_probed_self_claim_is_never_persisted_as_a_posterior(tmp_path):
+    # NEW-17 / ADR 0005: intent is never evidence. `skill_states` carries a belief for every Skill
+    # from the Diagnostic's seed onward, so the completion write persisted a 5/5 self-claim the
+    # Session never asked about as a measured posterior — and the next Session's seeding then lets
+    # that stale claim outrank the same Candidate's honest self-assessment and reports it as progress.
+    client = _test_client(tmp_path)
+    with client.websocket_connect("/api/sessions/claims") as ws:
+        ws.send_json(
+            {
+                "type": "start_session",
+                "mode": "demo",
+                "max_questions": 1,
+                "candidate_id": "minh",
+                "claimed_skills": {"vietnamese_nlp": 5, "mlops": 5, "system_design": 5},
+            }
+        )
+        _receive_until(ws, "question")
+        _answer(ws, "A reasonable answer about batching.")
+        completed = _receive_until(ws, "session_completed", limit=60)
+
+    probed = {item["skill"] for item in completed["state"]["transcript"] if item["evidence_weight"] > 0}
+    record = json.loads((tmp_path / "ledger.json").read_text(encoding="utf-8"))["minh"]
+
+    assert probed, "the Session measured nothing, so this test proves nothing"
+    assert set(record["skills"]) == probed
+    assert "vietnamese_nlp" not in record["skills"]  # a 5/5 claim, never asked about
 
 
 def test_an_unknown_session_is_still_a_404_after_the_disk_fallback(tmp_path):
