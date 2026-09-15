@@ -7,12 +7,25 @@ glossary.
 Development sequencing and acceptance gates live in **[the implementation plan](docs/issues/README.md)**.
 It links the existing slices and separates personal/trusted-pilot milestones from public-launch requirements.
 
-## Quickstart (live) — clone to a real interview in ~10 minutes
+## Quickstart (live) — clone to a real interview
 
 You need [uv](https://docs.astral.sh/uv/), Node 18+, and **one OpenAI API key**. Nothing else: no
 Chroma, no second provider, no Docker.
 
-**1. Clone and install** (~4 min, mostly `npm install`)
+**How long this takes**, measured on a clean clone on 2026-09-15 (R-04 / #59). Two numbers, because
+only one of them is ours to control:
+
+| | wall time | what it covers |
+|---|---:|---|
+| **Repo-controlled** — toolchain caches already warm | **8 s** | clone → `uv sync` → `npm install` → backend answering → a completed interview |
+| **Cold total** — nothing cached, everything downloaded | **38 s** | the above plus ~275 MB: a managed Python (103 MB, 4 s), the Python wheels (171 MB, 24 s) and `node_modules` (41 MB, 5 s) |
+
+Add however long it takes you to paste an API key. The cold number is **network-bound**, so it is
+the one that moves: it was measured on fast broadband, and on a slow link the three downloads
+dominate everything else the project does. The repo-controlled 8 s is what changes when this
+repository changes, and is the number to watch in review.
+
+**1. Clone and install** (~30 s cold, ~3 s warm)
 
 ```bash
 git clone https://github.com/nekloyh/get-hired.git && cd get-hired
@@ -209,7 +222,7 @@ cd web && npm run dev
 ```
 
 Then open `http://127.0.0.1:5173`. Choose `demo` mode to run without credentials; choose `live` once
-`.env` has the selected provider configured. See [Quickstart](#quickstart-live--clone-to-a-real-interview-in-10-minutes)
+`.env` has the selected provider configured. See [Quickstart](#quickstart-live--clone-to-a-real-interview)
 for the first-run walkthrough and for the auth settings needed before exposing this beyond localhost.
 
 ## Content packs (issue 0025 / ADR 0008)
