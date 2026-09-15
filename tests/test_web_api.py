@@ -560,6 +560,24 @@ def test_a_non_ascii_configured_token_refuses_to_start(tmp_path):
         _gated_client(tmp_path, token="mật-khẩu-chung")
 
 
+@pytest.mark.parametrize(
+    "origins",
+    ["*", " * ", "https://coach.example.com, *"],
+    ids=["bare", "padded", "buried-in-a-list"],
+)
+def test_a_wildcard_allowlist_refuses_to_start(tmp_path, origins):
+    # NEW-11. `*` fails OPEN on one surface and CLOSED on the other, which is why it must never
+    # start. CORS reads it as every origin and — allow_credentials being on — echoes the caller's own
+    # Origin back with a credentialed allow, so any page can read a transcript export; the WebSocket
+    # check compares it literally and rejects the deployed UI regardless. The operator who reached
+    # for it was chasing that very rejection, so they debug the socket and never look at CORS.
+    with pytest.raises(ValueError, match="must not contain") as caught:
+        _gated_client(tmp_path, origins=origins)
+
+    # The refusal has to name the value that works, or the next guess is wrong too.
+    assert "COACH_ALLOWED_ORIGINS=https://coach.example.com" in str(caught.value)
+
+
 def test_a_binary_frame_during_auth_closes_cleanly(tmp_path):
     # `receive_json` assumes a text frame; a binary one raises KeyError('text'), which is neither a
     # disconnect nor a validation error, so before the fix it escaped the endpoint as a traceback

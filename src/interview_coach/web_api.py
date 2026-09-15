@@ -158,8 +158,26 @@ SAFE_SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
 def allowed_origins(settings: Settings) -> tuple[str, ...]:
-    """Browser origins permitted to reach this API — one list for CORS and the WS handshake."""
+    """Browser origins permitted to reach this API — one list for CORS and the WS handshake.
+
+    ``*`` is refused, not honoured, because the two surfaces read it in opposite directions.
+    ``CORSMiddleware`` takes it as "every origin" and, because ``allow_credentials`` is on, answers
+    each request by echoing the caller's own Origin with a credentialed allow — so any page in the
+    operator's browser can read a transcript export back. The WebSocket check compares it as a
+    literal string, so the deployed UI is rejected anyway. An operator chasing the "will reject your
+    deployed UI" warning reaches for ``*``, gets the same rejection they were already debugging, and
+    never suspects what opened behind them. Refuse it at startup, where the cause is still visible,
+    exactly as a non-ASCII ``COACH_AUTH_TOKEN`` is refused.
+    """
     configured = [origin.strip() for origin in settings.allowed_origins.split(",") if origin.strip()]
+    if "*" in configured:
+        raise ValueError(
+            "COACH_ALLOWED_ORIGINS must not contain `*`: CORS reads it as every origin and, with "
+            "credentials allowed, hands any site that asks a readable copy of the transcript "
+            "export, while the WebSocket Origin check compares it literally and rejects your own "
+            "UI regardless. Set the exact origin serving the app, e.g. "
+            "`COACH_ALLOWED_ORIGINS=https://coach.example.com` (comma-separated for more than one)."
+        )
     return tuple(configured) if configured else DEFAULT_ALLOWED_ORIGINS
 
 
@@ -580,7 +598,7 @@ def create_app(
         logger.warning(
             "COACH_AUTH_TOKEN is set but COACH_ALLOWED_ORIGINS is empty: browser sockets are "
             "restricted to the dev-server origins %s, which will reject your deployed UI. Set "
-            "COACH_ALLOWED_ORIGINS to the origin serving the app.",
+            "COACH_ALLOWED_ORIGINS to the exact origin serving the app (`*` is refused).",
             ", ".join(DEFAULT_ALLOWED_ORIGINS),
         )
     app.add_middleware(
