@@ -660,11 +660,11 @@ def create_app(
                 try:
                     payload = _parse_payload(await receive_json_frame(websocket))
                 except ValueError as err:
-                    emit({"type": "session_error", "error": str(err)})
+                    emit(_frame_refused(str(err)))
                     continue
                 if isinstance(payload, StartSessionPayload):
                     if _is_running(runtime):
-                        emit({"type": "session_error", "error": "A Session is already running on this socket."})
+                        emit(_frame_refused("A Session is already running on this socket."))
                         continue
                     runtime.reset_run_state()
                     runtime.mode = _select_mode(payload.mode, api_state.settings)
@@ -677,7 +677,7 @@ def create_app(
                     )
                 elif isinstance(payload, ResumeSessionPayload):
                     if _is_running(runtime):
-                        emit({"type": "session_error", "error": "A Session is already running on this socket."})
+                        emit(_frame_refused("A Session is already running on this socket."))
                         continue
                     runtime.reset_run_state()
                     runtime.mode = _select_mode(payload.mode, api_state.settings)
@@ -706,22 +706,12 @@ def create_app(
                     # answer naming none cannot be bound to anything.
                     expected = runtime.awaiting_turn_id
                     if expected is None or payload.turn_id != expected:
-                        emit(
-                            {
-                                "type": "session_error",
-                                "error": "Answer refused: it does not answer the pending question.",
-                            }
-                        )
+                        emit(_frame_refused("Answer refused: it does not answer the pending question."))
                         continue
                     try:
                         runtime.answers.put_nowait(payload.answer)
                     except queue.Full:
-                        emit(
-                            {
-                                "type": "session_error",
-                                "error": "Answer dropped: earlier answers are still being processed.",
-                            }
-                        )
+                        emit(_frame_refused("Answer dropped: earlier answers are still being processed."))
                     else:
                         runtime.awaiting_turn_id = None
                 else:
@@ -868,6 +858,25 @@ def _parse_payload(raw: Any) -> ClientPayload:
         return model.model_validate(raw)
     except ValidationError as err:
         raise ValueError(str(err)) from err
+
+
+def _frame_refused(message: str) -> dict[str, Any]:
+    """A refusal the socket loop keeps looping after — the one ``session_error`` that is not fatal.
+
+    ``recoverable`` says exactly one thing, and a client may rely on nothing more: this FRAME was
+    rejected and nothing else moved. The Session, its ``awaiting_turn_id`` and the graph thread parked
+    in ``QueueCandidate.answer()`` are all untouched, so whatever the client applied optimistically
+    when it sent the frame can be put back and the frame re-sent. The key is absent everywhere else on
+    purpose: a refused start, a refused resume, a spent budget, a dead quota, a broken ledger, a cancel
+    and a crash all leave nothing on this socket to retry. Absent therefore means terminal, which is
+    what an older bundle already assumes for every error it sees.
+
+    It cannot be inferred client-side: after an answer is queued the graph thread emits NO frame until
+    the node finishes, so a provider crash while evaluating the answer just sent is indistinguishable
+    from the socket loop refusing that same answer. A client guessing from timing would re-arm a turn
+    the server has closed and hide the real fault behind a refuse/re-send loop.
+    """
+    return {"type": "session_error", "error": message, "recoverable": True}
 
 
 def _is_running(runtime: RuntimeSession) -> bool:

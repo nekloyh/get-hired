@@ -2058,3 +2058,21 @@ details[open] summary::before {
   font-size: 12px;
   padding: 1px 6px;
 }
+
+/* QA-15: the 20k answer bound, made visible before Send rather than reported after the text is gone. */
+.composer-meta {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: -8px;
+}
+
+.composer-count {
+  color: var(--ink-3);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.composer-count.at-cap {
+  color: var(--accent-3);
+  font-weight: 600;
+}

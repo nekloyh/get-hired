@@ -6,6 +6,13 @@ export const SKILLS = [
   'vietnamese_nlp',
 ] as const
 
+// Mirrors web_api.MAX_ANSWER_CHARS. The composer enforces it too (QA-15): the server's refusal only
+// arrives after the draft has been cleared and the answer already shown as sent, so a bound that
+// lives only on the server is a bound that destroys the text it rejects. `maxLength` counts UTF-16
+// code units and pydantic counts code points, and a string never has more code points than code
+// units — so the browser bound is the stricter of the two and cannot let an over-long frame through.
+export const MAX_ANSWER_CHARS = 20_000
+
 export type Skill = (typeof SKILLS)[number]
 export type SessionMode = 'auto' | 'demo' | 'live'
 // Session language_mode (issue 0024, ADR 0007): en = English interview; vn = Vietnamese;
@@ -198,7 +205,10 @@ export type SessionEvent =
   | { type: 'question'; question: string; turn_id: number }
   | { type: 'state_update'; state: SessionState }
   | { type: 'session_completed'; state: SessionState }
-  | { type: 'session_error'; error: string }
+  // QA-15: `recoverable` marks a frame the server's socket loop rejected while the Session kept
+  // running — nothing else moved, so the client may put back what it applied optimistically. Optional
+  // so an older server (which sends none) reads as "every error is terminal", i.e. today's behaviour.
+  | { type: 'session_error'; error: string; recoverable?: boolean }
 
 export type ChatMessage = {
   id: string

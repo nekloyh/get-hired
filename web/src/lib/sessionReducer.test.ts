@@ -130,3 +130,64 @@ describe('connection lifecycle', () => {
     expect(reduceConnectionClosed(errored)).toBe(errored)
   })
 })
+
+describe('a refused frame is not a dead Session (QA-15)', () => {
+  const OVERSIZE = 'x'.repeat(20_001)
+  const PYDANTIC_REFUSAL =
+    '1 validation error for CandidateAnswerPayload\nanswer\n  String should have at most 20000 characters'
+
+  const asked = () =>
+    reduceSessionEvent(initialSession, { type: 'question', question: 'Explain drift monitoring.', turn_id: 4 })
+
+  it('puts the question, the turn and the text back when the server refuses the frame', () => {
+    const sent = addCandidateAnswer(asked(), OVERSIZE)
+    const refused = reduceSessionEvent(sent, {
+      type: 'session_error',
+      error: PYDANTIC_REFUSAL,
+      recoverable: true,
+    })
+
+    expect(refused.status).toBe('active')
+    expect(refused.currentQuestion).toBe('Explain drift monitoring.')
+    expect(refused.currentTurnId).toBe(4)
+    expect(refused.error).toBeNull()
+    expect(refused.messages.filter((message) => message.role === 'candidate')).toHaveLength(0)
+    expect(refused.messages.at(-1)?.content).toBe(PYDANTIC_REFUSAL)
+  })
+
+  it('still ends the Session on a fault the server did not mark recoverable', () => {
+    const sent = addCandidateAnswer(asked(), 'Track input distributions.')
+    const dead = reduceSessionEvent(sent, { type: 'session_error', error: 'Session suspended: quota' })
+
+    expect(dead.status).toBe('error')
+    expect(dead.currentQuestion).toBe('')
+    expect(dead.currentTurnId).toBeNull()
+    expect(dead.error).toBe('Session suspended: quota')
+  })
+
+  it('still ends the Session when a recoverable refusal answers nothing in flight', () => {
+    const refused = reduceSessionEvent(asked(), {
+      type: 'session_error',
+      error: 'unknown WebSocket payload type: None',
+      recoverable: true,
+    })
+
+    expect(refused.status).toBe('error')
+    expect(refused.currentQuestion).toBe('')
+  })
+
+  it('drops the rollback record once the answer is provably in the graph', () => {
+    // Otherwise a provider crash DURING the evaluation of an accepted answer would re-arm a turn the
+    // server has already closed and hide the real fault behind a refuse/re-send loop.
+    const sent = addCandidateAnswer(asked(), 'Track input distributions.')
+    const next = reduceSessionEvent(sent, { type: 'question', question: 'And rollback?', turn_id: 5 })
+    const thenDead = reduceSessionEvent(next, {
+      type: 'session_error',
+      error: 'RuntimeError: provider died',
+      recoverable: true,
+    })
+
+    expect(next.pendingAnswer).toBeNull()
+    expect(thenDead.status).toBe('error')
+  })
+})

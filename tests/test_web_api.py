@@ -579,6 +579,35 @@ def test_a_wildcard_allowlist_refuses_to_start(tmp_path, origins):
     assert "COACH_ALLOWED_ORIGINS=https://coach.example.com" in str(caught.value)
 
 
+def test_a_refused_frame_is_marked_recoverable_and_a_dead_session_is_not(tmp_path):
+    # QA-15. The socket loop keeps looping after a bad frame; the run thread does not come back. The
+    # client cannot tell those apart by timing — after an answer is queued the graph emits NO frame
+    # until the node finishes, so a provider crash while evaluating the answer just sent looks exactly
+    # like the socket refusing that same answer. So the server states which it is, and the client
+    # rolls its optimistic send back only on a refusal.
+    client = _test_client(tmp_path)
+
+    with client.websocket_connect("/api/sessions/recoverable") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+        _receive_until(ws, "question")
+        # Oversize: rejected by the payload model, so the Session never sees it.
+        ws.send_json({"type": "candidate_answer", "answer": "x" * (web_api.MAX_ANSWER_CHARS + 1)})
+        refusal = _receive_until(ws, "session_error", limit=40)
+        assert refusal.get("recoverable") is True, refusal
+
+        # ...and the Session is genuinely still there: the same question still takes an answer.
+        _answer(ws, "A reasonable answer about batching.")
+        _receive_until(ws, "session_completed", limit=60)
+
+    # A refused START is terminal — the run thread has returned, so there is nothing to retry.
+    with client.websocket_connect("/api/sessions/recoverable") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
+        terminal = _receive_until(ws, "session_error", limit=40)
+
+    assert "already has saved progress" in terminal["error"]
+    assert "recoverable" not in terminal, terminal
+
+
 def test_a_binary_frame_during_auth_closes_cleanly(tmp_path):
     # `receive_json` assumes a text frame; a binary one raises KeyError('text'), which is neither a
     # disconnect nor a validation error, so before the fix it escaped the endpoint as a traceback
