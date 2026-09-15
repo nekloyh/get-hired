@@ -17,10 +17,44 @@ Suite: **848 → 972** pytest, **27 → 35** vitest. Every gate green after ever
 | M-2 | not coded, recorded in §5 with a trigger for each |
 | Stable checklist | **19 of 21 PASS, 1 FAIL, 1 BLOCKED-ON-YOU** |
 
-The FAIL is **checklist item 8**. `evaluator.py` changed (M0-7 guards the panel calls), so the tag
-needs a `coach bench --k 3` artifact at the production temperature in `docs/audits/`. That run costs
-real money, so per your instruction I did not run it. **This is the only thing between here and a
-tag that requires a decision rather than more work.** See §7 for the exact command.
+The FAIL is **checklist item 8**, and it is now a measurement rather than an outstanding task. You
+authorised the bench; I ran it once, at the production temperature, on the pinned judge:
+
+```
+coach bench --k 3   ->  34/35 cases within band, exit 1, ~181,424 tokens
+docs/audits/calibration-bench-2026-09-15.md   (committed, df45374)
+```
+
+**The gate is RED, and this branch did not cause it.** One case is out:
+
+| | band | runs | median | spread |
+|---|---|---|---|---|
+| `vnlp_segmentation_weak_vi` @ 2026-07-27 (the recorded 35/35 green) | 1.0–2.6 | 2.10 / 2.60 / 2.00 | 2.10 | 0.60 — top draw exactly ON the ceiling |
+| `vnlp_segmentation_weak_vi` @ 2026-09-15 (today) | 1.0–2.6 | **2.70 / 2.70 / 2.70** | **2.70** | **0.00 — all three above it** |
+
+Stable-but-out is a judge position, not sampling noise, and the distribution has moved up. Same model
+id, same cases, same bands. Attribution is settled from the run itself, not by argument:
+
+- `rubric.py` and `data/bench/` are **byte-identical to main** — cases, bands and anchors unchanged.
+- The only scoring-path delta is M0-7's `try/except` around the panel block, **and the panel never
+  ran**: 105 calls for 35 cases × 3 sweeps is exactly 1.0 per case-sweep (a committee adds 3, a
+  retry adds 1), and every `escalation` cell is `—`. Code that does not execute cannot move a score.
+- Noise telemetry recorded **zero** folds, retries and backoffs, so M0-5 changed no confidence.
+- M0-8 changes `evidence_weight_for`, which the bench never calls — it compares the judge's
+  `weighted_score` to the band, not the weight that score carries.
+
+So **the tag is blocked on a judge question, not on this work** — which is exactly the residual risk
+in §6: *the judge can drift inside a pinned model, and you only see it if you run the bench.* This
+run is that detection working.
+
+I did not re-run it and did not touch an anchor or a band. One k=3 invocation is the measurement;
+re-rolling until it passes is not, and the report's own rule is *never widen to go green*.
+
+Both flagged cases are Vietnamese answers scoring high — the second,
+`dl_overfitting_weak_vi`, straddles at 3.20/3.00/4.00 against a 1.6–3.2 ceiling. That is the
+documented language-fairness shape, and this artifact's own anchor dump shows why it is still live:
+`depth` and `system_thinking` still have no `3` anchor, so the judge resolves the 2→4 gap on style
+(GH #96 / #103). **Your call** — §7(b) lays out the three options.
 
 Item 21 (`.env`) is BLOCKED-ON-YOU, not failed: the deployment config is yours to set, the exact
 contents are in §7, and I verified the server's behaviour with those values set in a container.
@@ -149,7 +183,7 @@ Run at `4367d75`. Commands are the ones §7 of `QA-REPORT.md` specifies.
 | 5 | lockfile honest | **PASS** | `uv sync --locked --dev` exit 0 |
 | 6 | web gates green | **PASS** | lint 0, tsc 0, **vitest 35 passed**, build 0 |
 | 7 | wire format frozen | **PASS** | `tests/test_serde_golden.py` 9 passed |
-| 8 | judge untouched **or** re-benched | **FAIL** | `git diff main..HEAD -- evaluator.py` = 1 file, +38/−13. No bench artifact exists. **This is the tag blocker.** |
+| 8 | judge untouched **or** re-benched | **FAIL (measured)** | benched: `34/35`, exit 1, artifact committed at `df45374`. `vnlp_segmentation_weak_vi` 2.70/2.70/2.70 vs band 1.0–2.6. Not caused by this branch — see §1. **Tag blocker.** |
 | 9 | image builds from a clean tree | **PASS** | `git archive HEAD \| tar -x` → `docker build` exit 0 |
 | 10 | container serves as uid 10001 | **PASS** | `{'status':'ok','auth_required':True}`; `uid=10001(coach)` |
 | 11 | auth enforced | **PASS** | `401` without a bearer |
@@ -192,7 +226,7 @@ Rewritten against the current code. Items from `QA-REPORT.md` §8 that this wave
 | risk | why it survives | how you will notice |
 |---|---|---|
 | **Two pilot users share one Skill history** | QA-02's isolation half is unfixable under one shared token (§1). M0-14 only constrained the key | a Candidate's mastery jumping between Sessions with no interview that explains it; two people reporting each other's Skills |
-| **The judge can still drift inside a pinned model** | M0-13 gates the (provider, model, base_url) triple at startup; nothing detects the provider retraining under a stable name, and CI never calls the judge | bench scores moving with no code change — only visible if you actually run `coach bench --k 3` |
+| **The judge HAS drifted inside a pinned model** | no longer hypothetical — measured today: `vnlp_segmentation_weak_vi` moved from 2.10/2.60/2.00 to 2.70/2.70/2.70 on the same model id. M0-13 gates the triple at startup; nothing detects the provider retraining under a stable name, and CI never calls the judge | exactly how it surfaced here: bench scores moving with no code change. Only `coach bench --k 3` shows it |
 | **A reconnect during a real provider stall still waits up to 120 s** | M1-19 stopped it starving the whole event loop and capped concurrent joins, but a single unreachable provider costs ~4.2 min of retries, still longer than the join | repeated "The previous run of this Session is still finishing" clustered on one id; now also "already waiting on the maximum number of previous runs" |
 | **Two processes on one checkpoint `thread_id`** | M1-16 claims a per-Session lock in the **CLI**. The web server does not take it — it has its own in-process registry — so a CLI resume is refused while another CLI drives, but the web's own claim is not visible to the CLI's lock | interleaved transcript items; `started_at` jumping backwards |
 | **`postmortem` can lose a concurrent post-mortem's evidence** | §3: the lock is inside `save_posteriors`, not around load→fuse→save | a debrief's evidence silently absent from the next Session's priors |
@@ -234,25 +268,29 @@ One thing to check before deploying, because M1-21 changed a rule: if your live
 `/app/state/skill-ledger.json` has any Candidate id starting with `_`, rename it first. Those ids are
 now reserved. On this machine the file does not exist, so there is nothing to migrate here.
 
-### (b) The bench — checklist item 8
+### (b) The bench came back RED — this is now your decision
 
-M0-7 and M0-8 changed the scoring path. Both are argued to be delta-free and neither touches the
-prompt, the anchors or the cases — M0-8 in particular changes the *weight* a score carries into the
-Beta state, not the score, so the bench cannot see it by construction — but that is an expectation,
-not a measurement, and ADR 0009's gate is a measurement.
+Run, artifact committed, analysis in §1. 34/35, and the failure is a judge drift this branch did not
+cause. Three ways forward, and none of them is "run it again until it passes":
 
-```bash
-PRIMARY_PROVIDER=openai uv run coach bench --k 3 \
-  --out docs/audits/calibration-bench-$(date +%F).md
-```
+1. **Re-anchor `depth` and `system_thinking` (GH #96 / #103).** The principled fix. Both dimensions
+   still jump 2 → 4 with no `3`, so the judge resolves the gap on style — and both flagged cases are
+   Vietnamese answers scoring high, which is that bug's exact signature. This is scored work with a
+   bench run of its own, and a re-wording restarts the repeatability count from zero.
+2. **Re-derive the band for `vnlp_segmentation_weak_vi` from the observed distribution.** The
+   artifact's own advice, and legitimate *if* you conclude 2.70 is the right score for that answer —
+   a human has to make that call by reading the case. It is not the same thing as widening to go
+   green, and the difference is whether you looked at the answer first.
+3. **Tag anyway, with the red recorded.** Defensible for a trusted pilot: one case, 0.10 over, on a
+   known-open language-fairness bug, with the artifact committed and this report naming it. It means
+   tagging with a judge whose calibration you know has moved.
 
-~207k tokens. The gate is **median-of-k at the production temperature**, and one green invocation is
-not evidence — a `#96` wording went 35/35, 35/35, 34/35. Commit the artifact, then item 8 is green.
+I have not chosen for you, and I have not re-run it.
 
 Note M1-9 changed this command's failure mode: it now **refuses** (exit 2, no report written) if the
 day's budget cannot fund the sweep, rather than warning and spending it. `--ignore-budget` overrides
 the arithmetic if your real allowance is larger than our count; it cannot override a broken ledger
-or a dead quota.
+or a dead quota. Today's run cost 181,424 tokens against a 2,500,000 daily budget.
 
 ### (c) The PR — M0-16, prepared, **not pushed**
 
@@ -314,7 +352,9 @@ commits on the branch (mine)      43   (51 total incl. the 8 the QA report revie
 pytest                            848 → 972   (+124)
 vitest                            27  → 35    (+8)
 mypy                              34 source files, clean
-stable checklist                  19 PASS · 1 FAIL (item 8, the bench) · 1 BLOCKED-ON-YOU (item 21, .env)
+stable checklist                  19 PASS · 1 FAIL (item 8: bench 34/35, judge drift) ·
+                                  1 BLOCKED-ON-YOU (item 21, .env)
+bench                             34/35, ~181,424 tokens, docs/audits/calibration-bench-2026-09-15.md
 QA findings closed                45 of 47 fully; 2 partial (QA-02 isolation half — unfixable
                                   under one shared token; QA-16 trace-type half — never in the plan)
 still hanging                     coach bench --k 3 · .env · push+PR · 10 M-2 debts
