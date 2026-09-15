@@ -1,76 +1,72 @@
 # Milestone report — branch `audit/stabilize-2026-09-14`
 
-Input: `QA-REPORT.md` (47 findings; M-0 16 tasks, M-1 24 tasks, M-2 10 debts).
-Work: 43 new commits on top of the 8 the QA report reviewed (`60787d4` → `4367d75`).
+Input: `QA-REPORT.md` (47 findings; M-0 16 tasks, M-1 24 tasks, M-2 10 debts), committed at `db73419`.
+Work: **55 commits** on `main` (`2dac711`), of which the QA report had already reviewed the first 8.
 Suite: **848 → 972** pytest, **27 → 35** vitest. Every gate green after every commit.
+
+> Correction to this report's own earlier text: the branch carries **55** commits above `main`, not
+> "43 new on top of 8" (= 51). Measured: `git log --oneline --no-merges 2dac711..HEAD | wc -l` → 55.
+> Other stale numbers this pass re-measured are corrected in place and listed in §5.
 
 ---
 
-## 1. Status: can this be tagged?
+## 1. Status: tagged
 
-**Not yet. One line of the stable checklist is FAIL, and it is not a line I can close.**
+**Tagged `v0.1.0-pilot`, annotated, local only.** The tag sits on this branch's HEAD — the commit that
+carries this report. It is deliberately **not pushed**, because the PR is not merged and a pushed tag
+that later has to move is worse than a tag that waits.
 
 | | |
 |---|---|
-| M-0 | **complete** — 14 of 16 tasks; M0-1 and M0-16 are yours (§7) |
-| M-1 | **complete** — all 24 tasks |
-| M-2 | not coded, recorded in §5 with a trigger for each |
-| Stable checklist | **19 of 21 PASS, 1 FAIL, 1 BLOCKED-ON-YOU** |
+| M-0 | **complete** — 16 of 16. M0-1 (`.env`) and M0-16 (push/PR) were done this pass |
+| M-1 | **complete** — all 24 |
+| M-2 | not coded. Now **filed**, one GitHub issue each (§8) |
+| Stable checklist | **20 of 21 PASS, 1 FAIL** — re-run end to end, §4 |
+| Tag | `v0.1.0-pilot`, annotated, **local** — push it after you merge the PR |
+| PR | opened, CI result in §4 |
 
-The FAIL is **checklist item 8**, and it is now a measurement rather than an outstanding task. You
-authorised the bench; I ran it once, at the production temperature, on the pinned judge:
+### The one FAIL: checklist item 8, accepted with recorded rationale
 
-```
-coach bench --k 3   ->  34/35 cases within band, exit 1, ~181,424 tokens
-docs/audits/calibration-bench-2026-09-15.md   (committed, df45374)
-```
+`coach bench --k 3` came back **34/35, exit 1**. Per the instruction for this pass, option 3 was taken:
+**tag with the red recorded**. It is not marked PASS and must not be.
 
-**The gate is RED, and this branch did not cause it.** One case is out:
+Why accepting it is defensible here, and where it is not:
 
-| | band | runs | median | spread |
-|---|---|---|---|---|
-| `vnlp_segmentation_weak_vi` @ 2026-07-27 (the recorded 35/35 green) | 1.0–2.6 | 2.10 / 2.60 / 2.00 | 2.10 | 0.60 — top draw exactly ON the ceiling |
-| `vnlp_segmentation_weak_vi` @ 2026-09-15 (today) | 1.0–2.6 | **2.70 / 2.70 / 2.70** | **2.70** | **0.00 — all three above it** |
+- **This branch did not cause it.** `rubric.py` and `data/bench/` are **byte-identical to `main`**
+  (`git diff --quiet 2dac711..HEAD` on both → clean). The only scoring-path delta is `evaluator.py`
+  (+38 / −13), which is a `try/except` around the panel block — and the panel **never ran**: the
+  artifact records 105 LLM calls for 35 cases × 3 sweeps (exactly 1.0 per case-sweep; a committee
+  adds 3), every `escalation` cell is `—`, and shadow escalations are 0 at all three thresholds.
+  Code that does not execute cannot move a score.
+- **It is judge drift inside a pinned model.** `vnlp_segmentation_weak_vi` moved 2.10 / 2.60 / 2.00
+  (2026-07-27) → **2.70 / 2.70 / 2.70** (today), against band 1.0–2.6. Zero spread across three draws
+  is a stable judge position, not sampling noise. Same model id, same cases, same bands.
+- **The cause is a known open bug, not a new one.** Both flagged cases are Vietnamese answers scoring
+  high — the signature of a missing middle BARS anchor. The artifact's own anchor dump confirms
+  `depth` and `system_thinking` still carry only `2` and `4`, while `correctness` and `communication`
+  (which gained a `3` in #92) now show bias −0.29 and −0.14. That is GH **#96**, updated today with
+  these measurements and raised to `severity:high`.
+- **Where this is NOT defensible:** the milestone's declared scope is a **trusted pilot** with *no live
+  judge gate in CI*. Ship this to strangers whose scores matter, and a judge you know has moved is no
+  longer an acceptable risk. #96 is what turns the gate green.
 
-Stable-but-out is a judge position, not sampling noise, and the distribution has moved up. Same model
-id, same cases, same bands. Attribution is settled from the run itself, not by argument:
+The bench was **not** re-run and no anchor, band or case was touched — "never widen to go green".
 
-- `rubric.py` and `data/bench/` are **byte-identical to main** — cases, bands and anchors unchanged.
-- The only scoring-path delta is M0-7's `try/except` around the panel block, **and the panel never
-  ran**: 105 calls for 35 cases × 3 sweeps is exactly 1.0 per case-sweep (a committee adds 3, a
-  retry adds 1), and every `escalation` cell is `—`. Code that does not execute cannot move a score.
-- Noise telemetry recorded **zero** folds, retries and backoffs, so M0-5 changed no confidence.
-- M0-8 changes `evidence_weight_for`, which the bench never calls — it compares the judge's
-  `weighted_score` to the band, not the weight that score carries.
-
-So **the tag is blocked on a judge question, not on this work** — which is exactly the residual risk
-in §6: *the judge can drift inside a pinned model, and you only see it if you run the bench.* This
-run is that detection working.
-
-I did not re-run it and did not touch an anchor or a band. One k=3 invocation is the measurement;
-re-rolling until it passes is not, and the report's own rule is *never widen to go green*.
-
-Both flagged cases are Vietnamese answers scoring high — the second,
-`dl_overfitting_weak_vi`, straddles at 3.20/3.00/4.00 against a 1.6–3.2 ceiling. That is the
-documented language-fairness shape, and this artifact's own anchor dump shows why it is still live:
-`depth` and `system_thinking` still have no `3` anchor, so the judge resolves the 2→4 gap on style
-(GH #96 / #103). **Your call** — §7(b) lays out the three options.
-
-Item 21 (`.env`) is BLOCKED-ON-YOU, not failed: the deployment config is yours to set, the exact
-contents are in §7, and I verified the server's behaviour with those values set in a container.
-
-Two things I want you to read before deciding, because they change what the tag means:
+### Two things to read before you merge
 
 1. **M0-4 ended up stricter than the plan.** `turn_id` is now REQUIRED on every answer frame, not
-   optional. The optional version had a measured 1-in-8 misbinding race and did not close NEW-01.
-   The cost: an old client bundle held open across a deploy is refused rather than misattributed.
-   That is the safer failure, and the Candidate recovers by reloading — but it is a stricter wire
-   contract than the QA report proposed, so it is your call to accept. (`fd9c55d`)
-2. **QA-02 is only half closed, and cannot be fully closed at this milestone.** Two pilot users
-   sharing one token still share every Skill-ledger key. The report's suggested remedy —
-   `HMAC(token identity, name)` — cannot work: `token_identity` digests the single deployment-wide
-   token, so it is byte-identical for both users, which is the repro's own premise. What M0-14
-   closes is the free-text key. The isolation half needs real per-user identity (R-29 / GH #84).
+   optional. The optional version had a measured 1-in-8 misbinding race and did not close NEW-01. Cost:
+   an old client bundle held open across a deploy is refused rather than misattributed — the safer
+   failure, recoverable by reloading, but a stricter wire contract than the QA report proposed.
+   Verified live this pass: three hostile frames (replay, wrong `turn_id`, absent `turn_id`) were all
+   refused and none reached the transcript. (`fd9c55d`)
+2. **QA-02 is half closed and cannot be fully closed at this milestone** — see §6 and GH #84, where the
+   verified mechanism is now recorded: the Skill-ledger key is **supplied by the client and never
+   authenticated** (`web_api.py:111` validates a charset, `web_api.py:1067` loads priors for whatever
+   string arrived). Under one shared token that is read *and* write access to another pilot user's
+   Skill history by typing their id. The QA report's proposed `HMAC(token identity, name)` cannot fix
+   it: `token_identity()` (`usage.py:917`) digests the one deployment-wide secret, so it is identical
+   for every user — its own docstring says the per-user seam is R-29.
 
 ---
 
@@ -98,7 +94,7 @@ test-first: a characterisation test failing on the code as it stood, then the fi
 | M0-7 † | `98f3713` | QA-06 | `pytest -k dead_panel_voice` | 1 failed → 1 passed; `openai.APIConnectionError` raised out of `evaluate()` itself |
 | M0-8 † | `129e4e3` | QA-07 | `pytest -k "consensus_panel_cannot or degraded_consensus"` | 2 failed → 2 passed; `assert 2.0 == 1.1` (fully degraded evidence at maximum weight) |
 
-† changed the scoring path → the bench in §7 is owed.
+† changed the scoring path → the bench was owed, was run, and came back **34/35** (§1, §4 item 8).
 
 ### M-1
 
@@ -143,219 +139,242 @@ test-first: a characterisation test failing on the code as it stood, then the fi
 
 | id | why | what it needs |
 |---|---|---|
-| M0-1 | `.env` is a secret file I was told not to touch | you, 2 minutes — §7 |
-| M0-16 | push / PR / CI / close #119 | you — §7 has the PR body |
-| `coach bench --k 3` | real money | your go-ahead; §7 has the command |
-| M-2 (10 items) | out of scope by instruction | §5 |
+| ~~M0-1~~ | **DONE this pass** — `.env` set, MiMo keys removed, verified in a container | — |
+| ~~M0-16~~ | **DONE this pass** — pushed, PR opened, #119 closed from it | — |
+| ~~`coach bench --k 3`~~ | **RUN** — 34/35, artifact committed at `df45374` | the red is §1's decision |
+| M-2 (10 items) | out of scope by instruction — **now filed**, §5 | #124–#132, #84 |
 | **QA-16's other half** | **the plan has no row for it** | see below |
 
 **QA-16 is only half in the plan, and I did not widen the scope to cover the rest.** The finding has
 two parts: the `failed`-item rendering (M1-17, done, `0cdbd2f`) and *"declare `TraceRecord` in
 `types.ts`; render the five missing Committee fields"*. The second part appears in no M-0 or M-1 row,
 so it was never scheduled. Verified still open at `4367d75`: `web/src/lib/types.ts:112` is still
-`trace: Record<string, unknown>` against ten concrete server fields, and `ReportView.tsx` renders
+`trace: Record<string, unknown>` against **eleven** concrete server fields, and `ReportView.tsx` renders
 none of `initial_confidence`, `argument` or `key_evidence`. Consequence is unchanged from the QA
 report: the UI still cannot show the evidence the export shows. Nothing is corrupted by it — it is a
-display gap — so it does not block the tag, but it should be filed rather than assumed done.
+display gap — so it does not block the tag. **Filed as GH #121**, with the stale citations in
+QA-16 itself corrected (`types.ts:105` → `:112`, `ReportView.tsx:160-173` → `:171-184`,
+`session_serde.py:49-58` → `:49-59`, `exporter.py:180-198` → `:185-207`).
 
 Two things I deliberately did **not** widen, both recorded at the code:
 
-- **`postmortem`'s same-candidate read-modify-write.** M0-12 put an flock inside `save_posteriors`,
+- **`postmortem`'s same-candidate read-modify-write** (now **GH #122**). M0-12 put an flock inside `save_posteriors`,
   which serialises the merge but not `load_states` → fuse → `save_posteriors` as a pair. Two
   concurrent post-mortems for the *same* candidate can still lose one's evidence. The QA finding as
   written is the cross-candidate erasure, and that IS closed.
-- **`reconcile_accounting`'s sidecar rewrite.** Two simultaneous `coach usage --reconcile` runs are
+- **`reconcile_accounting`'s sidecar rewrite** (now **GH #123**). Two simultaneous `coach usage --reconcile` runs are
   still an unlocked read-modify-write. Out of QA-09's scope; the double-bill it used to cause is
   closed by M0-11's uuid dedup.
 
 ---
 
-## 4. The stable checklist, line by line
+## 4. The stable checklist, line by line — re-run end to end
 
-Run at `4367d75`. Commands are the ones §7 of `QA-REPORT.md` specifies.
+Re-run in full at `db73419` on 2026-09-15, including the container block. Commands are the ones §7 of
+`QA-REPORT.md` specifies. Exit codes are real, captured per command, not inferred from a pipeline.
 
-| # | check | result | evidence |
+| # | check | result | evidence (verbatim) |
 |---|---|---|---|
-| 1 | lint clean | **PASS** | `All checks passed!` exit 0 |
-| 2 | types clean | **PASS** | `Success: no issues found in 34 source files` |
-| 3 | suite green twice | **PASS** | `972 passed, 9 deselected, 2 xfailed` ×2, identical |
-| 4 | no test can hang | **PASS** | `pytest-timeout` + `--timeout=60` in pyproject; `timeout-minutes` on all **3** CI jobs |
-| 5 | lockfile honest | **PASS** | `uv sync --locked --dev` exit 0 |
-| 6 | web gates green | **PASS** | lint 0, tsc 0, **vitest 35 passed**, build 0 |
-| 7 | wire format frozen | **PASS** | `tests/test_serde_golden.py` 9 passed |
-| 8 | judge untouched **or** re-benched | **FAIL (measured)** | benched: `34/35`, exit 1, artifact committed at `df45374`. `vnlp_segmentation_weak_vi` 2.70/2.70/2.70 vs band 1.0–2.6. Not caused by this branch — see §1. **Tag blocker.** |
-| 9 | image builds from a clean tree | **PASS** | `git archive HEAD \| tar -x` → `docker build` exit 0 |
-| 10 | container serves as uid 10001 | **PASS** | `{'status':'ok','auth_required':True}`; `uid=10001(coach)` |
-| 11 | auth enforced | **PASS** | `401` without a bearer |
-| 12 | a whole Session completes | **PASS** | `COMPLETED status: complete questions: 2 transcript: 2`; `/app/state/exports/final-verify.md` 8,998 B |
-| 13 | state survives replacement | **PASS** | md5 `3379c9b9…` identical across `docker rm -f` + new container; endpoint 200 |
-| 14 | quota mid-question suspends | **PASS** | 1 passed |
-| 15 | two starts racing admit one | **PASS** | 2 passed (real second process) |
-| 16 | resume does not recharge | **PASS** | 9 passed |
-| 17 | bounds hold at the wire | **PASS** | 21 passed |
-| 18 | id reuse cannot destroy a report | **PASS** | 3 passed; **and at the wire**: refusal + export md5 unchanged |
-| 19 | unknown-id resume is friendly | **PASS** | first frame is `No saved Session found for 'never-existed-anywhere'…` |
-| 20 | an answer cannot be scored against the wrong question | **PASS** | at the wire: `Answer refused: it does not answer the pending question.` |
-| 21 | operator config is set | **BLOCKED ON YOU** | `auth_required: true` verified with the token set in a container; `.env` itself is §7 |
+| 1 | lint clean | **PASS** | `All checks passed!` · exit 0 |
+| 2 | types clean | **PASS** | `Success: no issues found in 34 source files` · exit 0 |
+| 3 | suite green twice, no flake | **PASS** | run 1 `972 passed, 9 deselected, 2 xfailed, 1 warning in 11.53s` exit 0; run 2 `972 passed, 9 deselected, 2 xfailed, 1 warning in 11.84s` exit 0 — summaries identical |
+| 4 | no test can hang | **PASS** | `pytest-timeout>=2.3` (`pyproject.toml:33`); `addopts = "-m 'not live and not rag' --timeout=60"` (`pyproject.toml:57`); `timeout-minutes` on **all 3** CI jobs — 15 / 15 / 20 (`ci.yml:11,25,46`) |
+| 5 | lockfile honest | **PASS** | `Resolved 150 packages in 0.80ms` / `Checked 65 packages in 0.55ms` · exit 0 |
+| 6 | web gates green | **PASS** | eslint exit 0; `tsc --noEmit` exit 0; vitest `Test Files 4 passed (4)` / `Tests 35 passed (35)` exit 0; build exit 0 (`index-BoZFRreM.js 226.32 kB`, `✓ built in 1.02s`) |
+| 7 | wire format frozen | **PASS** | `tests/test_serde_golden.py` → `9 passed in 0.28s` · exit 0 |
+| 8 | judge untouched **or** re-benched | **FAIL — accepted, rationale recorded (§1)** | `rubric.py: IDENTICAL` and `data/bench/: IDENTICAL` vs `2dac711`; `evaluator.py` `1 file changed, 38 insertions(+), 13 deletions(-)` → artifact owed. Artifact `docs/audits/calibration-bench-2026-09-15.md`: **`Cases within band: 34/35`**, exit 1. `vnlp_segmentation_weak_vi` 2.70/2.70/2.70 vs band 1.0–2.6. **Not PASS. Not caused by this branch.** |
+| 9 | image builds from a clean tree | **PASS** | `git archive HEAD \| tar -x` exit 0 → 219 files, 0 untracked leaked (`.env`/`*.bak.*` count = 0); `docker build` exit 0; `coach:v0.1.0-pilot 402MB` |
+| 10 | container serves as uid 10001 | **PASS** | `{"status":"ok",…,"auth_required":true,…}`; `uid=10001(coach) gid=10001(coach) groups=10001(coach)` |
+| 11 | auth enforced | **PASS** | no bearer → **401**; wrong bearer → **401**; correct bearer → **404** (gate rejects, token works, id simply absent) |
+| 12 | a whole Session completes in the container | **PASS** | `session_started state_update question state_update state_update question state_update state_update state_update session_completed`; `status: complete questions: 2 transcript: 2`; `/app/state/exports/pilot-final-001.md` **9,127 B** |
+| 13 | state survives container replacement | **PASS** | `docker rm -f` → new container, same volume. md5 `11067a5d3afa6147cb63491f93ee7b7f` **before and after**; health → 200, export → 200; ledger and both exports intact on the volume |
+| 14 | quota mid-question suspends cleanly | **PASS** | `tests/test_supervisor.py -k dead_quota_mid_session` → `1 passed, 62 deselected` · exit 0 |
+| 15 | two starts racing admit at most one | **PASS** | real two-**process** harness → `2 passed, 981 deselected` · exit 0 |
+| 16 | resume does not recharge a start reservation | **PASS** | `tests/test_usage.py -k resume` → `5 passed, 75 deselected` · exit 0. Code: `if metered and not resume:` at `web_api.py:988` |
+| 17 | bounds hold at the wire | **PASS** | 8 wire cases, **all refused, none wedged** — see the block below |
+| 18 | id reuse cannot destroy a report | **PASS** | `session_error`: *"This Session id already has saved progress… starting over here would overwrite the saved report."*; export md5 `11067a5d…` **unchanged** |
+| 19 | unknown-id resume is friendly | **PASS** | `session_error`: *"No saved Session found for 'never-existed-anywhere'. … there is nothing to resume."* — no `EmptyInputError` |
+| 20 | an answer cannot be scored against the wrong question | **PASS** | 3 hostile frames (replay of an answered `turn_id`, `turn_id: 999`, absent `turn_id`) → **3 × `Answer refused: it does not answer the pending question.`**, then `COMPLETED`. Occurrences of `STOLEN` in the resulting report: **0** |
+| 21 | operator config is set | **PASS** (was BLOCKED) | `auth_required` → `true` from the running container; `grep -c '^MIMO_' .env` → **0**; `COACH_AUTH_TOKEN` 64 hex chars; `COACH_ALLOWED_ORIGINS=http://localhost:5173` — **a dev value, see §9** |
 
-**Tag when line 8 is green.** Nothing else is outstanding on my side.
+**Item 17, the wire bounds, verbatim:**
+
+```
+start_session field bounds:
+  max_questions=11       -> session_error   1 validation error … Input should be less than or equal t…
+  max_questions=0        -> session_error   1 validation error … Input should be greater than or equa…
+  elapsed=4h+1s          -> session_error   1 validation error … max_elapsed_seconds …
+  elapsed=0              -> session_error   1 validation error … Input should be greater than 0
+  language=klingon       -> session_error   Input should be 'en', 'vn' or 'mixed'
+in-session bounds:
+  oversize answer        -> session_error   String should have at most 20000 characters
+    -> not wedged           next frame = question
+  non-object frames      -> session_error   expected a JSON object frame, got str
+    -> not wedged           next frame = question
+  queue flood (40 sent)  -> session_error   Answer refused: it does not answer the pending question.
+    -> outcome              frames=session_error state_update question   refusals=27
+```
+
+**Hostile `candidate_id` at the wire** (M0-14 / M1-21), all refused at the pydantic boundary before any
+Session state exists:
+
+```
+  candidate_id='_meta'                       -> session_error  String should match pattern '^$|…   (reserved prefix, NEW-28)
+  candidate_id='minh/../../etc/passwd'       -> session_error  String should match pattern '^$|…   (anchors hold)
+  candidate_id='a b'                         -> session_error  String should match pattern '^$|…
+  candidate_id='xxx…' (200 chars)            -> session_error  String should match pattern '^$|…
+  candidate_id='ném'                         -> session_error  String should match pattern '^$|…   (diacritics refused by design)
+  candidate_id='(empty)'                     -> session_started                                    (by design: one-shot cold start)
+```
+
+### Two counts in the previous run of this table were wrong
+
+Reported honestly rather than reconciled: the earlier §4 recorded **9 passed** for item 16 and **21
+passed** for item 17. Re-run at HEAD, the command §7 actually specifies for item 16
+(`pytest tests/test_usage.py -k resume`) selects **5** tests; widening `-k resume` to the whole suite
+gives **18**. Neither is 9. Item 17 is specified as a *wire probe*, not a pytest selector, so it was run
+as one this time — the closest pytest selector gives 15, not 21. **Both checks pass on their merits**;
+only the earlier counts were unreproducible.
 
 ---
 
-## 5. M-2: recorded, not coded
+## 5. M-2: filed, not coded
 
-| id | item | why deferred | what should trigger it |
+All ten are now GitHub issues with verified `file:line` evidence and a trigger. **Every number below was
+re-measured at `db73419`; four of the ten figures in the previous table were stale and are corrected.**
+
+| id | issue | item | what should trigger it |
 |---|---|---|---|
-| M2-1 | split `web_api.py` / `cli.py` | pure restructuring, no user-visible defect; both grew again this wave — `web_api.py` 1,122 → **1,345**, `cli.py` 1,246 → **1,433** | the next change that has to touch both halves of either file, or a merge conflict in them |
-| M2-2 | SQLite read path for the usage ledger | still trivial at ~1.4k rows | first day the ledger passes ~50k rows, or `coach usage` taking >1s |
-| M2-3 | ledger rotation | same trigger as M2-2 | pair it with M2-2 |
-| M2-4 | per-record ownership / accounts (GH #84) | explicitly a public-launch gate; this is a trusted pilot | **a second person using the deployment** — this is what closes QA-02's isolation half |
-| M2-5 | Skill-ledger history | needs a storage decision, not a patch | the progress dashboard (#83) |
-| M2-6 | the 16 remaining duplications | maintainability only | opportunistic |
-| M2-7 | `SelfCritiqueTrace`, `docs/reference/*`, write-only `data/` outputs | dead weight, zero risk | any pass that already touches them |
-| M2-8 | `resources.py:3` stale comment + Chroma-or-delete | one-line comment; the wire-or-delete call belongs with R-13 | R-13 |
-| M2-9 | `ruff format` | **24 files now** (15 tests, 7 src, 2 scripts) — was 18 | do it when no PR is in flight; it will conflict with everything |
-| M2-10 | follow-up re-ask guard, `skip_ahead` seed gate, sticky `concept_miss` | loop-quality polish; wastes a turn, corrupts nothing | a Candidate complaint about a repeated question |
+| M2-1 | **#124** | split `web_api.py` / `cli.py` | the next change that must touch both halves of either file, or a merge conflict in them |
+| M2-2 | **#125** | SQLite read path for the usage ledger | `coach usage` taking >1s, or the ledger passing ~50k rows |
+| M2-3 | **#126** | ledger rotation / TTL | pair it with M2-2; or the state volume crossing a size you care about |
+| M2-4 | *folded into* **#84** | per-record ownership / accounts | **a second person using the deployment.** This is QA-02's isolation half — not a separate issue, it *is* R-29 |
+| M2-5 | **#127** | Skill-ledger history | the progress dashboard (#83). Verified as a storage-shape prerequisite for #83, not a duplicate of it |
+| M2-6 | **#128** | the catalogued duplications | opportunistic — whenever a change already touches one of the copies |
+| M2-7 | **#129** | `SelfCritiqueTrace`, `docs/reference/*`, write-only `data/` outputs | any pass that already touches them |
+| M2-8 | **#130** | `resources.py:3` stale comment + Chroma wire-or-delete | the old trigger "R-13" is **dead** — GH #68 is closed; #130 carries a live replacement |
+| M2-9 | **#131** | `ruff format` | a window with no open PR touching the 26 files |
+| M2-10 | **#132** | follow-up re-ask guard, `skip_ahead` seed gate, sticky `concept_miss` | a Candidate reporting a repeated or skipped question |
+
+### Corrections to the previous table's numbers
+
+| claim | measured at `db73419` |
+|---|---|
+| M2-1: `web_api.py` 1,122 → 1,345 | baseline wrong. **984 → 1,345** (+361, +36.7%). HEAD figure right |
+| M2-1: `cli.py` 1,246 → 1,433 | baseline wrong, growth overstated ~3×. **1,367 → 1,433** (+66, +4.8%) — the CLI *churned* (562 changed lines), it did not grow |
+| M2-9: "24 files (15 tests, 7 src, 2 scripts), was 18" | **26 files — 16 tests, 8 src, 2 scripts.** And `QA-REPORT.md:163` records **28 at `main`**, so the drift **shrank** 28 → 26 |
+| M2-2: ledger "~1.4k rows" | **1,494 rows / 196,131 B**, 0 unparseable. Scan cost measured: ~2.16 ms/scan, ~17 ms per question (8 scans) |
+| M2-6: "the 16 remaining duplications" | the catalogue is **20 rows** (`AUDIT.md:245-264`); 11 sampled, 3 unified, 8 still live. Surviving count is **~17**, not 16 — it excludes a PARTIAL row and 3 newer duplications |
+| §3: "ten concrete server fields" in the trace | **eleven** (`microloop.py:162-181`) — the eleventh is `judge_unvalidated` |
 
 ---
 
 ## 6. Residual risk after this wave
 
-Rewritten against the current code. Items from `QA-REPORT.md` §8 that this wave closed are gone.
+Rewritten against the current code and this pass's measurements. Rows the wave closed are gone; rows
+whose premise this pass disproved are corrected, not repeated.
 
 | risk | why it survives | how you will notice |
 |---|---|---|
-| **Two pilot users share one Skill history** | QA-02's isolation half is unfixable under one shared token (§1). M0-14 only constrained the key | a Candidate's mastery jumping between Sessions with no interview that explains it; two people reporting each other's Skills |
-| **The judge HAS drifted inside a pinned model** | no longer hypothetical — measured today: `vnlp_segmentation_weak_vi` moved from 2.10/2.60/2.00 to 2.70/2.70/2.70 on the same model id. M0-13 gates the triple at startup; nothing detects the provider retraining under a stable name, and CI never calls the judge | exactly how it surfaced here: bench scores moving with no code change. Only `coach bench --k 3` shows it |
-| **A reconnect during a real provider stall still waits up to 120 s** | M1-19 stopped it starving the whole event loop and capped concurrent joins, but a single unreachable provider costs ~4.2 min of retries, still longer than the join | repeated "The previous run of this Session is still finishing" clustered on one id; now also "already waiting on the maximum number of previous runs" |
-| **Two processes on one checkpoint `thread_id`** | M1-16 claims a per-Session lock in the **CLI**. The web server does not take it — it has its own in-process registry — so a CLI resume is refused while another CLI drives, but the web's own claim is not visible to the CLI's lock | interleaved transcript items; `started_at` jumping backwards |
-| **`postmortem` can lose a concurrent post-mortem's evidence** | §3: the lock is inside `save_posteriors`, not around load→fuse→save | a debrief's evidence silently absent from the next Session's priors |
-| **Spend a gateway never reports** | M1-6 latches a fault when the token count is unreadable — but only for calls that go through the provider clients. A gateway that reports *plausible but wrong* numbers is still believed | `coach usage` totals drifting from the provider's own dashboard |
-| **A `session_error` is still a bare string** | M1-1 added `recoverable`, but every other error is distinguished only by its text | a future refusal that should be recoverable being marked terminal by omission — the default is terminal, which is the safe direction |
-| **The export is now mode 600** | `atomic_write_text` publishes through `tempfile`, which creates 0600. The server reads it as the same uid, so nothing is broken — but a backup or sidecar process running as another uid can no longer read `exports/*.md` | a backup job that used to work returning permission denied |
-| **`ruff format` drift is growing** | 18 → 24 files (M2-9) | nothing, until someone runs it and produces a 24-file diff |
+| **The judge HAS drifted inside a pinned model** | No longer hypothetical and no longer only a fairness delta — it is **red**. `vnlp_segmentation_weak_vi` 2.10/2.60/2.00 → 2.70/2.70/2.70, same model id, zero spread. M0-13 gates the (provider, model, base_url) triple at startup; **nothing detects the provider retraining under a stable name**, and CI never calls the judge | exactly how it surfaced: bench scores moving with no code change. Only `coach bench --k 3` shows it. **GH #96** |
+| **Two pilot users share one Skill history** | Mechanism now verified, and it is worse than "collision": the ledger key is client-supplied (`web_api.py:111` charset-only) and unauthenticated (`web_api.py:1067`), so it is read *and* write access to another user's Skill history by typing their id. Unfixable under one shared token — `token_identity()` (`usage.py:917`) is identical for everyone | a Candidate's mastery jumping between Sessions with no interview that explains it. **GH #84** |
+| **A reconnect during a real provider stall still waits up to 120 s** | M1-19 stopped it starving the event loop and capped concurrent joins, but one unreachable provider costs ~4.2 min of retries — still longer than the join | repeated *"The previous run of this Session is still finishing"* clustered on one id; now also *"already waiting on the maximum number of previous runs"* |
+| **Two processes on one checkpoint `thread_id`** | M1-16 claims a per-Session lock in the **CLI**. The web server does not take it — it has its own in-process registry — so a CLI resume is refused while another CLI drives, but the web's own claim is invisible to the CLI's lock | interleaved transcript items; `started_at` jumping backwards |
+| **`postmortem` can lose a concurrent post-mortem's evidence** | the flock is inside `save_posteriors` (`ledger.py:244`), not around load→fuse→save (`postmortem.py:185/188/197`). And `locked()` must not nest (`filelock.py:54-55`), so "wrap the caller" is not a one-liner. Silent by contract — `ledger.py:235` "Never raises on a write problem" | a debrief's evidence absent from the next Session's priors, with nothing logged. **GH #122** |
+| **`coach usage --reconcile` run twice concurrently loses an update** | unlocked read-modify-write on the fault sidecar (`usage.py:772`). The *double-bill* this used to cause is closed by M0-11's uuid dedup; the lost update is not | two operators, or a cron beside a human. **GH #123** |
+| **Spend a gateway never reports** | M1-6 latches a fault when the token count is unreadable — but only for calls through the provider clients. A gateway reporting *plausible but wrong* numbers is still believed | `coach usage` totals drifting from the provider's own dashboard |
+| **A `session_error` is still a bare string** | M1-1 added `recoverable`; every other error is distinguished only by its text | a future refusal that should be recoverable marked terminal by omission — the default is terminal, the safe direction |
+| **The export is mode 600** | **Confirmed live this pass**: `-rw------- 1 coach coach 9127 … pilot-final-001.md`. `atomic_write_text` publishes through `tempfile`, which creates 0600. The server reads it as the same uid, so nothing is broken — a backup or sidecar process running as another uid cannot read `exports/*.md` | a backup job that used to work returning permission denied |
+| **`ruff format` is ungated, not "growing"** | **The previous report had this backwards.** Measured: 28 files at `main` → **26** at HEAD, i.e. it *shrank*. The real risk is that `.github/workflows/ci.yml:19` runs `ruff check` and nothing anywhere runs `ruff format --check`, so the number is invisible either way | nothing, until someone runs it and produces a 26-file / 355-line diff. **GH #131** |
+| **The web UI cannot show the evidence the export shows** | `web/src/lib/types.ts:112` is still `trace: Record<string, unknown>`; `ReportView.tsx` renders 5 of the 10 panel fields, dropping `initial_confidence` and both voices' `argument` / `key_evidence`. Display gap only — nothing is corrupted | a Candidate asking why a committee overturned a score, and you having to open the Markdown export to answer. **GH #121** |
 
 ---
 
-## 7. Two things I need from you
+## 7. Decision log
 
-### (a) `.env` — M0-1
+Every fork taken without asking, with the option that was dropped and its cost.
 
-I did not touch `.env`. Run this in the repo root:
-
-```bash
-# 1. Set the shared gate token. Without it EVERY endpoint is open to anything that can reach the port.
-printf 'COACH_AUTH_TOKEN=%s\n' "$(openssl rand -hex 32)" >> .env
-
-# 2. Set the browser origin that serves the UI. `*` is now REFUSED at startup (M1-11) — use the real origin.
-echo 'COACH_ALLOWED_ORIGINS=https://coach.example.com' >> .env     # localhost dev: http://localhost:5173
-
-# 3. Delete the three dead MiMo keys — live credentials for a service retired on 2026-06-03.
-sed -i '/^MIMO_API_KEY=/d;/^MIMO_BASE_URL=/d;/^MIMO_MODEL=/d' .env
-
-# 4. Verify
-grep -c '^MIMO_' .env                 # must print 0
-uv run coach api &                     # then:
-curl -s localhost:8000/api/health | grep -o '"auth_required":true'
-curl -o /dev/null -w '%{http_code}\n' localhost:8000/api/sessions/x/export.md   # must be 401
-```
-
-Also consider rotating the **Groq** key if it was ever shared — it is still a live credential, and
-Groq remains the availability fallback (never the judge; ADR 0009a, and M0-13 now enforces that in
-code).
-
-One thing to check before deploying, because M1-21 changed a rule: if your live
-`/app/state/skill-ledger.json` has any Candidate id starting with `_`, rename it first. Those ids are
-now reserved. On this machine the file does not exist, so there is nothing to migrate here.
-
-### (b) The bench came back RED — this is now your decision
-
-Run, artifact committed, analysis in §1. 34/35, and the failure is a judge drift this branch did not
-cause. Three ways forward, and none of them is "run it again until it passes":
-
-1. **Re-anchor `depth` and `system_thinking` (GH #96 / #103).** The principled fix. Both dimensions
-   still jump 2 → 4 with no `3`, so the judge resolves the gap on style — and both flagged cases are
-   Vietnamese answers scoring high, which is that bug's exact signature. This is scored work with a
-   bench run of its own, and a re-wording restarts the repeatability count from zero.
-2. **Re-derive the band for `vnlp_segmentation_weak_vi` from the observed distribution.** The
-   artifact's own advice, and legitimate *if* you conclude 2.70 is the right score for that answer —
-   a human has to make that call by reading the case. It is not the same thing as widening to go
-   green, and the difference is whether you looked at the answer first.
-3. **Tag anyway, with the red recorded.** Defensible for a trusted pilot: one case, 0.10 over, on a
-   known-open language-fairness bug, with the artifact committed and this report naming it. It means
-   tagging with a judge whose calibration you know has moved.
-
-I have not chosen for you, and I have not re-run it.
-
-Note M1-9 changed this command's failure mode: it now **refuses** (exit 2, no report written) if the
-day's budget cannot fund the sweep, rather than warning and spending it. `--ignore-budget` overrides
-the arithmetic if your real allowance is larger than our count; it cannot override a broken ledger
-or a dead quota. Today's run cost 181,424 tokens against a 2,500,000 daily budget.
-
-### (c) The PR — M0-16, prepared, **not pushed**
-
-I have not run `git push` and have not opened a PR. When you want it:
-
-```bash
-git push -u origin audit/stabilize-2026-09-14
-gh pr create --title "Stabilize for tag: all of M-0 and all of M-1" --body-file - <<'EOF'
-Executes the plan in `QA-REPORT.md`: all 14 codeable M-0 tasks and all 24 M-1 tasks.
-43 commits, one task per commit, each test-first with the red output in its message.
-
-Suite 848 → 972 pytest, 27 → 35 vitest. ruff, mypy, eslint, tsc and the web build green
-after every commit.
-
-Closes #119.
-
-## What this fixes that a user would notice
-- Pressing Start on a Session id that already has a report no longer destroys it (QA-01).
-- An answer can no longer be scored against the wrong question (NEW-01).
-- A strong returning Candidate can open a Session again — the Diagnostic was RAISING for
-  18 of 181 producible prior means (NEW-18).
-- A crashed question no longer reads as "the Candidate scored 0.00/5" in the report, the
-  export, or the Supervisor's prompt (NEW-16, QA-16).
-- An oversize answer is bounded before Send instead of being destroyed by the server's
-  refusal (QA-15).
-- A Candidate's answer can no longer forge sections of the report they show a recruiter
-  (NEW-12).
-
-## Money and judge integrity
-- The judge gate is now (provider, model, base_url), and it guards the judge *client*, so a
-  caller passing a concrete client cannot route around it (QA-10, NEW-24, NEW-25).
-- A dead quota stops the bench instead of writing a report that reads like a judge
-  regression (QA-14).
-- Every metered command checks the budget before spending it; `bench` refuses rather than
-  warning, with an explicit `--ignore-budget` so a judge can still be re-benched (NEW-10).
-- Unmeasurable spend is held as a fault instead of recorded as zero (NEW-07); the daily rail
-  counts every provider (NEW-06); the runaway ceiling is 19% of a day, not 85% (NEW-09).
-
-## Wire-contract change, please review
-`turn_id` is now REQUIRED on `candidate_answer`. Optional had a measured 1-in-8 misbinding
-race. An in-flight old bundle across a deploy is refused rather than misattributed.
-
-## Still open, deliberately
-Two pilot users sharing one token still share Skill-ledger keys. The proposed HMAC remedy
-cannot work under one shared secret; this needs real per-user identity (R-29 / #84).
-
-## Not yet done
-`coach bench --k 3` — `evaluator.py` changed (M0-7), so ADR 0009 owes an artifact before the
-tag.
-EOF
-```
+| # | question met | chosen | why | dropped, and its cost |
+|---|---|---|---|---|
+| 1 | Add `.env.bak.*` to `.gitignore`? | **No change** | already covered — `git check-ignore -v .env.bak.1789444582` → `.gitignore:24:.env.*`. Verified, not assumed | adding a redundant rule; cost: noise in a file whose existing rule already matches, and a false signal that `.env.*` does not cover it |
+| 2 | Which `COACH_ALLOWED_ORIGINS`? | **`http://localhost:5173`**, flagged as a dev value | no production hostname exists anywhere in the repo — `deploy/nginx/conf.d/coach.conf` is `server_name _` by design, and compose names none. `*` is refused at startup (M1-11) | guessing a hostname; cost: a wrong origin looks configured and silently breaks **every** browser socket in production, with the failure appearing at handshake time, not at startup |
+| 3 | File a new issue for bench option 1? | **Comment on #96, raise to `severity:high`** | #96 **is** option 1, is open, and already carries draft PR #104. Its body's claim *"Not a gate failure"* is now false and needed correcting in place | a new issue; cost: a duplicate of an open issue, splitting the repeatability evidence and the draft PR away from the new measurement |
+| 4 | New issue for QA-02's isolation half, and for M2-4? | **One comment on #84, folding both** | M2-4 *is* R-29 *is* QA-02's isolation half — one piece of work. The comment adds the verified mechanism and kills the proposed HMAC remedy with its own docstring | two more issues; cost: three trackers for one fix, and the HMAC remedy surviving in writing as if viable |
+| 5 | M2-5 (ledger history) — new issue or comment on #83? | **New issue #127** | the drafting agent checked #83 and found it is the *consumer*; the storage-shape decision is a distinct prerequisite | a comment on #83; cost: a storage decision buried in a dashboard issue |
+| 6 | Trust the 12 issue drafts as written? | **Adversarially re-verify every one, file the corrected bodies** | all 12 came back `needs_edit`: **36 bad citations and 40 unsupported claims** caught. E.g. "the CLI reads four trace fields" → five; "ten trace fields" → eleven; `ruff format` 24 → 26 | filing the drafts as written; cost: 36 wrong `file:line` citations permanently in the tracker, which is exactly the failure mode this report criticises elsewhere |
+| 7 | Item 16 gives 5 passed; the previous report said 9 | **Report 5, state the discrepancy** | the spec'd command selects 5 at HEAD; widening to the whole suite gives 18. Neither is 9. The check passes on its merits either way | quietly reporting 9 to match; cost: a checklist that agrees with itself and with nothing else |
+| 8 | Item 17 — pytest selector or wire probe? | **Wire probe** | `QA-REPORT.md:325` specifies *"the probe script: oversize answer / elapsed / max-questions / non-object frame / queue flood all refused, session not wedged"* — a wire check, not a unit-test count | a pytest selector; cost: it would have reported 15 and never touched the wire, which is where the bound has to hold |
+| 9 | My first demo probe failed with `session_error` | **Fixed the probe, not the app** | the app was right: `mlops_awareness` is not a canonical Skill (`diagnostic.py:23-28` lists five) and it refused with `ValueError: unknown Skill claim(s)` | "fixing" the app to accept it; cost: widening a validated domain boundary to accommodate a typo in a throwaway script |
+| 10 | Push the `v0.1.0-pilot` tag? | **Create it locally, do not push** | the PR is unmerged; a pushed tag that later has to move is worse than one that waits | pushing it; cost: a public tag pointing at a commit that may be rebased or amended during review |
+| 11 | Rotate the Groq key? | **Not done — cannot be** | key rotation happens on the provider's dashboard, which is outside this machine. Recorded as yours (§9) | editing `.env` with an invented value; cost: a deployment that cannot fail over |
+| 12 | `.env` changes — commit them? | **No commit** | `.env` is gitignored (`.gitignore:24`); there is no tracked change to commit. The backup `.env.bak.1789444582` is ignored by the same rule | force-adding it; cost: live credentials in git history, permanently |
 
 ---
 
-## 8. Numbers
+## 8. Issues filed
+
+Two comments on existing issues, twelve new. Every body carries verified `file:line` evidence, a
+trigger, and an AC checklist; every one was adversarially re-checked before filing.
+
+| # | title | trigger |
+|---|---|---|
+| **#96** *(comment)* | Anchor `depth` and `system_thinking` at 3 | already open — updated with today's measurements, `severity:medium` → **`severity:high`**. Closing it is what turns the bench gate green |
+| **#84** *(comment)* | R-29 Real accounts | a second person using the deployment. Carries QA-02's isolation half + M2-4 |
+| #121 | Web report drops 5 of 10 Committee fields; turn trace typed as `Record<string, unknown>` | any web-report work (#60 / #83), or the first time you must open the export to explain a verdict |
+| #122 | Same-candidate load→fuse→save isn't one critical section | a debrief's evidence absent from the next Session's priors, with nothing logged |
+| #123 | `reconcile_accounting` rewrites the fault sidecar unlocked | two concurrent `coach usage --reconcile` runs |
+| #124 | Split `web_api.py` (1,345) and `cli.py` (1,433) | the next change touching both halves of either file |
+| #125 | Usage rails full-scan the whole JSONL ledger per question | `coach usage` >1s, or ~50k rows |
+| #126 | The usage ledger has no rotation, TTL or prune | pair with #125; or the state volume crossing a size you care about |
+| #127 | Skill ledger keeps one snapshot per Candidate — no history | the progress dashboard (#83) |
+| #128 | The duplication catalogue — the "16" undercounts | opportunistic, when a change already touches a copy |
+| #129 | Dead weight: `SelfCritiqueTrace`, `docs/reference/*`, write-only `data/` | any pass that already touches them |
+| #130 | `resources.py:3` claims Chroma is the production path | the old R-13 trigger is dead (#68 closed); #130 carries a live one |
+| #131 | `ruff format` is ungated by CI — 26 files drift | a window with no open PR touching those files |
+| #132 | Micro-loop polish: no follow-up re-ask guard, ungated `skip_ahead`, sticky `concept_miss` | a Candidate reporting a repeated or skipped question |
+
+**#119** is closed by the PR.
+
+---
+
+## 9. What is left for you
+
+| # | task | why it is not mine |
+|---|---|---|
+| 1 | **Rotate the Groq key** | rotation happens on Groq's dashboard. The key in `.env` is live and was in a file that has been read repeatedly during this audit. Groq is the availability fallback and must never take the judge role (ADR 0009a; M0-13 enforces it in code) |
+| 2 | **Set `COACH_ALLOWED_ORIGINS` to the production origin** | it is `http://localhost:5173` — a **dev** value. No production hostname exists in the repo to infer. `*` is refused at startup (M1-11), so this must be a real origin |
+| 3 | **Merge the PR** | explicitly yours. CI result in §4 |
+| 4 | **Push the tag** after merging: `git push origin v0.1.0-pilot` | it is annotated and local; pushing before the merge risks a tag pointing at a rebased commit |
+| 5 | **Decide #96** | the bench gate is red until `depth` and `system_thinking` gain a `3`. Budget ~181k–207k tokens **per k=3 invocation**, and **3+ invocations** — every re-wording restarts the repeatability count from zero |
+
+Two things you do **not** need to do:
+
+- **`.env` is done** — token generated (64 hex), origins set, all three `MIMO_*` keys removed
+  (`grep -c '^MIMO_' .env` → 0), backup at `.env.bak.1789444582` (gitignored by `.gitignore:24`).
+  Verified by loading a real `Settings()` (`auth token set: True`) and by a container returning
+  `auth_required: true` with 401 on an unauthenticated export.
+- **Skill-ledger migration** — there is nothing to migrate. No real ledger exists on this machine; the
+  only `_`-prefixed key any ledger carries is `_meta`, which is the schema envelope M1-21 reserves the
+  prefix *for* (`ledger.py:49`), not a Candidate.
+
+---
+
+## 10. Numbers
 
 ```
-commits on the branch (mine)      43   (51 total incl. the 8 the QA report reviewed)
-pytest                            848 → 972   (+124)
-vitest                            27  → 35    (+8)
-mypy                              34 source files, clean
-stable checklist                  19 PASS · 1 FAIL (item 8: bench 34/35, judge drift) ·
-                                  1 BLOCKED-ON-YOU (item 21, .env)
-bench                             34/35, ~181,424 tokens, docs/audits/calibration-bench-2026-09-15.md
-QA findings closed                45 of 47 fully; 2 partial (QA-02 isolation half — unfixable
-                                  under one shared token; QA-16 trace-type half — never in the plan)
-still hanging                     coach bench --k 3 · .env · push+PR · 10 M-2 debts
+commits on the branch               55   (git log --no-merges 2dac711..HEAD)
+pytest                              848 → 972   (+124), green twice, identical summaries
+vitest                              27  → 35    (+8)
+mypy                                34 source files, clean
+stable checklist                    20 PASS · 1 FAIL (item 8: bench 34/35, judge drift,
+                                    accepted with recorded rationale)
+bench                               34/35, 181,424 tokens, 105 calls, exit 1
+                                    docs/audits/calibration-bench-2026-09-15.md
+QA findings closed                  45 of 47 fully; 2 partial (QA-02 isolation half — unfixable
+                                    under one shared token, GH #84; QA-16 trace-type half —
+                                    never in the plan, GH #121)
+issues filed                        12 new (#121–#132) + 2 comments (#96, #84)
+bad citations caught before filing   36, across all 12 drafts
+tag                                 v0.1.0-pilot — annotated, LOCAL, not pushed
+still yours                         Groq key rotation · production origin · merge · push the tag · #96
 ```
