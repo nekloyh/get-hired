@@ -10,6 +10,7 @@ from interview_coach.diagnostic import (
     TopicPlanSource,
     diagnose,
     diagnose_or_degrade,
+    role_criticality,
 )
 from interview_coach.evaluator import Evaluation
 from interview_coach.skill import apply_evaluation
@@ -202,3 +203,53 @@ def test_diagnose_or_degrade_offline_matches_plain_diagnose():
 
     assert degraded.topic_plan_source is TopicPlanSource.DETERMINISTIC
     assert [e.skill for e in degraded.topic_plan] == [e.skill for e in plain.topic_plan]
+
+
+# --- NEW-18: every prior mean the pipeline can produce must seed a legal Beta -------------------
+
+# One role that exercises all three criticalities, so the sweep needs no private seam.
+_PROBE_ROLE = "machine learning engineer"
+_PROBE_SKILLS = (
+    ("mlops", RoleCriticality.MUST_HAVE),
+    ("system_design", RoleCriticality.CORE),
+    ("vietnamese_nlp", RoleCriticality.PERIPHERAL),
+)
+# Every prior mean _initial_mastery_means can hand _seed_prior: the cold-start 0.5, a self-claim
+# (_self_assessment_to_mean over 1..5 -> [0.2, 0.8]), and a carried ledger prior or correlation
+# nudge — both of which pass through _clamp_mean, i.e. the closed interval [0.05, 0.95].
+_PRODUCIBLE_MEANS = tuple(round(0.05 + i * 0.005, 4) for i in range(181))
+
+
+@pytest.mark.parametrize(("skill", "criticality"), _PROBE_SKILLS)
+def test_every_producible_prior_mean_seeds_a_legal_beta(skill, criticality):
+    # prior_strength inverts a variance target that is unattainable at an extreme mean, so it can go
+    # non-positive and seed alpha, beta <= 0 — an illegal Beta, not merely a degenerate one, which
+    # raises out of SkillState and kills the Diagnostic before the interview starts.
+    profile = CandidateProfile(target_role=_PROBE_ROLE)
+    assert role_criticality(_PROBE_ROLE)[skill] is criticality
+
+    bad: list[tuple[float, str]] = []
+    for mean in _PRODUCIBLE_MEANS:
+        try:
+            state = diagnose(profile, None, ledger_priors={skill: mean}).priors[skill].state
+        except ValueError as err:
+            bad.append((mean, f"raised {err}"))
+            continue
+        if state.alpha <= 0.0 or state.beta <= 0.0:
+            bad.append((mean, f"alpha={state.alpha} beta={state.beta}"))
+
+    assert not bad, (
+        f"{criticality.value}: {len(bad)} of {len(_PRODUCIBLE_MEANS)} producible prior means "
+        f"seed a non-positive Beta -- {bad}"
+    )
+
+
+def test_a_strong_returning_candidate_can_still_open_a_session():
+    # ADR 0006: 0.95 is exactly the carried, decayed mean _clamp_mean is built to admit, and a few
+    # Sessions of strong mlops answers reach it. It must seed a usable prior, not kill the run.
+    profile = CandidateProfile(target_role=_PROBE_ROLE)  # mlops is MUST_HAVE here
+
+    prior = diagnose(profile, None, ledger_priors={"mlops": 0.95}).priors["mlops"]
+
+    assert prior.prior_strength > 0.0
+    assert prior.state.mastery == pytest.approx(0.95)  # ADR 0002: the mean is the ledger's, untouched
