@@ -221,6 +221,11 @@ def call_counts(before: Mapping[str, int], after: Mapping[str, int]) -> tuple[in
 class LLMClient(ABC):
     """The abstract interface every agent depends on."""
 
+    # Stamped True by ``build_role_clients`` when COACH_ALLOW_UNVALIDATED_JUDGE seated this client as
+    # the judge. Read by the micro-loop into every TurnTrace, and by the exporter (ADR 0009 /
+    # NEW-25): a reader of one score must be able to tell it is not bench-comparable.
+    judge_unvalidated: bool = False
+
     @abstractmethod
     def chat(
         self,
@@ -905,6 +910,27 @@ def _pinned_role_client(settings: Settings, role: RoleName) -> LLMClient:
     return _CLIENT_CLASSES[config.name](config)
 
 
+def _checked_judge(settings: Settings, client: LLMClient) -> LLMClient:
+    """Gate whatever is about to BE the judge, wherever it came from (ADR 0009).
+
+    The guard used to live only on the ``settings.role_config`` path, which a caller that passes a
+    concrete provider client skips entirely — the bench gate and the judge pin both dropped, silently.
+    Gating the client instead means a new caller (a script, a replay tool, a future web mode that
+    builds one client to avoid failover) cannot route around it.
+
+    Demo brains and test fakes are exempt because they are not a provider at all: they never call one,
+    spend nobody's allowance, and produce no score anyone compares to a bench artifact.
+    """
+    if not isinstance(client, _OpenAICompatibleClient) or not hasattr(settings, "role_config"):
+        return client
+    settings._require_bench_validated_judge(
+        client.provider_name, "", client._settings.model, client._settings.base_url
+    )
+    if getattr(settings, "allow_unvalidated_judge", False):
+        client.judge_unvalidated = True
+    return client
+
+
 def build_role_clients(settings: Settings, default_client: LLMClient | None = None) -> RoleClients:
     """Build the ADR 0010 role bundle.
 
@@ -920,8 +946,8 @@ def build_role_clients(settings: Settings, default_client: LLMClient | None = No
         # No router = nothing to pin or route (fakes, demo mode). No ``role_config`` = a partial
         # settings double (several CLI tests fake Settings with a SimpleNamespace) — role routing
         # only applies to the real Settings contract.
-        return RoleClients.single(default)
+        return RoleClients.single(_checked_judge(settings, default))
     non_judge: dict[str, LLMClient] = {}
     for role in ("interviewer", "supervisor", "diagnostic", "planner"):
         non_judge[role] = _pinned_role_client(settings, role) if settings.role_overridden(role) else default
-    return RoleClients(judge=_pinned_role_client(settings, "judge"), **non_judge)
+    return RoleClients(judge=_checked_judge(settings, _pinned_role_client(settings, "judge")), **non_judge)

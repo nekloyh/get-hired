@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 
 import httpx
@@ -24,6 +25,7 @@ from interview_coach.llm import (
     StructuredOutputError,
     ToolCallingUnsupported,
     build_client,
+    build_role_clients,
     call_counts,
 )
 from interview_coach.usage import ProviderQuotaExhausted, usage_for_day
@@ -871,3 +873,93 @@ def test_provider_label_prefers_the_router_identity_over_a_wrapped_client():
     assert provider_label(SimpleNamespace(primary_provider="openai")) == "openai"
     # The demo client and every test fake land here — nothing without a provider spends an allowance.
     assert provider_label(SimpleNamespace()) == UNKNOWN_PROVIDER
+
+
+# --- the ADR 0009 judge gate lives on the client, not only on the settings path (M0-13 / NEW-24) ---
+
+
+def _judge_settings(**overrides) -> Settings:
+    fields: dict[str, object] = {
+        "_env_file": None,
+        "primary_provider": "openai",
+        "openai_api_key": "test",
+        "openai_model": "gpt-5.4-mini",
+        "groq_api_key": "test",
+        "groq_model": "groq-model",
+    }
+    fields.update(overrides)
+    return Settings(**fields)
+
+
+def test_a_caller_supplied_provider_client_cannot_become_the_judge():
+    # NEW-24: build_role_clients short-circuited to RoleClients.single() for any non-router default,
+    # which dropped the bench gate AND the judge pin together, silently. The guard has to live on the
+    # client about to BE the judge, or the next caller — a script, a replay tool, a web mode that
+    # builds one client to avoid failover — routes around it exactly like this one does.
+    settings = _judge_settings()
+    groq = GroqClient(settings.provider_config("groq"))
+
+    with pytest.raises(ValueError, match="no green `coach bench` artifact"):
+        build_role_clients(settings, groq)
+
+
+def test_a_fake_or_demo_client_is_still_exempt():
+    # The exemption is "not a provider at all", not "not a router": demo mode and every fake-based
+    # test must stay on single-client semantics. A fake never calls a provider, spends nobody's
+    # allowance, and produces no score anyone compares to a bench artifact.
+    fake = _StaticClient('{"x": 1, "label": "fake"}')
+
+    assert build_role_clients(_judge_settings(), fake).judge is fake
+
+
+def test_an_opted_in_unvalidated_judge_is_logged_loudly_and_stamped(caplog):
+    # NEW-25: ADR 0009 grants no exemption, so the hatch stays — it is how `coach bench` measures a
+    # candidate model in the first place — but stops being silent. A WARNING at startup, and a mark
+    # that survives into the trace and the export so a reader of a score can tell it is not
+    # bench-comparable.
+    settings = _judge_settings(openai_model="gpt-4o-mini", allow_unvalidated_judge=True)
+
+    with caplog.at_level(logging.WARNING):
+        roles = build_role_clients(settings)
+
+    assert roles.judge.judge_unvalidated is True
+    assert "unvalidated judge" in caplog.text.lower()
+    assert "gpt-4o-mini" in caplog.text
+
+
+def test_an_unvalidated_judge_is_stamped_into_every_turn_trace_and_the_export():
+    from interview_coach.exporter import render_session_markdown
+    from interview_coach.microloop import ScriptedCandidate, run_micro_loop
+    from interview_coach.rubric import Rubric
+    from interview_coach.seeds import SeedQuestion
+    from interview_coach.session_serde import TranscriptItem
+
+    judge = _StaticClient(
+        json.dumps(
+            {
+                "dimensions": {
+                    "correctness": {"score": 4, "evidence": "cites the tradeoff directly"},
+                    # `rubric_with_delivery` adds this dimension for an English Session, and the
+                    # judge schema requires a score for every active dimension.
+                    "english_delivery": {"score": 4, "evidence": "clear, idiomatic phrasing"},
+                },
+                "weighted_score": 4.0,
+                "confidence": 0.8,
+                "follow_up_recommended": False,
+                "follow_up_rationale": "n/a",
+            }
+        )
+    )
+    judge.judge_unvalidated = True
+    seed = SeedQuestion(
+        skill="ml_fundamentals",
+        question="Explain the bias-variance tradeoff.",
+        rubric=Rubric(weights={"correctness": 1.0}),
+        answers=("Variance dominates when the model is too flexible.",),
+    )
+
+    result = run_micro_loop(judge, seed, ScriptedCandidate(seed.answers), max_turns=1)
+
+    assert result.turns[0].trace.judge_unvalidated is True
+    state = {"transcript": [TranscriptItem.from_micro_loop(result, plan_index=0)]}
+    assert "UNVALIDATED JUDGE" in render_session_markdown(state)

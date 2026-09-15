@@ -175,6 +175,10 @@ class TurnTrace:
     # silent failover, and this is where it becomes visible after the fact.
     llm_calls: int = 0
     llm_calls_by_provider: tuple[tuple[str, int], ...] = ()
+    # True when COACH_ALLOW_UNVALIDATED_JUDGE seated a judge with no green bench artifact (ADR 0009 /
+    # NEW-25). Per TURN, not per Session, because that is the grain at which a score is read back: a
+    # reviewer looking at one evaluation must be able to see it is not bench-comparable.
+    judge_unvalidated: bool = False
 
 
 @dataclass(frozen=True)
@@ -259,6 +263,7 @@ def run_micro_loop(
                 evaluator_self_critique_triggers=_escalation_triggers(evaluation),
                 llm_calls=llm_calls,
                 llm_calls_by_provider=llm_calls_by_provider,
+                judge_unvalidated=getattr(client, "judge_unvalidated", False),
             ),
         )
 

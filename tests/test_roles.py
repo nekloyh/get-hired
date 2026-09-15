@@ -93,7 +93,9 @@ def test_role_override_builds_pinned_client_and_leaves_the_rest():
 
 
 def test_judge_override_stays_pinned_never_routed():
-    settings = _settings(role_judge_model="gpt-5.4-nano", role_judge_temperature=0.0)
+    # gpt-5.4-nano has no bench artifact, so since M0-13 this override is legal only behind the
+    # audited opt-in — which is itself the proof that ROLE_JUDGE_MODEL now reaches the gate at all.
+    settings = _settings(role_judge_model="gpt-5.4-nano", role_judge_temperature=0.0, allow_unvalidated_judge=True)
     roles = build_role_clients(settings)
 
     assert isinstance(roles.judge, OpenAIClient)

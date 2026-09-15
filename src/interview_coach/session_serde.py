@@ -56,6 +56,7 @@ class TraceRecord:
     stop_reason: str | None = None
     llm_calls: int | None = None
     llm_calls_by_provider: Sequence[Sequence[Any]] | None = None
+    judge_unvalidated: bool | None = None
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> TraceRecord:
@@ -212,6 +213,10 @@ def _dump_turn(turn: Any) -> dict[str, Any]:
     trace = asdict(turn.trace)
     if turn.trace.stop_reason is not None:
         trace["stop_reason"] = turn.trace.stop_reason.value
+    if not trace.get("judge_unvalidated"):
+        # Absent, never False, on a validated judge: a positive marker only. That also keeps the wire
+        # — and tests/golden/replay-trajectory.json — byte-identical for every normal Session.
+        trace.pop("judge_unvalidated", None)
     return {
         "question": turn.question,
         "answer": turn.answer,

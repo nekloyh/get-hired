@@ -29,6 +29,13 @@ def render_session_markdown(session_state: Mapping[str, Any]) -> str:
     lines.append(f"- Stop reason: `{_md(session_state.get('stop_reason', 'n/a'))}`")
     lines.append(f"- Questions: `{session_state.get('question_count', 0)}`")
     lines.append(f"- Language mode: `{_md(session_state.get('language_mode', 'en'))}`")
+    if any(turn.trace.judge_unvalidated for item in transcript_items(session_state) for turn in item.turns):
+        lines.append("")
+        lines.append(
+            "> **UNVALIDATED JUDGE** — COACH_ALLOW_UNVALIDATED_JUDGE was set, so these scores were "
+            "produced by a model with no green `coach bench` artifact. They are NOT comparable to "
+            "bench-validated scores (ADR 0009)."
+        )
     lines.append("")
     _append_skill_states(lines, session_state)
     _append_ledger_deltas(lines, session_state)
@@ -141,6 +148,8 @@ def _append_transcript(lines: list[str], session_state: Mapping[str, Any]) -> No
                 # and the export is where that becomes reviewable after the session is over.
                 split = ", ".join(f"{name} {n}" for name, n in trace.llm_calls_by_provider or ())
                 lines.append(f"LLM calls: **{calls}**" + (f" ({_md(split)})" if split else ""))
+            if trace.judge_unvalidated:
+                lines.append("Judge: **UNVALIDATED** — no green `coach bench` artifact (ADR 0009).")
             lines.append("")
 
 
