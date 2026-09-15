@@ -88,14 +88,10 @@ def test_demo_websocket_start_answer_flow_and_export(tmp_path):
         question = _receive_until(ws, "question")
         assert "question" in question["question"].lower() or question["question"]
 
-        ws.send_json(
-            {
-                "type": "candidate_answer",
-                "answer": (
-                    "I would compare training and validation behavior, watch for leakage and drift, "
-                    "and explain the trade-off before choosing the model."
-                ),
-            }
+        _answer(
+            ws,
+            "I would compare training and validation behavior, watch for leakage and drift, "
+            "and explain the trade-off before choosing the model.",
         )
 
         update = _receive_until(ws, "state_update")
@@ -124,7 +120,7 @@ def test_web_session_threads_language_mode_into_state(tmp_path):
     with client.websocket_connect("/api/sessions/mixed-session") as ws:
         ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1, "language_mode": "mixed"})
         _receive_until(ws, "question")
-        ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+        _answer(ws, "A short demo answer about drift.")
         completed = _receive_until(ws, "session_completed")
         assert completed["state"]["language_mode"] == "mixed"
 
@@ -181,9 +177,7 @@ def test_resume_after_cancel_preserves_the_in_flight_question(tmp_path):
         ws.send_json({"type": "resume_session", "mode": "demo"})
         _receive_until(ws, "session_started")
         _receive_until(ws, "question")
-        ws.send_json(
-            {"type": "candidate_answer", "answer": "A real answer about the bias-variance tradeoff and regularization."}
-        )
+        _answer(ws, "A real answer about the bias-variance tradeoff and regularization.")
         completed = _receive_until(ws, "session_completed")
 
     state = completed["state"]
@@ -203,7 +197,7 @@ def _receive_both(ws, first_type: str, second_type: str, *, limit: int = 60) -> 
     """
     found: dict[str, dict] = {}
     for _ in range(limit):
-        event = ws.receive_json()
+        event = _remember_question(ws, ws.receive_json())
         if event["type"] in (first_type, second_type):
             found.setdefault(event["type"], event)
         if len(found) == 2:
@@ -251,25 +245,40 @@ def test_an_answer_is_bound_to_the_turn_it_answers(tmp_path):
     assert any(answer.startswith("REAL: an answer for the second") for answer in answers), answers
 
 
-def test_an_id_less_client_still_cannot_answer_a_question_nobody_asked(tmp_path):
-    # The binding is enforced server-side, not by the client's UI state: a bundle that sends no
-    # turn_id at all (an old tab after a mid-Session deploy, curl, anything) is still refused when it
-    # answers a turn nothing is waiting on. That is what makes this a fix rather than a convention.
+def test_an_id_less_answer_is_refused_outright(tmp_path):
+    # An answer with no turn_id is refused ALWAYS, not only when nothing is pending. "Nothing is
+    # pending" is not a state the client can rely on: the socket loop and the graph thread run
+    # concurrently, so a stray id-less answer that arrives just after the NEXT question is armed
+    # matches it and is scored against the wrong question — the exact misattribution NEW-01 is about.
+    # Measured before this: the Session completed with the stolen text scored as Q2's evidence, about
+    # one run in eight. The server has minted a turn id for every question it asked, so an answer
+    # that names none cannot be bound to anything, and refusing is the only safe reading.
     client = _test_client(tmp_path)
 
     with client.websocket_connect("/api/sessions/queue-jump-legacy") as ws:
         ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 2})
-        first_turn_id = _receive_until(ws, "question")["turn_id"]
-        ws.send_json({"type": "candidate_answer", "answer": "REAL: bias and variance trade off."})
-        ws.send_json({"type": "candidate_answer", "answer": "STOLEN: typed for the first question."})
-        refusal, second = _receive_both(ws, "session_error", "question")
+        first = _receive_until(ws, "question")
+        ws.send_json({"type": "candidate_answer", "answer": "STOLEN: sent with no turn id."})
+        refusal = _receive_until(ws, "session_error", limit=40)
         assert "does not answer" in refusal["error"]
-        ws.send_json({"type": "candidate_answer", "answer": "REAL: an answer for the second question."})
+
+        # The Session is not wedged: the same question still accepts a properly bound answer.
+        ws.send_json(
+            {"type": "candidate_answer", "answer": "REAL: bias and variance.", "turn_id": first["turn_id"]}
+        )
+        second = _receive_until(ws, "question", limit=40)
+        ws.send_json(
+            {
+                "type": "candidate_answer",
+                "answer": "REAL: an answer for the second question.",
+                "turn_id": second["turn_id"],
+            }
+        )
         completed = _receive_until(ws, "session_completed", limit=60)
 
     answers = [turn["answer"] for item in completed["state"]["transcript"] for turn in item["turns"]]
     assert not any(answer.startswith("STOLEN") for answer in answers), answers
-    assert second["turn_id"] > first_turn_id
+    assert second["turn_id"] > first["turn_id"]
 
 
 def test_start_cancel_start_on_one_socket_clears_stale_state(tmp_path):
@@ -315,9 +324,7 @@ def test_returning_candidate_seeds_priors_and_carries_a_delta(tmp_path):
             ws.send_json({"type": "start_session", "mode": "demo", "candidate_id": "demo", "max_questions": 1})
             _receive_until(ws, "session_started")
             _receive_until(ws, "question")
-            ws.send_json(
-                {"type": "candidate_answer", "answer": "A solid answer about bias, variance, leakage, and drift."}
-            )
+            _answer(ws, "A solid answer about bias, variance, leakage, and drift.")
             return _receive_until(ws, "session_completed")["state"]
 
     first = _run_one("s1")
@@ -327,9 +334,26 @@ def test_returning_candidate_seeds_priors_and_carries_a_delta(tmp_path):
     assert second["ledger_prior_mastery"]  # returning candidate: priors carried from the ledger
 
 
+# NEW-01: every question carries a turn id and every answer must echo it, so the receive helpers
+# remember the last question each socket saw and `_answer` sends the bound frame. Keyed by id(ws)
+# because a TestClient websocket is not hashable; entries are per-test and die with the process.
+_LAST_QUESTION: dict[int, int] = {}
+
+
+def _remember_question(ws, event):
+    if event.get("type") == "question" and isinstance(event.get("turn_id"), int):
+        _LAST_QUESTION[id(ws)] = event["turn_id"]
+    return event
+
+
+def _answer(ws, text: str) -> None:
+    """Answer the question this socket last received, echoing its turn id (NEW-01)."""
+    ws.send_json({"type": "candidate_answer", "answer": text, "turn_id": _LAST_QUESTION[id(ws)]})
+
+
 def _receive_until(ws, event_type: str, *, limit: int = 20):
     for _ in range(limit):
-        event = ws.receive_json()
+        event = _remember_question(ws, ws.receive_json())
         if event["type"] == event_type:
             return event
     raise AssertionError(f"did not receive event type {event_type!r}")
@@ -604,7 +628,7 @@ def _complete_a_demo_session(client, session_id: str) -> None:
         ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
         _receive_until(ws, "question")
         while True:
-            ws.send_json({"type": "candidate_answer", "answer": "A reasonable answer about batching."})
+            _answer(ws, "A reasonable answer about batching.")
             event = _receive_until_any(ws, {"question", "session_completed"}, limit=60)
             if event["type"] == "session_completed":
                 return
@@ -612,7 +636,7 @@ def _complete_a_demo_session(client, session_id: str) -> None:
 
 def _receive_until_any(ws, event_types: set[str], *, limit: int = 40):
     for _ in range(limit):
-        event = ws.receive_json()
+        event = _remember_question(ws, ws.receive_json())
         if event["type"] in event_types:
             return event
     raise AssertionError(f"did not receive any of {event_types}")
@@ -931,7 +955,7 @@ def test_a_resumed_session_keeps_its_language_for_retrieval(tmp_path):
     with client.websocket_connect("/api/sessions/vn-session") as ws:
         ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1, "language_mode": "vn"})
         _receive_until(ws, "question")
-        ws.send_json({"type": "candidate_answer", "answer": "Câu trả lời demo về drift."})
+        _answer(ws, "Câu trả lời demo về drift.")
         _receive_until(ws, "session_completed", limit=40)
 
     values = _checkpoint_values(app.state.web_api, "vn-session")
@@ -1233,12 +1257,7 @@ def _complete_a_demo_session(client, session_id: str) -> None:
         )
         _receive_until(ws, "session_started")
         _receive_until(ws, "question")
-        ws.send_json(
-            {
-                "type": "candidate_answer",
-                "answer": "I would compare training and validation behavior and watch for leakage.",
-            }
-        )
+        _answer(ws, "I would compare training and validation behavior and watch for leakage.")
         _receive_until(ws, "session_completed", limit=40)
 
 
@@ -1516,7 +1535,7 @@ def test_a_funded_live_session_still_starts(tmp_path, monkeypatch):
         started = ws.receive_json()
         assert started["type"] == "session_started"
         _expect_question(ws)
-        ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+        _answer(ws, "A short demo answer about drift.")
         completed = _receive_until(ws, "session_completed")
 
     assert completed["state"]["status"] == "complete"
@@ -1565,7 +1584,7 @@ def test_a_running_session_suspends_when_a_billed_call_cannot_be_recorded(tmp_pa
         assert ws.receive_json()["type"] == "session_started"
         _expect_question(ws)
         _break_the_ledger(tmp_path)
-        ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+        _answer(ws, "A short demo answer about drift.")
         event = _receive_until_any(ws, {"session_error", "session_completed"})
 
     assert event["type"] == "session_error"
@@ -1585,7 +1604,7 @@ def test_demo_mode_runs_even_with_an_unwritable_ledger(tmp_path, monkeypatch):
         ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
         assert ws.receive_json()["type"] == "session_started"
         _expect_question(ws)
-        ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+        _answer(ws, "A short demo answer about drift.")
         completed = _receive_until(ws, "session_completed")
 
     assert completed["state"]["status"] == "complete"
@@ -1604,7 +1623,7 @@ def test_demo_mode_is_exempt_from_every_budget_rail(tmp_path, monkeypatch):
         ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
         assert ws.receive_json()["type"] == "session_started"
         _expect_question(ws)
-        ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+        _answer(ws, "A short demo answer about drift.")
         completed = _receive_until(ws, "session_completed")
 
     assert completed["state"]["status"] == "complete"
@@ -1729,7 +1748,7 @@ def test_a_mid_session_breach_suspends_instead_of_completing(tmp_path, monkeypat
         _start_live(ws, max_questions=2)
         assert ws.receive_json()["type"] == "session_started"
         _expect_question(ws)  # Q1 really was asked before the rail fired
-        ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+        _answer(ws, "A short demo answer about drift.")
         for _ in range(40):
             # "question" ends the loop only so a rail that fails to fire reddens this test instead
             # of blocking forever on a Q2 nobody is going to answer.
@@ -1781,7 +1800,7 @@ def test_a_dead_quota_mid_session_suspends_the_web_session(tmp_path, monkeypatch
         _start_live(ws, max_questions=2)
         assert ws.receive_json()["type"] == "session_started"
         _expect_question(ws)
-        ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+        _answer(ws, "A short demo answer about drift.")
         for _ in range(40):
             seen.append(ws.receive_json())
             if seen[-1]["type"] in {"session_error", "session_completed", "question"}:
@@ -1874,7 +1893,7 @@ def test_the_web_rail_counts_only_the_questions_actually_left(tmp_path, monkeypa
         assert ws.receive_json()["type"] == "session_started"
         for _ in range(2):
             _expect_question(ws)
-            ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+            _answer(ws, "A short demo answer about drift.")
         event = _receive_until_any(ws, {"session_completed", "session_error"}, limit=60)
 
     assert event["type"] == "session_completed", f"a fundable Session was suspended: {event}"
@@ -1900,7 +1919,7 @@ def test_a_new_interview_on_the_same_browser_id_is_not_suspended(tmp_path, monke
             _start_live(ws, max_questions=1)
             assert ws.receive_json()["type"] == "session_started"
             _expect_question(ws)
-            ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+            _answer(ws, "A short demo answer about drift.")
             event = _receive_until_any(ws, {"session_completed", "session_error"}, limit=60)
         assert event["type"] == expect, f"{event}"
         return event
@@ -1929,7 +1948,7 @@ def test_a_suspended_web_session_can_actually_be_resumed(tmp_path, monkeypatch):
         _start_live(ws, max_questions=2)
         assert ws.receive_json()["type"] == "session_started"
         _expect_question(ws)
-        ws.send_json({"type": "candidate_answer", "answer": "A short demo answer about drift."})
+        _answer(ws, "A short demo answer about drift.")
         event = _receive_until_any(ws, {"session_error", "session_completed", "question"})
     assert event["type"] == "session_error", f"the rail did not suspend after Q1: {event}"
 
@@ -1976,7 +1995,7 @@ def _drop_the_socket_mid_provider_call(client, blocked: _BlockedRun, session_id:
         _receive_until(ws, "session_started")
         _receive_until(ws, "question")
         first_run = client.app.state.web_api.runtimes[session_id]
-        ws.send_json({"type": "candidate_answer", "answer": "An answer the Evaluator is still scoring."})
+        _answer(ws, "An answer the Evaluator is still scoring.")
         assert blocked.entered.wait(timeout=5), "the graph thread never took the answer"
     return first_run
 
@@ -2000,7 +2019,7 @@ def test_a_reconnect_waits_for_the_previous_runs_thread_before_resuming(tmp_path
             blocked.release.set()
             _receive_until(ws, "session_started")
             _receive_until(ws, "question")
-            ws.send_json({"type": "candidate_answer", "answer": "A real answer about the bias-variance tradeoff."})
+            _answer(ws, "A real answer about the bias-variance tradeoff.")
             completed = _receive_until(ws, "session_completed")
     finally:
         blocked.release.set()
@@ -2041,7 +2060,7 @@ def test_a_non_object_frame_is_a_session_error_not_a_wedged_session_id(tmp_path)
         _receive_until(ws, "question")
         ws.send_text("null")
         error = _receive_until(ws, "session_error")
-        ws.send_json({"type": "candidate_answer", "answer": "A real answer about the bias-variance tradeoff."})
+        _answer(ws, "A real answer about the bias-variance tradeoff.")
         completed = _receive_until(ws, "session_completed")
 
     assert "JSON object" in error["error"]

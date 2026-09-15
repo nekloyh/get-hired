@@ -112,9 +112,9 @@ class ResumeSessionPayload(BaseModel):
 class CandidateAnswerPayload(BaseModel):
     type: Literal["candidate_answer"]
     answer: str = Field(max_length=MAX_ANSWER_CHARS)
-    # NEW-01: which turn this answers. Optional on the wire because the *server* enforces the
-    # binding (see the handler): an old bundle that omits it is still refused when it answers a turn
-    # nobody is waiting on, so absence is a missing convenience, not a bypass.
+    # NEW-01: which turn this answers. Nullable in the schema so a frame that omits it reaches the
+    # handler and is REFUSED there with a Candidate-readable message, rather than dying as a raw
+    # pydantic ValidationError — but it is required in effect: the handler rejects `None`.
     turn_id: int | None = None
 
 
@@ -680,8 +680,14 @@ def create_app(
                     # which. Without this the queue is a bare FIFO, so a second answer sent while one
                     # question is pending shifts every later question's evidence onto the wrong
                     # prompt — silently, with no error, all the way into the Skill ledger.
+                    # The id is REQUIRED, not merely checked when present. "Nothing is pending" is
+                    # not a state a client can rely on: this loop and the graph thread run
+                    # concurrently, so an id-less answer that arrives just after the NEXT question is
+                    # armed matches it and is scored against the wrong question — measured at about
+                    # one run in eight. The server mints an id for every question it asks, so an
+                    # answer naming none cannot be bound to anything.
                     expected = runtime.awaiting_turn_id
-                    if expected is None or (payload.turn_id is not None and payload.turn_id != expected):
+                    if expected is None or payload.turn_id != expected:
                         emit(
                             {
                                 "type": "session_error",
