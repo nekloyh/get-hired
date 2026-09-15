@@ -45,6 +45,11 @@ services:
     volumes:
       - ./deploy/nginx/conf.d:/etc/nginx/conf.d:ro
       - ./deploy/nginx/certs:/etc/nginx/certs:ro
+      # The ACME http-01 webroot, shared with the host's certbot. conf.d/coach.conf already serves
+      # /.well-known/acme-challenge/ from /var/www/certbot, but nothing was mounted there, so the
+      # challenge 404'd and the only authenticator left was `--standalone` — which needs :80, and
+      # this container holds :80 for the life of the deployment. Renewal therefore could not work.
+      - ./deploy/certbot-webroot:/var/www/certbot:ro
 
 volumes:
   coach-state:

@@ -45,25 +45,47 @@ baked at build time is readable by anyone who can fetch the app it is supposed t
 
 ## 3. Certificates
 
-For a real hostname, issue once on the host with certbot and point the mount at the result:
+**Bootstrap first, then issue.** nginx refuses to start without a certificate file (`cannot load
+certificate "/etc/nginx/certs/fullchain.pem"`), and certbot's http-01 challenge is served *by*
+nginx — so the self-signed pair is not just the staging path, it is step one of the real one:
 
 ```bash
-sudo certbot certonly --standalone -d coach.example.com
-sudo mkdir -p deploy/nginx/certs
-sudo cp /etc/letsencrypt/live/coach.example.com/{fullchain.pem,privkey.pem} deploy/nginx/certs/
-```
-
-For a staging box or a local smoke test, a self-signed pair is enough (browsers will warn):
-
-```bash
-mkdir -p deploy/nginx/certs && cd deploy/nginx/certs
+mkdir -p deploy/nginx/certs deploy/certbot-webroot && cd deploy/nginx/certs
 openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
   -keyout privkey.pem -out fullchain.pem \
   -subj "/CN=coach.example.com" -addext "subjectAltName=DNS:coach.example.com"
+cd -
 ```
 
-Then replace `server_name _;` in `deploy/nginx/conf.d/coach.conf` with your hostname. Renewal is a
-host-side certbot timer plus `docker compose restart nginx`; nothing in the image expires.
+Replace `server_name _;` in `deploy/nginx/conf.d/coach.conf` with your hostname, bring the stack up
+(§4), and only then issue the real certificate — over the webroot nginx already serves, **not**
+`--standalone`:
+
+```bash
+# /srv/coach is this checkout's absolute path; substitute yours in all three places. The
+# --deploy-hook value must stay on one line.
+sudo certbot certonly --webroot -w /srv/coach/deploy/certbot-webroot \
+  -d coach.example.com \
+  --deploy-hook 'cp "$RENEWED_LINEAGE/fullchain.pem" "$RENEWED_LINEAGE/privkey.pem" /srv/coach/deploy/nginx/certs/ && docker compose -f /srv/coach/docker-compose.yml restart nginx'
+```
+
+`--standalone` cannot work here and must not be used: it binds :80 itself, and the nginx container
+holds :80 for the life of the deployment. It would fail at issuance and — worse — `certbot renew`
+replays whatever authenticator issuance recorded, so a certificate issued with `--standalone`
+renews with `--standalone`: failing from ~day 60 and hard-expiring at day 90, taking `wss://` down
+with `https://`, because the UI's WebSocket inherits the page scheme.
+
+The hook is what makes renewal actually land: nginx serves *copies* under `deploy/nginx/certs/`, so
+a renewal that only rewrites `/etc/letsencrypt/live/…` and restarts nginx re-serves the expired
+copy. Certbot saves `--deploy-hook` into `/etc/letsencrypt/renewal/coach.example.com.conf`, so the
+packaged `certbot.timer` needs no further configuration. Two details are load-bearing: the hook runs
+with no useful cwd, so every path in it is absolute; and both `.pem` files are named, because
+certbot runs hooks through `/bin/sh`, which does not expand `{a,b}`.
+
+Verify before you depend on it: `sudo certbot renew --dry-run` with the stack **up**. It exercises
+the webroot for real; it does *not* run deploy hooks, so also confirm the ACME location is
+reachable: `curl -si -H 'Host: coach.example.com' http://<host>/.well-known/acme-challenge/probe` —
+a 404 from *nginx* is correct, a 301 to `https://` means the location is not matching.
 
 ## 4. Run
 
@@ -93,8 +115,22 @@ A `docker restart` mid-question is recoverable: the browser shows *Connection lo
 resumes from the checkpoint, and the pending question is re-emitted. This is verified from a real
 browser against a real container — see §8.
 
-Back it up with `docker run --rm -v coach-state:/state -v "$PWD:/backup" alpine tar czf
-/backup/coach-state.tgz -C /state .`
+Back it up **outside the checkout**:
+
+```bash
+sudo install -d -m 700 /var/backups/coach
+docker compose run --rm --no-deps --user root -v /var/backups/coach:/backup app \
+  tar czf "/backup/coach-state-$(date +%F).tgz" -C /app/state .
+```
+
+`docker compose run` is what makes this correct: Compose names the volume `<project>_coach-state`,
+so a hand-written `docker run` that mounts `coach-state` by its bare key mounts a *different*
+volume — one Docker silently creates, empty — and tars nothing. Running it as the `app` service
+borrows the mount that service already has. The destination is off the checkout on purpose: `$PWD`
+is the git working tree and the Docker build context, and the archive is every Candidate's
+transcript plus both ledgers — no `.gitignore` rule covers it, so `git add -A` on the deploy host
+would publish it. A dated name keeps one bad run from overwriting the only copy; copy it to another
+host to make it a backup.
 
 ## 6. The single-worker constraint
 
