@@ -2063,6 +2063,31 @@ def test_an_oversize_time_budget_is_refused(tmp_path):
     assert "less than or equal to" in event["error"]
 
 
+# --- QA-02: the Skill ledger key is a constrained key, not free text ------------------------------
+
+_UNSAFE_CANDIDATE_IDS = ["minh/../../etc/passwd", "a" * 65, "minh\nINFO forged log line", " ", "minh minh", "Nguyễn"]
+
+
+@pytest.mark.parametrize("bad", _UNSAFE_CANDIDATE_IDS)
+def test_a_free_text_candidate_id_is_refused_before_a_session_starts(tmp_path, bad):
+    # QA-02: candidate_id is the ONLY key into the shared cross-session Skill ledger — read on start
+    # (load_priors) and destructively REPLACED on completion (save_posteriors). It must be a
+    # constrained key: unbounded, arbitrary-charset text lands verbatim in a JSON file every pilot
+    # Session rewrites, and in a %r-formatted log line. And it must be refused LOUDLY here, not
+    # degraded downstream: a silent cold start that then silently never saves is the ADR 0005 failure.
+    # This does NOT isolate two pilot users sharing one token — one shared secret is one principal,
+    # so no derivation available today separates them; per-user identity is R-29.
+    client = _test_client(tmp_path)
+
+    with client.websocket_connect("/api/sessions/bad-candidate-id") as ws:
+        ws.send_json({"type": "start_session", "mode": "demo", "candidate_id": bad, "max_questions": 1})
+        event = ws.receive_json()
+
+    assert event["type"] == "session_error", event
+    assert "String should match pattern" in event["error"]
+    assert not (tmp_path / "ledger.json").exists()
+
+
 def test_answers_past_the_queue_bound_are_dropped_not_buffered(tmp_path, monkeypatch):
     # The graph never consumes here, so a flood of answers must be refused past the bound, and the
     # socket loop must still answer the next frame instead of blocking on a full queue.

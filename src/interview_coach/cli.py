@@ -52,7 +52,7 @@ from .eval_harness import harness_passed, render_golden_answer_report, run_golde
 from .exporter import export_session_markdown
 from .forge import MAX_DRAFTS, ForgeError, render_forge_report, run_forge, write_forge_outputs
 from .language import DEFAULT_LANGUAGE_MODE, LANGUAGE_MODES
-from .ledger import load_priors, save_posteriors
+from .ledger import SAFE_CANDIDATE_ID, is_safe_candidate_id, load_priors, save_posteriors
 from .llm import (
     UNKNOWN_PROVIDER,
     LLMClient,
@@ -343,6 +343,15 @@ def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
         path = export_architecture_diagram(args.diagram, roles)
         print(f"Exported architecture diagram to {path}")
         return 0
+    if args.candidate and not is_safe_candidate_id(args.candidate):
+        # Refuse BEFORE the interview: save_posteriors is silent by contract, so a bad --candidate
+        # would otherwise run the whole Session and then persist none of its Skill evidence.
+        print(
+            f"Refusing to start this Session: --candidate {args.candidate!r} is not a valid Skill "
+            f"ledger key (expected {SAFE_CANDIDATE_ID.pattern}).",
+            file=sys.stderr,
+        )
+        return 2
 
     question_bank = None
     if args.pack:

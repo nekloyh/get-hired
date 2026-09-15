@@ -88,9 +88,20 @@ export function SetupPanel({
         ) : null}
         <label>
           Candidate id <span className="hint">(optional — remembers progress across sessions)</span>
+          {/*
+            An id, not a display name: the server constrains it to [A-Za-z0-9_-]{1,64} because it is a
+            key in the shared Skill ledger (QA-02). Enforced here too, and shown as an id-shaped
+            example, because the server's refusal arrives as a session_error the reducer treats as
+            terminal — so a Candidate who types their own name would otherwise have to rotate the
+            Session to retry. Diacritics are rejected, which is why the placeholder no longer says
+            "your name".
+          */}
           <input
             value={form.candidateId}
-            placeholder="e.g. your name"
+            placeholder="e.g. minh-nguyen"
+            pattern="[A-Za-z0-9_-]{1,64}"
+            maxLength={64}
+            title="Letters, digits, hyphen and underscore only (max 64)."
             onChange={(event) => onChange({ ...form, candidateId: event.target.value })}
           />
         </label>

@@ -288,6 +288,21 @@ def test_a_concurrent_second_process_cannot_erase_this_processs_record(tmp_path)
     assert candidates == ["alice", "bob", "carol"]
 
 
+@pytest.mark.parametrize("bad", ["minh/../../etc/passwd", "a" * 65, "minh\nINFO forged", " ", "minh minh", "Nguyễn"])
+def test_an_unsafe_candidate_id_is_never_written_as_a_ledger_key(tmp_path, bad, caplog):
+    # Defence in depth behind the web payload guard, and the rule the CLI shares: the key is one
+    # shared JSON file that every Session and both CLI commands rewrite. Honours the module contract —
+    # never raises, warns, and leaves the file untouched rather than half-written.
+    path = tmp_path / "ledger.json"
+
+    save_posteriors(path, bad, {"mlops": SkillState("mlops", alpha=8.0, beta=2.0)}, now=0.0)
+
+    assert not path.exists(), f"an unvalidated id was written into the shared ledger: {bad!r}"
+    assert load_priors(path, bad, now=0.0) is None
+    assert load_states(path, bad, now=0.0) is None
+    assert "not a valid Skill ledger key" in caplog.text
+
+
 def test_the_ledger_carries_a_schema_version_that_is_never_read_as_a_candidate(tmp_path):
     path = tmp_path / "ledger.json"
     save_posteriors(path, "alice", {"mlops": SkillState("mlops", alpha=8.0, beta=2.0)}, now=0.0)

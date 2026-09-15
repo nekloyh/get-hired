@@ -1211,3 +1211,32 @@ def test_the_derived_ceiling_is_silent_on_a_worst_case_session_and_still_stops_a
     # And it was stopped well short of eating the day, which is what "nothing bounds a single
     # session" asked for.
     assert usage.session_run_spend("berserk") < usage.DEFAULT_DAILY_TOKEN_BUDGET // 2
+
+
+def test_session_refuses_an_unsafe_candidate_id_before_the_interview(tmp_path, monkeypatch, capsys):
+    # QA-02. `save_posteriors` is silent by contract — it warns and returns — so without a guard here
+    # a bad --candidate ran the whole interview and then persisted none of its Skill evidence, which
+    # is the failure the cross-session memory exists to prevent.
+    from interview_coach.demo_llm import DemoLLMClient
+
+    monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
+    monkeypatch.setattr(cli, "build_client", lambda settings: DemoLLMClient())
+
+    rc = cli.main(
+        [
+            "session",
+            "--scripted",
+            "--no-live",
+            "--max-questions",
+            "1",
+            "--candidate",
+            "minh minh",
+            "--session-id",
+            "unsafe-candidate",
+            "--checkpoint-db",
+            str(tmp_path / "c.sqlite"),
+        ]
+    )
+
+    assert rc == 2
+    assert "not a valid Skill ledger key" in capsys.readouterr().err

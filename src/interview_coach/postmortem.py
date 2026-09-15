@@ -34,7 +34,7 @@ from pydantic import BaseModel, Field
 
 from .diagnostic import CRITICALITY_SETTINGS, SKILLS, RoleCriticality, role_criticality
 from .exporter import _md
-from .ledger import load_states, save_posteriors
+from .ledger import SAFE_CANDIDATE_ID, is_safe_candidate_id, load_states, save_posteriors
 from .llm import LLMClient, Message, Validator
 from .microloop import Candidate, CandidateIntent
 from .resources import ResourceStore
@@ -171,6 +171,10 @@ def run_postmortem(
     """
     if not candidate_id:
         raise ValueError("postmortem requires a candidate id — the Skill ledger is the whole point")
+    if not is_safe_candidate_id(candidate_id):
+        # Before elicitation, not after: the ledger guard is silent by contract, so without this the
+        # debrief would spend a whole elicitation + reconstruction and then persist nothing.
+        raise ValueError(f"{candidate_id!r} is not a valid Skill ledger key (expected {SAFE_CANDIDATE_ID.pattern})")
     now = time.time() if now is None else now
 
     transcript = run_elicitation(client, candidate, target_role=target_role, companies=companies)

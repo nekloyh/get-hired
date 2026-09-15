@@ -40,7 +40,7 @@ from .demo_llm import DemoLLMClient
 from .diagnostic import CandidateProfile, diagnose_or_degrade
 from .exporter import export_session_markdown, render_session_markdown
 from .language import DEFAULT_LANGUAGE_MODE
-from .ledger import load_priors, save_posteriors
+from .ledger import SAFE_CANDIDATE_ID, load_priors, save_posteriors
 from .llm import UNKNOWN_PROVIDER, LLMClient, build_client, build_role_clients, provider_label
 from .microloop import DEFAULT_MAX_TURNS, CandidateInputUnavailable, CandidateIntent
 from .resources import build_resource_store
@@ -92,7 +92,13 @@ class StartSessionPayload(BaseModel):
     target_role: str = "machine learning engineer"
     target_companies: list[str] = Field(default_factory=list)
     claimed_skills: dict[str, float] = Field(default_factory=dict)
-    candidate_id: str = ""  # cross-session Skill ledger id (0023); empty = one-shot cold start
+    # Cross-session Skill ledger id (0023); empty = one-shot cold start. A constrained KEY, not a
+    # display name and not ownership: the shared token is one principal, so this cannot separate two
+    # pilot users — that is R-29. Refusing loudly at the boundary is what keeps a bad id from
+    # degrading into a silent cold start that then silently never saves (ADR 0005). The ^/$ anchors
+    # are load-bearing: pydantic's `pattern` is a search, not a match, so unanchored it accepts
+    # "minh/../../etc/passwd".
+    candidate_id: str = Field("", pattern=rf"^$|^{SAFE_CANDIDATE_ID.pattern}$")
     max_questions: int = Field(DEFAULT_MAX_QUESTIONS, ge=1, le=10)
     max_elapsed_seconds: float = Field(DEFAULT_MAX_ELAPSED_SECONDS, gt=0, le=MAX_ELAPSED_SECONDS_CEILING)
     language_mode: Literal["en", "vn", "mixed"] = "en"  # issue 0024, ADR 0007

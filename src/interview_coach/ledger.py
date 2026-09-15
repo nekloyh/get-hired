@@ -23,6 +23,7 @@ import json
 import logging
 import math
 import os
+import re
 import tempfile
 import threading
 from collections.abc import Mapping
@@ -37,6 +38,22 @@ logger = logging.getLogger(__name__)
 SECONDS_PER_DAY = 86_400.0
 # Written under the top-level ``_meta`` key; candidate records are every other key.
 LEDGER_SCHEMA_VERSION = 1
+
+# A Candidate id is a *key* in one shared JSON file that every pilot Session and both CLI commands
+# read and rewrite, so it is constrained the way the Session id already is. This is NOT ownership:
+# one shared secret is one principal (`Settings.auth_token`, R-07 — real per-user auth is R-29), so
+# no server-side derivation available today can separate two pilot users who share a token. What it
+# closes is the free-text half of QA-02: an unbounded, arbitrary-charset key in a file this module
+# promises is "diff-friendly and hand-inspectable", and one that `%r` formats straight into a log
+# line. Note it refuses diacritics, so a Vietnamese name is an invalid KEY — the field is an id, and
+# the UI says so; widening to Unicode letters re-opens the log-forging and hand-editability
+# arguments and should be a deliberate decision, not a loosening to make a test pass.
+SAFE_CANDIDATE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def is_safe_candidate_id(candidate_id: str) -> bool:
+    """Whether ``candidate_id`` may be used as a Skill ledger key."""
+    return bool(SAFE_CANDIDATE_ID.fullmatch(candidate_id))
 
 # Half-life of carried evidence, in days: after this long a Skill's pseudo-count mass above the neutral
 # prior has decayed by half, so a returning Candidate's edge fades over ~a month of absence. Chosen so
@@ -101,6 +118,9 @@ def _load_candidate(
     non-finite ledger logs a warning and degrades to cold start rather than crashing the Session.
     """
     if not candidate_id:
+        return None
+    if not is_safe_candidate_id(candidate_id):
+        logger.warning("%r is not a valid Skill ledger key; starting cold.", candidate_id)
         return None
     try:
         raw = Path(path).read_text(encoding="utf-8")
@@ -185,6 +205,9 @@ def save_posteriors(
     Session — it logs a warning and moves on.
     """
     if not candidate_id:
+        return
+    if not is_safe_candidate_id(candidate_id):
+        logger.warning("%r is not a valid Skill ledger key; Session memory not persisted.", candidate_id)
         return
     target = Path(path)
     with _SAVE_LOCK, locked(target):
