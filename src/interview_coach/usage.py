@@ -56,6 +56,7 @@ from threading import Lock
 from typing import Any
 from uuid import uuid4
 
+from . import telemetry
 from .filelock import locked
 
 logger = logging.getLogger(__name__)
@@ -269,10 +270,17 @@ _SESSION_ID: ContextVar[str] = ContextVar("interview_coach_usage_session", defau
 
 @contextmanager
 def session_scope(session_id: str) -> Iterator[None]:
-    """Attribute every ledger row written inside this block to ``session_id``."""
+    """Attribute every ledger row written inside this block to ``session_id``.
+
+    The noise counters (telemetry.py) are scoped here too, and for the same reason: they count events
+    raised by these very calls. The web API runs one thread per Session, so a process-wide Counter let
+    one Candidate's sanitizer fold be read as another Candidate's judgment noise and haircut a clean
+    confidence — infrastructure noise becoming Skill evidence (ADR 0005).
+    """
     token = _SESSION_ID.set(session_id)
     try:
-        yield
+        with telemetry.session_counters():
+            yield
     finally:
         _SESSION_ID.reset(token)
 

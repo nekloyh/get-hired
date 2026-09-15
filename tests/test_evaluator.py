@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import unicodedata
 
 import pytest
 
-from interview_coach import telemetry
+from interview_coach import telemetry, usage
 from interview_coach.config import load_settings
 from interview_coach.evaluator import (
     DIVERGENCE_CONFIDENCE_CEILING,
@@ -850,6 +851,70 @@ def test_flatten_fold_counts_as_noise_and_caps(make_client):
     assert ev.confidence == pytest.approx(NOISE_CONFIDENCE_CEILING)
     assert ev.trust is not None
     assert "sanitizer.judgment_flattened_in_dimensions" in ev.trust.noise_events
+
+
+# --- counters are per-Session, not per-process (QA-03) -------------------------------------------
+
+_GATE_SECONDS = 10.0
+
+
+def _hold_open(fake, entered: threading.Event, release: threading.Event):
+    """Hold this fake's provider call open so another Session's judge call can interleave inside it."""
+    inner = fake.chat.completions.create
+
+    def create(**kwargs):
+        entered.set()
+        assert release.wait(_GATE_SECONDS), "the interleaved Session never finished"
+        return inner(**kwargs)
+
+    fake.chat.completions.create = create
+    return fake
+
+
+def test_another_sessions_fold_must_not_haircut_this_sessions_confidence(make_client):
+    # ADR 0005: one Candidate's provider hiccup must never become evidence about another Candidate.
+    # The web API runs one thread per Session, so two judge calls are genuinely in flight at once.
+    # Session B's reply needs one sanitizer fold; Session A's is spotless — and A's confidence (which
+    # sets its Beta evidence weight) must not feel B's fold. The gate sits INSIDE
+    # `chat.completions.create`, i.e. inside Session A's own chat_json window, which is exactly where
+    # the process-wide Counter was read as "did THIS judgment fold anything".
+    from interview_coach.evaluator import NOISE_CONFIDENCE_CEILING
+
+    clean = _eval_json(_good_dimensions(), confidence=0.95)
+    flattened = json.loads(clean)
+    flattened["dimensions"]["weighted_score"] = flattened.pop("weighted_score")
+
+    entered, release = threading.Event(), threading.Event()
+    client_a, fake_a = make_client([clean])
+    _hold_open(fake_a, entered, release)
+    client_b, _ = make_client([json.dumps(flattened)])
+    kept: dict[str, Evaluation] = {}
+
+    def run_a() -> None:
+        with usage.session_scope("sess-a"):
+            kept["a"] = evaluate(client_a, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+
+    def run_b() -> None:
+        assert entered.wait(_GATE_SECONDS), "Session A never reached its judge call"
+        try:
+            with usage.session_scope("sess-b"):
+                kept["b"] = evaluate(client_b, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
+        finally:
+            release.set()
+
+    threads = [threading.Thread(target=run_a), threading.Thread(target=run_b)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(2 * _GATE_SECONDS)
+        assert not thread.is_alive()
+
+    # B keeps its own haircut: the signal must survive the isolation, not be thrown away with it.
+    assert kept["b"].trust.noise_events == ("sanitizer.judgment_flattened_in_dimensions",)
+    assert kept["b"].confidence == pytest.approx(NOISE_CONFIDENCE_CEILING)
+    # A never folded anything, so A's judgment is clean and full-confidence.
+    assert kept["a"].trust.noise_events == ()
+    assert kept["a"].confidence == pytest.approx(0.95)
 
 
 def test_panel_budget_exhausted_keeps_guarded_first_pass(make_client):
