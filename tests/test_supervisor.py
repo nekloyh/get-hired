@@ -1178,3 +1178,96 @@ def test_the_prompt_cannot_promise_a_seed_the_pack_does_not_have():
 
     assert f"- mlops: probed {probes}/{probes} seeds (0 left)" in body
     assert "another seed remains" not in body
+
+
+def test_an_accounting_fault_at_the_supervisor_decision_suspends_instead_of_degrading(
+    tmp_path, make_client, monkeypatch
+):
+    # QA-05 / M0-6. `decide_next_move` re-raised ProviderQuotaExhausted but not AccountingUnavailable,
+    # so a ledger that goes unwritable mid-Session landed in the transport backstop: the Supervisor
+    # degraded to the deterministic fallback, advanced the plan past a question that never ran, and
+    # wrote a decision record blaming "a provider transport error" — an operator stop disguised as a
+    # provider blip, permanently, in the checkpoint and the Markdown export. It must suspend like the
+    # quota stop does and resume clean.
+    from interview_coach import supervisor
+    from interview_coach.usage import AccountingUnavailable
+
+    monkeypatch.setattr(supervisor, "run_micro_loop", _fake_micro_loop(4.0))
+    client, _ = make_client(
+        [
+            AccountingUnavailable("Usage accounting is UNRECONCILED: 1 provider call(s) were billed"),
+            _decision("advance_plan", "Need the next planned Skill."),
+            _decision("advance_plan", "Need the next planned Skill."),
+            _plan("mlops", "system_design", "vietnamese_nlp"),
+        ]
+    )
+    session_id = "accounting-decide-session"
+    config = session_config(session_id)
+    state = initial_session_state(session_id, _diagnostic(), max_questions=3, started_at=0)
+
+    with SqliteSaver.from_conn_string(str(tmp_path / "accounting.sqlite")) as checkpointer:
+        graph = build_session_graph(client, checkpointer=checkpointer, now=lambda: 1)
+        raised: list[BaseException] = []
+        try:
+            for _ in graph.stream(state, config, stream_mode="values"):
+                pass
+        except AccountingUnavailable as err:
+            raised.append(err)
+        checkpoint = graph.get_state(config).values
+
+        assert raised, "the accounting fault was swallowed by the Supervisor's transport backstop"
+        assert checkpoint["question_count"] == 1
+        assert [item["stop_reason"] for item in checkpoint["transcript"]] == ["resolved"]
+        assert checkpoint["status"] == SessionStatus.ACTIVE.value
+        # No decision record, so nothing mislabels the accounting fault as a transport error.
+        assert checkpoint.get("supervisor_decisions", []) == []
+
+        final = list(graph.stream(None, config, stream_mode="values"))[-1]
+
+    assert final["status"] == SessionStatus.COMPLETE.value
+    assert len(final["transcript"]) == 3
+    assert StopReason.FAILED.value not in {item["stop_reason"] for item in final["transcript"]}
+    assert not any("transport error" in d["llm_reasoning"] for d in final["supervisor_decisions"])
+
+
+def test_an_accounting_fault_at_the_study_plan_node_stops_instead_of_completing_silently(
+    tmp_path, make_client, monkeypatch
+):
+    # QA-05 / M0-6, second net. study_plan_node's `except Exception` swallowed both typed operator
+    # stops into `study_plan_error` and let the graph reach END, so `coach session` exited 0 on a
+    # broken ledger with the fault buried in an export field. The interview is already COMPLETE in
+    # the checkpoint, so re-raising here is a suspend, not a loss: a resume re-runs only this node.
+    from interview_coach import supervisor
+    from interview_coach.usage import AccountingUnavailable
+
+    monkeypatch.setattr(supervisor, "run_micro_loop", _fake_micro_loop(5.0))
+    client, _ = make_client(
+        [
+            AccountingUnavailable("Usage accounting is UNRECONCILED: 1 provider call(s) were billed"),
+            _plan("system_design", "vietnamese_nlp", "ml_fundamentals"),
+        ]
+    )
+    session_id = "accounting-plan-session"
+    config = session_config(session_id)
+    state = initial_session_state(session_id, _diagnostic(), max_questions=1, started_at=0)
+
+    with SqliteSaver.from_conn_string(str(tmp_path / "accounting-plan.sqlite")) as checkpointer:
+        graph = build_session_graph(client, checkpointer=checkpointer, now=lambda: 1)
+        raised: list[BaseException] = []
+        try:
+            for _ in graph.stream(state, config, stream_mode="values"):
+                pass
+        except AccountingUnavailable as err:
+            raised.append(err)
+        checkpoint = graph.get_state(config).values
+
+        assert raised, "the accounting fault was swallowed into study_plan_error"
+        assert checkpoint["status"] == SessionStatus.COMPLETE.value  # the interview itself resolved
+        assert [item["stop_reason"] for item in checkpoint["transcript"]] == ["resolved"]
+        assert checkpoint.get("study_plan") is None
+        assert checkpoint.get("study_plan_error") is None  # not recorded as a degraded planner
+
+        final = list(graph.stream(None, config, stream_mode="values"))[-1]
+
+    assert final["study_plan"] is not None  # the resume re-runs only the end-matter node
+    assert len(final["transcript"]) == 1

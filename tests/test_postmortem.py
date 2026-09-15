@@ -378,3 +378,33 @@ def test_cli_postmortem_end_to_end_with_markdown_export(tmp_path, monkeypatch, m
     # The ledger genuinely moved: score 2.0 at conf 0.4 adds ~0.41 to beta at the reduced weight.
     reloaded = load_states(path, "alice", now=time.time())
     assert reloaded["mlops"].beta > 2.3
+
+
+def test_an_accounting_fault_in_the_replan_stops_the_command_and_keeps_the_fusion(
+    tmp_path, make_client, monkeypatch
+):
+    # QA-05 / M0-6, third net. The re-plan's `except Exception` re-raised CandidateIntent but not the
+    # two typed operator stops, so a refused call was filed as `study_plan_error` and `coach
+    # postmortem` exited 0 — an operator stop rendered as a degraded planner. It must reach
+    # `cli._dispatch`, which exits 2 with the remedy. The ledger fusion happens BEFORE this call, so
+    # re-raising loses nothing durable: the fused posteriors are on disk either way.
+    from interview_coach import postmortem
+    from interview_coach.usage import AccountingUnavailable
+
+    path = tmp_path / "ledger.json"
+    save_posteriors(path, "alice", {"mlops": SkillState("mlops", alpha=8.0, beta=2.0)}, now=NOW)
+
+    def _refusing_plan(*args, **kwargs):
+        raise AccountingUnavailable("Usage accounting is UNRECONCILED: 1 provider call(s) were billed")
+
+    monkeypatch.setattr(postmortem, "plan_study", _refusing_plan)
+    score, conf = 2.0, 0.4
+    client, _ = make_client([*_elicitation_replies(), _scorecard(_entry(score=score, confidence=conf))])
+
+    with pytest.raises(AccountingUnavailable):
+        run_postmortem(client, ScriptedCandidate(_answers()), candidate_id="alice", ledger_db=path, now=NOW)
+
+    # The fusion that already landed is durable — the stop is about the end-matter call, not the ledger.
+    weight = POSTMORTEM_WEIGHT_RATIO * confidence_weight(conf)
+    reloaded = load_states(path, "alice", now=NOW)
+    assert reloaded["mlops"].alpha == pytest.approx(8.0 + weight * score_to_quality(score))

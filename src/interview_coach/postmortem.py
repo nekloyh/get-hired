@@ -40,6 +40,7 @@ from .microloop import Candidate, CandidateIntent
 from .resources import ResourceStore
 from .skill import POSTMORTEM_WEIGHT_RATIO, SkillState, confidence_weight, score_to_quality
 from .study_planner import StudyTarget, plan_study, rank_study_targets
+from .usage import AccountingUnavailable, ProviderQuotaExhausted
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +198,11 @@ def run_postmortem(
     try:
         study_plan = plan_study(client, after_state, resource_store=resource_store).model_dump(mode="json")
     except CandidateIntent:  # ADR 0005: intent propagates out of every net, always re-raised first
+        raise
+    except (AccountingUnavailable, ProviderQuotaExhausted):
+        # M0a / F1 and GH #119: a refused or dead call is an operator stop, not a planner blip. The
+        # ledger fusion above is already durable, so nothing is lost by stopping here; `_dispatch`
+        # turns this into exit 2 with the remedy instead of exit 0 with a `study_plan_error` field.
         raise
     except Exception as err:  # noqa: BLE001 — optional end-matter; a planner blip must not void the fusion
         logger.warning("post-mortem study planner failed; keeping the ledger fusion without a plan: %s", err)

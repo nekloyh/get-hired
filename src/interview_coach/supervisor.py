@@ -329,6 +329,11 @@ def build_session_graph(
         # discard the completed Session — degrade to no plan and let the graph reach END.
         try:
             plan = plan_study(roles.planner, state, resource_store=resource_store)
+        except (AccountingUnavailable, ProviderQuotaExhausted):
+            # Not a planner blip to degrade around: the Session is COMPLETE in the checkpoint, so a
+            # resume re-runs only this node once accounting is healthy or the quota resets. Swallowed,
+            # this reached END and `coach session` exited 0 on a broken ledger.
+            raise
         except Exception as err:  # noqa: BLE001 — last optional node; any failure here must not crash the run
             logger.warning("study planner failed; completing the Session without a Study Plan: %s", err)
             return {"study_plan": None, "study_plan_error": f"{type(err).__name__}: {err}"}
@@ -392,9 +397,11 @@ def decide_next_move(
             err,
         )
         return fallback
-    except ProviderQuotaExhausted:
-        # GH #119: the resolved question is already checkpointed, so suspending here is safe; a
-        # deterministic fallback would only walk the Session into the next dead call.
+    except (AccountingUnavailable, ProviderQuotaExhausted):
+        # GH #119 and M0a / F1: the resolved question is already checkpointed, so suspending here is
+        # safe; a deterministic fallback would only walk the Session into the next dead or refused
+        # call — and would leave a decision record permanently reading "a provider transport error",
+        # which neither of these is, in the checkpoint and the Markdown export.
         raise
     except Exception as err:  # noqa: BLE001 — the only otherwise-unguarded macro-loop LLM call site
         # A provider/transport failure (timeout, HTTP error after fallback exhaustion) is an
