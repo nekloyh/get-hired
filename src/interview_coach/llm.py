@@ -31,6 +31,7 @@ from .usage import (
     ProviderQuotaExhausted,
     accounting_gate,
     record_quota_exhausted,
+    record_unmeasured_call,
     record_usage,
 )
 
@@ -350,6 +351,24 @@ class LLMClient(ABC):
         raise ToolCallingUnsupported(f"{type(self).__name__} does not support native tool-calling")
 
 
+def _token_count(used: object, *names: str) -> int | None:
+    """One side of a call's token count under any of ``names``, or None if the response states none.
+
+    ``input_tokens``/``output_tokens`` is the same number under the name several OpenAI-compatible
+    gateways use; reading it is the difference between a counted call and a held fault. A value that
+    is present but is not a number is no count at all — it must not be rounded down to zero.
+    """
+    for name in names:
+        raw = used.get(name) if isinstance(used, Mapping) else getattr(used, name, None)
+        if raw is None:
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _extract_json(content: str) -> str:
     """Pull a JSON object out of a reply, tolerating ```json fences and surrounding prose."""
     text = content.strip()
@@ -494,16 +513,40 @@ class _OpenAICompatibleClient(LLMClient):
             outcome,
         )
 
+    def _is_billed(self) -> bool:
+        """Whether the completion just returned came from a real provider, and so cost money.
+
+        The class cannot answer this: every test double in this suite IS a real provider client, with
+        a scripted transport injected at construction. The transport is the only thing that differs —
+        a billed call goes out through the ``openai.OpenAI`` instance ``_openai()`` builds — so it is
+        what the question has to be asked of. Erring permissive (latching for fakes) refuses the next
+        call in every test that scripts a reply without a ``usage`` block; erring strict loses real
+        spend, which is the failure this whole path exists to prevent.
+        """
+        return isinstance(self._client, OpenAI)
+
     def _record_usage(self, completion: Any) -> None:
-        """Append this call's token usage to the daily ledger (fakes without ``usage`` are skipped)."""
+        """Append this call's token usage to the daily ledger, or latch what it could not count.
+
+        A billed call whose token count cannot be read is NOT a zero-token call. Recording it as zero
+        — what a missing ``usage`` block, or a gateway naming the fields
+        ``input_tokens``/``output_tokens``, used to produce — makes real spend invisible to every rail
+        that counts this ledger, which is the exact outcome the accounting slice exists to prevent. So
+        it becomes an accounting fault instead: unknown spend, said out loud, refusing the next
+        metered call until someone reconciles it.
+        """
         used = getattr(completion, "usage", None)
-        if used is None:
+        prompt = _token_count(used, "prompt_tokens", "input_tokens")
+        completion_count = _token_count(used, "completion_tokens", "output_tokens")
+        if prompt is None or completion_count is None:
+            if self._is_billed():
+                record_unmeasured_call(self.provider_name, self._settings.model, detail=f"usage={used!r}")
             return
         record_usage(
             self.provider_name,
             self._settings.model,
-            prompt_tokens=getattr(used, "prompt_tokens", 0) or 0,
-            completion_tokens=getattr(used, "completion_tokens", 0) or 0,
+            prompt_tokens=prompt,
+            completion_tokens=completion_count,
         )
 
     def chat(

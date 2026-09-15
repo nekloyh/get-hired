@@ -493,6 +493,45 @@ def _latch_fault(entry: Mapping[str, object], err: OSError, target: Path) -> Non
     _flush_faults(target)
 
 
+def record_unmeasured_call(provider: str, model: str, *, detail: str, path: Path | None = None) -> None:
+    """Latch a call the provider answered but did not state a usable token count for.
+
+    The same fault :func:`_latch_fault` raises for a row that would not write, and for the same
+    reason: the call was billed, so the day's spend is now undetermined. What it deliberately does
+    NOT carry is an ``entry`` — there is no row to replay, because the cost is not known. That makes
+    :func:`reconcile_accounting` report it exactly as it reports a fault whose row was lost ("that
+    spend stays unknown, not zero") rather than folding a fabricated 0 into the day's total, which is
+    the one answer a ledger may never invent.
+    """
+    target = path or ledger_path()
+    record: dict[str, Any] = {
+        "ts": _now_ts(),
+        "id": _new_fault_id(),
+        "kind": "accounting_fault",
+        "row": "tokens_unmeasured",
+        "billed": True,
+        "ledger": str(target),
+        "error": detail,
+        "provider": provider,
+        "model": model,
+    }
+    if session_id := _SESSION_ID.get():
+        # No ``entry`` to carry it, so it is stamped here or lost — which Session spent the unknown
+        # amount is the first question anyone reading this sidecar will ask.
+        record["session"] = session_id
+    logger.error(
+        "%s/%s answered but stated no usable token count (%s) — the call was billed and its cost is "
+        "UNKNOWN, so it is held as an accounting fault rather than recorded as zero. Metered calls "
+        "are refused until this is reconciled (`coach usage --reconcile`).",
+        provider,
+        model,
+        detail,
+    )
+    with _FAULT_LOCK:
+        _FAULTS.append({"record": record, "parked": False})
+    _flush_faults(target)
+
+
 def _append(entry: dict[str, object], path: Path | None) -> None:
     """Append one ledger row. Never raises; a failure latches an accounting fault instead."""
     target = path or ledger_path()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from types import SimpleNamespace
 
 import httpx
 import openai as openai_sdk
@@ -773,6 +774,80 @@ def test_a_reconciled_ledger_lets_calls_through_again(monkeypatch, tmp_path, fak
     client.chat_json([{"role": "user", "content": "allowed"}], Foo)
     assert fake.call_count == 1
     assert usage_for_day()["groq"] == {"prompt": 100, "completion": 20, "total": 120, "calls": 1}
+
+
+def _billed_client(replies: list) -> tuple[GroqClient, list]:
+    """A client whose transport really is ``openai.OpenAI`` — i.e. one whose calls cost money.
+
+    The suite's usual double is not one, and must not be: a fake that latched an accounting fault
+    would refuse the next call in every test that scripts a reply without a ``usage`` block.
+    Constructing the SDK object makes no network call; swapping its `create` is what keeps this
+    offline.
+    """
+    sdk = openai_sdk.OpenAI(api_key="test", base_url="http://groq.test", max_retries=0)
+    calls: list = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return replies[min(len(calls) - 1, len(replies) - 1)]
+
+    sdk.chat.completions.create = create
+    return GroqClient(_provider("groq"), client=sdk), calls
+
+
+def _answer(used: object | None) -> SimpleNamespace:
+    message = SimpleNamespace(content='{"x": 1, "label": "ok"}', tool_calls=None)
+    return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=used)
+
+
+def test_a_billed_call_with_no_token_count_is_held_not_forgiven():
+    """A response that states no usage is unknown spend, and unknown is not zero (M0a / NEW-07).
+
+    The call is already paid for; the only question left is whether the system can still say what the
+    day cost. Returning quietly here answered "yes, nothing" — the same permissive reading of a
+    missing number that the unwritable-ledger case exists to forbid — so the next call goes out
+    against a total that is known to be wrong. It latches instead, and that latch stops call two.
+    """
+    client, calls = _billed_client([_answer(None), _answer(None)])
+
+    client.chat_json([{"role": "user", "content": "one"}], Foo)
+
+    assert len(calls) == 1
+    assert usage_for_day().get("groq") is None  # nothing could be counted...
+    with pytest.raises(usage.AccountingUnavailable) as caught:
+        client.chat_json([{"role": "user", "content": "two"}], Foo)
+    assert len(calls) == 1  # ...so there is no second billed call
+    assert "UNRECONCILED" in str(caught.value)
+
+
+def test_a_gateway_that_names_tokens_input_output_is_counted_not_zeroed():
+    """`input_tokens`/`output_tokens` is the same number under the other common spelling.
+
+    Read it and the call is accounted for; miss it and the ledger gains a row asserting a real call
+    cost nothing, which is worse than no row at all — it is a lie the budget rails average into the
+    day.
+    """
+    client, _ = _billed_client([_answer(SimpleNamespace(input_tokens=90, output_tokens=12))])
+
+    client.chat_json([{"role": "user", "content": "go"}], Foo)
+
+    assert usage_for_day()["groq"] == {"prompt": 90, "completion": 12, "total": 102, "calls": 1}
+    assert usage.accounting_fault() is None
+
+
+def test_a_scripted_test_double_is_not_a_billed_call(fake_openai_factory):
+    """The guard rail on the rail: fakes answer without a `usage` block and nobody was charged.
+
+    Latching for them would refuse the second provider call in every test in this suite, so the
+    distinction cannot be "the response carried no usage" — it has to be "the transport was real".
+    """
+    client = GroqClient(_provider("groq"), client=fake_openai_factory(['{"x": 1, "label": "ok"}']))
+
+    client.chat_json([{"role": "user", "content": "one"}], Foo)
+    client.chat_json([{"role": "user", "content": "two"}], Foo)
+
+    assert usage.accounting_fault() is None
+    assert usage_for_day().get("groq") is None
 
 
 def test_sdk_retries_disabled_so_backoff_is_singly_owned(monkeypatch):
