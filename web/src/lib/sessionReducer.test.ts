@@ -68,6 +68,21 @@ describe('session event reducer', () => {
     expect(answered.messages.map((message) => message.role)).toEqual(['system', 'interviewer', 'candidate'])
   })
 
+  it('keeps the Session open while the planner runs after the last state_update', () => {
+    // NEW-15: the Supervisor stamps `complete` one graph node before the Study Plan exists, so the
+    // server streams a state_update reading complete with `study_plan: null` and only then spends
+    // 5-30s in the planner. Ending the Session on that frame rendered the report early — "N/A %
+    // readiness", "Study Plan was not produced." Only `session_completed` is the end.
+    const planning = { ...stateFixture, status: 'complete', study_plan: null, study_plan_error: null }
+
+    const streaming = reduceSessionEvent(initialSession, { type: 'state_update', state: planning })
+    expect(streaming.status).toBe('evaluating')
+
+    const finished = reduceSessionEvent(streaming, { type: 'session_completed', state: stateFixture })
+    expect(finished.status).toBe('complete')
+    expect(finished.state?.study_plan?.readiness_estimate).toBe(0.62)
+  })
+
   it('stores final state and error events', () => {
     const completed = reduceSessionEvent(initialSession, { type: 'session_completed', state: stateFixture })
     expect(completed.status).toBe('complete')
@@ -94,6 +109,15 @@ describe('connection lifecycle', () => {
     expect(dropped.status).toBe('disconnected')
     expect(dropped.currentQuestion).toBe('')
     expect(dropped.messages.at(-1)?.content).toMatch(/Connection to the interviewer was lost/)
+  })
+
+  it('treats a drop inside the planner window as a recoverable disconnect (NEW-15)', () => {
+    // The report is not ready yet, so the close is a fault with a resume path — not a finished
+    // Session. Resuming re-enters the graph at the study_plan node.
+    const planning = { ...stateFixture, status: 'complete', study_plan: null, study_plan_error: null }
+    const streaming = reduceSessionEvent(initialSession, { type: 'state_update', state: planning })
+
+    expect(reduceConnectionClosed(streaming).status).toBe('disconnected')
   })
 
   it('ignores a close after completion (a clean shutdown is not a fault)', () => {

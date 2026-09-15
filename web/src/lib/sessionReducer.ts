@@ -47,9 +47,14 @@ export function reduceSessionEvent(session: AppSession, event: SessionEvent): Ap
     }
   }
   if (event.type === 'state_update') {
+    // NEW-15: a state_update never ends the Session, even when the state it carries already reads
+    // `complete`. The Supervisor stamps that status one graph node BEFORE the planner runs, so
+    // ending here rendered the report during the 5-30s planner call — "N/A % readiness", "Study Plan
+    // was not produced." Only `session_completed` carries a finished Session. The state is still
+    // stored on every frame, so the live rails keep updating during the planner window.
     return {
       ...session,
-      status: event.state.status === 'complete' ? 'complete' : 'evaluating',
+      status: 'evaluating',
       state: event.state,
     }
   }
