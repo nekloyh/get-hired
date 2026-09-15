@@ -1,5 +1,9 @@
 # Deploying the Adaptive Interview Coach on a single VPS
 
+> **Before you let anyone else in**, work through [`pilot-runbook.md`](pilot-runbook.md): the
+> pre-flight gate, the limits you have to state to pilot users, and a backup you have actually
+> restored. This file gets the stack up; that one decides whether it is safe to hand over.
+
 The deploy target is deliberately small: **one host, one process, one shared secret**, sized for the
 handful of trusted users this project actually has. Multi-user identity and a real database are
 R-29, not this document.
