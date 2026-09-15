@@ -195,6 +195,29 @@ def test_contested_verdict_moves_posterior_less_than_consensus_at_identical_scor
     assert consensus.mastery > contested.mastery > before.mastery
 
 
+def test_consensus_panel_cannot_outweigh_a_guard_capped_confidence():
+    # QA-07: the deterministic guards exist to distrust a degraded judgment, and the escalated path
+    # must not launder them away. A verdict whose entire audit trail was blanked is capped to
+    # EVIDENCE_DEGRADE_CONFIDENCE_CEILING by evaluator._finalize; two panel voices happening to agree
+    # must not restore it to full EVIDENCE_WEIGHT. evidence_degraded is a derived field, so it arrives
+    # via model_copy — the same path production takes.
+    degraded = _panel_evaluation(4.0, disagreement=0.0, confidence=0.4).model_copy(update={"evidence_degraded": True})
+
+    assert evidence_weight_for(degraded) == pytest.approx(confidence_weight(0.4))
+    assert evidence_weight_for(degraded) < panel_agreement_weight(0.0)
+
+
+def test_degraded_consensus_verdict_moves_the_beta_less_than_a_clean_one():
+    # The property QA-07 buys: identical verdict score, identical (zero) committee disagreement — the
+    # judgment the guards distrusted must move the posterior strictly less. Before the fix the worse
+    # the evidence was, the more the panel fired, and the heavier it counted.
+    before = SkillState.neutral("ml_fundamentals")
+    clean = apply_evaluation(before, _panel_evaluation(5.0, disagreement=0.0, confidence=0.95))
+    degraded = apply_evaluation(before, _panel_evaluation(5.0, disagreement=0.0, confidence=0.4))
+
+    assert clean.mastery > degraded.mastery > before.mastery
+
+
 # --- R-20: the single rehydration point ----------------------------------------------------------
 
 

@@ -164,9 +164,19 @@ def evidence_weight_for(evaluation: Evaluation) -> float:
     confidence. Both the belief update (:func:`apply_evaluation`) and the transcript's recorded
     ``evidence_weight`` (supervisor's dump) must call this same function, or the export lies about
     the weight that was actually applied.
+
+    On the escalated path the two are combined with ``min()``, not dispatched between: committee
+    agreement is the escalation's own quality signal, but it must never *raise* the weight above what
+    the deterministic guards already decided this judgment is worth. A verdict whose entire audit
+    trail was blanked (``evidence_degraded``, confidence capped to
+    ``EVIDENCE_DEGRADE_CONFIDENCE_CEILING``) or whose parse needed noise folds must not enter the Beta
+    at full weight because the Skeptic and the Advocate happened to land on the same number — the
+    worse the evidence, the more the panel fires, so dispatching made bad evidence count heaviest.
+    Both functions live on the same scale — ``EVIDENCE_WEIGHT * [CONFIDENCE_WEIGHT_FLOOR, 1]``, i.e.
+    [0.5, 2.0] — so ``min()`` compares like with like.
     """
     if evaluation.panel is not None:
-        return panel_agreement_weight(evaluation.panel.disagreement)
+        return min(panel_agreement_weight(evaluation.panel.disagreement), confidence_weight(evaluation.confidence))
     return confidence_weight(evaluation.confidence)
 
 
