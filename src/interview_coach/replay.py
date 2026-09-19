@@ -20,10 +20,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
+from .bank import load_pack
 from .diagnostic import SKILLS, CandidateProfile, diagnose
 from .language import DEFAULT_LANGUAGE_MODE
 from .llm import LLMClient, Message
-from .seeds import SeedQuestion
+from .seeds import QuestionBank, SeedQuestion
 from .session_serde import transcript_items
 from .skill import SkillState
 from .supervisor import (
@@ -36,7 +37,10 @@ from .supervisor import (
     session_config,
 )
 
-REPLAY_ARTIFACT_VERSION = 1
+# 2 adds `pack`. A version-1 artifact has no pack field and is a built-in-bank artifact by
+# definition — every one ever dumped was — so it still loads, it is not migrated.
+REPLAY_ARTIFACT_VERSION = 2
+_READABLE_ARTIFACT_VERSIONS = (1, 2)
 
 
 @dataclass(frozen=True)
@@ -107,6 +111,7 @@ def run_persona_session(
     checkpointer: Any | None = None,
     now: Callable[[], float] = time.time,
     language_mode: str = DEFAULT_LANGUAGE_MODE,
+    question_bank: QuestionBank | None = None,
 ) -> dict[str, Any]:
     """Drive a full unattended Session with the persona answering; return the final state.
 
@@ -116,7 +121,13 @@ def run_persona_session(
     exercise a vn/mixed trajectory — without it the loop-level bench would be structurally en-only.
     """
     factory = persona_candidate_factory(candidate_client or judge_client, persona)
-    graph = build_session_graph(judge_client, checkpointer=checkpointer, candidate_factory=factory, now=now)
+    graph = build_session_graph(
+        judge_client,
+        checkpointer=checkpointer,
+        candidate_factory=factory,
+        question_bank=question_bank,
+        now=now,
+    )
     diagnostic = diagnose(persona.profile(), None)
     state = initial_session_state(
         session_id, diagnostic, max_questions=max_questions, started_at=now(), language_mode=language_mode
@@ -148,22 +159,41 @@ def attempts_by_skill(final_state: Mapping[str, Any]) -> dict[str, int]:
 
 @dataclass(frozen=True)
 class ReplayArtifact:
-    """A versioned dump of a Session trajectory for decision-level replay."""
+    """A versioned dump of a Session trajectory for decision-level replay.
+
+    ``pack`` is the content-pack directory the Session ran from, or None for the built-in bank. It
+    is not decoration: every seed rail in the Supervisor answers "are there seeds left?" against a
+    bank, and replaying a pack Session against the built-in bank measures a decision the real
+    Session could never have made (#113).
+    """
 
     version: int
     persona: str
     final_state: dict[str, Any]
     ground_truth: dict[str, float] = field(default_factory=dict)
+    pack: str | None = None
 
 
-def dump_replay_artifact(path: str | Path, persona: Persona, final_state: Mapping[str, Any]) -> Path:
-    """Persist a trajectory as a versioned JSON replay artifact."""
+def dump_replay_artifact(
+    path: str | Path,
+    persona: Persona,
+    final_state: Mapping[str, Any],
+    *,
+    pack: str | Path | None = None,
+) -> Path:
+    """Persist a trajectory as a versioned JSON replay artifact.
+
+    ``pack`` MUST be the pack the Session ran from. Omitting it on a pack Session does not produce a
+    slightly worse artifact — it produces one that replays against the wrong seed inventory and
+    reports the result as a measurement.
+    """
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "version": REPLAY_ARTIFACT_VERSION,
         "persona": persona.name,
         "ground_truth": dict(persona.mastery),
+        "pack": None if pack is None else str(pack),
         "final_state": dict(final_state),
     }
     target.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
@@ -172,7 +202,7 @@ def dump_replay_artifact(path: str | Path, persona: Persona, final_state: Mappin
 
 def load_replay_artifact(path: str | Path) -> ReplayArtifact:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
-    if data.get("version") != REPLAY_ARTIFACT_VERSION:
+    if data.get("version") not in _READABLE_ARTIFACT_VERSIONS:
         raise ValueError(f"unsupported replay artifact version {data.get('version')!r}")
     final_state = dict(data["final_state"])
     # The envelope version says how the *file* is shaped; it says nothing about the Session state
@@ -190,7 +220,21 @@ def load_replay_artifact(path: str | Path) -> ReplayArtifact:
         persona=str(data["persona"]),
         final_state=final_state,
         ground_truth={k: float(v) for k, v in data.get("ground_truth", {}).items()},
+        # Absent on a version-1 artifact, which is exactly what "the built-in bank" means there.
+        pack=None if data.get("pack") is None else str(data["pack"]),
     )
+
+
+def replay_bank(artifact: ReplayArtifact) -> QuestionBank | None:
+    """The seed inventory this trajectory actually ran against, or None for the built-in bank.
+
+    Raises rather than falling back: a pack directory that has moved since the dump makes the
+    artifact unreplayable, and answering with the built-in bank instead would be the #113 defect
+    wearing a different hat — a wrong measurement reported as a measurement.
+    """
+    if artifact.pack is None:
+        return None
+    return load_pack(artifact.pack).questions
 
 
 def replay_decision(
@@ -203,5 +247,16 @@ def replay_decision(
 
     The counterfactual: "given exactly this state, what would model X decide?" — the seed of
     decision-level regression testing across model swaps.
+
+    The bank comes from the artifact, not from the ambient default: every Supervisor seed rail
+    (`_has_unused_seed`, `_extra_probe_required`, `_seed_availability_summary`,
+    `_next_action_semantics`) is computed against it, and the FPT pack ships 4 seeds per Skill
+    against the built-in bank's 9/9/12/9/6 — so a replay of an exhausted pack Session would
+    otherwise be told seeds remain.
     """
-    return decide_next_move(client, cast("SessionState", artifact.final_state), now=now)
+    return decide_next_move(
+        client,
+        cast("SessionState", artifact.final_state),
+        now=now,
+        question_bank=replay_bank(artifact),
+    )

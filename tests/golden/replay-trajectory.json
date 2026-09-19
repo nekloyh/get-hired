@@ -659,6 +659,7 @@
     "mlops": 0.15,
     "system_design": 0.5
   },
+  "pack": null,
   "persona": "alice",
-  "version": 1
+  "version": 2
 }
