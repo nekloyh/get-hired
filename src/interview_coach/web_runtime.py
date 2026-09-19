@@ -46,6 +46,12 @@ STALE_RUNTIME_JOIN_SECONDS = 120.0
 # the cap an admitted join always gets a thread, and a refused one never waits for one.
 MAX_CONCURRENT_STALE_JOINS = 8
 
+# Every Session runs on a thread named `session-<id>`. The name is load-bearing twice over: a
+# `faulthandler` dump or `py-spy dump` on a wedged deployment names the Session that is stuck
+# instead of `Thread-7`, and the suite's teardown (tests/conftest.py) uses the prefix to prove no
+# Session thread outlived the test that started it (GH #134).
+SESSION_THREAD_NAME_PREFIX = "session-"
+
 # Completed states kept in RAM; the export endpoint falls back to the Markdown `_persist_export` wrote.
 MAX_COMPLETED_SESSIONS_IN_MEMORY = 64
 
@@ -160,7 +166,9 @@ class RuntimeSession:
         self.answers.put_nowait(_CANCEL)
 
     def start(self, target, *args: Any) -> None:
-        self.thread = threading.Thread(target=target, args=args, daemon=True)
+        self.thread = threading.Thread(
+            target=target, args=args, daemon=True, name=f"{SESSION_THREAD_NAME_PREFIX}{self.session_id}"
+        )
         self.thread.start()
 
 

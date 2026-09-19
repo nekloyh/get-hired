@@ -7,13 +7,16 @@ retry/validation logic in ``chat_json`` is exercised end-to-end against canned m
 from __future__ import annotations
 
 import json
+import logging
 import os
+import threading
 
 import pytest
 
 from interview_coach import telemetry, usage
 from interview_coach.config import ProviderSettings, Settings
 from interview_coach.llm import GroqClient, LLMRouter, reset_breakers
+from interview_coach.web_runtime import SESSION_THREAD_NAME_PREFIX
 
 # At conftest import, not in a fixture, and deliberately: `interview_coach.web_api` runs BOTH of its
 # module-scope environment readers — `guard_single_worker()` and `configure_session_logging(...)` —
@@ -92,6 +95,86 @@ def _clear_coach_log_file():
     """
     yield
     os.environ.pop("COACH_LOG_FILE", None)
+
+
+# Long enough that a machine under load is never the reason this trips, short enough that a genuinely
+# wedged run fails the suite instead of hanging it. The only run that is deliberately blocked
+# (`test_a_reconnect_gives_up_on_a_run_that_will_not_finish`) releases its gate in its own `finally`,
+# so it is already unblocked by the time this fixture joins.
+SESSION_THREAD_JOIN_SECONDS = 15.0
+
+
+@pytest.fixture(autouse=True)
+def _drop_log_handlers_bound_to_a_dead_stream():
+    """No test may leave a root handler pointing at a stream the next test cannot write to.
+
+    GH #134, and the actual cause of the `--- Logging error ---` blocks. `cli.main` calls
+    `logging.basicConfig(..., force=True)` (cli.py), which is right in production — it runs once,
+    against the process's real stderr — and radioactive in-process: `force=True` drops pytest's own
+    root handlers and installs a `StreamHandler` bound to whatever `sys.stderr` was at that instant,
+    which for the ~100 tests that drive `main()` under `capsys` is a capture object pytest closes at
+    that test's teardown. The root logger is process-global, so the dead sink outlives its test and
+    every `interview_coach` record for the rest of the session is written into a closed file.
+
+    Measured before this fixture: **2,441** records hit `ValueError: I/O operation on closed file`
+    in one green run, the overwhelming majority of them on MainThread. Only two to four of those
+    surfaced as a visible `--- Logging error ---` block, because `logging.handleError` prints its
+    complaint to `sys.stderr` too — so whether the noise is seen depends on the state of capture at
+    that instant, not on which record was late. That is why the count wobbled between runs and why
+    the visible ones were all Session threads: their writes land in the gap between tests.
+
+    Removing the dead handler is not the silencing the issue rules out. The record still reaches
+    pytest's own capture handler and `caplog`; what is dropped is a sink that can no longer be
+    written to at all.
+    """
+    root = logging.getLogger()
+    # Setup side, and this is what keeps the teardown honest: if the cleanup below is ever removed,
+    # the first test that runs after a CLI test fails here by name instead of the suite quietly going
+    # back to writing thousands of records into a closed file.
+    inherited = [h for h in root.handlers if getattr(getattr(h, "stream", None), "closed", False)]
+    assert not inherited, (
+        f"a previous test left {len(inherited)} root log handler(s) bound to a closed stream: "
+        f"{inherited}. Every record this test logs would be written into it."
+    )
+    yield
+    for handler in list(root.handlers):
+        stream = getattr(handler, "stream", None)
+        if stream is not None and getattr(stream, "closed", False):
+            root.removeHandler(handler)
+
+
+@pytest.fixture(autouse=True)
+def _no_session_thread_outlives_its_test():
+    """A Session runs on a background thread; no test may return while its own thread is still up.
+
+    GH #134. The visible symptom was four `--- Logging error ---` blocks with a full traceback in a
+    green run: a cancelled Session logged `cancelled by Candidate intent` after pytest had closed the
+    stream its handler writes to, so `logging` printed the handler's own failure. Silencing that —
+    `logging.raiseExceptions = False`, or a filter on the record — would hide the late write instead
+    of removing it, and the late write is the actual finding: a test that returns while the thread is
+    still inside `_run_session_thread` asserted against state the thread had not finished leaving.
+    The `finally` there is what releases the reservation, publishes posteriors and unregisters the id.
+
+    Measured at the time of writing: 17 tests in `tests/test_web_api.py` left a live Session thread,
+    not the three the log happened to name — which one gets caught is a matter of how late in the run
+    it lands. So this joins centrally rather than patching the tests the noise pointed at.
+
+    Only threads this test started are its responsibility, hence the before/after difference: an
+    earlier leak must not be reported against whoever runs next.
+    """
+    before = {t for t in threading.enumerate() if t.name.startswith(SESSION_THREAD_NAME_PREFIX)}
+    yield
+    started_here = [
+        t for t in threading.enumerate() if t.name.startswith(SESSION_THREAD_NAME_PREFIX) and t not in before
+    ]
+    for thread in started_here:
+        thread.join(timeout=SESSION_THREAD_JOIN_SECONDS)
+    still_running = sorted(t.name for t in started_here if t.is_alive())
+    assert not still_running, (
+        f"Session thread(s) still running {SESSION_THREAD_JOIN_SECONDS}s after the test returned: "
+        f"{still_running}. The test needs to drive the Session to an end state (or close the socket "
+        f"and read the resulting event) before it returns."
+    )
 
 
 class _FakeFunction:

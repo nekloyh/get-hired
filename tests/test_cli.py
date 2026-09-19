@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -1441,3 +1442,29 @@ def test_a_second_driver_is_refused_while_another_process_holds_the_session(tmp_
     state = _checkpoint_state("shared", db_path)
     assert state["question_count"] == 1  # refused before it drove anything
     assert state["status"] == "active"
+
+
+def test_running_the_cli_in_process_binds_a_root_log_handler_to_the_captured_stream(capsys):
+    """The hazard GH #134 turned out to be, pinned where it is created rather than where it shows.
+
+    `main` calls `logging.basicConfig(..., force=True)`, which is correct in a real process — it runs
+    once, against the real stderr — and radioactive in-process: `force=True` drops pytest's own root
+    handlers and installs a `StreamHandler` bound to whatever `sys.stderr` is at that instant. Under
+    `capsys` that is a capture object pytest closes at this test's teardown, and the root logger is
+    process-global, so the dead sink outlives the test. Measured before the cleanup landed: **2,441**
+    records in one green run raised `ValueError: I/O operation on closed file`, of which only two to
+    four surfaced as a visible `--- Logging error ---` block.
+
+    This asserts the hazard exists, so it cannot be removed silently. The autouse
+    `_drop_log_handlers_bound_to_a_dead_stream` fixture in conftest is what contains it, and that
+    fixture's own setup assertion is what stops the containment from being deleted.
+    """
+    assert cli.main(["usage"]) == 0
+    capsys.readouterr()
+
+    streams = [getattr(handler, "stream", None) for handler in logging.getLogger().handlers]
+
+    assert sys.stderr in streams, (
+        "cli.main no longer binds a root handler to the current sys.stderr. If that is deliberate, "
+        "the conftest cleanup may be narrowed — but check what replaced basicConfig first."
+    )
