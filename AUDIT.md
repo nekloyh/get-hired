@@ -156,6 +156,21 @@ Client→server payloads `start_session`/`resume_session`/`candidate_answer`/`ca
 | 8 | **Browser** | `localStorage["coach.sessionId"]`, `sessionStorage["coach.authToken"]` | UUID / token | UI | UI | LIVE |
 | 9 | Static content | `src/interview_coach/data/*.yaml` (45 questions, 40 notes), `data/packs/fpt/*` (20 questions, 10 notes), `data/bench/cases.yaml`, `data/bench/retrieval-labels.yaml` (62 rows), `data/replay/*.json` | validated at import (`bank.py:87-135`; `seeds.py:73`) | git | loaders | LIVE (bank, pack, bench, labels). **Never loaded by any code:** `data/bench/pending-cases-2026-07-11.yaml`, `data/forge/review-queue-2026-07-11.yaml` (+ report) — write-only outputs committed to git. |
 
+> **Superseded since this audit ran — two rows, kept as written.** This file is a snapshot of the
+> working tree at `2dac711` on 2026-09-14 and its `file:line` refs are part of that record, so the
+> rows above are not rewritten. What has changed:
+>
+> - **Row 5 (Chroma).** The `resources` collection is gone, not merely unreached: `ChromaResourceStore`,
+>   `coach ingest-resources`, `--resource-store` and `--resource-persist-dir` were deleted under
+>   GH #130, and `resources.py`'s docstring now carries the reasoning. The row's `web_api.py:812` and
+>   `cli.py:1174, 1251` refs no longer resolve — `web_api.py` is 329 lines and `cli.py` 629 after the
+>   GH #124 split. The `concepts` collection is unaffected and still live.
+> - **Row 9 (never-loaded data files).** Still accurate as an observation, now a recorded decision
+>   rather than an open finding: `data/forge/review-queue-2026-07-11.yaml` and its report are
+>   **retained on purpose** as bench-label material (ADR 0009 addendum b), which each file's header
+>   now states — see GH #129. `data/bench/pending-cases-2026-07-11.yaml` was already out of scope as
+>   frozen gate input.
+
 **Duplicated sources of truth:**
 1. A completed Session exists in **three** places — checkpoint (#1), RAM (#6), Markdown (#4). The export endpoint reads RAM, then the file, **never the checkpoint** (`web_api.py:642-654`); after a restart the Markdown rendering is the only readable copy.
 2. Skill posteriors live in the checkpoint's `skill_states` **and** the skill ledger, which keeps only the last snapshot (`ledger.py:210-216`) — the progress dashboard (GH #83) has no history to draw from (`docs/issues/README.md:55` agrees).
