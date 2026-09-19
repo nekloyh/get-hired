@@ -23,7 +23,7 @@ from interview_coach.fixtures import QUESTION
 from interview_coach.microloop import DEFAULT_MAX_TURNS
 from interview_coach.rubric import DIMENSIONS
 from interview_coach.supervisor import build_session_graph, initial_session_state, session_config
-from interview_coach.web_api import MAX_ANSWER_CHARS, WS_MAX_FRAME_BYTES
+from interview_coach.web_protocol import MAX_ANSWER_CHARS, WS_MAX_FRAME_BYTES
 
 
 @pytest.fixture

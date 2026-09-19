@@ -1001,7 +1001,8 @@ def _cmd_api(client: ClientArg, args: argparse.Namespace) -> int:
     # would otherwise reach the operator as a traceback out of uvicorn's app loader. The import
     # itself is not extra work — `uvicorn.run` on an import string loads the same module a few lines
     # down, in this same process (`config.load_app()`, reload or not).
-    from .web_api import WS_MAX_FRAME_BYTES, guard_single_worker
+    from .web_ops import guard_single_worker
+    from .web_protocol import WS_MAX_FRAME_BYTES
 
     try:
         # argv=[] on purpose: `coach api` has no --workers flag, so argparse has already rejected
