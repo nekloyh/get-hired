@@ -28,7 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from interview_coach import cli, supervisor, ui  # noqa: E402
+from interview_coach import cli_session, supervisor, ui  # noqa: E402
 from interview_coach.demo_llm import DemoLLMClient  # noqa: E402
 from interview_coach.exporter import render_session_markdown  # noqa: E402
 from interview_coach.llm import LLMClient, Message, ResponseFormat  # noqa: E402
@@ -104,7 +104,7 @@ def dump(outdir: Path) -> list[Path]:
     prompt = supervisor._build_supervisor_messages(drifted)[1]["content"]
     written.append(_write(outdir / "supervisor-prompt.txt", prompt))
     written.append(_write(outdir / "session-export.md", render_session_markdown(final_state)))
-    written.append(_write(outdir / "session-summary.txt", _capture(cli._print_session_summary, final_state)))
+    written.append(_write(outdir / "session-summary.txt", _capture(cli_session._print_session_summary, final_state)))
     written.append(_write(outdir / "skill-state-rows.txt", "\n".join(ui.render_skill_state_rows(final_state))))
 
     planner_lines = [_transcript_evidence(drifted), ""]

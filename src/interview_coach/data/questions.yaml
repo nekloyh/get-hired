@@ -585,8 +585,9 @@ mlops:
 
   # --- Forge-admitted 2026-07-11 (issue 0028), human-reviewed and merged 2026-07-19 (R-33, GH #88).
   # answers[0] are the admission-tested strong exemplars kept verbatim; answers[1] are
-  # hand-written Follow-up replies. The weak admission answers remain in
-  # data/forge/review-queue-2026-07-11.yaml as bench-label material (ADR 0009 addendum b).
+  # hand-written Follow-up replies. The weak admission answers were NOT merged and stay in
+  # data/forge/review-queue-2026-07-11.yaml, which is retained as a bench-label source rather than a
+  # pending queue (ADR 0009 addendum b; the decision is recorded in that file's header, GH #129).
   - question: You own a fraud model that is deployed in real time. Two weeks after launch, the business
       reports a small but steady drop in approval quality, but the offline validation metrics from the
       last training run still look strong. How would you design a monitoring and retraining plan that

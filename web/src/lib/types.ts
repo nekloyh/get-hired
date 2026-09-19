@@ -91,13 +91,6 @@ export type Evaluation = {
   follow_up_rationale: string
   evidence_degraded?: boolean
   delivery_fixes?: string[]
-  // Legacy: only pre-2026-07-11 checkpoints carry it; current escalations write `panel`.
-  self_critique?: {
-    triggers: string[]
-    first_confidence: number
-    second_confidence: number
-    kept_pass: string
-  } | null
   panel?: PanelTrace | null
   trust?: TrustTrace | null
 }

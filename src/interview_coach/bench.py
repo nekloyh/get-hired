@@ -512,8 +512,6 @@ def render_bench_report(
         escalation = "—"
         if r.evaluation is not None and r.evaluation.panel is not None:
             escalation = "panel: " + ", ".join(r.evaluation.panel.triggers)
-        elif r.evaluation is not None and r.evaluation.self_critique is not None:
-            escalation = ", ".join(r.evaluation.self_critique.triggers)
         lines.append(
             f"| {r.case.case_id} | {r.case.skill} | {r.case.language} | {r.case.expected_range} "
             f"| {score} | {runs} | {conf} | {escalation} | {mark} |"

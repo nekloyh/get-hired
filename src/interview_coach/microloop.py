@@ -113,15 +113,8 @@ class InteractiveCandidate:
 
 
 def _escalation_triggers(evaluation: Evaluation) -> tuple[str, ...]:
-    """The deterministic triggers that escalated this judgment, wherever the trace lives.
-
-    New escalations carry a PanelTrace (issue 0027); pre-panel checkpoints carry SelfCritiqueTrace.
-    """
-    if evaluation.panel is not None:
-        return evaluation.panel.triggers
-    if evaluation.self_critique is not None:
-        return evaluation.self_critique.triggers
-    return ()
+    """The deterministic triggers that escalated this judgment, or () if it was not escalated."""
+    return evaluation.panel.triggers if evaluation.panel is not None else ()
 
 
 class StopReason(StrEnum):

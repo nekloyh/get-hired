@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from interview_coach.bank import BankError, load_pack
 from interview_coach.llm import LLMClient, Message, ResponseFormat
 from interview_coach.replay import (
     REPLAY_ARTIFACT_VERSION,
@@ -18,6 +19,7 @@ from interview_coach.replay import (
     load_replay_artifact,
     posterior_masteries,
     probed_ordering,
+    replay_bank,
     replay_decision,
     run_persona_session,
 )
@@ -173,6 +175,111 @@ def test_replay_artifact_roundtrips_and_reruns_the_decision_node(tmp_path):
     # Counterfactual: re-run the decision node over the dumped state with a *different* model.
     decision = replay_decision(artifact, _SimJudge(supervisor_action="end_early"), now=lambda: 1.0)
     assert decision.action.value == "end_early"
+
+
+# --- #113: a replay artifact records the bank it ran against ------------------------------------
+
+_FPT_PACK = Path(__file__).resolve().parents[1] / "data" / "packs" / "fpt"
+
+
+def _exhausted_pack_trajectory():
+    """A Session that used every seed the FPT pack has for its first Skill, and stopped there.
+
+    The pack ships 4 seeds per Skill against the built-in bank's 9/9/12/9/6, so at four attempts on
+    `ml_fundamentals` the pack is empty and the built-in bank still has five left. That gap is the
+    whole of #113: it is invisible unless the artifact remembers which bank it ran against.
+    """
+    persona = Persona(name="alice", mastery={"deep_learning": 0.9, "mlops": 0.2})
+    final = run_persona_session(
+        _SimJudge(supervisor_action="extra_question"),
+        persona,
+        session_id="alice-pack",
+        candidate_client=_PersonaTextClient(),
+        max_questions=4,
+        now=lambda: 1.0,
+        question_bank=load_pack(_FPT_PACK).questions,
+    )
+    return persona, final
+
+
+def test_a_pack_session_and_a_builtin_session_do_not_take_the_same_trajectory():
+    # Same persona, same judge, same clock — only the seed inventory differs. The Supervisor asks for
+    # `extra_question` every time; under the pack it is refused once `ml_fundamentals` runs dry and
+    # the Session is pushed on to the next Skill, under the built-in bank it never is. If these two
+    # came out equal, `question_bank` would not be reaching the graph and every assertion below
+    # would be measuring nothing.
+    _, from_pack = _exhausted_pack_trajectory()
+    persona = Persona(name="alice", mastery={"deep_learning": 0.9, "mlops": 0.2})
+    from_builtin = run_persona_session(
+        _SimJudge(supervisor_action="extra_question"),
+        persona,
+        session_id="alice-builtin",
+        candidate_client=_PersonaTextClient(),
+        max_questions=6,
+        now=lambda: 1.0,
+    )
+
+    assert attempts_by_skill(from_pack) == {"ml_fundamentals": 4}  # capped by the pack's shelf
+    assert attempts_by_skill(from_builtin) == {"ml_fundamentals": 6}  # the built-in bank never ran out
+
+
+def test_the_same_trajectory_replays_differently_depending_on_the_pack_it_recorded(tmp_path):
+    # THE #113 defect, in one assertion. Two artifacts over the SAME final_state, replayed with the
+    # SAME client: the only difference is what the artifact says it ran against. Before this change
+    # `replay_decision` called `decide_next_move` with no bank at all, so the pack replay silently
+    # answered from the built-in bank — the replay bench that several issues name as "the gate" for
+    # Supervisor changes was measuring a decision the real Session could not have made.
+    persona, final = _exhausted_pack_trajectory()
+    from_pack = load_replay_artifact(dump_replay_artifact(tmp_path / "pack.json", persona, final, pack=_FPT_PACK))
+    from_builtin = load_replay_artifact(dump_replay_artifact(tmp_path / "builtin.json", persona, final))
+
+    # The counterfactual `replay_decision` exists for: same state, more budget. Without it the
+    # max_questions hard rail answers END_EARLY before any bank is consulted.
+    for artifact in (from_pack, from_builtin):
+        artifact.final_state["max_questions"] = 12
+
+    client = _SimJudge(supervisor_action="extra_question")
+    assert replay_decision(from_builtin, client, now=lambda: 1.0).action.value == "extra_question"
+    pack_decision = replay_decision(from_pack, client, now=lambda: 1.0)
+    assert pack_decision.action.value == "advance_plan"
+    assert "next Topic Plan entry" in pack_decision.reasoning  # refused, then the deterministic fallback
+
+
+def test_an_artifact_that_recorded_no_pack_replays_against_the_builtin_bank(tmp_path):
+    persona, final = _exhausted_pack_trajectory()
+    artifact = load_replay_artifact(dump_replay_artifact(tmp_path / "none.json", persona, final))
+
+    assert artifact.pack is None
+    assert replay_bank(artifact) is None
+
+
+def test_a_version_1_artifact_still_loads_and_means_the_builtin_bank(tmp_path):
+    # Every artifact ever dumped before this change is version 1 and ran against the built-in bank,
+    # so "no pack field" is not missing data — it is the answer. Migrating them would be inventing a
+    # field they never had; refusing them would strand the one checked into this repo.
+    persona, final = _exhausted_pack_trajectory()
+    path = dump_replay_artifact(tmp_path / "v1.json", persona, final, pack=_FPT_PACK)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["version"] = 1
+    del payload["pack"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    artifact = load_replay_artifact(path)
+
+    assert artifact.version == 1
+    assert artifact.pack is None
+
+
+def test_a_pack_that_has_moved_since_the_dump_refuses_to_replay(tmp_path):
+    # Falling back to the built-in bank here would be the #113 defect wearing a different hat: a
+    # wrong measurement, reported as a measurement, with nothing in the output saying so.
+    persona, final = _exhausted_pack_trajectory()
+    artifact = load_replay_artifact(
+        dump_replay_artifact(tmp_path / "gone.json", persona, final, pack=tmp_path / "packs" / "vanished")
+    )
+
+    with pytest.raises(BankError, match="does not exist"):
+        replay_decision(artifact, _SimJudge(), now=lambda: 1.0)
 
 
 # --- NEW-26: the envelope version is not the Session state's version ------------------------------

@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient
 from starlette.status import WS_1008_POLICY_VIOLATION
 from starlette.websockets import WebSocketDisconnect
 
-from interview_coach import usage, web_api
+from interview_coach import usage, web_api, web_ops, web_protocol, web_runtime, web_session_driver
 from interview_coach.config import Settings
 from interview_coach.demo_llm import DemoLLMClient
 from interview_coach.llm import RoleClients
@@ -589,7 +589,7 @@ def test_a_refused_frame_is_marked_recoverable_and_a_dead_session_is_not(tmp_pat
         ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
         _receive_until(ws, "question")
         # Oversize: rejected by the payload model, so the Session never sees it.
-        ws.send_json({"type": "candidate_answer", "answer": "x" * (web_api.MAX_ANSWER_CHARS + 1)})
+        ws.send_json({"type": "candidate_answer", "answer": "x" * (web_protocol.MAX_ANSWER_CHARS + 1)})
         refusal = _receive_until(ws, "session_error", limit=40)
         assert refusal.get("recoverable") is True, refusal
 
@@ -846,7 +846,7 @@ def test_a_failed_disk_write_does_not_fail_the_session(tmp_path, monkeypatch):
     def explode(*_args, **_kwargs):
         raise OSError("no space left on device")
 
-    monkeypatch.setattr("interview_coach.web_api.export_session_markdown", explode)
+    monkeypatch.setattr("interview_coach.web_session_driver.export_session_markdown", explode)
     client = _test_client(tmp_path)
 
     _complete_a_demo_session(client, "unwritable")
@@ -973,7 +973,7 @@ def _threads(checkpointer) -> set[str]:
 def test_the_sweep_drops_only_threads_past_the_ttl(tmp_path):
     from langgraph.checkpoint.sqlite import SqliteSaver
 
-    from interview_coach.web_api import prune_checkpoints
+    from interview_coach.web_ops import prune_checkpoints
 
     now = datetime(2026, 7, 27, tzinfo=UTC).timestamp()
     with SqliteSaver.from_conn_string(str(tmp_path / "cp.sqlite")) as checkpointer:
@@ -1023,7 +1023,7 @@ def test_resuming_a_swept_session_id_is_refused_before_the_graph_runs(tmp_path):
 def test_an_unreadable_timestamp_is_left_alone_rather_than_guessed(tmp_path):
     from langgraph.checkpoint.sqlite import SqliteSaver
 
-    from interview_coach.web_api import prune_checkpoints
+    from interview_coach.web_ops import prune_checkpoints
 
     with SqliteSaver.from_conn_string(str(tmp_path / "cp.sqlite")) as checkpointer:
         _put_checkpoint(checkpointer, "undated", "not-a-timestamp")
@@ -1063,7 +1063,7 @@ def test_a_resumed_session_keeps_its_language_for_retrieval(tmp_path):
     # R-14's real hazard: the resume payload carries no language_mode, so without reading it back
     # out of the checkpoint a resumed Vietnamese Session would silently rebuild its retrieval on the
     # English embedder and rank near-randomly for the rest of the interview.
-    from interview_coach.web_api import _checkpoint_values, _session_language_mode
+    from interview_coach.web_session_driver import _checkpoint_values, _session_language_mode
 
     # Run the Session to completion before reading: while a question is pending the graph is blocked
     # INSIDE the node, so no checkpoint for that step has been written yet and reading here would be
@@ -1086,7 +1086,7 @@ def test_a_resumed_session_keeps_its_language_for_retrieval(tmp_path):
 
 
 def test_an_unknown_session_falls_back_to_the_default_language(tmp_path):
-    from interview_coach.web_api import _checkpoint_values, _session_language_mode
+    from interview_coach.web_session_driver import _checkpoint_values, _session_language_mode
 
     api_state = _app(tmp_path).state.web_api
     values = _checkpoint_values(api_state, "never-existed")
@@ -1354,7 +1354,7 @@ def test_an_unwritable_log_file_warns_instead_of_killing_the_server(tmp_path, ca
     blocker = tmp_path / "not-a-dir"
     blocker.write_text("", encoding="utf-8")
 
-    with caplog.at_level(logging.WARNING, logger="interview_coach.web_api"):
+    with caplog.at_level(logging.WARNING, logger="interview_coach"):
         configure_session_logging(log_file=str(blocker / "coach.log"))
 
     assert any(record.levelno == logging.WARNING for record in caplog.records)
@@ -1404,20 +1404,20 @@ def test_the_finished_record_is_written_before_the_client_is_told(tmp_path, monk
             if "finished" in record.getMessage():
                 order.append("log")
 
-    emit_through = web_api.EventEmitter.__call__
+    emit_through = web_runtime.EventEmitter.__call__
 
     def _record_then_emit(self, event):
         if event.get("type") == "session_completed":
             order.append("emit")
         emit_through(self, event)
 
-    monkeypatch.setattr(web_api.EventEmitter, "__call__", _record_then_emit)
+    monkeypatch.setattr(web_runtime.EventEmitter, "__call__", _record_then_emit)
     handler = _Ordering()
-    logging.getLogger("interview_coach.web_api").addHandler(handler)
+    logging.getLogger("interview_coach.web_session_driver").addHandler(handler)
     try:
         _complete_a_demo_session(_test_client(tmp_path), "ordering-1")
     finally:
-        logging.getLogger("interview_coach.web_api").removeHandler(handler)
+        logging.getLogger("interview_coach.web_session_driver").removeHandler(handler)
 
     assert order == ["log", "emit"]
 
@@ -1428,7 +1428,7 @@ def test_a_newline_in_the_session_id_cannot_forge_a_cancel_record(tmp_path, capl
     # they are the two an attacker can reach on demand.
     client = _test_client(tmp_path)
 
-    with caplog.at_level(logging.INFO, logger="interview_coach.web_api"):
+    with caplog.at_level(logging.INFO, logger="interview_coach"):
         with client.websocket_connect("/api/sessions/forged%0AINFO:%20granted%20admin") as ws:
             ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
             _receive_until(ws, "session_started")
@@ -1451,10 +1451,10 @@ def test_a_newline_in_the_session_id_cannot_forge_a_failure_record(tmp_path, cap
     def _explode(*args, **kwargs):
         raise RuntimeError("provider exploded")
 
-    monkeypatch.setattr(web_api, "build_session_graph", _explode)
+    monkeypatch.setattr(web_session_driver, "build_session_graph", _explode)
     client = _test_client(tmp_path)
 
-    with caplog.at_level(logging.INFO, logger="interview_coach.web_api"):
+    with caplog.at_level(logging.INFO, logger="interview_coach"):
         with client.websocket_connect("/api/sessions/forged%0AINFO:%20granted%20admin") as ws:
             ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
             _receive_until(ws, "session_error")
@@ -1475,11 +1475,11 @@ def test_a_newline_in_the_session_id_cannot_forge_an_export_failure_record(tmp_p
     def _no_disk(*args, **kwargs):
         raise OSError("no space left on device")
 
-    monkeypatch.setattr(web_api, "export_session_markdown", _no_disk)
+    monkeypatch.setattr(web_session_driver, "export_session_markdown", _no_disk)
     api_state = _app(tmp_path).state.web_api
 
-    with caplog.at_level(logging.ERROR, logger="interview_coach.web_api"):
-        web_api._persist_export(api_state, forged, {"session_id": forged})
+    with caplog.at_level(logging.ERROR, logger="interview_coach"):
+        web_session_driver._persist_export(api_state, forged, {"session_id": forged})
 
     messages = [r.getMessage() for r in caplog.records if "Markdown export" in r.getMessage()]
     assert messages, "the export failure path logged nothing to check"
@@ -1494,12 +1494,12 @@ def test_a_newline_in_the_session_id_cannot_forge_a_resume_warning(tmp_path, cap
     api_state = _app(tmp_path).state.web_api
     api_state.checkpoint_db = str(tmp_path)  # a directory: sqlite cannot open it
 
-    with caplog.at_level(logging.WARNING, logger="interview_coach.web_api"):
+    with caplog.at_level(logging.WARNING, logger="interview_coach"):
         # R-25 split the read from the interpretation: `_checkpoint_values` is the half that touches
         # the untrusted id and logs, `_session_language_mode` is pure. Both still have to degrade.
-        values = web_api._checkpoint_values(api_state, forged)
+        values = web_session_driver._checkpoint_values(api_state, forged)
         payload = ResumeSessionPayload(type="resume_session", mode="demo")
-        mode = web_api._session_language_mode(payload, True, values)
+        mode = web_session_driver._session_language_mode(payload, True, values)
 
     assert values == {}
     assert mode == "en"  # still degrades rather than crashing the resume
@@ -1525,8 +1525,8 @@ def test_a_newline_in_a_checkpoint_thread_id_cannot_forge_a_prune_record(caplog)
         def delete_thread(self, thread_id):
             raise RuntimeError("database is locked")
 
-    with caplog.at_level(logging.WARNING, logger="interview_coach.web_api"):
-        assert web_api.prune_checkpoints(_Unprunable(), max_age_seconds=1.0, now=1e12) == []
+    with caplog.at_level(logging.WARNING, logger="interview_coach"):
+        assert web_ops.prune_checkpoints(_Unprunable(), max_age_seconds=1.0, now=1e12) == []
 
     messages = [r.getMessage() for r in caplog.records if "checkpoint thread" in r.getMessage()]
     assert messages, "the prune failure path logged nothing to check"
@@ -1556,9 +1556,9 @@ def test_a_damaged_checkpoint_file_is_reported_as_damaged_once_not_as_n_bad_thre
         def delete_thread(self, thread_id):
             raise sqlite3.DatabaseError("database disk image is malformed")
 
-    with caplog.at_level(logging.WARNING, logger="interview_coach.web_api"):
+    with caplog.at_level(logging.WARNING, logger="interview_coach"):
         assert (
-            web_api.prune_checkpoints(_Damaged(), max_age_seconds=1.0, now=1e12, db_label="/app/state/cp.sqlite") == []
+            web_ops.prune_checkpoints(_Damaged(), max_age_seconds=1.0, now=1e12, db_label="/app/state/cp.sqlite") == []
         )
 
     damaged = [r for r in caplog.records if "is damaged" in r.getMessage()]
@@ -1634,8 +1634,8 @@ def _live_client(tmp_path, monkeypatch, *, token: str = "", brain=None):
     # must not make these tests behave differently from CI.
     for name in ("LLM_DAILY_TOKEN_BUDGET", "LLM_SESSION_TOKEN_BUDGET", "COACH_DAILY_QUESTION_CAP"):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setattr(web_api, "build_client", lambda settings: make_brain())
-    monkeypatch.setattr(web_api, "build_role_clients", lambda settings, client: RoleClients.single(client))
+    monkeypatch.setattr(web_session_driver, "build_client", lambda settings: make_brain())
+    monkeypatch.setattr(web_session_driver, "build_role_clients", lambda settings, client: RoleClients.single(client))
     settings = Settings(
         _env_file=None,
         primary_provider="groq",
@@ -1875,7 +1875,7 @@ def test_a_start_that_dies_before_anything_is_checkpointed_gives_the_questions_b
 
     client = _live_client(tmp_path, monkeypatch)
     monkeypatch.setenv("COACH_DAILY_QUESTION_CAP", "10")
-    monkeypatch.setattr(web_api, "build_resource_store", _explode)
+    monkeypatch.setattr(web_session_driver, "build_resource_store", _explode)
 
     with client.websocket_connect("/api/sessions/crashed") as ws:
         _start_live(ws, max_questions=10)
@@ -1889,7 +1889,7 @@ def test_a_start_that_dies_before_anything_is_checkpointed_gives_the_questions_b
     run_thread.join(10)
     assert not run_thread.is_alive()
     assert "RuntimeError" in event["error"], event
-    assert web_api._checkpoint_values(client.app.state.web_api, "crashed") == {}  # nothing to resume
+    assert web_session_driver._checkpoint_values(client.app.state.web_api, "crashed") == {}  # nothing to resume
     assert usage.questions_today(usage.token_identity("")) == 0
 
 
@@ -1981,7 +1981,7 @@ def test_a_dead_quota_on_the_diagnostic_tells_the_web_candidate_to_start_over(tm
     def _quota_dies(*args, **kwargs):
         raise ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")
 
-    monkeypatch.setattr(web_api, "diagnose_or_degrade", _quota_dies)
+    monkeypatch.setattr(web_session_driver, "diagnose_or_degrade", _quota_dies)
     client = _live_client(tmp_path, monkeypatch)
 
     with client.websocket_connect("/api/sessions/quota-diag") as ws:
@@ -2005,8 +2005,8 @@ def test_a_refused_live_session_never_starts_the_interview(tmp_path, monkeypatch
     monkeypatch.delenv("LLM_SESSION_TOKEN_BUDGET", raising=False)
     monkeypatch.delenv("COACH_DAILY_QUESTION_CAP", raising=False)
     usage.record_usage("groq", "test-model", prompt_tokens=10, completion_tokens=0)
-    monkeypatch.setattr(web_api, "build_client", lambda settings: _ProviderDemoClient())
-    monkeypatch.setattr(web_api, "build_role_clients", lambda settings, client: RoleClients.single(client))
+    monkeypatch.setattr(web_session_driver, "build_client", lambda settings: _ProviderDemoClient())
+    monkeypatch.setattr(web_session_driver, "build_role_clients", lambda settings, client: RoleClients.single(client))
 
     settings = Settings(
         _env_file=None,
@@ -2016,21 +2016,21 @@ def test_a_refused_live_session_never_starts_the_interview(tmp_path, monkeypatch
         groq_model="test-model",
         concept_store="memory",
     )
-    api_state = web_api.WebApiState(
+    api_state = web_runtime.WebApiState(
         settings=settings,
         checkpoint_db=str(tmp_path / "checkpoints.sqlite"),
         ledger_db=str(tmp_path / "ledger.json"),
         exports_dir=str(tmp_path / "exports"),
     )
     events: list[dict] = []
-    runtime = web_api.RuntimeSession(session_id="refused", mode="live", emit=events.append)
+    runtime = web_runtime.RuntimeSession(session_id="refused", mode="live", emit=events.append)
     # Pre-queued so that a Session which wrongly starts still terminates instead of blocking here.
     runtime.answers.put("An answer nobody should ever have been asked for.")
 
-    web_api._run_session_thread(
+    web_session_driver._run_session_thread(
         api_state,
         runtime,
-        web_api.StartSessionPayload(type="start_session", max_questions=1),
+        web_protocol.StartSessionPayload(type="start_session", max_questions=1),
         False,
     )
 
@@ -2189,7 +2189,7 @@ def test_a_reconnect_waits_for_the_previous_runs_thread_before_resuming(tmp_path
 
 
 def test_a_reconnect_gives_up_on_a_run_that_will_not_finish(tmp_path, monkeypatch):
-    monkeypatch.setattr(web_api, "STALE_RUNTIME_JOIN_SECONDS", 0.05)
+    monkeypatch.setattr(web_runtime, "STALE_RUNTIME_JOIN_SECONDS", 0.05)
     blocked = _BlockedRun(monkeypatch)
     client = _test_client(tmp_path)
     try:
@@ -2234,19 +2234,19 @@ def test_a_claim_that_finishes_waiting_never_overwrites_a_different_in_flight_ru
     api_state = _app(tmp_path).state.web_api
     stale_done, b_done = threading.Event(), threading.Event()
 
-    def _runtime(name: str, gate: threading.Event) -> web_api.RuntimeSession:
-        runtime = web_api.RuntimeSession(session_id="x", mode="demo", emit=lambda event: None, socket_closed=True)
+    def _runtime(name: str, gate: threading.Event) -> web_runtime.RuntimeSession:
+        runtime = web_runtime.RuntimeSession(session_id="x", mode="demo", emit=lambda event: None, socket_closed=True)
         runtime.thread = threading.Thread(target=gate.wait, daemon=True)
         runtime.thread.start()
         return runtime
 
     stale = _runtime("stale", stale_done)
     b = _runtime("b", b_done)
-    a = web_api.RuntimeSession(session_id="x", mode="demo", emit=lambda event: None)
+    a = web_runtime.RuntimeSession(session_id="x", mode="demo", emit=lambda event: None)
 
     async def scenario():
         api_state.runtimes["x"] = stale
-        claim = asyncio.create_task(web_api._claim_session_id(api_state, "x", a))
+        claim = asyncio.create_task(web_runtime._claim_session_id(api_state, "x", a))
         await asyncio.sleep(0.05)  # A is inside the join
         assert "x" in api_state.waiting
         with api_state.lock:
@@ -2260,7 +2260,7 @@ def test_a_claim_that_finishes_waiting_never_overwrites_a_different_in_flight_ru
         stale_done.set()
         b_done.set()
 
-    assert result == web_api._STILL_FINISHING
+    assert result == web_runtime._STILL_FINISHING
     assert api_state.runtimes["x"] is b
     assert api_state.waiting == set()
 
@@ -2270,17 +2270,17 @@ def test_only_one_reconnect_waits_on_a_stale_run_at_a_time(tmp_path):
 
     api_state = _app(tmp_path).state.web_api
     gate = threading.Event()
-    stale = web_api.RuntimeSession(session_id="y", mode="demo", emit=lambda event: None, socket_closed=True)
+    stale = web_runtime.RuntimeSession(session_id="y", mode="demo", emit=lambda event: None, socket_closed=True)
     stale.thread = threading.Thread(target=gate.wait, daemon=True)
     stale.thread.start()
-    first = web_api.RuntimeSession(session_id="y", mode="demo", emit=lambda event: None)
-    second = web_api.RuntimeSession(session_id="y", mode="demo", emit=lambda event: None)
+    first = web_runtime.RuntimeSession(session_id="y", mode="demo", emit=lambda event: None)
+    second = web_runtime.RuntimeSession(session_id="y", mode="demo", emit=lambda event: None)
 
     async def scenario():
         api_state.runtimes["y"] = stale
-        waiting = asyncio.create_task(web_api._claim_session_id(api_state, "y", first))
+        waiting = asyncio.create_task(web_runtime._claim_session_id(api_state, "y", first))
         await asyncio.sleep(0.05)
-        refused = await web_api._claim_session_id(api_state, "y", second)
+        refused = await web_runtime._claim_session_id(api_state, "y", second)
         gate.set()
         return refused, await waiting
 
@@ -2289,7 +2289,7 @@ def test_only_one_reconnect_waits_on_a_stale_run_at_a_time(tmp_path):
     finally:
         gate.set()
 
-    assert refused == web_api._STILL_FINISHING
+    assert refused == web_runtime._STILL_FINISHING
     assert granted is None
     assert api_state.runtimes["y"] is first
 
@@ -2303,13 +2303,15 @@ def test_a_mass_reconnect_neither_pins_the_default_executor_nor_stalls_a_new_soc
     # refused, and so does every other user of the default executor on this loop (`getaddrinfo`).
     import asyncio
 
-    monkeypatch.setattr(web_api, "STALE_RUNTIME_JOIN_SECONDS", 5.0)
+    monkeypatch.setattr(web_runtime, "STALE_RUNTIME_JOIN_SECONDS", 5.0)
     api_state = _app(tmp_path).state.web_api
     gate = threading.Event()
     ids = [f"mass-{n}" for n in range(40)]  # more than min(32, cpu+4), whatever the box
 
     for session_id in ids:
-        stale = web_api.RuntimeSession(session_id=session_id, mode="demo", emit=lambda event: None, socket_closed=True)
+        stale = web_runtime.RuntimeSession(
+            session_id=session_id, mode="demo", emit=lambda event: None, socket_closed=True
+        )
         stale.thread = threading.Thread(target=gate.wait, daemon=True)
         stale.thread.start()
         api_state.runtimes[session_id] = stale
@@ -2317,8 +2319,8 @@ def test_a_mass_reconnect_neither_pins_the_default_executor_nor_stalls_a_new_soc
     async def scenario():
         claims = [
             asyncio.create_task(
-                web_api._claim_session_id(
-                    api_state, sid, web_api.RuntimeSession(session_id=sid, mode="demo", emit=lambda event: None)
+                web_runtime._claim_session_id(
+                    api_state, sid, web_runtime.RuntimeSession(session_id=sid, mode="demo", emit=lambda event: None)
                 )
             )
             for sid in ids
@@ -2339,11 +2341,11 @@ def test_a_mass_reconnect_neither_pins_the_default_executor_nor_stalls_a_new_soc
         gate.set()
 
     assert probe == "free", "the stale-run joins pinned the asyncio default executor"
-    cap = web_api.MAX_CONCURRENT_STALE_JOINS
+    cap = web_runtime.MAX_CONCURRENT_STALE_JOINS
     assert waiting <= cap, f"{waiting} reconnects were joining at once; the cap is {cap}"
     # Refused, not stalled: the over-cap claims answered while the joins were still in flight.
     assert settled == len(ids) - cap
-    assert outcomes.count(web_api._TOO_MANY_JOINS) == len(ids) - cap
+    assert outcomes.count(web_runtime._TOO_MANY_JOINS) == len(ids) - cap
     assert outcomes.count(None) == cap
     assert api_state.waiting == set()
 
@@ -2355,7 +2357,7 @@ def test_an_oversize_answer_is_refused_as_a_session_error(tmp_path):
     client = _test_client(tmp_path)
 
     with client.websocket_connect("/api/sessions/oversize") as ws:
-        ws.send_json({"type": "candidate_answer", "answer": "x" * (web_api.MAX_ANSWER_CHARS + 1)})
+        ws.send_json({"type": "candidate_answer", "answer": "x" * (web_protocol.MAX_ANSWER_CHARS + 1)})
         event = ws.receive_json()
 
     assert event["type"] == "session_error"
@@ -2367,7 +2369,11 @@ def test_an_oversize_time_budget_is_refused(tmp_path):
 
     with client.websocket_connect("/api/sessions/too-long") as ws:
         ws.send_json(
-            {"type": "start_session", "mode": "demo", "max_elapsed_seconds": web_api.MAX_ELAPSED_SECONDS_CEILING + 1}
+            {
+                "type": "start_session",
+                "mode": "demo",
+                "max_elapsed_seconds": web_protocol.MAX_ELAPSED_SECONDS_CEILING + 1,
+            }
         )
         event = ws.receive_json()
 
@@ -2421,7 +2427,7 @@ def test_a_flood_of_answers_with_no_pending_question_is_refused_not_buffered(tmp
         with client.websocket_connect("/api/sessions/flood") as ws:
             ws.send_json({"type": "start_session", "mode": "demo", "max_questions": 1})
             _receive_until(ws, "session_started")
-            for _ in range(web_api.ANSWER_QUEUE_MAXSIZE + 1):
+            for _ in range(web_runtime.ANSWER_QUEUE_MAXSIZE + 1):
                 ws.send_json({"type": "candidate_answer", "answer": "flood"})
             ws.send_json({"type": "bogus"})
             seen: list[dict] = []
@@ -2433,19 +2439,19 @@ def test_a_flood_of_answers_with_no_pending_question_is_refused_not_buffered(tmp
         release.set()
 
     errors = [event["error"] for event in seen if event["type"] == "session_error"]
-    assert len([e for e in errors if "does not answer" in e]) == web_api.ANSWER_QUEUE_MAXSIZE + 1, errors
+    assert len([e for e in errors if "does not answer" in e]) == web_runtime.ANSWER_QUEUE_MAXSIZE + 1, errors
     assert "unknown WebSocket payload type" in errors[-1]
 
 
 def test_a_cancel_is_never_dropped_by_a_full_answer_queue():
-    runtime = web_api.RuntimeSession(session_id="full", mode="demo", emit=lambda event: None)
-    for _ in range(web_api.ANSWER_QUEUE_MAXSIZE):
+    runtime = web_runtime.RuntimeSession(session_id="full", mode="demo", emit=lambda event: None)
+    for _ in range(web_runtime.ANSWER_QUEUE_MAXSIZE):
         runtime.answers.put_nowait("queued")
 
     runtime.cancel()
 
     assert runtime.cancelled.is_set()
-    assert runtime.answers.get_nowait() is web_api._CANCEL
+    assert runtime.answers.get_nowait() is web_runtime._CANCEL
     assert runtime.answers.empty()
 
 
@@ -2455,10 +2461,10 @@ def test_a_cancel_is_never_dropped_by_a_full_answer_queue():
 def test_completed_sessions_are_bounded_in_memory(tmp_path):
     client = _test_client(tmp_path)
     api_state = client.app.state.web_api
-    cap = web_api.MAX_COMPLETED_SESSIONS_IN_MEMORY
+    cap = web_runtime.MAX_COMPLETED_SESSIONS_IN_MEMORY
 
     for index in range(cap + 1):
-        web_api._remember_completed(api_state, f"done-{index}", {"status": "complete"})
+        web_runtime._remember_completed(api_state, f"done-{index}", {"status": "complete"})
 
     assert len(api_state.completed_sessions) == cap
     assert "done-0" not in api_state.completed_sessions

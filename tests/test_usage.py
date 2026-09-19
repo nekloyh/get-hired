@@ -1400,9 +1400,15 @@ def test_a_released_reservation_gives_the_cap_back_without_rewriting_a_row(tmp_p
 
 
 def _held_row(fault_id: str, *, prompt: int, completion: int) -> dict:
-    """One row shaped exactly as `_latch_fault` parks it, written straight into the sidecar."""
+    """One row shaped exactly as `_latch_fault` parks it, written straight into the sidecar.
+
+    Stamped NOW, not with a fixed date: `usage_for_day` only sums rows whose `ts` falls on the
+    current UTC day, so a hardcoded timestamp is a test that passes on the day it is written and
+    fails silently afterwards. (It did: written 2026-09-15, first red on 2026-09-19.)
+    """
+    now = usage._now_ts()
     return {
-        "ts": "2026-09-15T00:00:00+00:00",
+        "ts": now,
         "id": fault_id,
         "kind": "accounting_fault",
         "row": "tokens",
@@ -1410,7 +1416,7 @@ def _held_row(fault_id: str, *, prompt: int, completion: int) -> dict:
         "ledger": "unused",
         "error": "OSError: injected",
         "entry": {
-            "ts": "2026-09-15T00:00:00+00:00",
+            "ts": now,
             "kind": "tokens",
             "provider": "openai",
             "model": "gpt-5.4-mini",

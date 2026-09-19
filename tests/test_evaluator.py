@@ -461,18 +461,16 @@ def test_low_confidence_escalates_to_the_panel(make_client):
     assert ev.panel.advocate.recommended_score == pytest.approx(4.5)
     assert ev.panel.disagreement == pytest.approx(2.0)
     assert ev.panel.initial_confidence == pytest.approx(0.3)
-    assert ev.self_critique is None  # the lone re-read is superseded by the panel
     assert fake.call_count == 4  # first pass + skeptic + advocate + verdict
 
 
-def test_high_confidence_does_not_trigger_self_critique(make_client):
+def test_high_confidence_pays_for_no_escalation_at_all(make_client):
     # THE cost gate (issue 0027 acceptance criterion): a confident score never pays panel calls.
     client, fake = make_client([_eval_json(_good_dimensions(), weighted=4.0, confidence=0.7)])
 
     ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
 
     assert ev.confidence == pytest.approx(0.7)
-    assert ev.self_critique is None
     assert ev.panel is None
     assert fake.call_count == 1
 
@@ -517,16 +515,19 @@ def test_panel_logs_triggers_and_disagreement(make_client, caplog):
 
 
 def test_model_cannot_author_the_derived_fields(make_client):
-    # evidence_degraded / self_critique / panel are guard-owned: a model echoing them (the verdict
-    # prompt replays first-pass JSON) must not smuggle in — or talk its way out of — a haircut.
+    # evidence_degraded / panel / trust are guard-owned: a model echoing them (the verdict prompt
+    # replays first-pass JSON) must not smuggle in — or talk its way out of — a haircut. The dead
+    # `self_critique` key rides along as an unknown field: it must be ignored, never resurrect.
     forged = json.loads(_eval_json(_good_dimensions())) | {
         "evidence_degraded": True,
         "panel": None,
-        "self_critique": None,
+        "trust": None,
+        "self_critique": {"triggers": ["low_confidence"], "kept_pass": "self_critique"},
     }
     client, fake = make_client([json.dumps(forged)])
     ev = evaluate(client, QUESTION.question, STRONG_ANSWER, QUESTION.rubric)
     assert ev.evidence_degraded is False  # the model's claim was stripped, not trusted
+    assert not hasattr(ev, "self_critique")  # #129: the field is gone, and an echo cannot re-add it
     assert fake.call_count == 1
 
 

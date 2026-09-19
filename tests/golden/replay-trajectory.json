@@ -483,7 +483,6 @@
               "follow_up_rationale": "Demo Evaluator keeps the loop short so the web workflow can be reviewed.",
               "follow_up_recommended": false,
               "panel": null,
-              "self_critique": null,
               "trust": {
                 "divergence": 0.0,
                 "noise_events": [],
@@ -556,7 +555,6 @@
               "follow_up_rationale": "Demo Evaluator keeps the loop short so the web workflow can be reviewed.",
               "follow_up_recommended": false,
               "panel": null,
-              "self_critique": null,
               "trust": {
                 "divergence": 0.0,
                 "noise_events": [],
@@ -625,7 +623,6 @@
               "follow_up_rationale": "Demo Evaluator keeps the loop short so the web workflow can be reviewed.",
               "follow_up_recommended": false,
               "panel": null,
-              "self_critique": null,
               "trust": {
                 "divergence": 0.0,
                 "noise_events": [],
@@ -662,6 +659,7 @@
     "mlops": 0.15,
     "system_design": 0.5
   },
+  "pack": null,
   "persona": "alice",
-  "version": 1
+  "version": 2
 }
