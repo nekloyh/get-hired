@@ -59,7 +59,7 @@ Nested shapes (`session_serde.py` is the typed read view; writers are the truth)
 | Transcript item (resolved) | `skill, plan_index, stop_reason, resolved_weighted_score, resolved_confidence, evidence_weight, skill_state, turns` | `session_serde.py:130-143` |
 | Transcript item (failed) | same keys with zero sentinels, `turns: []`, plus `error` | `session_serde.py:146-164` |
 | Turn | `question, answer, is_follow_up, grounding_concept_id, grounding_concept_title, evaluation, trace` | `session_serde.py:211-223` |
-| `evaluation` | `Evaluation.model_dump(mode="json")`: `dimensions, weighted_score, confidence, follow_up_recommended, follow_up_rationale, evidence_degraded, delivery_fixes, self_critique, panel, trust` | `evaluator.py:169-198` |
+| `evaluation` | `Evaluation.model_dump(mode="json")`: `dimensions, weighted_score, confidence, follow_up_recommended, follow_up_rationale, evidence_degraded, delivery_fixes, panel, trust` | `evaluator.py:158-186` |
 | `trace` | `TurnTrace` fields (`microloop.py:155-177`); `stop_reason` stored as its string value | `session_serde.py:211-214` |
 | Decision record | `SupervisorDecision` fields `action, reasoning, target_skill, target_plan_index, will_probe_skill` (`supervisor.py:98-109`) + `after_question, from_plan_index, to_plan_index, deviation, llm_reasoning` | `supervisor.py:466-472` |
 
