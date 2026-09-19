@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from interview_coach import cli, usage
+from interview_coach import cli, cli_session, usage
 from interview_coach.demo_llm import DemoLLMClient
 from interview_coach.diagnostic import CandidateProfile, DiagnosticResult, TopicPlanSource, diagnose
 from interview_coach.eval_harness import GoldenAnswerCase, GoldenAnswerResult
@@ -206,7 +206,7 @@ def test_run_session_graph_prints_live_skill_state_updates(make_client, capsys):
     state = initial_session_state("live-cli-session", diagnostic, max_questions=1, started_at=0)
     graph = build_session_graph(client, now=lambda: 1)
 
-    final = cli._run_session_graph(graph, state, session_config("live-cli-session"), live=True)
+    final = cli_session._run_session_graph(graph, state, session_config("live-cli-session"), live=True)
 
     assert final["question_count"] == 1
     output = capsys.readouterr().out
@@ -239,7 +239,7 @@ def test_session_summary_prints_recorded_error_for_failed_question(capsys):
         ],
     }
 
-    cli._print_session_summary(state)
+    cli_session._print_session_summary(state)
 
     output = capsys.readouterr().out
     assert "stop=failed_recorded_and_skipped" in output
@@ -252,7 +252,7 @@ def test_unknown_resume_message_hints_when_no_checkpoints(tmp_path):
     from langgraph.checkpoint.sqlite import SqliteSaver
 
     with SqliteSaver.from_conn_string(str(tmp_path / "session.sqlite")) as checkpointer:
-        message = cli._unknown_session_message("ghost-id", checkpointer, "session.sqlite")
+        message = cli_session._unknown_session_message("ghost-id", checkpointer, "session.sqlite")
 
     assert "ghost-id" in message
     assert "No saved Sessions found" in message
@@ -301,7 +301,7 @@ def test_run_session_graph_does_not_replay_resumed_history_as_live(tmp_path, cap
     capsys.readouterr()  # drop pre-seed output
     with SqliteSaver.from_conn_string(str(db_path)) as checkpointer:
         graph = build_session_graph(demo, checkpointer=checkpointer)
-        cli._run_session_graph(graph, None, session_config(session_id), live=True, already_seen=1)
+        cli_session._run_session_graph(graph, None, session_config(session_id), live=True, already_seen=1)
 
     output = capsys.readouterr().out
     assert "QUESTION 1 RESOLVED" not in output  # the already-resolved Q1 is not replayed as live
@@ -314,7 +314,7 @@ def test_session_refuses_to_restart_over_inflight_checkpoint(tmp_path, monkeypat
 
     monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
     monkeypatch.setattr(cli, "build_client", lambda settings: DemoLLMClient())
-    monkeypatch.setattr(cli, "resumable_session_state", lambda graph, session_id: {"status": "active"})
+    monkeypatch.setattr(cli_session, "resumable_session_state", lambda graph, session_id: {"status": "active"})
 
     rc = cli.main(["session", "--scripted", "--session-id", "busy", "--checkpoint-db", str(tmp_path / "c.sqlite")])
 
@@ -369,7 +369,7 @@ def test_session_refuses_to_restart_over_a_completed_checkpoint(tmp_path, monkey
 
     monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
     monkeypatch.setattr(cli, "build_client", lambda settings: DemoLLMClient())
-    monkeypatch.setattr(cli, "resumable_session_state", lambda graph, session_id: {"status": "complete"})
+    monkeypatch.setattr(cli_session, "resumable_session_state", lambda graph, session_id: {"status": "complete"})
 
     rc = cli.main(
         [
@@ -531,8 +531,8 @@ def test_a_suspend_still_shows_the_question_that_was_just_resolved(tmp_path, cap
     with SqliteSaver.from_conn_string(str(db_path)) as checkpointer:
         graph = build_session_graph(demo, checkpointer=checkpointer)
         state = initial_session_state(session_id, _demo_diagnostic(), max_questions=3, started_at=0.0)
-        with pytest.raises(cli.SessionBudgetSuspended):
-            cli._run_session_graph(
+        with pytest.raises(cli_session.SessionBudgetSuspended):
+            cli_session._run_session_graph(
                 graph, state, session_config(session_id), live=True, budget_stop=stop_after_the_first_question
             )
 
@@ -1237,7 +1237,7 @@ def test_a_dead_quota_on_the_diagnostic_offers_no_resume_because_nothing_was_che
     def _quota_dies_on_the_diagnostic(*args, **kwargs):
         raise ProviderQuotaExhausted("groq daily quota exhausted (insufficient_quota)")
 
-    monkeypatch.setattr(cli, "diagnose_or_degrade", _quota_dies_on_the_diagnostic)
+    monkeypatch.setattr(cli_session, "diagnose_or_degrade", _quota_dies_on_the_diagnostic)
     _tmp_ledger(monkeypatch, tmp_path)
     monkeypatch.setattr(cli, "load_settings", lambda: _settings(configured=True))
     monkeypatch.setattr(cli, "build_client", lambda settings: _ProviderDemoClient())
@@ -1415,7 +1415,7 @@ def test_a_second_driver_is_refused_while_another_process_holds_the_session(tmp_
     _suspend_after_first_question(demo, db_path, "shared")
     capsys.readouterr()
 
-    sidecar = lock_path_for(cli._checkpoint_lock_target(str(db_path), "shared"))
+    sidecar = lock_path_for(cli_session._checkpoint_lock_target(str(db_path), "shared"))
     sidecar.parent.mkdir(parents=True, exist_ok=True)
     holder = sidecar.open("a+", encoding="utf-8")
     fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
