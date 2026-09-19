@@ -1056,7 +1056,7 @@ def _run_session_thread(
             seed=True,
             embedding_model=embedder,
         )
-        resource_store = build_resource_store("memory", seed=True)
+        resource_store = build_resource_store(seed=True)
 
         # The same guard the CLI installs, built from the same factory — the two surfaces must not
         # be able to disagree about when a Session suspends or what it is told.

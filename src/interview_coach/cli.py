@@ -5,7 +5,6 @@
 - ``coach eval-harness`` (slice 0012): run held-out golden answers through the Evaluator.
 - ``coach api`` (slice 0012): run the FastAPI/WebSocket backend for the React UI.
 - ``coach ingest-concepts`` (slice 0007): fill a Chroma ``concepts`` collection with seed notes.
-- ``coach ingest-resources`` (slice 0011): fill a Chroma ``resources`` collection with study materials.
 - ``coach forge`` (issue 0028): Writer + three ordered gates that queue new bank questions for
   human review under ``data/forge/``.
 
@@ -82,7 +81,7 @@ from .postmortem import (
     export_postmortem_markdown,
     run_postmortem,
 )
-from .resources import SEED_RESOURCES, ChromaResourceStore, build_resource_store
+from .resources import build_resource_store
 from .seeds import QUESTION_BANK
 from .session_serde import measured_skill_states
 from .skill import POSTMORTEM_WEIGHT_RATIO, SkillState, confidence_weight
@@ -467,11 +466,7 @@ def _cmd_session(client: ClientArg, args: argparse.Namespace) -> int:
             seed=not args.no_seed_concepts,
             embedding_model=embedder,
         )
-    resource_store = build_resource_store(
-        args.resource_store,
-        persist_dir=args.resource_persist_dir,
-        seed=not args.no_seed_resources,
-    )
+    resource_store = build_resource_store(seed=not args.no_seed_resources)
     # R-25: the provider whose daily allowance this Session actually spends — the judge role, same
     # as the bench and forge preflights read. A client with no provider identity (demo, test fakes)
     # spends nobody's allowance, so every rail below is inert for it.
@@ -697,11 +692,7 @@ def _cmd_postmortem(client: ClientArg, args: argparse.Namespace) -> int:
     ):
         print(f"Refusing to run `coach postmortem`: {refusal}", file=sys.stderr)
         return 2
-    resource_store = build_resource_store(
-        args.resource_store,
-        persist_dir=args.resource_persist_dir,
-        seed=not args.no_seed_resources,
-    )
+    resource_store = build_resource_store(seed=not args.no_seed_resources)
     candidate = ScriptedCandidate(args.scripted_recollection) if args.scripted_recollection else InteractiveCandidate()
     try:
         result = run_postmortem(
@@ -991,13 +982,6 @@ def _cmd_ingest_concepts(client: ClientArg, args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_ingest_resources(client: ClientArg, args: argparse.Namespace) -> int:
-    store = ChromaResourceStore.create(persist_dir=args.persist_dir)
-    count = store.ingest(SEED_RESOURCES)
-    print(f"Ingested {count} learning resources into Chroma collection at {args.persist_dir!r}.")
-    return 0
-
-
 def _cmd_api(client: ClientArg, args: argparse.Namespace) -> int:
     import uvicorn
 
@@ -1162,17 +1146,6 @@ def main(argv: list[str] | None = None) -> int:
         help=_CONCEPT_EMBEDDER_HELP,
     )
     session_parser.add_argument(
-        "--resource-store",
-        choices=["memory", "chroma"],
-        default="memory",
-        help="Resource store used by the Study Planner.",
-    )
-    session_parser.add_argument(
-        "--resource-persist-dir",
-        default=".chroma",
-        help="Chroma persistence directory when --resource-store=chroma.",
-    )
-    session_parser.add_argument(
         "--no-seed-resources",
         action="store_true",
         help="Do not upsert the built-in learning resources before planning.",
@@ -1237,17 +1210,6 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         help="Scripted recollection answer for non-interactive runs; repeat once per answer. "
         "Omit to be debriefed interactively in the terminal.",
-    )
-    pm_parser.add_argument(
-        "--resource-store",
-        choices=["memory", "chroma"],
-        default="memory",
-        help="Resource store used by the regenerated Study Plan.",
-    )
-    pm_parser.add_argument(
-        "--resource-persist-dir",
-        default=".chroma",
-        help="Chroma persistence directory when --resource-store=chroma.",
     )
     pm_parser.add_argument(
         "--no-seed-resources",
@@ -1356,10 +1318,6 @@ def main(argv: list[str] | None = None) -> int:
         help=_CONCEPT_EMBEDDER_HELP,
     )
     ingest_parser.set_defaults(func=_cmd_ingest_concepts, requires_llm=False)
-
-    resources_parser = sub.add_parser("ingest-resources", help="Slice 0011: seed the Chroma resources collection")
-    resources_parser.add_argument("--persist-dir", default=".chroma", help="Chroma persistence directory.")
-    resources_parser.set_defaults(func=_cmd_ingest_resources, requires_llm=False)
 
     api_parser = sub.add_parser("api", help="Slice 0012: run the FastAPI WebSocket backend")
     api_parser.add_argument("--host", default="127.0.0.1")
