@@ -1,12 +1,22 @@
-# Question Forge review queue (issue 0028) — HUMAN MERGE ONLY.
-# STATUS: MERGED 2026-07-19 — all 3 drafts admitted into src/interview_coach/data/questions.yaml
-# (mlops section) after the delegated human review (R-33, GH #88). answers[1] (the weak admission
-# answers) stay HERE as bench-label material per ADR 0009 addendum (b); do not merge them twice.
-# Generated 2026-07-11 by `coach forge --skill mlops --n 3` (judge provider: openai, model: gpt-5.4-mini).
-# Gates passed: contract, novelty, admission (strong band 3.5-5.0, weak band 1.0-3.0).
-# answers[0] is the admitted strong answer; answers[1] is the admission-test WEAK answer,
-# kept for review — replace answers[1:] with Follow-up replies when merging.
-# Nothing here enters data/questions.yaml or any pack automatically.
+# RETAINED BENCH-LABEL SOURCE — not a pending review queue. Nothing here is waiting for anyone.
+#
+# GH #129 asked whether this file is dead weight: it is written by `write_forge_outputs`
+# (src/interview_coach/forge.py) and no code anywhere reads it back. The decision, 2026-09-19, is to
+# KEEP it, and the reason is `answers[1]`. Those are the admission-test WEAK answers — human-reviewed
+# question/answer pairs with a known-weak label, which is exactly the scarce input the judge
+# calibration bench is built from (ADR 0009 addendum b), and that bench is still RED at 34/35 on
+# `depth` and `system_thinking` (GH #96). Deleting the file to tidy a write-only path would forfeit
+# label material for the one gate that is still failing. It is read by a human, deliberately.
+#
+# Review is DONE: all 3 drafts were admitted into src/interview_coach/data/questions.yaml (mlops
+# section) on 2026-07-19 after the delegated human review (R-33, GH #88). `answers[0]` are those
+# admitted strong exemplars and are now duplicated in the bank on purpose — do NOT merge them a
+# second time. `answers[1]` were never merged and must not be: a weak answer in the bank is a
+# question, not an exemplar.
+#
+# Provenance: generated 2026-07-11 by `coach forge --skill mlops --n 3` (judge provider: openai,
+# model: gpt-5.4-mini). Gates passed: contract, novelty, admission (strong band 3.5-5.0, weak band
+# 1.0-3.0). A future `coach forge` run writes a NEW dated file; it never rewrites this one.
 
 mlops:
 - question: You own a fraud model that is deployed in real time. Two weeks after launch, the business

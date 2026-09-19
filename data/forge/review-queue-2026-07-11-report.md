@@ -1,5 +1,9 @@
 # Question Forge run — mlops
 
+> **Status: closed, and retained on purpose.** All 3 drafts were merged into the bank on 2026-07-19
+> (R-33, GH #88). This report and its queue are kept as the provenance record for those questions and
+> as bench-label material (GH #129's decision, 2026-09-19) — nothing here is pending.
+
 - Date: 2026-07-11
 - Judge provider: openai — model: gpt-5.4-mini
   (the configured primary; a mid-run provider failover silently swaps the judge — check WARNING logs before trusting borderline admissions)
