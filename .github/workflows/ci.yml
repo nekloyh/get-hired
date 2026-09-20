@@ -86,6 +86,17 @@ jobs:
         working-directory: web
       - if: failure()
         run: cat api.log
+      # This job's `coach api` is never stopped by any step, so it is still listening when the job's
+      # POST steps run — and `setup-uv`'s post step is `uv cache prune --ci`, which waits on a cache
+      # lock the live server holds. Measured on run 35430706774: every spec green, then
+      # "Timeout (300s) when waiting for lock ... is another uv process running?" and a red job.
+      # It is a race (the same commit's earlier runs passed), which is worse than a reliable failure.
+      # `pkill -f` rather than a saved PID because `uv run` is a wrapper around a child `coach`
+      # process — the pattern matches both, and killing only the wrapper leaves the server up
+      # (web/e2e/reconnect-flow.spec.ts hit exactly that and documents it). The reconnect spec kills
+      # its own :8010 backend; this is only the :8000 one the job itself started.
+      - if: always()
+        run: pkill -f 'coach api --port 8000' || true
 
   # The deployment artifact this milestone is about was ungated: nothing in CI built the image or
   # validated the compose file, so a broken Dockerfile or compose stanza was only discovered on the

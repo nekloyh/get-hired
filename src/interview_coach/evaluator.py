@@ -101,19 +101,6 @@ class DimensionScore(BaseModel):
     )
 
 
-class SelfCritiqueTrace(BaseModel):
-    """Trace of the Evaluator's one allowed self-critique pass.
-
-    Retained for pre-0027 transcripts: on current escalations the single re-read is superseded by
-    the Panel Verdict (:class:`PanelTrace`), so new evaluations carry ``panel`` instead.
-    """
-
-    triggers: tuple[str, ...]
-    first_confidence: float = Field(ge=0, le=1)
-    second_confidence: float = Field(ge=0, le=1)
-    kept_pass: Literal["first_pass", "self_critique"]
-
-
 class PanelOpinion(BaseModel):
     """One advisory voice in the Panel Verdict (issue 0027).
 
@@ -195,7 +182,6 @@ class Evaluation(BaseModel):
             "scored 3 or below; empty when english_delivery is inactive or strong."
         ),
     )
-    self_critique: SelfCritiqueTrace | None = None
     panel: PanelTrace | None = None
     trust: TrustTrace | None = None
 
@@ -211,7 +197,7 @@ class Evaluation(BaseModel):
         *semantic* rule — weak delivery must carry >= 3 fixes — stays a hard validator that steers
         the retry.
 
-        ``evidence_degraded``, ``self_critique``, and ``panel`` are DERIVED fields owned by the
+        ``evidence_degraded``, ``panel`` and ``trust`` are DERIVED fields owned by the
         deterministic guards, never model-authored: a model echoing ``evidence_degraded: true``
         (the panel-verdict prompt replays the first-pass JSON, actively inviting the echo) must not
         smuggle in a confidence haircut — or talk its way out of one. The guards attach these
@@ -221,7 +207,7 @@ class Evaluation(BaseModel):
         if not isinstance(data, dict):
             return data
         data = {**data}
-        for derived in ("evidence_degraded", "self_critique", "panel", "trust"):
+        for derived in ("evidence_degraded", "panel", "trust"):
             if data.pop(derived, None) is not None:
                 telemetry.incr("sanitizer.derived_field_echoed")
         dimensions = data.get("dimensions")

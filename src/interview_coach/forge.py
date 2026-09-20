@@ -18,6 +18,12 @@ Survivors land in a review-queue YAML under ``data/forge/`` that a human merges 
 ever enters ``data/questions.yaml`` or a pack automatically (the import-time bank load makes a bad
 auto-merge brick the whole package, so the human promotion gate is a hard invariant). Every
 rejection records which gate killed it and why, so gate ordering and yield are measurable.
+
+Those files stay checked in after the merge, and no code reads them back. That is deliberate, not an
+abandoned loop (GH #129): the rejected ``answers[1]`` are human-reviewed answers carrying a
+known-weak label, which is the input the judge calibration bench is built from (ADR 0009 addendum b).
+Each file's own header records the decision; a new run writes a new dated file and never rewrites an
+old one.
 """
 
 from __future__ import annotations

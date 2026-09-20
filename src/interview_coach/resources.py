@@ -1,23 +1,21 @@
 """Learning resource retrieval for the Study Planner (slice 0011).
 
-**The in-memory ASCII-Jaccard store is the production path, everywhere, by default.** This docstring
-used to claim Chroma was, and it never has been: `web_api.py:1059` hardcodes
-``build_resource_store("memory", seed=True)`` with no Setting and no env knob, so the web API cannot
-be pointed at Chroma at all, and both CLI call sites default ``--resource-store`` to ``memory``.
-There is no ``"auto"`` branch here the way there is for the concept store, and no ``resource_store``
-field in ``Settings``. Chroma is reachable only by passing ``--resource-store chroma`` to
-``coach session`` or ``coach postmortem`` after running ``coach ingest-resources``.
+One store: the deterministic in-memory ASCII-Jaccard one. There used to be a Chroma-backed
+alternative behind ``--resource-store chroma``; it was deleted under GH #130 and this is the
+reasoning, so nobody rebuilds it by accident.
 
-Why that is defensible today, and what would change it: ``SEED_RESOURCES`` is 10 entries across 5
-Skills — two each — and ``InMemoryResourceStore.search`` hard-filters on ``skill=`` before it ranks,
-so the ranker is choosing between two candidates. An embedder cannot improve that. The shelf-size
-threshold where it starts to matter is the same one recorded for concepts (``concepts.py:351``,
-~20-25 per Skill), or whenever ADR 0014 taxonomy-as-data grows the catalog.
+``SEED_RESOURCES`` is 10 entries across 5 Skills — two each — and ``InMemoryResourceStore.search``
+hard-filters on ``skill=`` before it ranks. The ranker is therefore choosing between two candidates,
+and no embedder improves a choice between two candidates. Meanwhile the Chroma half was never on any
+default path: the web API hardcoded ``memory``, both CLI call sites defaulted to it, there was no
+``Settings`` field and no ``"auto"`` branch, so it was a flag, an ingest command and ~110 lines
+carrying a maintenance cost against zero measured benefit — including a hand-written guard against
+e5-family embedders it could not encode for.
 
-**Open decision, GH #130:** either delete the Chroma half (``ChromaResourceStore``,
-``coach ingest-resources``, the two ``--resource-store`` flags, the ``@pytest.mark.rag`` test) or
-wire it the way concepts are wired (an ``"auto"`` branch, a Setting, the web API honouring it).
-Leaving it as a flag nothing defaults to is what produced a docstring that lied for two months.
+Rebuild it when the catalog passes the shelf-size threshold already recorded for concepts
+(``concepts.py:351``, ~20-25 per Skill), or when ADR 0014 taxonomy-as-data grows it. The concept
+store's prefix-aware path is the model to copy; `git log --diff-filter=D -- src/interview_coach`
+finds the deleted class if it is ever wanted back.
 
 The Planner never calls this as a tool; Python retrieves resource candidates first, then injects
 them into the single-shot Planner prompt.
@@ -27,16 +25,11 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Protocol, cast
-
-from .concepts import BGE_SMALL_EN, embedder_revision
+from typing import Protocol
 
 logger = logging.getLogger(__name__)
-
-RESOURCE_COLLECTION = "resources"
 
 
 @dataclass(frozen=True)
@@ -145,123 +138,6 @@ class InMemoryResourceStore:
 
         ordered = sorted(candidates, key=rank, reverse=True)[:n_results]
         return [ResourceMatch(resource=resource, score=rank(resource)[0]) for resource in ordered]
-
-
-class ChromaResourceStore:
-    """Chroma-backed resource store using the BGE small English embedder."""
-
-    def __init__(self, collection) -> None:
-        self._collection = collection
-
-    @classmethod
-    def create(
-        cls,
-        *,
-        persist_dir: str | Path | None = None,
-        collection_name: str = RESOURCE_COLLECTION,
-        embedding_model: str = BGE_SMALL_EN,
-    ) -> ChromaResourceStore:
-        from .concepts import _EMBEDDING_PREFIXES
-
-        if embedding_model in _EMBEDDING_PREFIXES:
-            # The resource store has no prefix-aware encoding path yet: silently accepting an
-            # e5-family id here would embed queries without their required "query: " prefix and
-            # degrade ranking with no error — the exact bug the concept store just fixed.
-            raise RuntimeError(
-                f"{embedding_model!r} needs asymmetric query/passage prefixes, which the resource "
-                "store does not implement yet — use the default embedder here, or port the concept "
-                "store's prefix-aware path first"
-            )
-        try:
-            import chromadb
-            from chromadb.utils import embedding_functions
-        except ImportError as err:
-            raise RuntimeError(
-                "Chroma resource retrieval requires optional packages: chromadb and sentence-transformers"
-            ) from err
-
-        revision = embedder_revision(embedding_model)
-        # See concepts.py: chromadb's protocol does not admit its own concrete implementation.
-        embedding_fn: Any = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=embedding_model, revision=revision
-        )
-        client = chromadb.PersistentClient(path=str(persist_dir)) if persist_dir else chromadb.Client()
-        # Stamp the embedder into the collection metadata, exactly as the concept store does: the
-        # candidate embedders are all 384-dim, so Chroma would happily accept queries from a
-        # different model against a persisted index and return confidently-scored garbage. The
-        # resource store persists too, so it needs the same guard — its absence here was the gap.
-        collection = client.get_or_create_collection(
-            name=collection_name,
-            embedding_function=embedding_fn,
-            metadata={"hnsw:space": "cosine", "embedder": embedding_model},
-        )
-        stamped = (getattr(collection, "metadata", None) or {}).get("embedder")
-        if stamped is not None and stamped != embedding_model:
-            raise RuntimeError(
-                f"collection {collection_name!r} was built with embedder {stamped!r} but "
-                f"{embedding_model!r} was requested — embeddings do not mix across models. "
-                "Re-ingest into a fresh persist dir (or delete the old collection) to switch."
-            )
-        return cls(collection)
-
-    def ingest(self, resources: Iterable[LearningResource]) -> int:
-        batch = list(resources)
-        if not batch:
-            return 0
-        self._collection.upsert(
-            ids=[resource.id for resource in batch],
-            documents=[resource.summary for resource in batch],
-            metadatas=[resource.metadata() for resource in batch],
-        )
-        return len(batch)
-
-    def search(
-        self,
-        query: str,
-        *,
-        skill: str | None = None,
-        n_results: int = 3,
-    ) -> list[ResourceMatch]:
-        if n_results < 1:
-            raise ValueError("n_results must be >= 1")
-        where = _metadata_filter({"skill": skill})
-        query_kwargs = {
-            "query_texts": [query],
-            "n_results": n_results,
-            "include": ["documents", "metadatas", "distances"],
-        }
-        if where is not None:
-            query_kwargs["where"] = where
-        result = self._collection.query(**query_kwargs)
-        ids = result.get("ids", [[]])[0]
-        if not ids:
-            raise LookupError(f"no resources match skill={skill!r}")
-        matches: list[ResourceMatch] = []
-        for i, item_id in enumerate(ids):
-            metadata: Mapping[str, object] = result["metadatas"][0][i]
-            distance = result.get("distances", [[None]])[0][i]
-            resource = LearningResource(
-                id=str(metadata.get("id") or item_id),
-                skill=str(metadata["skill"]),
-                title=str(metadata["title"]),
-                url=str(metadata["url"]),
-                summary=str(result["documents"][0][i]),
-                resource_type=str(metadata.get("resource_type", "article")),
-                effort_minutes=int(cast("int", metadata.get("effort_minutes", 45))),
-                tags=tuple(str(metadata.get("tags", "")).split(",")) if metadata.get("tags") else (),
-            )
-            matches.append(ResourceMatch(resource=resource, score=None if distance is None else 1.0 - float(distance)))
-        logger.info("resource search returned %d hit(s) for skill=%r", len(matches), skill)
-        return matches
-
-
-def _metadata_filter(values: Mapping[str, str | None]) -> dict | None:
-    clauses = [{key: value} for key, value in values.items() if value is not None]
-    if not clauses:
-        return None
-    if len(clauses) == 1:
-        return clauses[0]
-    return {"$and": clauses}
 
 
 SEED_RESOURCES: tuple[LearningResource, ...] = (
@@ -405,19 +281,9 @@ def seed_resource_store(store: ResourceStore | None = None) -> ResourceStore:
     return target
 
 
-def build_resource_store(
-    kind: str = "memory",
-    *,
-    persist_dir: str | Path | None = None,
-    seed: bool = True,
-) -> ResourceStore:
+def build_resource_store(*, seed: bool = True) -> ResourceStore:
     """Build the resource store used by the Study Planner."""
-    if kind == "memory":
-        store: ResourceStore = InMemoryResourceStore()
-    elif kind == "chroma":
-        store = ChromaResourceStore.create(persist_dir=persist_dir)
-    else:
-        raise ValueError(f"unknown resource store kind: {kind!r}")
+    store: ResourceStore = InMemoryResourceStore()
     if seed:
         store.ingest(SEED_RESOURCES)
     return store

@@ -187,7 +187,6 @@ uv run python -m interview_coach pack lint data/packs/fpt                       
 uv run python -m interview_coach session --pack data/packs/fpt --scripted --max-questions 3                     # 0025: run a Session from a pack
 uv run python -m interview_coach eval-harness        # issue 0012: golden-answer Evaluator harness
 uv run python -m interview_coach ingest-concepts --persist-dir .chroma
-uv run python -m interview_coach ingest-resources --persist-dir .chroma
 uv run python scripts/smoke_issue_0009.py   # live: validate the Diagnostic agent against the real provider
 ```
 
@@ -287,8 +286,9 @@ cd web && npm run test:e2e  # optional: requires the backend API running and Pla
   the gap the Evaluator flagged using the `lookup_concept` tool. It never scores.
 - `src/interview_coach/concepts.py` — seed concept notes, the `lookup_concept` tool interface,
   deterministic in-memory retrieval for tests, and the Chroma/BGE persistent store.
-- `src/interview_coach/resources.py` — seed learning resources, deterministic in-memory retrieval,
-  and the Chroma/BGE `resources` collection used by the Study Planner.
+- `src/interview_coach/resources.py` — the seed learning-resource catalog and the deterministic
+  in-memory retrieval the Study Planner uses. One store by design (#130): the catalog is two entries
+  per Skill behind a hard `skill=` filter, which no embedder can rank better.
 - `src/interview_coach/study_planner.py` — end-of-Session Study Planner: ranks weak/role-critical
   Skills, retrieves resource candidates, and produces a typed two-week `StudyPlan`.
 - `src/interview_coach/eval_harness.py` — golden-answer Evaluator harness with expected score ranges,
