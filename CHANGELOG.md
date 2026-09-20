@@ -13,7 +13,7 @@ better. It records what a reader upgrading between tags has to know.
 
 ---
 
-## [0.2.0] — unreleased
+## [0.2.0] — 2026-09-20
 
 Dead code removed, the two 1,400-line files split, and the replay bench made measurable. No
 behaviour change was intended anywhere in this release; where one was possible, it is named below.
@@ -113,5 +113,5 @@ The first tag a trusted pilot could run against: M0a, M0b and M1 complete. Full 
 - **Full-stack nginx/TLS dry-run**, which found two defects and fixed both: WebSocket frames were
   unbounded by nginx, and nginx reported no health of its own.
 
-[0.2.0]: https://github.com/nekloyh/get-hired/compare/v0.1.0-pilot...HEAD
+[0.2.0]: https://github.com/nekloyh/get-hired/compare/v0.1.0-pilot...v0.2.0
 [0.1.0-pilot]: https://github.com/nekloyh/get-hired/releases/tag/v0.1.0-pilot
