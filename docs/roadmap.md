@@ -23,11 +23,13 @@ generating *candidate answers*, not judging them.
 
 That is the lever. The judge must stay on an API — ADR 0009 pins it, and no model that fits in 6 GB
 of VRAM passes the bench. **The candidate does not.** The replay bench
-([0029](issues/0029-simulated-candidate-replay-bench.md)) already exists for exactly this, and it has
-one defect in the way: replay artifacts record no pack, so the bench always measures the built-in
+([0029](issues/0029-simulated-candidate-replay-bench.md)) already exists for exactly this, and it had
+one defect in the way: replay artifacts recorded no pack, so the bench always measured the built-in
 bank ([#113](https://github.com/nekloyh/get-hired/issues/113)).
 
-**Fix #113, then put a local model behind the simulated candidate, and #96 becomes affordable.**
+**#113 is fixed as of `v0.2.0`** — artifacts carry `pack`, `REPLAY_ARTIFACT_VERSION` is 2, and
+`replay_decision` feeds the recorded bank back in. **The remaining step is the local model behind the
+simulated candidate, and then #96 becomes affordable.** It has no issue filed yet.
 
 ---
 
@@ -59,7 +61,7 @@ blocking is an API-priced measurement, not local compute.
 
 | # | Work | Why here |
 |---|---|---|
-| 1 | **[#113](https://github.com/nekloyh/get-hired/issues/113)** — replay artifacts carry pack/model/prompt provenance | unblocks §1. Until an artifact says which pack it was recorded against, the replay bench cannot be trusted as the cheap tier |
+| 1 | ~~**[#113](https://github.com/nekloyh/get-hired/issues/113)** — replay artifacts carry pack provenance~~ **DONE, `v0.2.0`** | unblocked §1: an artifact now says which pack it was recorded against, so the replay bench can be trusted as the cheap tier. `model`/`prompt` provenance is still absent — see the prompt-hash row in §4 |
 | 2 | **Local candidate behind the replay bench** | turns the expensive half of every judge experiment into local compute |
 | 3 | **[#96](https://github.com/nekloyh/get-hired/issues/96)** (then [#103](https://github.com/nekloyh/get-hired/issues/103)) — anchor `depth` and `system_thinking` at 3 | the last red line on the milestone. A missing middle BARS anchor is a measured language-fairness bug, not a style question (ADR 0009 addendum d) |
 | 4 | **Q1 — session/turn/role attribution on the trace** (continues [#81](https://github.com/nekloyh/get-hired/issues/81)) | every per-call `llm-call` line exists but carries no Session, turn or role. Without that a trajectory cannot be reconstructed — and reconstructing trajectories is learning goal #1 |
@@ -82,11 +84,11 @@ Assessed against practice as of this writing; re-check the tooling names before 
 | **Cost accounting per call** | **done** — usage ledger, daily caps, `ACCOUNTING:` fails loud and blocks metered work | [#125](https://github.com/nekloyh/get-hired/issues/125)/[#126](https://github.com/nekloyh/get-hired/issues/126) are polish |
 | **Structured output** | **done** — per-model `json_schema` capability | — |
 | **Per-role model routing** | **done** — ADR 0010, judge pinned in code | this is where a local model slots in (§2) |
-| **Two-tier evals** | **missing** — one tier, expensive, run by hand | cheap tier (replay/golden, zero API calls) on every PR; expensive tier only on judge/prompt changes. Depends on #113 |
+| **Two-tier evals** | **unblocked, not built** — one tier, expensive, run by hand; #113's blocker is gone | cheap tier (replay/golden, zero API calls) on every PR; expensive tier only on judge/prompt changes. Nothing is waiting on another fix now |
 | **Prompt versioning** | **missing** — prompts are inline, and a bench artifact does not record which prompt produced it | stamp a prompt hash into the bench artifact. Without it "which prompt was that 35/35 on?" is unanswerable |
 | **Trace attribution** | **partial** — every call logs `llm-call provider= model= ms= …`; none of it carries Session/turn/role | Q1 above. OpenTelemetry GenAI semantic conventions plus a self-hosted viewer (Langfuse/Phoenix) both run comfortably on this box |
-| **Trajectory eval** | **partial** — the replay bench exists, but its artifacts are pack-blind | #113 |
-| **Human-in-the-loop labelling** | **half-built** — the Question Forge writes a review queue that nothing reads back | either close the loop or delete the writer; [#129](https://github.com/nekloyh/get-hired/issues/129) |
+| **Trajectory eval** | **done for the pack axis** — the replay bench exists and its artifacts are no longer pack-blind (`v0.2.0`) | next axis is provenance: stamp the judge model and a prompt hash into the artifact |
+| **Human-in-the-loop labelling** | **decided, deliberately one-way** — the Question Forge writes a review queue a human reads; no code reads it back, and [#129](https://github.com/nekloyh/get-hired/issues/129) resolved that as intended, not broken | the rejected weak answers are bench-label material (ADR 0009 addendum b); each file's header says so |
 | **Refactor safety net** | **done** — `tests/test_serde_golden.py` is a byte-identity harness | use it, not `coach bench`, to prove a refactor changed nothing |
 
 ---

@@ -119,11 +119,16 @@ interview in progress. It is read-only in the UI; use **New session** to start a
 
 ## Status
 
-**`v0.1.0-pilot` (2026-09-15).** M-0 and M-1 of the [implementation plan](docs/issues/README.md) are
+**`v0.2.0` (2026-09-20).** M-0 and M-1 of the [implementation plan](docs/issues/README.md) are
 complete: the Session is bounded, its spend is accounted for, and the stack deploys behind nginx/TLS.
 The whole path has been driven through a real compose stack — HTTP→HTTPS, `wss://` through the proxy,
 a restart mid-question, a teardown and restore — and what that run found is in
 [`MILESTONE-REPORT.md`](MILESTONE-REPORT.md) §5.
+
+`v0.2.0` adds no feature. It removes dead code, splits the two 1,400-line modules, and makes the
+replay bench measure the pack it was actually recorded against; it also **removes public CLI
+surface**, which is why the minor version moved. [`CHANGELOG.md`](CHANGELOG.md) has the list, including
+what is still red.
 
 **Before anyone but you uses it, work through [`docs/pilot-runbook.md`](docs/pilot-runbook.md).** It
 is a pre-flight gate, and one of its lines is a Groq key rotation that only you can tick.
@@ -155,7 +160,7 @@ Docker image with an nginx/TLS compose stack.
 | One shared token, no accounts | anyone with it can read or overwrite anyone's Skill history by typing their Candidate id ([#84](https://github.com/nekloyh/get-hired/issues/84)) |
 | Resume is per **question**, not per turn | a crash costs the question in flight, not the interview |
 | The Skill ledger keeps one snapshot per Candidate | there is no history to chart yet ([#127](https://github.com/nekloyh/get-hired/issues/127)) |
-| Self-critique is dormant | its low-confidence trigger never fires on the current judge; the Panel above is what replaced it. `SelfCritiqueTrace` is a leftover type with no producer ([#129](https://github.com/nekloyh/get-hired/issues/129)) |
+| Self-critique is dormant | its low-confidence trigger never fires on the current judge; the Panel above is what replaced it. The leftover `SelfCritiqueTrace` type was deleted in `v0.2.0` ([#129](https://github.com/nekloyh/get-hired/issues/129)), so the dormancy is now the only part left — a replacement signal is ADR 0011, still Proposed |
 
 ## Setup
 
