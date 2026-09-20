@@ -39,15 +39,11 @@ def test_validate_language_mode_rejects_typos_loudly():
 
 
 def test_english_answer_is_english():
-    assert answer_is_english(
-        "Overfitting happens when the model memorizes the training data instead of generalizing."
-    )
+    assert answer_is_english("Overfitting happens when the model memorizes the training data instead of generalizing.")
 
 
 def test_vietnamese_answer_is_not_english():
-    assert not answer_is_english(
-        "Overfitting xảy ra khi mô hình học thuộc dữ liệu train thay vì tổng quát hoá."
-    )
+    assert not answer_is_english("Overfitting xảy ra khi mô hình học thuộc dữ liệu train thay vì tổng quát hoá.")
 
 
 def test_code_switched_vietnamese_stays_vietnamese():
@@ -301,8 +297,7 @@ def test_the_function_word_gate_flips_no_calibration_bench_case():
     ]
     assert len(texts) == 70, "bench corpus changed size; re-measure before trusting this invariant"
     disagreements = [
-        (case_id, field) for case_id, field, value in texts
-        if answer_is_english(value) != letters_only_verdict(value)
+        (case_id, field) for case_id, field, value in texts if answer_is_english(value) != letters_only_verdict(value)
     ]
     assert disagreements == []
 

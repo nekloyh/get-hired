@@ -83,8 +83,7 @@ def test_rotation_stays_within_the_distinct_set():
     n = seed_count(skill)
     span = n
     rotated = {
-        select_seed_question(skill, 0, rotation=rotation_offset(f"session-{i}", span)).question
-        for i in range(10)
+        select_seed_question(skill, 0, rotation=rotation_offset(f"session-{i}", span)).question for i in range(10)
     }
     all_prompts = {q.question for q in QUESTION_BANK[skill]}
     assert rotated <= all_prompts

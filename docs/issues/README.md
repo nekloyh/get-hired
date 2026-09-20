@@ -2,17 +2,29 @@
 
 ## Status and authority
 
-**Planned; no implementation started by this update. Updated 2026-09-13.** This is the canonical
-sequencing and milestone index for `docs/issues/`; numbered slice documents retain their detailed
-contracts and historical completion records. It replaces the old Now/Next/Later ordering only
-where the reconciliation table below says so. Accepted ADRs still win. GitHub Issues remain the
-live work tracker; links here reuse existing work, not newly created issues.
+**M0 and M1 are DONE and shipped as `v0.1.0-pilot` (2026-09-15). M2 is filed as issues, not coded.
+Milestone status last reconciled 2026-09-15; the plan text below was written 2026-09-13.**
 
-Code inspection baseline: `2dac711b3b9efc292406222e369fcd0a45301872` in the local checkout.
-No runtime configuration, code, issues, commits, or live eval campaigns changed in this planning
-pass. GitHub issue/PR status was **not refreshed**: linked identifiers are existing references,
-not assertions that work is still open or that a remote branch has landed. Before implementation,
-check the linked issue and any pending PR, reuse their work, and record the actual starting commit.
+| Milestone | State | Evidence |
+|---|---|---|
+| M0a — writable durable usage ledger, visible accounting failure | **done** | [`../audits/m0a-usage-ledger-2026-09-13.md`](../audits/m0a-usage-ledger-2026-09-13.md) |
+| M0b — input/frame/output bounds, admission, bounded queues, cleanup | **done** | [`../../MILESTONE-REPORT.md`](../../MILESTONE-REPORT.md) §2 |
+| M1 — durable answer, durable effect | **done** | MILESTONE-REPORT §2, §5 (driven through the real compose stack) |
+| M2 — explain and measure the judge and the loop | **filed, not coded** | MILESTONE-REPORT §7; GH #96, #103, #113 |
+| M3–M6 | not started | — |
+
+This is the canonical sequencing and milestone index for `docs/issues/`; numbered slice documents
+retain their detailed contracts and historical completion records. It replaces the old
+Now/Next/Later ordering only where the reconciliation table below says so. Accepted ADRs still win.
+GitHub Issues remain the live work tracker; links here reuse existing work, not newly created
+issues.
+
+**Everything below this section is the 2026-09-13 planning pass, unedited.** Its code inspection
+baseline is `2dac711b3b9efc292406222e369fcd0a45301872`, which is 58 commits behind `main` — so its
+"Verified:" file and line references, and every gap it describes as open, are a snapshot from before
+M0/M1 landed. Read it for the sequencing and the reasoning, not for the current state of a file;
+GitHub issue/PR status was not refreshed in it either. Before implementing anything here, check the
+linked issue, check the code, and record the actual starting commit.
 
 ## Goals, scope, and assumptions
 

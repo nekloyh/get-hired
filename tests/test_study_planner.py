@@ -116,9 +116,7 @@ def _plan_json(
                         else "Produce a short answer and one follow-up answer."
                     ),
                     "resource_ids": (
-                        []
-                        if day in review_days or day in empty_days
-                        else [resource_ids[(day - 1) % len(resource_ids)]]
+                        [] if day in review_days or day in empty_days else [resource_ids[(day - 1) % len(resource_ids)]]
                     ),
                 }
                 for day in range(1, 15)
@@ -153,7 +151,10 @@ def test_plan_study_materializes_only_catalog_resource_urls(make_client):
 
     assert plan.prioritized_topics[0].skill == "mlops"
     assert plan.prioritized_topics[0].resources[0].id == "mlops_google_rules"
-    assert plan.prioritized_topics[0].resources[0].url == "https://developers.google.com/machine-learning/guides/rules-of-ml"
+    assert (
+        plan.prioritized_topics[0].resources[0].url
+        == "https://developers.google.com/machine-learning/guides/rules-of-ml"
+    )
     assert [call["skill"] for call in store.search_calls] == ["mlops", "system_design"]
     prompt = fake.chat.completions.calls[0]["messages"][-1]["content"]
     assert "RESOURCE CANDIDATES" in prompt

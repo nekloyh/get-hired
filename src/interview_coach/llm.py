@@ -994,9 +994,7 @@ def _checked_judge(settings: Settings, client: LLMClient) -> LLMClient:
     """
     if not isinstance(client, _OpenAICompatibleClient) or not hasattr(settings, "role_config"):
         return client
-    settings._require_bench_validated_judge(
-        client.provider_name, "", client._settings.model, client._settings.base_url
-    )
+    settings._require_bench_validated_judge(client.provider_name, "", client._settings.model, client._settings.base_url)
     if getattr(settings, "allow_unvalidated_judge", False):
         client.judge_unvalidated = True
     return client

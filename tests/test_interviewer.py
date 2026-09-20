@@ -102,8 +102,7 @@ def test_follow_up_prompt_targets_the_gap(make_client):
     assert "depth: 2/5" in user_msg  # the weakest dimension is surfaced (weakest-first ordering)
     final_messages = fake.chat.completions.calls[1]["messages"]
     assert any(
-        m.get("role") == "tool" and "The L2 penalty shrinks weights" in m.get("content", "")
-        for m in final_messages
+        m.get("role") == "tool" and "The L2 penalty shrinks weights" in m.get("content", "") for m in final_messages
     )
 
 
@@ -279,9 +278,7 @@ def test_missing_concept_note_degrades_on_native_path(make_tool_client):
         )
 
     assert fake.call_count == 2  # the tool round-trip + the final structured turn both ran
-    assert store.lookup_calls == [
-        {"query": "L2 penalty variance mechanism", "skill": "mlops", "language": None}
-    ]
+    assert store.lookup_calls == [{"query": "L2 penalty variance mechanism", "skill": "mlops", "language": None}]
 
 
 def test_missing_concept_note_degrades_on_json_path():
@@ -301,9 +298,7 @@ def test_missing_concept_note_degrades_on_json_path():
         )
 
     assert len(client.calls) == 1  # the tool-plan call ran; the follow-up call never happens
-    assert store.lookup_calls == [
-        {"query": "L2 penalty variance mechanism", "skill": "mlops", "language": None}
-    ]
+    assert store.lookup_calls == [{"query": "L2 penalty variance mechanism", "skill": "mlops", "language": None}]
 
 
 def test_native_declined_fails_loudly(make_tool_client):
@@ -400,9 +395,7 @@ def test_lookup_widens_to_any_language_when_shelf_has_no_vi_notes():
     from interview_coach.concepts import InMemoryConceptStore
     from interview_coach.interviewer import _lookup_with_widening
 
-    store = InMemoryConceptStore(
-        [ConceptNote(id="en_note", skill="mlops", title="drift", content="drift monitoring")]
-    )
+    store = InMemoryConceptStore([ConceptNote(id="en_note", skill="mlops", title="drift", content="drift monitoring")])
 
     lookup, applied = _lookup_with_widening(store, "drift", skill="mlops", language="vi")
 

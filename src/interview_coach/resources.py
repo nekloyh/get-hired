@@ -1,9 +1,26 @@
 """Learning resource retrieval for the Study Planner (slice 0011).
 
-The production path is a Chroma ``resources`` collection using the same BGE small English embedder
-as concept retrieval. Tests and offline demos use a deterministic in-memory implementation, but the
-Planner sees the same catalog IDs either way. The Planner never calls this as a tool; Python
-retrieves resource candidates first, then injects them into the single-shot Planner prompt.
+**The in-memory ASCII-Jaccard store is the production path, everywhere, by default.** This docstring
+used to claim Chroma was, and it never has been: `web_api.py:1059` hardcodes
+``build_resource_store("memory", seed=True)`` with no Setting and no env knob, so the web API cannot
+be pointed at Chroma at all, and both CLI call sites default ``--resource-store`` to ``memory``.
+There is no ``"auto"`` branch here the way there is for the concept store, and no ``resource_store``
+field in ``Settings``. Chroma is reachable only by passing ``--resource-store chroma`` to
+``coach session`` or ``coach postmortem`` after running ``coach ingest-resources``.
+
+Why that is defensible today, and what would change it: ``SEED_RESOURCES`` is 10 entries across 5
+Skills — two each — and ``InMemoryResourceStore.search`` hard-filters on ``skill=`` before it ranks,
+so the ranker is choosing between two candidates. An embedder cannot improve that. The shelf-size
+threshold where it starts to matter is the same one recorded for concepts (``concepts.py:351``,
+~20-25 per Skill), or whenever ADR 0014 taxonomy-as-data grows the catalog.
+
+**Open decision, GH #130:** either delete the Chroma half (``ChromaResourceStore``,
+``coach ingest-resources``, the two ``--resource-store`` flags, the ``@pytest.mark.rag`` test) or
+wire it the way concepts are wired (an ``"auto"`` branch, a Setting, the web API honouring it).
+Leaving it as a flag nothing defaults to is what produced a docstring that lied for two months.
+
+The Planner never calls this as a tool; Python retrieves resource candidates first, then injects
+them into the single-shot Planner prompt.
 """
 
 from __future__ import annotations

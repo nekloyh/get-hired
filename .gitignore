@@ -43,3 +43,6 @@ data/exports/
 .DS_Store
 
 deploy/nginx/certs/
+
+# Playwright JSON reports written by .github/e2e-ran.sh
+web/playwright-*.json

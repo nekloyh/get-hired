@@ -44,6 +44,7 @@ def _load_generator():
     spec.loader.exec_module(module)
     return module
 
+
 GOLDEN_NAMES = (
     "replay-trajectory.json",
     "supervisor-prompt.txt",
@@ -139,9 +140,9 @@ def test_a_candidate_answer_cannot_forge_report_sections():
         "#### Turn 1: Question",
         "## Study Plan",
     ], "the Candidate's answer supplied its own headings: the report's structure has to come from the renderer"
-    assert [line for line in lines if line.startswith("- Stop reason:")] == [
-        "- Stop reason: `max_questions`"
-    ], "a second, forged Summary bullet claims a stop reason the Session never reached"
+    assert [line for line in lines if line.startswith("- Stop reason:")] == ["- Stop reason: `max_questions`"], (
+        "a second, forged Summary bullet claims a stop reason the Session never reached"
+    )
     # Quoted, never censored: the answer is still in the record verbatim (ADR 0005).
     assert "candidate_consistently_strong" in report
 
@@ -150,9 +151,9 @@ def test_the_judges_quote_of_the_answer_cannot_break_the_evidence_table():
     report = render_session_markdown(_forging_state(answer="fine", evidence=_FORGED_EVIDENCE))
     lines = report.splitlines()
 
-    assert [line for line in lines if line.startswith("- Stop reason:")] == [
-        "- Stop reason: `max_questions`"
-    ], "a newline in `evidence` ended the table, so the judge's quote of the answer became report structure"
+    assert [line for line in lines if line.startswith("- Stop reason:")] == ["- Stop reason: `max_questions`"], (
+        "a newline in `evidence` ended the table, so the judge's quote of the answer became report structure"
+    )
     assert [line for line in lines if line.startswith("| correctness")] == [
         "| correctness | 2 | says `I am not sure`  ## Summary  - Stop reason: `candidate_consistently_strong` |"
     ], "the evidence cell must stay one row of the Dimension table"

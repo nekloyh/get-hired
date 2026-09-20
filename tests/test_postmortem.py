@@ -84,10 +84,7 @@ def _answers(n: int = MIN_ELICITATION_QUESTIONS) -> list[str]:
 
 
 def _transcript() -> tuple[RecollectionTurn, ...]:
-    return tuple(
-        RecollectionTurn(question=f"Q{i}", answer=f"A{i}")
-        for i in range(1, MIN_ELICITATION_QUESTIONS + 1)
-    )
+    return tuple(RecollectionTurn(question=f"Q{i}", answer=f"A{i}") for i in range(1, MIN_ELICITATION_QUESTIONS + 1))
 
 
 def _settings() -> SimpleNamespace:
@@ -118,9 +115,7 @@ def test_recollection_to_typed_evidence_updates_ledger_end_to_end(tmp_path, make
         ]
     )
 
-    result = run_postmortem(
-        client, ScriptedCandidate(_answers()), candidate_id="alice", ledger_db=path, now=NOW
-    )
+    result = run_postmortem(client, ScriptedCandidate(_answers()), candidate_id="alice", ledger_db=path, now=NOW)
 
     # Exact fusion property (mirrors test_skill.py's exactness): alpha/beta move by precisely
     # POSTMORTEM_WEIGHT_RATIO * confidence_weight(conf) pseudo-counts split by quality.
@@ -156,9 +151,7 @@ def test_run_postmortem_requires_a_candidate_id(tmp_path, make_client):
     # The ledger is the whole point (issue 0026); an empty id would silently no-op both ledger I/O.
     client, fake = make_client([_step(False)])
     with pytest.raises(ValueError):
-        run_postmortem(
-            client, ScriptedCandidate(["a"]), candidate_id="", ledger_db=tmp_path / "ledger.json"
-        )
+        run_postmortem(client, ScriptedCandidate(["a"]), candidate_id="", ledger_db=tmp_path / "ledger.json")
     assert fake.call_count == 0  # fails at setup, before any LLM call
 
 
@@ -167,9 +160,7 @@ def test_run_postmortem_requires_a_candidate_id(tmp_path, make_client):
 
 def test_postmortem_shift_is_strictly_smaller_than_live_at_same_score_and_confidence():
     before = SkillState.neutral("mlops")
-    scorecard = ReconstructedScorecard(
-        entries=[ReconstructedSkillEntry(**_entry(score=5.0, confidence=0.8))]
-    )
+    scorecard = ReconstructedScorecard(entries=[ReconstructedSkillEntry(**_entry(score=5.0, confidence=0.8))])
     fused = fuse_scorecard({"mlops": before}, scorecard)["mlops"]
     live = apply_evaluation(before, _evaluation(5.0, 0.8))
 
@@ -211,9 +202,7 @@ def test_stale_ledger_record_decays_before_observing(tmp_path):
     assert states["mlops"].beta == pytest.approx(expected_beta)
 
     score, conf = 2.0, 0.4
-    scorecard = ReconstructedScorecard(
-        entries=[ReconstructedSkillEntry(**_entry(score=score, confidence=conf))]
-    )
+    scorecard = ReconstructedScorecard(entries=[ReconstructedSkillEntry(**_entry(score=score, confidence=conf))])
     fused = fuse_scorecard(states, scorecard)["mlops"]
     weight = POSTMORTEM_WEIGHT_RATIO * confidence_weight(conf)
     assert fused.alpha == pytest.approx(expected_alpha + weight * score_to_quality(score))
@@ -233,9 +222,7 @@ def test_premature_done_is_ignored_before_the_minimum(make_client):
 
 def test_never_done_forces_stop_at_the_maximum(make_client):
     client, fake = make_client([_step(False)])
-    transcript = run_elicitation(
-        client, ScriptedCandidate(_answers(MAX_ELICITATION_QUESTIONS + 3))
-    )
+    transcript = run_elicitation(client, ScriptedCandidate(_answers(MAX_ELICITATION_QUESTIONS + 3)))
     assert len(transcript) == MAX_ELICITATION_QUESTIONS
     assert fake.call_count == MAX_ELICITATION_QUESTIONS  # budget spent: the model is not consulted again
 
@@ -243,9 +230,7 @@ def test_never_done_forces_stop_at_the_maximum(make_client):
 # --- abort is intent (ADR 0005) -------------------------------------------------------------------
 
 
-def test_abort_mid_elicitation_exits_2_and_leaves_ledger_byte_identical(
-    tmp_path, monkeypatch, make_client, capsys
-):
+def test_abort_mid_elicitation_exits_2_and_leaves_ledger_byte_identical(tmp_path, monkeypatch, make_client, capsys):
     # Mirror of test_candidate_intent_aborts_session_and_is_not_recorded_as_failed: the scripted
     # Candidate runs out mid-debrief (CandidateExhausted, a CandidateIntent) — clean exit 2, the
     # partial recollection is discarded, and the ledger file is BYTE-identical (zero writes).
@@ -281,9 +266,7 @@ def test_abort_mid_elicitation_exits_2_and_leaves_ledger_byte_identical(
 
 
 def test_unknown_skill_is_retried_once_with_error_feedback_then_accepted(make_client):
-    client, fake = make_client(
-        [_scorecard(_entry(skill="basket_weaving")), _scorecard(_entry(skill="mlops"))]
-    )
+    client, fake = make_client([_scorecard(_entry(skill="basket_weaving")), _scorecard(_entry(skill="mlops"))])
     scorecard = reconstruct_scorecard(client, _transcript())
     assert [entry.skill for entry in scorecard.entries] == ["mlops"]
     assert fake.call_count == 2
@@ -325,13 +308,9 @@ def test_plan_regenerates_on_the_after_state(tmp_path, make_client, monkeypatch)
 
     monkeypatch.setattr(postmortem, "plan_study", _spy_plan)
     score, conf = 2.0, 0.4
-    client, fake = make_client(
-        [*_elicitation_replies(), _scorecard(_entry(score=score, confidence=conf))]
-    )
+    client, fake = make_client([*_elicitation_replies(), _scorecard(_entry(score=score, confidence=conf))])
 
-    result = run_postmortem(
-        client, ScriptedCandidate(_answers()), candidate_id="alice", ledger_db=path, now=NOW
-    )
+    result = run_postmortem(client, ScriptedCandidate(_answers()), candidate_id="alice", ledger_db=path, now=NOW)
 
     # The planner sees the AFTER (fused) state, with role-criticality metadata synthesized.
     weight = POSTMORTEM_WEIGHT_RATIO * confidence_weight(conf)
@@ -381,9 +360,7 @@ def test_cli_postmortem_end_to_end_with_markdown_export(tmp_path, monkeypatch, m
     assert reloaded["mlops"].beta > 2.3
 
 
-def test_an_accounting_fault_in_the_replan_stops_the_command_and_keeps_the_fusion(
-    tmp_path, make_client, monkeypatch
-):
+def test_an_accounting_fault_in_the_replan_stops_the_command_and_keeps_the_fusion(tmp_path, make_client, monkeypatch):
     # QA-05 / M0-6, third net. The re-plan's `except Exception` re-raised CandidateIntent but not the
     # two typed operator stops, so a refused call was filed as `study_plan_error` and `coach
     # postmortem` exited 0 — an operator stop rendered as a degraded planner. It must reach

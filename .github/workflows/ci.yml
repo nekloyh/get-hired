@@ -17,6 +17,10 @@ jobs:
       # image build, where Dockerfile:37 uses --frozen. This job now fails on that drift instead.
       - run: uv sync --locked --dev
       - run: uv run ruff check
+      # `ruff check` and `ruff format` are different tools: the linter never reflows code, so
+      # formatting drifted on 26 of 71 files while the lint gate stayed green (#131). Checked,
+      # not applied — CI must report drift, not rewrite the contributor's commit.
+      - run: uv run ruff format --check
       - run: uv run mypy
       - run: uv run pytest -q
 
@@ -37,6 +41,51 @@ jobs:
       - run: npm run lint
       - run: npm test
       - run: npm run build
+
+  # Two Playwright specs have been in `web/e2e/` since issue 0016 and ran nowhere: the `web` job is
+  # vitest only, so the one path a Candidate actually takes — a browser socket through to a final
+  # report, and a reconnect after the server is killed mid-question — was covered by unit tests and
+  # a script somebody had to remember to run. Both are green locally (1.7s and 51.7s), so this is
+  # gating something that already works rather than importing a known-red suite.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: uv sync --locked --dev
+      - run: npm ci
+        working-directory: web
+      # chromium only. The config also declares a `mobile-chrome` project; adding it doubles the
+      # slowest job here to gate a viewport, not a behaviour.
+      - run: npx playwright install --with-deps chromium
+        working-directory: web
+      # No `.env` on a fresh checkout, so the server starts with COACH_AUTH_TOKEN unset and the
+      # specs need no token. `nohup`, because each step gets its own shell.
+      - run: nohup uv run coach api --port 8000 > api.log 2>&1 &
+      # `demo-flow` calls `test.skip` when it cannot reach a backend — a skip reports GREEN. Proving
+      # the health endpoint answered BEFORE the spec runs is what stops a backend that failed to
+      # start from silently emptying this job.
+      - run: curl -sf --retry 30 --retry-delay 1 --retry-connrefused http://127.0.0.1:8000/api/health
+      # Both specs run through `ran.sh`, which fails the job when Playwright reports a SKIP. Between
+      # them these two have four `test.skip` branches — no backend, wrong project, wrong
+      # VITE_API_URL, backend never came up — and every one of them exits 0 and reads as green.
+      - run: bash ../.github/e2e-ran.sh demo npx playwright test e2e/demo-flow.spec.ts --project=chromium
+        working-directory: web
+      # Separate invocation, not a second spec in the same run: this one drives its own backend on
+      # :8010 and VITE_API_URL has to be set when Playwright starts the Vite dev server, not after.
+      # It runs in DEMO mode (the spec's default): what it proves is that the graph, the checkpointer
+      # and the socket survive the server being killed, none of which know which provider answered,
+      # and running it live would spend real API money on every push.
+      - run: bash ../.github/e2e-ran.sh reconnect npm run test:e2e:reconnect --
+        working-directory: web
+      - if: failure()
+        run: cat api.log
 
   # The deployment artifact this milestone is about was ungated: nothing in CI built the image or
   # validated the compose file, so a broken Dockerfile or compose stanza was only discovered on the

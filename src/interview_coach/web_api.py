@@ -8,6 +8,7 @@ import os
 import queue
 import re
 import secrets
+import sqlite3
 import sys
 import threading
 import time
@@ -539,7 +540,7 @@ def configure_session_logging(log_file: str = "") -> None:
     log.addHandler(rotating)
 
 
-def prune_checkpoints(checkpointer: Any, *, max_age_seconds: float, now: float) -> list[str]:
+def prune_checkpoints(checkpointer: Any, *, max_age_seconds: float, now: float, db_label: str = "") -> list[str]:
     """Drop checkpoint threads whose newest checkpoint is older than ``max_age_seconds``.
 
     The checkpoint DB had no reaper of any kind: every Session ever started stayed in it for the life
@@ -566,12 +567,30 @@ def prune_checkpoints(checkpointer: Any, *, max_age_seconds: float, now: float) 
     except Exception:
         logger.warning("could not enumerate checkpoint threads; skipping the sweep", exc_info=True)
         return []
-    pruned = []
+    pruned: list[str] = []
     for thread_id, stamp in sorted(newest.items()):
         if now - stamp <= max_age_seconds:
             continue
         try:
             checkpointer.delete_thread(thread_id)
+        except sqlite3.DatabaseError as err:
+            # Not this thread's problem — the FILE is damaged, and every remaining delete would raise
+            # the same thing. Said once, in the words an operator can act on: the per-thread warning
+            # below reads like a transient hiccup, and a checkpoint DB that cannot be written is also
+            # one that cannot resume a Session, which is the failure this server is least able to
+            # explain afterwards. Measured on this repo's own dev checkpoint file: `PRAGMA
+            # integrity_check` reported "wrong # of entries in index sqlite_autoindex_writes_1" and
+            # startup printed one full traceback per stale thread, none of them saying "corrupt".
+            logger.error(
+                "the checkpoint database at %s is damaged (%s: %s); the sweep stopped and RESUME IS "
+                "NOT RELIABLE until it is repaired. Check it with `PRAGMA integrity_check`, repair "
+                "with `REINDEX`, or stop the server and delete the file to start clean — deleting it "
+                "abandons every in-flight Session, completed ones are already in the exports.",
+                db_label or "the configured COACH_CHECKPOINT_DB",
+                type(err).__name__,
+                err,
+            )
+            return pruned
         except Exception:
             # %r: a checkpoint thread id *is* a Session id, so this string came from a URL path
             # segment however indirectly — a round trip through SQLite launders nothing.
@@ -822,7 +841,7 @@ def _sweep_checkpoints_at_startup(api_state: WebApiState) -> None:
         return
     try:
         with SqliteSaver.from_conn_string(api_state.checkpoint_db) as checkpointer:
-            prune_checkpoints(checkpointer, max_age_seconds=ttl, now=time.time())
+            prune_checkpoints(checkpointer, max_age_seconds=ttl, now=time.time(), db_label=str(api_state.checkpoint_db))
     except Exception:
         # A cleanup must never be the reason the server fails to start.
         logger.warning("checkpoint sweep failed at startup", exc_info=True)
