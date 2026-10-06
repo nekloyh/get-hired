@@ -51,6 +51,15 @@ Every PR that changes behaviour, a command or a document's location adds a line 
 - **`scripts/release.sh`**: `prepare <ver>` edits only `pyproject.toml`, `uv.lock` and this file;
   `tag <ver>` gates, tags and pushes the tag in the same step ([#140]).
 
+### Fixed
+
+- **Two writers for the same Candidate no longer lose each other's Skill evidence** ([#122]). A finishing
+  Session (web or CLI) and a `coach postmortem` each read the Candidate's ledger record outside the
+  lock, merged onto it, and saved, so the second save replaced the first's Skills, with no exception
+  and no log line. `ledger.update_posteriors` now runs load → update → save as one critical section
+  under the existing thread lock and flock, and both writers go through it.
+
+[#122]: https://github.com/nekloyh/get-hired/issues/122
 [#138]: https://github.com/nekloyh/get-hired/issues/138
 [#140]: https://github.com/nekloyh/get-hired/issues/140
 [#141]: https://github.com/nekloyh/get-hired/issues/141

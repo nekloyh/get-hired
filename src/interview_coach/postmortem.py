@@ -14,8 +14,8 @@ Three ADRs shape this module:
   propagates out of every net, the CLI aborts with exit 2, and the partial recollection is
   discarded with zero ledger writes — never silently fabricated into evidence.
 - ADR 0006 — cross-session memory stays a decayed-prior channel: the fused posterior lands in the
-  Skill ledger (``ledger.load_states`` decays *before* we observe, because ``save_posteriors``
-  restamps the decay clock), not in any prompt.
+  Skill ledger (``ledger.update_posteriors`` hands the fusion states already decayed, because the
+  save restamps the decay clock), not in any prompt.
 
 Orchestration is hand-rolled plain Python (ADR 0004) and every LLM step is a single-shot
 ``chat_json`` with the accumulated transcript injected — no tools, no graph (ADR 0003).
@@ -34,7 +34,7 @@ from pydantic import BaseModel, Field
 
 from .diagnostic import CRITICALITY_SETTINGS, SKILLS, RoleCriticality, role_criticality
 from .exporter import _md
-from .ledger import SAFE_CANDIDATE_ID, is_safe_candidate_id, load_states, save_posteriors
+from .ledger import SAFE_CANDIDATE_ID, is_safe_candidate_id, update_posteriors
 from .llm import LLMClient, Message, Validator
 from .microloop import Candidate, CandidateIntent
 from .resources import ResourceStore
@@ -178,21 +178,29 @@ def run_postmortem(
     transcript = run_elicitation(client, candidate, target_role=target_role, companies=companies)
     scorecard = reconstruct_scorecard(client, transcript, target_role=target_role, companies=companies)
 
-    # Decay-before-observe (ADR 0006): load_states already decayed the carried params to `now`;
-    # Skills never seen before start from the weak neutral prior.
-    states_before = load_states(ledger_db, candidate_id, now=now) or {}
-    for entry in scorecard.entries:
-        states_before.setdefault(entry.skill, SkillState.neutral(entry.skill))
-    states_after = fuse_scorecard(states_before, scorecard)
-    # save_posteriors replaces the whole record and restamps the decay clock, so the untouched
-    # Skills' *decayed* states ride along — their mass is preserved, not silently un-decayed.
-    # NEW-17 deliberately does NOT apply here: `save_measured_posteriors`' predicate is the
-    # TRANSCRIPT, and a post-mortem has none — `_synthesized_session_state` carries an empty one, so
-    # a transcript-shaped filter would return {} and silently stop persisting the fused evidence.
-    # The rule the three callers share is "only evidence-bearing Skills"; each supplies its own
-    # notion of evidence, and here it is the reconstructed scorecard, which is real (second-hand,
-    # at half weight) for Skills that have no transcript item anywhere.
-    save_posteriors(ledger_db, candidate_id, states_after, now=now)
+    seen: dict[str, dict[str, SkillState]] = {}
+
+    def fuse(carried: dict[str, SkillState]) -> dict[str, SkillState]:
+        # Decay-before-observe (ADR 0006): `carried` is already decayed to `now`; Skills never seen
+        # before start from the weak neutral prior.
+        before = dict(carried)
+        for entry in scorecard.entries:
+            before.setdefault(entry.skill, SkillState.neutral(entry.skill))
+        seen["before"] = before
+        return fuse_scorecard(before, scorecard)
+
+    # One critical section from read to write (#122): a Session completing for this Candidate while
+    # the debrief runs either lands before this read, and is carried, or after this write, and
+    # carries it. It never lands in between and gets replaced. The record is replaced whole and the
+    # decay clock restamped, so the untouched Skills' *decayed* states ride along. NEW-17
+    # deliberately does NOT apply here: `save_measured_posteriors`' predicate is the TRANSCRIPT, and
+    # a post-mortem has none — `_synthesized_session_state` carries an empty one, so a
+    # transcript-shaped filter would return {} and silently stop persisting the fused evidence. The
+    # rule the three callers share is "only evidence-bearing Skills"; each supplies its own notion of
+    # evidence, and here it is the reconstructed scorecard, which is real (second-hand, at half
+    # weight) for Skills that have no transcript item anywhere.
+    states_after = update_posteriors(ledger_db, candidate_id, fuse, now=now) or {}
+    states_before = seen["before"]
 
     before_state = _synthesized_session_state(candidate_id, states_before, target_role, companies)
     after_state = _synthesized_session_state(candidate_id, states_after, target_role, companies)
