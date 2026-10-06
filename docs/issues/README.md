@@ -2,15 +2,17 @@
 
 ## Status and authority
 
-**M0 and M1 are DONE and shipped as `v0.1.0-pilot` (2026-09-15). M2 is filed as issues, not coded.
-Milestone status last reconciled 2026-09-15; the plan text below was written 2026-09-13.**
+**M0 and M1 are DONE and shipped as `v0.1.0-pilot` (2026-09-15). M2 is filed as issues, and one of
+its three is now coded: `v0.2.0` (2026-09-20) landed Q3's pack-aware replay (#113). Q1 (trace
+attribution) and Q2 (#96/#103 anchors) remain. Milestone status last reconciled 2026-09-20; the plan
+text below was written 2026-09-13.**
 
 | Milestone | State | Evidence |
 |---|---|---|
 | M0a — writable durable usage ledger, visible accounting failure | **done** | [`../audits/m0a-usage-ledger-2026-09-13.md`](../audits/m0a-usage-ledger-2026-09-13.md) |
 | M0b — input/frame/output bounds, admission, bounded queues, cleanup | **done** | [`../../MILESTONE-REPORT.md`](../../MILESTONE-REPORT.md) §2 |
 | M1 — durable answer, durable effect | **done** | MILESTONE-REPORT §2, §5 (driven through the real compose stack) |
-| M2 — explain and measure the judge and the loop | **filed, not coded** | MILESTONE-REPORT §7; GH #96, #103, #113 |
+| M2 — explain and measure the judge and the loop | **partly coded** — Q3 (#113, pack-aware replay) shipped in `v0.2.0`; Q1 (trace attribution) and Q2 (#96, #103) open | MILESTONE-REPORT §7; [`../../CHANGELOG.md`](../../CHANGELOG.md) |
 | M3–M6 | not started | — |
 
 This is the canonical sequencing and milestone index for `docs/issues/`; numbered slice documents

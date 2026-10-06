@@ -5,7 +5,7 @@ This is the gate between a deployment that *runs* and one that is safe to hand t
 before anyone else touches it, what you have to say out loud to the people using it, and what to do
 when something goes wrong.
 
-Scope: the `v0.1.0-pilot` tag. **Trusted pilot, not a public launch** — the difference is not a
+Scope: `v0.2.0` (and `v0.1.0-pilot` before it — nothing here changed between them). **Trusted pilot, not a public launch** — the difference is not a
 feature list, it is that every person with the token is trusted with every other person's data. §2
 is not a disclaimer; it is the deployment's actual security model.
 
@@ -70,7 +70,7 @@ including the `http://` variant of your own host, because the scheme is part of 
 
 ## 2. What you must tell every pilot user
 
-Say these in words they will act on. All four are properties of `v0.1.0-pilot`, not bugs to be
+Say these in words they will act on. All four are properties of the release, not bugs to be
 worked around.
 
 ### One token, no privacy between you
