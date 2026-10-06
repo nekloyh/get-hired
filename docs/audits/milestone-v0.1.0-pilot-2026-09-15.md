@@ -296,7 +296,7 @@ For a stack behind nginx the origin must be the **browser's** origin (`https://<
 Vite dev origin. Verified above: the exact value is accepted and every near-miss — including
 `http://` of the same host — is refused at the handshake with 403. The local `.env` now holds the
 **dry-run** value `https://coach.localtest.me`. It is still not a production value; pre-flight line
-2 in [`docs/pilot-runbook.md`](docs/pilot-runbook.md) is the gate that catches it.
+2 in [`docs/pilot-runbook.md`](../pilot-runbook.md) is the gate that catches it.
 
 ---
 
@@ -464,7 +464,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 365 -keyout privkey.pem -out ful
 cd - && docker compose up -d --build
 ```
 
-Then work through [`docs/pilot-runbook.md`](docs/pilot-runbook.md) §1 before anyone else connects.
+Then work through [`docs/pilot-runbook.md`](../pilot-runbook.md) §1 before anyone else connects.
 
 ---
 
