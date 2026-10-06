@@ -46,6 +46,12 @@ Every PR that changes behaviour, a command or a document's location adds a line 
   prints the fingerprint, says whether it matches the lock, and stamps it into the report. It found
   one judge change that had shipped unbenched: #129 removed `"self_critique":null` from the three
   Panel prompts in 0.2.0. The 2026-09-15 bench never escalated, so its measurement still holds.
+- **Every `llm-call` trace line names its Session, question, turn and role** ([#144]). The new
+  fields `session= question= turn= role=` are appended after `outcome=`, so existing greps still
+  match. A live trajectory can now be rebuilt from the log, and two overlapping Sessions' calls,
+  retries included, no longer blur together. Roles come from the agent entry points (`evaluate` is
+  judge, including its Panel; `generate_follow_up` is interviewer; …), so a call cannot be
+  mislabelled by whichever client object carried it.
 - **`coach bench --only <case_id|paired_id>`** screens a judge wording on a subset ([#145]). The
   budget rail asks for that share only; the report is marked **SCREEN**, goes to the gitignored
   `logs/`, and can never be the artifact `judge.lock` points at (ADR 0009 addendum h). An unknown
@@ -86,6 +92,7 @@ Every PR that changes behaviour, a command or a document's location adds a line 
 [#138]: https://github.com/nekloyh/get-hired/issues/138
 [#140]: https://github.com/nekloyh/get-hired/issues/140
 [#141]: https://github.com/nekloyh/get-hired/issues/141
+[#144]: https://github.com/nekloyh/get-hired/issues/144
 [#145]: https://github.com/nekloyh/get-hired/issues/145
 
 ---

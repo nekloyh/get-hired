@@ -31,6 +31,7 @@ from .usage import (
     AccountingUnavailable,
     ProviderQuotaExhausted,
     accounting_gate,
+    current_session_id,
     record_quota_exhausted,
     record_unmeasured_call,
     record_usage,
@@ -540,8 +541,10 @@ class _OpenAICompatibleClient(LLMClient):
         used = getattr(completion, "usage", None)
         telemetry.incr(LLM_CALL_KEY)
         telemetry.incr(f"{LLM_CALL_PROVIDER_PREFIX}{self.provider_name}")
+        # #144: who made the call. Appended after `outcome=` so every existing grep still matches.
+        who = telemetry.trace_fields()
         logger.info(
-            "%s provider=%s model=%s ms=%.0f prompt=%d completion=%d outcome=%s",
+            "%s provider=%s model=%s ms=%.0f prompt=%d completion=%d outcome=%s session=%s question=%s turn=%s role=%s",
             CALL_LOG_PREFIX,
             self.provider_name,
             self._settings.model,
@@ -549,6 +552,10 @@ class _OpenAICompatibleClient(LLMClient):
             getattr(used, "prompt_tokens", 0) or 0,
             getattr(used, "completion_tokens", 0) or 0,
             outcome,
+            current_session_id() or "-",
+            who.get("question", "-"),
+            who.get("turn", "-"),
+            who.get("role", "-"),
         )
 
     def _is_billed(self) -> bool:

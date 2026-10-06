@@ -20,10 +20,15 @@ Not persisted — persistence belongs to the usage ledger (usage.py), which trac
 
 from __future__ import annotations
 
+import functools
 from collections import Counter
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
+from typing import ParamSpec, TypeVar
+
+P = ParamSpec("P")
+R = TypeVar("R")
 
 _counters: Counter[str] = Counter()
 # The Session's own counters, when one is in scope. A ContextVar for the same reason usage.py's
@@ -67,3 +72,50 @@ def reset() -> None:
 def delta(before: Mapping[str, int], after: Mapping[str, int]) -> dict[str, int]:
     """Counts that moved between two snapshots — what one bench/forge run actually folded."""
     return {key: count - before.get(key, 0) for key, count in after.items() if count != before.get(key, 0)}
+
+
+# --- Call attribution (#144) ------------------------------------------------------------------------
+# Every `llm-call` trace line (llm._OpenAICompatibleClient._trace_call) carries the Session (from
+# usage.session_scope) and these fields, so a live Session's trajectory can be rebuilt from its log
+# alone: which question, which turn, which role. Ambient for the reasons the counters above are:
+# the line is written deep inside the provider client, which knows none of this. langgraph's copied
+# node context and a Session's own thread both preserve it, exactly as they preserve the counters.
+_trace: ContextVar[tuple[tuple[str, str], ...]] = ContextVar("interview_coach_trace", default=())
+
+
+@contextmanager
+def trace_scope(**fields: object) -> Iterator[None]:
+    """Stamp ``fields`` (``question=``, ``turn=``, ``role=``) on every ``llm-call`` line inside this block.
+
+    Nested scopes add to what the outer one set and may override it; a ``None`` value is ignored.
+    """
+    merged = dict(_trace.get())
+    merged.update({key: str(value) for key, value in fields.items() if value is not None})
+    token = _trace.set(tuple(merged.items()))
+    try:
+        yield
+    finally:
+        _trace.reset(token)
+
+
+def trace_fields() -> dict[str, str]:
+    """The attribution in scope right now, as a plain dict."""
+    return dict(_trace.get())
+
+
+def traced_role(role: str) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    """Mark an agent's entry point: every provider call made inside it is traced as ``role``.
+
+    Set at the entry point rather than at each call site, because the function IS that role: every
+    call ``evaluate`` makes is a judge call, including the Panel's, whichever client object carries it.
+    """
+
+    def decorate(fn: Callable[P, R]) -> Callable[P, R]:
+        @functools.wraps(fn)
+        def traced(*args: P.args, **kwargs: P.kwargs) -> R:
+            with trace_scope(role=role):
+                return fn(*args, **kwargs)
+
+        return traced
+
+    return decorate

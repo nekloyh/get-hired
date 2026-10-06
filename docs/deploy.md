@@ -191,9 +191,11 @@ Either way metered work stops and demo mode keeps working, so a misconfigured de
 demonstrable rather than dead. Suspended Sessions keep their resolved questions in the checkpoint
 and record nothing as `failed` (ADR 0005).
 
-The `llm-call provider=… model=… ms=… outcome=…` line (R-26) is the one that makes a silent judge
-failover visible after the fact. If you ever see the judge role on a provider it is not pinned to,
-that is a bug worth reporting — ADR 0009 says the judge never fails over onto another model.
+The `llm-call provider=… model=… ms=… outcome=… session=… question=… turn=… role=…` line (R-26,
+attributed by #144) is the one that makes a silent judge failover visible after the fact. If you
+ever see `role=judge` on a provider it is not pinned to, that is a bug worth reporting: ADR 0009
+says the judge never fails over onto another model. To follow one Session, run
+`docker compose logs app | grep 'session=<id>'`.
 
 Server logs are INFO by default and go to stderr, which `docker compose logs` shows but a container
 restart discards. To keep them, `docker-compose.yml` sets `COACH_LOG_FILE=/app/state/logs/coach-api.log`
