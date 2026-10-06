@@ -1,0 +1,10 @@
+{
+  "fingerprint": "sha256:03cabecb0ba6f517090b02b840432a92dc0194304aa2ca8540533d02f98a6975",
+  "baseline": {
+    "artifact": "docs/audits/calibration-bench-2026-09-15.md",
+    "result": "RED 34/35",
+    "red_cases": ["vnlp_segmentation_weak_vi"],
+    "stamped": false,
+    "provenance": "The artifact predates the fingerprint (#141), so the fingerprint was recomputed at df45374, the code that run measured: sha256:b979db23593fb1c6580305c6ed8efb5434e8219831df2f4c5e89e6cbb97ea83e. It differs from the fingerprint above in exactly one way: the three Panel prompts (skeptic, advocate, verdict) no longer carry \"self_critique\":null inside the embedded first-pass JSON, because bf48c98 (#129) deleted the field. That run never escalated (105 calls = 35 cases x 3 sweeps, and every escalation cell reads '—'), so every request it actually sent is byte-identical to what this code sends. The Panel path was not exercised by that measurement and is not measured by this lock either."
+  }
+}

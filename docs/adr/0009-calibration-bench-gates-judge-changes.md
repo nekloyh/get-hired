@@ -216,3 +216,38 @@ affordable.
 *Source: GH #96, 2026-07-27: three measured wordings, a per-dimension EN/VN diagnosis on both
 regressed pairs, and the strong-case regression that a single-invocation reading would have missed.
 Landed on `main` 2026-10-06 (GH #141) when the branch that carried it was archived.*
+
+## Addendum (2026-10-06): "is this a judge change?" is now a test — GH #141
+
+### (g) Every judge change moves a hash that the suite pins
+
+Until this addendum, the gate held only if a reviewer recognised a change as a judge change, and one
+slipped through. #129 deleted `SelfCritiqueTrace` in `v0.2.0`, and the three Panel prompts, which
+embed the first-pass JSON, lost their `"self_critique":null` key. By this ADR's first sentence that
+is a prompt change. Nothing noticed it.
+
+`interview_coach.judge_lock` computes a **judge fingerprint**: the sha256 of the exact requests the
+judge would send for three canonical answers. A request means `model`, `temperature`, `messages` and
+`response_format`, built by the production client's own `request_kwargs`. The three answers between
+them walk every request path `evaluate` has: the first pass, the evidence and weak-delivery repairs,
+and the Panel's skeptic, advocate and verdict. Scripted replies stand in for the provider.
+`judge.lock` pins the fingerprint, and `tests/test_judge_lock.py` fails when the code's fingerprint
+differs. A refactor that sends the same bytes passes. A change to a prompt, an anchor, the schema,
+the escalation policy, the model, the temperature or the endpoint fails, and the failure message
+names the procedure.
+
+1. **A red `test_judge_lock` is this ADR's gate, not a test to update.** The lock moves only together
+   with a confirm-bench artifact (k=3, repeated per (f)) that carries the new fingerprint. `coach
+   bench` prints the fingerprint, says whether it matches the lock, and stamps it into the report.
+2. **The lock pins what the code builds**: the bench-validated triple at the default temperature. An env
+   override (`ROLE_JUDGE_TEMPERATURE`, `LLM_TEMPERATURE`) gives a different fingerprint in the bench
+   report, and that is how a run on a non-default configuration shows it cannot be the lock's artifact.
+3. **A measured baseline is not a green one.** The lock's first baseline is the 2026-09-15 artifact, RED
+   at 34/35, and #96 owns the red case. Fixing that case is a judge change like any other.
+4. **The fingerprint covers requests, not replies.** Provider-side drift inside a pinned model id is
+   invisible to it. The 2026-09-15 red case moved with no code change (see that artifact's commit,
+   `df45374`). Only re-running the bench sees that kind of drift.
+
+*Source: GH #141, 2026-10-06. Recomputed at `df45374`, the code the 2026-09-15 bench ran, the
+fingerprint differs from `main`'s only by the `self_critique` key above. That run never escalated
+(105 calls = 35 cases × 3 sweeps), so every request it sent is byte-identical to what `main` sends.*

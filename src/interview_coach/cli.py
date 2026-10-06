@@ -46,6 +46,7 @@ from .eval_harness import (
     run_golden_answer_harness,
 )
 from .forge import MAX_DRAFTS, ForgeError, render_forge_report, run_forge, write_forge_outputs
+from .judge_lock import JUDGE_LOCK_PATH, fingerprint_of, load_judge_lock
 from .llm import (
     UNKNOWN_PROVIDER,
     LLMClient,
@@ -358,6 +359,17 @@ def _cmd_bench(client: ClientArg, args: argparse.Namespace) -> int:
             "run may die mid-run on insufficient_quota, and any Session running now may suspend.",
             file=sys.stderr,
         )
+    # Before the telemetry window opens, so the fingerprint's scripted walk never reads as bench traffic.
+    fingerprint = fingerprint_of(judge)
+    if fingerprint is not None:
+        if not JUDGE_LOCK_PATH.is_file():
+            # An installed package (the Docker image) has no checkout around it, so there is no lock to compare.
+            verdict = "no judge.lock beside this install to compare against"
+        elif fingerprint == load_judge_lock()["fingerprint"]:
+            verdict = "matches judge.lock"
+        else:
+            verdict = "DIFFERS from judge.lock: this run measures a judge change"
+        print(f"Judge fingerprint {fingerprint} ({verdict}).")
     telemetry_before = telemetry.snapshot()
     data = load_bench_data(args.cases or None)
     if k > 1:
@@ -374,6 +386,7 @@ def _cmd_bench(client: ClientArg, args: argparse.Namespace) -> int:
         date=utc_date(),
         telemetry_delta=telemetry.delta(telemetry_before, telemetry_after),
         token_usage=run_usage,
+        judge_fingerprint=fingerprint,
     )
     out = Path(args.out) if args.out else Path("docs/audits") / f"calibration-bench-{utc_date()}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
