@@ -39,6 +39,8 @@ def test_the_baseline_artifact_exists_and_is_stamped_or_says_why_not():
     baseline = load_judge_lock()["baseline"]
     artifact = REPO / baseline["artifact"]
     assert artifact.is_file(), f"judge.lock names a bench artifact that does not exist: {artifact}"
+    # A SCREEN run (#145) covers a subset of cases and is never gate evidence (ADR 0009 addendum h).
+    assert "**SCREEN**" not in artifact.read_text(encoding="utf-8"), "judge.lock may not point at a SCREEN report"
     if baseline["stamped"]:
         assert load_judge_lock()["fingerprint"] in artifact.read_text(encoding="utf-8"), (
             "judge.lock says its artifact is stamped, but the artifact does not carry the locked fingerprint"

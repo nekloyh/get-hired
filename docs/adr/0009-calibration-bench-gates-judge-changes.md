@@ -251,3 +251,32 @@ names the procedure.
 *Source: GH #141, 2026-10-06. Recomputed at `df45374`, the code the 2026-09-15 bench ran, the
 fingerprint differs from `main`'s only by the `self_critique` key above. That run never escalated
 (105 calls = 35 cases × 3 sweeps), so every request it sent is byte-identical to what `main` sends.*
+
+## Addendum (2026-10-06b): screen a wording, confirm the survivor — GH #145
+
+### (h) Two speeds, and only one of them is a gate
+
+A full confirm run costs ~181–207k tokens per k=3 invocation, and (f) requires several invocations
+per wording. All of that is **judge** spend: `coach bench` scores fixed, hand-labelled answers and
+generates nothing. A cheaper candidate cannot make it cheaper. Filtering by dimension does not help
+either, because every case weights `depth` and `system_thinking`.
+
+What does help is spending the full price only on a wording that has already survived a cheap look:
+
+- **Screen**: `coach bench --only <case_id|paired_id> ...` runs a chosen subset (~10 cases) and asks
+  the budget rail for that share only. Pick the **target pairs** (the red case, the pair the wording
+  is meant to fix) plus **edge sentinels**: cases whose runs straddle a band edge (the `⚠` rows) and
+  strong cases that drifted under an earlier unscoped clause (see (e)). A screen answers two
+  questions: did the fix work, and did it leak? The report is marked `**SCREEN**` and is written to
+  the gitignored `logs/`.
+- **Confirm**: the full set, median-of-k=3, repeated per (f). Only a confirm run counts as gate
+  evidence.
+
+Rule: **a screen is never gate evidence.** It does not count toward (f)'s repeated invocations, and
+`judge.lock` may not point at one, which `tests/test_judge_lock.py` enforces. A wording that fails its
+screen never reaches the confirm stage. Three wordings screened with one confirmed cost about 0.8M
+tokens; confirming all three costs about 1.8M.
+
+*Source: GH #145, 2026-10-06. The earlier plan to cut this cost with a local simulated candidate
+assumed the bench generates answers; it does not (`bench._evaluate_case` → `evaluate`). That lever
+belongs to the replay bench (#146).*
