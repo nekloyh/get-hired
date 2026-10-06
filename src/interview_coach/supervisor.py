@@ -595,6 +595,10 @@ def _make_supervisor_validators(state: SessionState, bank: QuestionBank | None =
     last_skill = _last_probed_skill(state)
     extra_probe_required = _extra_probe_required(state, attempts, bank)
     expected_advance_skill = _advance_plan_target_skill(state)
+    current_index = state.get("current_plan_index", 0)
+    # "Already-satisfied" (the prompt's promise for skip_ahead) at its minimum: the Skill was asked
+    # AND answered this Session. A `failed` item is infrastructure, not an answer (ADR 0005).
+    answered = {item.skill for item in transcript_items(state) if item.stop_reason != StopReason.FAILED.value}
 
     def validate(decision: SupervisorDecision) -> None:
         if decision.target_skill is not None and decision.target_skill not in skills:
@@ -634,8 +638,43 @@ def _make_supervisor_validators(state: SessionState, bank: QuestionBank | None =
                 f"switch_skill target {decision.target_skill!r} has no unused seed; pick a Skill that "
                 "still has an unused seed or choose advance_plan / end_early."
             )
+        if decision.action is SupervisorAction.SKIP_AHEAD and decision.target_plan_index is not None:
+            _check_skip_ahead(decision.target_plan_index, plan, current_index, answered, attempts, bank)
 
     return [validate]
+
+
+def _check_skip_ahead(
+    target: int,
+    plan: list[dict[str, Any]],
+    current_index: int,
+    answered: set[str],
+    attempts: Mapping[str, int],
+    bank: QuestionBank | None,
+) -> None:
+    """The policy rail skip_ahead never had (#132): forward only, over answered Skills, onto a fresh seed.
+
+    Before this the validator checked only that the target was inside the plan. A backwards jump
+    passed, and so did a forward jump over entries whose Skill nobody had asked about yet, which
+    dropped planned topics while the prompt promised "already-satisfied plan entries".
+    """
+    if target <= current_index + 1:
+        raise ValueError(
+            f"skip_ahead to plan index {target} skips nothing: the next entry is {current_index + 1} and the "
+            "plan never moves backwards. Use advance_plan for the next entry."
+        )
+    unanswered = [plan[i]["skill"] for i in range(current_index + 1, target) if plan[i]["skill"] not in answered]
+    if unanswered:
+        raise ValueError(
+            f"skip_ahead would skip plan entries whose Skill has not been answered this Session: {unanswered}. "
+            "Only already-satisfied entries may be skipped; choose advance_plan, or switch_skill if a later "
+            "Skill matters more."
+        )
+    if not _has_unused_seed(plan[target]["skill"], attempts, bank):
+        raise ValueError(
+            f"skip_ahead target {plan[target]['skill']!r} has no unused seed; it would re-ask an identical "
+            "question. Choose a different entry, advance_plan, or end_early."
+        )
 
 
 def _extra_probe_required(state: SessionState, attempts: Mapping[str, int], bank: QuestionBank | None) -> bool:

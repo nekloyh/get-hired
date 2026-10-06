@@ -59,7 +59,17 @@ Every PR that changes behaviour, a command or a document's location adds a line 
   and no log line. `ledger.update_posteriors` now runs load → update → save as one critical section
   under the existing thread lock and flock, and both writers go through it.
 
+- **The micro-loop no longer re-asks, skips untouched topics, or drops a found note** ([#132]).
+  The Interviewer now sees the follow-ups already asked in the exchange, and a repeat of any of them
+  is rejected like a repeat of the seed. Before this, turns 3–4 could repeat turn 2 verbatim.
+  `skip_ahead` must jump forward past at least one entry, may skip only plan entries whose Skill was
+  already answered this Session (a `failed` item does not count), and must land on a Skill with an
+  unused seed. Before this, a backwards jump or a jump over never-asked topics passed. A
+  `lookup_concept` hit that followed a miss in the same turn now grounds the follow-up instead of
+  being discarded.
+
 [#122]: https://github.com/nekloyh/get-hired/issues/122
+[#132]: https://github.com/nekloyh/get-hired/issues/132
 [#138]: https://github.com/nekloyh/get-hired/issues/138
 [#140]: https://github.com/nekloyh/get-hired/issues/140
 [#141]: https://github.com/nekloyh/get-hired/issues/141

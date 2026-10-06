@@ -234,7 +234,8 @@ def test_micro_loop_does_not_override_evaluator_follow_up_decision(make_client):
             _followup(),
             _eval(5, follow_up=True, confidence=0.9),  # FU1: strong + confident
             _tool(),
-            _followup(),
+            # A different question: repeating FU1 verbatim is now rejected as a re-ask (#132).
+            _followup("How does a larger L2 penalty change the variance of the fitted model?"),
             _eval(5, follow_up=True, confidence=0.9),  # FU2 -> cap
         ]
     )
@@ -252,6 +253,46 @@ def test_micro_loop_does_not_override_evaluator_follow_up_decision(make_client):
     assert result.turns[-1].is_follow_up is True
     assert result.turns[-1].trace.stop_reason is StopReason.SAFETY_CAP
     assert fake.call_count == 7
+
+
+def test_a_follow_up_that_repeats_an_earlier_one_is_rejected_and_the_retry_sees_what_was_asked(make_client):
+    # #132. The re-ask guard compared a new follow-up against the SEED alone, and the prompt never
+    # listed the follow-ups already asked. DEFAULT_MAX_TURNS = 4 allows three follow-ups, so turns 3
+    # and 4 could repeat turn 2 word for word. The Interviewer now sees the earlier follow-ups, and
+    # a repeat of any of them fails validation, so the structured-output repair asks again.
+    first = "What mechanism connects the L2 penalty to lower variance?"
+    second = "How does a larger L2 penalty change the variance of the fitted model?"
+    client, fake = make_client(
+        [
+            _eval(3, follow_up=True),
+            _tool(),
+            _followup(first),
+            _eval(3, follow_up=True),
+            _tool(),
+            _followup(first),  # a verbatim repeat of FU1: rejected by the validator
+            _followup(second),  # the repair round's answer
+            _eval(4, follow_up=False),
+        ]
+    )
+    seed = _seed(
+        [
+            "an okay answer with a real gap",
+            "a partial follow-up answer number one",
+            "a fuller follow-up answer number two",
+        ]
+    )
+
+    result = run_micro_loop(client, seed, ScriptedCandidate(seed.answers))
+
+    assert [turn.question for turn in result.turns[1:]] == [first, second]
+    assert result.stop_reason is StopReason.RESOLVED
+    calls = fake.chat.completions.calls
+    assert "FOLLOW-UPS ALREADY ASKED" not in calls[1]["messages"][1]["content"]  # FU1's prompt is unchanged
+    assert (
+        f"FOLLOW-UPS ALREADY ASKED IN THIS EXCHANGE (do not repeat any of them):\n- {first}"
+        in (calls[4]["messages"][1]["content"])
+    )
+    assert "repeats one already asked in this exchange" in calls[6]["messages"][-1]["content"]
 
 
 def test_strong_seed_follow_up_still_runs_until_evaluator_resolves(make_client):
