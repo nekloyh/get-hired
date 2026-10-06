@@ -5,7 +5,7 @@ This is the gate between a deployment that *runs* and one that is safe to hand t
 before anyone else touches it, what you have to say out loud to the people using it, and what to do
 when something goes wrong.
 
-Scope: `v0.2.0` (and `v0.1.0-pilot` before it — nothing here changed between them). **Trusted pilot, not a public launch** — the difference is not a
+Scope: whatever `main` is. A release that changes a pre-flight line says so in [`CHANGELOG.md`](../CHANGELOG.md); otherwise this file still applies. **Trusted pilot, not a public launch** — the difference is not a
 feature list, it is that every person with the token is trusted with every other person's data. §2
 is not a disclaimer; it is the deployment's actual security model.
 
@@ -102,8 +102,8 @@ the same question is re-issued → the post-restart answer lands in the report.)
 
 ### The scores are for practice, not for judging anyone
 
-The grader is an LLM whose calibration is **known to have drifted**, and the calibration gate is
-currently **red at 34/35** (`docs/audits/calibration-bench-2026-09-15.md`, GH #96). One known effect:
+The grader is an LLM whose calibration is **known to have drifted**, and its calibration gate is
+**not green** (GH #96 owns it; the newest `docs/audits/calibration-bench-*.md` has the numbers). One known effect:
 Vietnamese answers can score higher than the identical English answer, because two rubric dimensions
 have a gap in their scale. Use the feedback to practise. **Do not use these scores to compare
 people, and do not put them in front of a recruiter as a measurement.**
