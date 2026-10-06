@@ -4,7 +4,7 @@ import { ReportView } from './ReportView'
 import { SessionAlert } from './SessionAlert'
 import { SkillBars } from './SkillBars'
 import { TopicPlan } from './TopicPlan'
-import { stateFixture, withEvaluation, withFailedQuestion } from '../test/fixtures'
+import { stateFixture, withEvaluation, withFailedQuestion, withTrace } from '../test/fixtures'
 
 describe('Skill and progress rendering', () => {
   it('renders mastery, confidence context, and role criticality', () => {
@@ -93,9 +93,40 @@ describe('report rendering', () => {
 
     const block = screen.getByLabelText('Committee verdict')
     expect(block).toHaveTextContent('Escalated on low_confidence, divergence')
-    expect(block).toHaveTextContent('First pass 2.50/5 → verdict 3.50/5 · disagreement 2.00 points')
-    expect(block).toHaveTextContent('Skeptic 2/5 · Advocate 4/5')
+    // #121: the five fields the export printed and the browser dropped — initial_confidence and
+    // both voices' argument and key_evidence, i.e. the reasoning behind the overturned score.
+    expect(block).toHaveTextContent(
+      'First pass 2.50/5 (confidence 0.40) → verdict 3.50/5 · disagreement 2.00 points',
+    )
+    expect(block).toHaveTextContent('Skeptic (2/5): Thin on rollback. — evidence: rollback risk')
+    expect(block).toHaveTextContent('Advocate (4/5): Names delayed labels. — evidence: delayed labels')
     expect(screen.queryByText(/citations unverifiable/)).not.toBeInTheDocument()
+  })
+
+  it('badges a score from an unvalidated judge (ADR 0009, #121)', () => {
+    render(<ReportView state={withTrace({ judge_unvalidated: true })} />)
+
+    expect(screen.getByText(/unvalidated judge — not comparable/)).toBeInTheDocument()
+  })
+
+  it('badges an escalation that was suppressed, so it never reads as a confident pass (#121)', () => {
+    const trust = {
+      pre_guard_confidence: 0.3,
+      unverifiable_fraction: 0,
+      divergence: 0,
+      noise_events: [],
+      panel_suppressed: true,
+    }
+    render(<ReportView state={withEvaluation({ trust })} />)
+
+    expect(screen.getByText('committee review skipped — first-pass score kept')).toBeInTheDocument()
+  })
+
+  it('shows no trust badge on a validated, non-escalated turn', () => {
+    render(<ReportView state={stateFixture} />)
+
+    expect(screen.queryByText(/unvalidated judge/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/committee review skipped/)).not.toBeInTheDocument()
   })
   it('shows why a question failed and never prints a 0.00/5 the Candidate did not earn (ADR 0005)', () => {
     render(<ReportView state={withFailedQuestion()} />)

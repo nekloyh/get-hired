@@ -48,7 +48,8 @@ Every PR that changes behaviour, a command or a document's location adds a line 
   Panel prompts in 0.2.0. The 2026-09-15 bench never escalated, so its measurement still holds.
 - **ADR 0009 addenda (e) and (f) are on `main`** ([#141]). They were cited as binding but existed only
   on the unmerged #96 branch. Addendum (g) records the lock.
-- **`scripts/release.sh`**: `prepare <ver>` edits only `pyproject.toml`, `uv.lock` and this file;
+- **`scripts/release.sh`**: `prepare <ver>` edits only version fields (`pyproject.toml`, `uv.lock`,
+  `web/package{,-lock}.json`) and this file;
   `tag <ver>` gates, tags and pushes the tag in the same step ([#140]).
 
 ### Fixed
@@ -68,6 +69,14 @@ Every PR that changes behaviour, a command or a document's location adds a line 
   `lookup_concept` hit that followed a miss in the same turn now grounds the follow-up instead of
   being discarded.
 
+- **The web report shows the whole Committee packet** ([#121]). It now shows the first pass's
+  confidence and each voice's argument and quoted evidence, which is why an escalated score moved.
+  Before, it showed only that the score moved; the Markdown export always printed all ten fields.
+  Two trust badges the server already sent now appear: *unvalidated judge* (ADR 0009) and
+  *committee review skipped*, so a suppressed escalation no longer reads as a confident pass. The
+  turn trace is typed (`TraceRecord`) instead of `Record<string, unknown>`.
+
+[#121]: https://github.com/nekloyh/get-hired/issues/121
 [#122]: https://github.com/nekloyh/get-hired/issues/122
 [#132]: https://github.com/nekloyh/get-hired/issues/132
 [#138]: https://github.com/nekloyh/get-hired/issues/138

@@ -144,6 +144,13 @@ export function ReportView({ state }: { state: SessionState | null }) {
                 {turn.evaluation.evidence_degraded ? (
                   <span className="evidence-badge">citations unverifiable — confidence capped</span>
                 ) : null}
+                {/* #121: both are trust signals the server already sends; the export prints the first. */}
+                {turn.trace.judge_unvalidated ? (
+                  <span className="evidence-badge">unvalidated judge — not comparable to bench-validated scores</span>
+                ) : null}
+                {turn.evaluation.trust?.panel_suppressed ? (
+                  <span className="evidence-badge">committee review skipped — first-pass score kept</span>
+                ) : null}
                 {turn.evaluation.panel ? (
                   <CommitteeVerdict panel={turn.evaluation.panel} verdict={turn.evaluation.weighted_score} />
                 ) : null}
@@ -167,18 +174,27 @@ export function ReportView({ state }: { state: SessionState | null }) {
   )
 }
 
-/** The Panel Verdict the export already prints (issue 0027): who advised what, and how split they were. */
+/**
+ * The Panel Verdict packet, all ten data points the Markdown export prints (issue 0027, #121): why
+ * it escalated, how the first pass and the verdict compare, and what each voice argued and quoted.
+ * The arguments are why a score moved; without them the browser showed only that it did.
+ */
 function CommitteeVerdict({ panel, verdict }: { panel: PanelTrace; verdict: number }) {
   return (
     <div className="panel-verdict" aria-label="Committee verdict">
       <strong>Committee verdict</strong>
       <span>Escalated on {panel.triggers.join(', ')}</span>
       <span>
-        First pass {panel.initial_score.toFixed(2)}/5 → verdict {verdict.toFixed(2)}/5 · disagreement{' '}
-        {panel.disagreement.toFixed(2)} points
+        First pass {panel.initial_score.toFixed(2)}/5 (confidence {panel.initial_confidence.toFixed(2)}) → verdict{' '}
+        {verdict.toFixed(2)}/5 · disagreement {panel.disagreement.toFixed(2)} points
       </span>
       <span>
-        Skeptic {panel.skeptic.recommended_score}/5 · Advocate {panel.advocate.recommended_score}/5
+        Skeptic ({panel.skeptic.recommended_score}/5): {panel.skeptic.argument} — evidence:{' '}
+        {panel.skeptic.key_evidence}
+      </span>
+      <span>
+        Advocate ({panel.advocate.recommended_score}/5): {panel.advocate.argument} — evidence:{' '}
+        {panel.advocate.key_evidence}
       </span>
     </div>
   )

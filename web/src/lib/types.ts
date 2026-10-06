@@ -95,6 +95,28 @@ export type Evaluation = {
   trust?: TrustTrace | null
 }
 
+/**
+ * One turn's trace exactly as `session_serde._dump_turn` puts it on the wire (`microloop.TurnTrace`,
+ * read back as `session_serde.TraceRecord`). Typed so a renamed server field breaks the build here
+ * instead of silently rendering nothing (#121).
+ */
+export type TraceRecord = {
+  evaluator_self_critique_triggers: string[]
+  concept_lookup_query: string | null
+  concept_lookup_skill: string | null
+  concept_lookup_language: string | null
+  concept_hit_id: string | null
+  concept_hit_title: string | null
+  concept_hit_score: number | null
+  stop_reason: string | null
+  /** Absent on checkpoints written before R-26 (#81). */
+  llm_calls?: number
+  /** `[provider, calls]` pairs; a judge failover shows up here as a second provider. */
+  llm_calls_by_provider?: [string, number][]
+  /** Popped from the wire when false, so absent means the judge was bench-validated (ADR 0009). */
+  judge_unvalidated?: boolean
+}
+
 export type TranscriptTurn = {
   question: string
   answer: string
@@ -102,7 +124,7 @@ export type TranscriptTurn = {
   grounding_concept_id?: string | null
   grounding_concept_title?: string | null
   evaluation: Evaluation
-  trace: Record<string, unknown>
+  trace: TraceRecord
 }
 
 export type TranscriptItem = {
