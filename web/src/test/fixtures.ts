@@ -1,4 +1,4 @@
-import type { Evaluation, SessionState } from '../lib/types'
+import type { Evaluation, SessionState, TraceRecord } from '../lib/types'
 
 export const stateFixture: SessionState = {
   session_id: 's1',
@@ -31,7 +31,18 @@ export const stateFixture: SessionState = {
             follow_up_recommended: false,
             follow_up_rationale: 'Enough evidence for demo.',
           },
-          trace: {},
+          trace: {
+            evaluator_self_critique_triggers: [],
+            concept_lookup_query: null,
+            concept_lookup_skill: null,
+            concept_lookup_language: null,
+            concept_hit_id: null,
+            concept_hit_title: null,
+            concept_hit_score: null,
+            stop_reason: 'resolved',
+            llm_calls: 1,
+            llm_calls_by_provider: [['openai', 1]],
+          },
         },
       ],
     },
@@ -92,6 +103,16 @@ export function withEvaluation(patch: Partial<Evaluation>): SessionState {
   return {
     ...stateFixture,
     transcript: [{ ...item, turns: [{ ...turn, evaluation: { ...turn.evaluation, ...patch } }] }],
+  }
+}
+
+/** stateFixture with its single turn's trace patched (#121: the trace used to be an untyped bag). */
+export function withTrace(patch: Partial<TraceRecord>): SessionState {
+  const [item] = stateFixture.transcript
+  const [turn] = item.turns
+  return {
+    ...stateFixture,
+    transcript: [{ ...item, turns: [{ ...turn, trace: { ...turn.trace, ...patch } }] }],
   }
 }
 

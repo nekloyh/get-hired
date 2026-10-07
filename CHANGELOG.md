@@ -48,9 +48,37 @@ Every PR that changes behaviour, a command or a document's location adds a line 
   Panel prompts in 0.2.0. The 2026-09-15 bench never escalated, so its measurement still holds.
 - **ADR 0009 addenda (e) and (f) are on `main`** ([#141]). They were cited as binding but existed only
   on the unmerged #96 branch. Addendum (g) records the lock.
-- **`scripts/release.sh`**: `prepare <ver>` edits only `pyproject.toml`, `uv.lock` and this file;
+- **`scripts/release.sh`**: `prepare <ver>` edits only version fields (`pyproject.toml`, `uv.lock`,
+  `web/package{,-lock}.json`) and this file;
   `tag <ver>` gates, tags and pushes the tag in the same step ([#140]).
 
+### Fixed
+
+- **Two writers for the same Candidate no longer lose each other's Skill evidence** ([#122]). A finishing
+  Session (web or CLI) and a `coach postmortem` each read the Candidate's ledger record outside the
+  lock, merged onto it, and saved, so the second save replaced the first's Skills, with no exception
+  and no log line. `ledger.update_posteriors` now runs load → update → save as one critical section
+  under the existing thread lock and flock, and both writers go through it.
+
+- **The micro-loop no longer re-asks, skips untouched topics, or drops a found note** ([#132]).
+  The Interviewer now sees the follow-ups already asked in the exchange, and a repeat of any of them
+  is rejected like a repeat of the seed. Before this, turns 3–4 could repeat turn 2 verbatim.
+  `skip_ahead` must jump forward past at least one entry, may skip only plan entries whose Skill was
+  already answered this Session (a `failed` item does not count), and must land on a Skill with an
+  unused seed. Before this, a backwards jump or a jump over never-asked topics passed. A
+  `lookup_concept` hit that followed a miss in the same turn now grounds the follow-up instead of
+  being discarded.
+
+- **The web report shows the whole Committee packet** ([#121]). It now shows the first pass's
+  confidence and each voice's argument and quoted evidence, which is why an escalated score moved.
+  Before, it showed only that the score moved; the Markdown export always printed all ten fields.
+  Two trust badges the server already sent now appear: *unvalidated judge* (ADR 0009) and
+  *committee review skipped*, so a suppressed escalation no longer reads as a confident pass. The
+  turn trace is typed (`TraceRecord`) instead of `Record<string, unknown>`.
+
+[#121]: https://github.com/nekloyh/get-hired/issues/121
+[#122]: https://github.com/nekloyh/get-hired/issues/122
+[#132]: https://github.com/nekloyh/get-hired/issues/132
 [#138]: https://github.com/nekloyh/get-hired/issues/138
 [#140]: https://github.com/nekloyh/get-hired/issues/140
 [#141]: https://github.com/nekloyh/get-hired/issues/141

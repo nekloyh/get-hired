@@ -255,6 +255,10 @@ def test_no_probing_agent_sees_prior_session_memory_across_a_whole_session(make_
 # made), a pure config knob (rubric, language_mode, role, bank), or the client that will carry the
 # call. None of them can hold prior-session text.
 #
+# `asked` (#132) is current-EXCHANGE content: `run_micro_loop` builds it empty for each question and
+# appends only the follow-ups the Interviewer generated inside that same question, so it cannot hold
+# text from another question, let alone another Session.
+#
 # This is the tripwire for the builders whose inputs are scalars rather than state: a coaching-memory
 # feature cannot reach the Evaluator or the Interviewer without adding a parameter, and adding one
 # turns this red. If you are here because of that: decide whether the new input can carry
@@ -283,8 +287,16 @@ _PROBING_BUILDER_PARAMETERS = {
         "evaluation",
         "lookup",
         "language_mode",
+        "asked",
     },
-    "interviewer._build_native_user": {"original_question", "answer", "evaluation", "skill", "language_mode"},
+    "interviewer._build_native_user": {
+        "original_question",
+        "answer",
+        "evaluation",
+        "skill",
+        "language_mode",
+        "asked",
+    },
     "interviewer.render_seed_question": {"client", "question", "language_mode"},
 }
 

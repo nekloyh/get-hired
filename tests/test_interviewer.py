@@ -430,3 +430,35 @@ def test_lookup_without_language_preference_raises_on_empty_shelf():
     store = InMemoryConceptStore([])
     with _pytest.raises(LookupError):
         _lookup_with_widening(store, "q", skill="mlops", language=None)
+
+
+def test_the_re_ask_guard_covers_every_follow_up_already_asked():
+    from interview_coach.interviewer import _make_validators
+
+    reject_reask = _make_validators("Explain L2.", lambda: None, "en", asked=("What is the penalty mechanism?",))[0]
+    with pytest.raises(ValueError, match="already asked in this exchange"):
+        reject_reask(FollowUp(question="  what is the PENALTY mechanism  ", targets="t"))
+    with pytest.raises(ValueError, match="re-asks the original question"):
+        reject_reask(FollowUp(question="explain l2", targets="t"))
+    reject_reask(FollowUp(question="Why does the penalty reduce variance?", targets="t"))  # new: passes
+
+
+def test_a_hit_after_a_miss_in_the_same_turn_still_grounds_the_follow_up(make_tool_client):
+    # #132 item 3. One assistant turn may call lookup_concept more than once. A miss recorded
+    # `concept_miss` and nothing ever cleared it, so a later hit in the same turn was thrown away and
+    # the question resolved with no follow-up. Now the loop degrades only when NO lookup succeeded.
+    store = _store()  # holds an ml_fundamentals note only, so the mlops lookup misses
+    two_calls = {"tool_calls": [*_tool_call_reply(skill="mlops")["tool_calls"], *_tool_call_reply()["tool_calls"]]}
+    client, _ = make_tool_client([two_calls, _followup_json()])
+
+    fu = generate_follow_up(
+        client,
+        original_question="Why does L2 regularization reduce overfitting?",
+        answer="It makes the weights smaller which is better.",
+        evaluation=_weak_evaluation(),
+        skill=None,  # the request's own skill picks the shelf, which is how a miss and a hit can share a turn
+        concept_store=store,
+    )
+
+    assert fu.concept_id == "l2"
+    assert [call["skill"] for call in store.lookup_calls] == ["mlops", "ml_fundamentals"]

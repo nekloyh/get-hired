@@ -235,6 +235,7 @@ def run_micro_loop(
     is_follow_up = False
     grounding_concept_id: str | None = None
     grounding_concept_title: str | None = None
+    asked: list[str] = []  # follow-ups already put to the Candidate in this exchange (#132)
     # One committee per question, not per turn: every turn of a collapsing exchange re-triggering
     # the panel would pay 3 extra calls each time — the budget is the free-tier cost rail.
     panel_budget = PanelBudget.per_question()
@@ -290,6 +291,7 @@ def run_micro_loop(
                 skill=seed.skill,
                 concept_store=concept_store,
                 language_mode=language_mode,
+                asked=tuple(asked),
             )
         except FollowUpUnavailable as err:
             # The Evaluator wanted a follow-up but the Interviewer could not produce one (a persistent
@@ -320,6 +322,7 @@ def run_micro_loop(
             )
         )
         question = follow_up.question
+        asked.append(question)
         is_follow_up = True
         grounding_concept_id = follow_up.concept_id
         grounding_concept_title = follow_up.concept_title

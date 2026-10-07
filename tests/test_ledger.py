@@ -25,6 +25,7 @@ from interview_coach.ledger import (
     load_states,
     save_measured_posteriors,
     save_posteriors,
+    update_posteriors,
 )
 from interview_coach.session_serde import measured_skill_states
 from interview_coach.skill import NEUTRAL_ALPHA, NEUTRAL_BETA, SkillState, apply_evaluation
@@ -353,6 +354,116 @@ def test_a_concurrent_second_process_cannot_erase_this_processs_record(tmp_path)
     assert child.exitcode == 0
     candidates = sorted(key for key in json.loads(path.read_text(encoding="utf-8")) if key != "_meta")
     assert candidates == ["alice", "bob", "carol"]
+
+
+def _skills(path: Path, candidate_id: str) -> dict[str, tuple[float, float]]:
+    states = load_states(path, candidate_id, now=0.0) or {}
+    return {skill: (state.alpha, state.beta) for skill, state in states.items()}
+
+
+def test_two_completions_for_the_same_candidate_both_keep_their_evidence(tmp_path, monkeypatch):
+    # #122. save_measured_posteriors used to run load_states OUTSIDE the lock and save_posteriors
+    # inside it. Two writers for the SAME Candidate both read the same record, both merged onto it,
+    # and the second save replaced the whole record with its own copy. The first writer's Skill was
+    # silently dropped, because the function never raises and a lost write hits no warning. The
+    # cross-candidate half was closed by M0-12 (the test above). This is the same-candidate half,
+    # widened with the same slow read so the race is deterministic rather than GIL luck.
+    path = tmp_path / "ledger.json"
+    save_posteriors(path, "minh", {"nlp": SkillState("nlp", alpha=4.0, beta=4.0)}, now=0.0)
+    real_read_text = Path.read_text
+
+    def slow_read_text(self, *args, **kwargs):
+        raw = real_read_text(self, *args, **kwargs)
+        if self == path:
+            time.sleep(0.05)
+        return raw
+
+    monkeypatch.setattr(Path, "read_text", slow_read_text)
+    barrier = threading.Barrier(2)
+
+    def complete(skill: str, alpha: float) -> None:
+        barrier.wait()
+        save_measured_posteriors(path, "minh", {skill: SkillState(skill, alpha=alpha, beta=1.0)}, now=0.0)
+
+    threads = [threading.Thread(target=complete, args=("ml", 5.0)), threading.Thread(target=complete, args=("dl", 3.0))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    monkeypatch.undo()
+
+    assert _skills(path, "minh") == {"nlp": (4.0, 4.0), "ml": (5.0, 1.0), "dl": (3.0, 1.0)}
+
+
+def test_update_posteriors_returns_what_it_saved_and_writes_nothing_for_an_unusable_id(tmp_path):
+    path = tmp_path / "ledger.json"
+    saved = update_posteriors(path, "minh", lambda carried: {**carried, "ml": SkillState("ml", 2.0, 1.0)}, now=0.0)
+    assert saved is not None and set(saved) == {"ml"}
+    assert _skills(path, "minh") == {"ml": (2.0, 1.0)}
+    before = path.read_bytes()
+    for unusable in ("", "minh/../x"):
+        assert update_posteriors(path, unusable, lambda carried: {"ml": SkillState("ml", 9.0, 1.0)}, now=0.0) is None
+    assert path.read_bytes() == before
+
+
+def test_an_update_that_raises_writes_nothing(tmp_path):
+    # The update runs inside the critical section; if it blows up, the old record must stand untouched.
+    path = tmp_path / "ledger.json"
+    save_posteriors(path, "minh", {"ml": SkillState("ml", alpha=2.0, beta=1.0)}, now=0.0)
+    before = path.read_bytes()
+
+    def broken(carried):
+        raise ZeroDivisionError("a fusion bug")
+
+    with pytest.raises(ZeroDivisionError):
+        update_posteriors(path, "minh", broken, now=0.0)
+    assert path.read_bytes() == before
+
+
+def _complete_and_park(path: str, read_flag, release) -> None:
+    """Child process: enter save_measured_posteriors' read and park inside it."""
+    target = Path(path)
+    real_read_text = Path.read_text
+
+    def parked(self, *args, **kwargs):
+        raw = real_read_text(self, *args, **kwargs)
+        if self == target and not read_flag.is_set():
+            read_flag.set()
+            release.wait(10)
+        return raw
+
+    Path.read_text = parked
+    save_measured_posteriors(target, "minh", {"dl": SkillState("dl", alpha=3.0, beta=1.0)}, now=0.0)
+
+
+def test_a_second_process_cannot_save_the_same_candidate_from_a_read_this_one_is_about_to_replace(tmp_path):
+    # #122, across processes: `coach postmortem` or `coach session` beside the web server. The child
+    # parks right after its FIRST read of the ledger. That read must already sit inside the
+    # flock-held critical section, or the parent's save lands between the child's read and its write
+    # and the child's write erases it.
+    path = tmp_path / "ledger.json"
+    save_posteriors(path, "minh", {"nlp": SkillState("nlp", alpha=4.0, beta=4.0)}, now=0.0)
+
+    ctx = mp.get_context("fork")
+    child_read, release = ctx.Event(), ctx.Event()
+    child = ctx.Process(target=_complete_and_park, args=(str(path), child_read, release))
+    child.start()
+    assert child_read.wait(10), "the child never read the ledger"
+
+    def complete() -> None:
+        save_measured_posteriors(path, "minh", {"ml": SkillState("ml", alpha=5.0, beta=1.0)}, now=0.0)
+
+    thread = threading.Thread(target=complete)
+    thread.start()
+    thread.join(0.5)
+    held_out = thread.is_alive()
+    release.set()
+    child.join(10)
+    thread.join(10)
+
+    assert child.exitcode == 0
+    assert held_out, "the parent's save ran while the child sat between its read and its write"
+    assert _skills(path, "minh") == {"nlp": (4.0, 4.0), "ml": (5.0, 1.0), "dl": (3.0, 1.0)}
 
 
 @pytest.mark.parametrize("bad", ["minh/../../etc/passwd", "a" * 65, "minh\nINFO forged", " ", "minh minh", "Nguyễn"])
