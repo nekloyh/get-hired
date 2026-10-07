@@ -295,8 +295,9 @@ def test_a_backed_off_retry_is_traced_as_a_retry(make_client, caplog, monkeypatc
     with caplog.at_level(logging.INFO, logger="interview_coach.llm"):
         client.chat([{"role": "user", "content": "go"}])
 
-    outcomes = [m.split("outcome=")[1] for m in caplog.messages if m.startswith(CALL_LOG_PREFIX)]
-    assert outcomes == ["retry:APIStatusError", "ok"]
+    # Parsed as key=value pairs: the line grew Session/question/turn/role fields after `outcome=` (#144).
+    lines = [dict(kv.split("=", 1) for kv in m.split()[1:]) for m in caplog.messages if m.startswith(CALL_LOG_PREFIX)]
+    assert [line["outcome"] for line in lines] == ["retry:APIStatusError", "ok"]
 
 
 def test_structured_output_failure_logs_the_raw_reply(make_client, caplog):

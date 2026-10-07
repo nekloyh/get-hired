@@ -3,13 +3,97 @@
 Notable changes per released tag. The format is loosely [Keep a Changelog]; versions are `0.x`, so a
 **minor** bump is where a breaking change lands.
 
-Two things this file deliberately does not do. It does not claim a gate is green that is not: the
-judge calibration bench is **RED at 34/35** and has been since 2026-07-27 ([#96]), and no release
-below changes that. And it does not list every commit — `git log v0.1.0-pilot..v0.2.0` does that
-better. It records what a reader upgrading between tags has to know.
+This is one of the three places status may live: GitHub holds work, ADRs hold decisions, and this
+file holds what shipped ([rule](docs/issues/README.md#where-status-lives)). Two things it deliberately
+does not do. It does not claim a gate is green that is not: a release that ships with a red gate
+says so under **Known red**. And it does not list every commit, because `git log <tag>..<tag>` does
+that better. It records what a reader upgrading between tags has to know.
+
+Every PR that changes behaviour, a command or a document's location adds a line under
+`[Unreleased]`; `scripts/release.sh prepare` turns that section into the release entry.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [#96]: https://github.com/nekloyh/get-hired/issues/96
+
+---
+
+## [Unreleased]
+
+### Changed
+
+- **Status lives in three places only**: GitHub milestones (work), this file (what shipped) and ADR
+  `Status:` lines (decisions) ([#140]). `README.md`, `CLAUDE.md`, `docs/roadmap.md`,
+  `docs/issues/README.md` and `docs/pilot-runbook.md` no longer repeat it. `CLAUDE.md` had called the
+  judge green at 35/35 for two months after the gate went red.
+- **The three root reports are dated records in `docs/audits/`**: `AUDIT.md` →
+  `forensic-audit-2026-09-14.md`, `QA-REPORT.md` → `qa-report-2026-09-15.md`, `MILESTONE-REPORT.md` →
+  `milestone-v0.1.0-pilot-2026-09-15.md`. The 2026-09-13 planning pass left `docs/issues/README.md`
+  for `docs/audits/implementation-plan-2026-09-13.md`. `docs/audits/README.md` maps the old names.
+- **Work is tracked as `#NN` in three milestones**: `v0.3.0 Stable`, then `v0.4.0 Foundation`;
+  `Later` is frozen. The old `Now`/`Next` wave milestones are retired.
+- **`docs/roadmap.md` §2 is corrected**: `coach bench` scores fixed answers, so a judge change costs
+  judge tokens. A local simulated candidate cannot make it cheaper; screening a wording on a few cases
+  before confirming on all 35 can ([#145]).
+
+### Added
+
+- **CI runs every Monday** and on demand (`workflow_dispatch`), so a pause cannot hide a calendar,
+  toolchain or dependency break ([#138]). GitHub disables a public repo's schedule after 60 days with no
+  activity. Dependabot alerts and security fixes are on; version-update PRs are not.
+- **A judge fingerprint and `judge.lock`** ([#141]): a sha256 of the exact requests the judge would send
+  for three canonical answers covering every `evaluate` request path. `tests/test_judge_lock.py` fails on
+  any prompt, anchor, schema, escalation-policy, model, temperature or endpoint change. `coach bench`
+  prints the fingerprint, says whether it matches the lock, and stamps it into the report. It found
+  one judge change that had shipped unbenched: #129 removed `"self_critique":null` from the three
+  Panel prompts in 0.2.0. The 2026-09-15 bench never escalated, so its measurement still holds.
+- **Every `llm-call` trace line names its Session, question, turn and role** ([#144]). The new
+  fields `session= question= turn= role=` are appended after `outcome=`, so existing greps still
+  match. A live trajectory can now be rebuilt from the log, and two overlapping Sessions' calls,
+  retries included, no longer blur together. Roles come from the agent entry points (`evaluate` is
+  judge, including its Panel; `generate_follow_up` is interviewer; …), so a call cannot be
+  mislabelled by whichever client object carried it.
+- **`coach bench --only <case_id|paired_id>`** screens a judge wording on a subset ([#145]). The
+  budget rail asks for that share only; the report is marked **SCREEN**, goes to the gitignored
+  `logs/`, and can never be the artifact `judge.lock` points at (ADR 0009 addendum h). An unknown
+  name refuses (exit 2) instead of silently screening less.
+- **ADR 0009 addenda (e) and (f) are on `main`** ([#141]). They were cited as binding but existed only
+  on the unmerged #96 branch. Addendum (g) records the lock.
+- **`scripts/release.sh`**: `prepare <ver>` edits only version fields (`pyproject.toml`, `uv.lock`,
+  `web/package{,-lock}.json`) and this file;
+  `tag <ver>` gates, tags and pushes the tag in the same step ([#140]).
+
+### Fixed
+
+- **Two writers for the same Candidate no longer lose each other's Skill evidence** ([#122]). A finishing
+  Session (web or CLI) and a `coach postmortem` each read the Candidate's ledger record outside the
+  lock, merged onto it, and saved, so the second save replaced the first's Skills, with no exception
+  and no log line. `ledger.update_posteriors` now runs load → update → save as one critical section
+  under the existing thread lock and flock, and both writers go through it.
+
+- **The micro-loop no longer re-asks, skips untouched topics, or drops a found note** ([#132]).
+  The Interviewer now sees the follow-ups already asked in the exchange, and a repeat of any of them
+  is rejected like a repeat of the seed. Before this, turns 3–4 could repeat turn 2 verbatim.
+  `skip_ahead` must jump forward past at least one entry, may skip only plan entries whose Skill was
+  already answered this Session (a `failed` item does not count), and must land on a Skill with an
+  unused seed. Before this, a backwards jump or a jump over never-asked topics passed. A
+  `lookup_concept` hit that followed a miss in the same turn now grounds the follow-up instead of
+  being discarded.
+
+- **The web report shows the whole Committee packet** ([#121]). It now shows the first pass's
+  confidence and each voice's argument and quoted evidence, which is why an escalated score moved.
+  Before, it showed only that the score moved; the Markdown export always printed all ten fields.
+  Two trust badges the server already sent now appear: *unvalidated judge* (ADR 0009) and
+  *committee review skipped*, so a suppressed escalation no longer reads as a confident pass. The
+  turn trace is typed (`TraceRecord`) instead of `Record<string, unknown>`.
+
+[#121]: https://github.com/nekloyh/get-hired/issues/121
+[#122]: https://github.com/nekloyh/get-hired/issues/122
+[#132]: https://github.com/nekloyh/get-hired/issues/132
+[#138]: https://github.com/nekloyh/get-hired/issues/138
+[#140]: https://github.com/nekloyh/get-hired/issues/140
+[#141]: https://github.com/nekloyh/get-hired/issues/141
+[#144]: https://github.com/nekloyh/get-hired/issues/144
+[#145]: https://github.com/nekloyh/get-hired/issues/145
 
 ---
 
@@ -100,7 +184,7 @@ behaviour change was intended anywhere in this release; where one was possible, 
 ## [0.1.0-pilot] — 2026-09-15
 
 The first tag a trusted pilot could run against: M0a, M0b and M1 complete. Full record in
-[`MILESTONE-REPORT.md`](MILESTONE-REPORT.md); what to check before letting anyone in is
+[`docs/audits/milestone-v0.1.0-pilot-2026-09-15.md`](docs/audits/milestone-v0.1.0-pilot-2026-09-15.md); what to check before letting anyone in is
 [`docs/pilot-runbook.md`](docs/pilot-runbook.md).
 
 - **Usage accounting is durable and fails loud** — a metered call is refused when the ledger cannot
@@ -113,5 +197,6 @@ The first tag a trusted pilot could run against: M0a, M0b and M1 complete. Full 
 - **Full-stack nginx/TLS dry-run**, which found two defects and fixed both: WebSocket frames were
   unbounded by nginx, and nginx reported no health of its own.
 
+[Unreleased]: https://github.com/nekloyh/get-hired/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/nekloyh/get-hired/compare/v0.1.0-pilot...v0.2.0
 [0.1.0-pilot]: https://github.com/nekloyh/get-hired/releases/tag/v0.1.0-pilot

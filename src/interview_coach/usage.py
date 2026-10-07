@@ -341,6 +341,11 @@ def session_scope(session_id: str) -> Iterator[None]:
         _SESSION_ID.reset(token)
 
 
+def current_session_id() -> str:
+    """The Session the calls on this thread belong to, or ``""`` outside any ``session_scope``."""
+    return _SESSION_ID.get()
+
+
 def _now_ts() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 

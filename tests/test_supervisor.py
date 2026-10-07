@@ -1009,7 +1009,8 @@ def _validate(state, *, reasoning: str = "test decision", **decision_kwargs):
 
 def test_every_action_accepts_the_skill_it_really_probes():
     state = _plan_state(["ml_fundamentals", "deep_learning", "mlops"], current_index=0)
-    state["transcript"] = [_transcript_item("ml_fundamentals")]
+    # deep_learning already answered, so skip_ahead over its plan entry is a legal skip (#132).
+    state["transcript"] = [_transcript_item("deep_learning"), _transcript_item("ml_fundamentals")]
 
     _validate(state, action=SupervisorAction.ADVANCE_PLAN, will_probe_skill="deep_learning")
     _validate(state, action=SupervisorAction.EXTRA_QUESTION, will_probe_skill="ml_fundamentals")
@@ -1042,7 +1043,7 @@ def test_null_always_passes_so_an_omitting_model_behaves_as_before():
     # The field is a cross-check, not new information. A model that never fills it must not be
     # worse off than before R-22 — otherwise this becomes a compatibility break dressed as a fix.
     state = _plan_state(["ml_fundamentals", "deep_learning", "mlops"], current_index=0)
-    state["transcript"] = [_transcript_item("ml_fundamentals")]
+    state["transcript"] = [_transcript_item("deep_learning"), _transcript_item("ml_fundamentals")]
 
     for action, kwargs in [
         (SupervisorAction.ADVANCE_PLAN, {}),
@@ -1383,3 +1384,46 @@ def test_a_checkpoint_from_a_newer_schema_refuses_to_run(tmp_path, monkeypatch):
 
     assert str(SESSION_SCHEMA_VERSION + 98) in str(err.value)
     assert StopReason.FAILED.value not in stops
+
+
+# --- #132: skip_ahead's policy rail ----------------------------------------------------------------
+
+
+def _skip_state(answered: list[str]):
+    state = _plan_state(["ml_fundamentals", "deep_learning", "mlops", "system_design"], current_index=0)
+    state["transcript"] = [_transcript_item(skill) for skill in answered]
+    return state
+
+
+@pytest.mark.parametrize("target", [0, 1], ids=["backwards-or-stay", "next-entry-is-advance_plan"])
+def test_skip_ahead_must_skip_at_least_one_entry_and_never_moves_back(target):
+    with pytest.raises(ValueError, match="skips nothing"):
+        _validate(_skip_state(["ml_fundamentals"]), action=SupervisorAction.SKIP_AHEAD, target_plan_index=target)
+
+
+def test_skip_ahead_cannot_drop_a_planned_skill_nobody_has_answered():
+    # The gap #132 names: the only rail was `target < plan_len`, so this jump dropped deep_learning
+    # from the Session while the prompt promised to skip only "already-satisfied plan entries".
+    with pytest.raises(ValueError, match=r"not been answered this Session: \['deep_learning'\]"):
+        _validate(_skip_state(["ml_fundamentals"]), action=SupervisorAction.SKIP_AHEAD, target_plan_index=2)
+
+
+def test_skip_ahead_over_an_already_answered_skill_is_allowed():
+    _validate(
+        _skip_state(["deep_learning", "ml_fundamentals"]), action=SupervisorAction.SKIP_AHEAD, target_plan_index=2
+    )
+
+
+def test_a_failed_question_does_not_count_as_answered():
+    # ADR 0005: an infrastructure failure is not evidence, so it cannot make a Skill "satisfied".
+    state = _skip_state(["ml_fundamentals"])
+    state["transcript"].insert(0, _transcript_item("deep_learning", stop_reason="failed"))
+    with pytest.raises(ValueError, match="not been answered"):
+        _validate(state, action=SupervisorAction.SKIP_AHEAD, target_plan_index=2)
+
+
+def test_skip_ahead_onto_a_skill_with_no_unused_seed_is_rejected():
+    used_up = ["mlops"] * seed_count("mlops")
+    state = _skip_state(["deep_learning", *used_up, "ml_fundamentals"])
+    with pytest.raises(ValueError, match="no unused seed"):
+        _validate(state, action=SupervisorAction.SKIP_AHEAD, target_plan_index=2)

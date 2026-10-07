@@ -1,39 +1,55 @@
-# Roadmap — what to build next, on what hardware, and why in that order
+# Roadmap — what unblocks what, and what this machine can host
 
-Written 2026-09-15, at `v0.1.0-pilot`. This is the *direction* document: the sequencing table in
-[`issues/README.md`](issues/README.md) stays canonical for what each milestone contains, and an ADR
-still wins over both. What this adds is the two questions that plan does not answer — which work
-unblocks the rest, and what the machine it runs on can and cannot host.
+This is the *direction* document. **The [GitHub milestones](https://github.com/nekloyh/get-hired/milestones)
+hold what each milestone contains and whether it is done.** This file does not repeat either, and an
+ADR wins over both. It answers two questions a milestone list cannot: why this order, and what the
+hardware can and cannot host.
 
 Priority is unchanged: **(1) learn agentic systems, (2) a usable prep tool, (3) recruiter signal.**
 
 ---
 
-## 1. The binding constraint is the cost of measuring the judge, not the code
+## 1. Order: stable, then foundation, then features
 
-M0 and M1 are done. The one gate still red is the judge calibration bench — 34/35, an EN/VN split on
-`depth` and `system_thinking`, both of which have a hole at 3 in their 1–5 scale
-([#96](https://github.com/nekloyh/get-hired/issues/96)).
+| Milestone | Why it comes here |
+|---|---|
+| `v0.3.0 Stable` | The code was green; the system around it was not. Status copied into many documents drifted: `CLAUDE.md` called the judge green for two months after its gate went red. Two draft PRs aged 71 and 87 days, nothing ran against `main` during a pause, and one data-loss race (#122) is open. Nothing built on top of that can be trusted. |
+| `v0.4.0 Foundation` | The next features touch the same two weak layers. **State:** every product step (#127 → #83, then #84) changes the usage and Skill ledgers, where the race and scaling defects cluster. One transactional store (#143) fixes four open issues by construction. **Measurement:** a judge change is affordable only if a wording can be screened cheaply (#145). A live problem is debuggable only if every call names its Session, turn and role (#144). The anchor fixes #96 and #103 come after both. |
+| `Later` | Frozen until both close: features (#83–#88), the redesign (#60), and eval work gated on ADR sections that are still Proposed (#71, #72, #79). |
 
-It is not stuck on difficulty. It is stuck on price. Every k=3 invocation costs roughly 181k–207k
-tokens, a judge re-wording restarts the repeatability count from zero, and three green invocations
-are required before a change is believed — because one green run is not a measurement (a #96 wording
-already went 35/35, 35/35, 34/35). So every attempt costs ~600k tokens and most of that is spent
-generating *candidate answers*, not judging them.
-
-That is the lever. The judge must stay on an API — ADR 0009 pins it, and no model that fits in 6 GB
-of VRAM passes the bench. **The candidate does not.** The replay bench
-([0029](issues/0029-simulated-candidate-replay-bench.md)) already exists for exactly this, and it had
-one defect in the way: replay artifacts recorded no pack, so the bench always measured the built-in
-bank ([#113](https://github.com/nekloyh/get-hired/issues/113)).
-
-**#113 is fixed as of `v0.2.0`** — artifacts carry `pack`, `REPLAY_ARTIFACT_VERSION` is 2, and
-`replay_decision` feeds the recorded bank back in. **The remaining step is the local model behind the
-simulated candidate, and then #96 becomes affordable.** It has no issue filed yet.
+Not next, deliberately: **#84 (accounts/Postgres)** is a public-launch gate, not a pilot dependency.
+Building it before #143 means porting several hand-rolled file formats instead of one schema, then maintaining auth
+through every schema change #127 and #83 make.
 
 ---
 
-## 2. Hardware — buy nothing
+## 2. A judge change costs judge tokens
+
+A judge change (#96, #103) must pass `coach bench --k 3`, and pass it more than once (ADR 0009
+addenda d–f). On all 35 cases one invocation costs ~181–207k tokens. One wording needs several
+invocations, so it costs ~600k.
+
+**All of it is judge spend.** The bench scores fixed, hand-labelled answers from
+`data/bench/cases.yaml` (`bench._evaluate_case` → `evaluate`). Nothing generates a candidate answer.
+An earlier version of this file blamed candidate generation and named a local simulated candidate as
+the lever. That premise was wrong for this gate. Filtering by dimension does not help either: all 35
+cases weight `depth` and `system_thinking`.
+
+The lever is two speeds (#145):
+
+- **Screen** a wording on ~10 target and sentinel cases (~60k tokens). A screen run is never gate evidence.
+- **Confirm** only the wording that survives screening, on all 35 cases.
+
+Screening three wordings and confirming the one that survives then costs ~0.8M tokens. Running all three on the full set three times each costs ~1.8M. A judge fingerprint (#141) ties
+every confirm run to the exact judge configuration it measured.
+
+The judge must stay on an API. ADR 0009 pins it, and no model that fits in 6 GB of VRAM passes the
+bench. A local candidate is useful where candidates *are* generated, in the replay bench (slice 0029,
+#146).
+
+---
+
+## 3. Hardware — buy nothing
 
 | | |
 |---|---|
@@ -42,65 +58,49 @@ simulated candidate, and then #96 becomes affordable.** It has no issue filed ye
 | GPU | **RTX 3060 Laptop, 6 GB VRAM** |
 | Disk | 334 GB free |
 
-6 GB of VRAM is the only real constraint, and it does not sit on the critical path.
+The 6 GB of VRAM is the only real constraint, and nothing on the critical path needs more.
 
 | Workload | Local? | Note |
 |---|---|---|
 | **Judge** (`gpt-5.4-mini`) | **No** | pinned by ADR 0009 and its addendum a; the judge role never fails over, let alone to a local model. Any swap is a bench-gated change |
-| **Simulated candidate** (replay bench) | **Yes** | a 7–8B at Q4 is ~4.5 GB. This is the lever in §1 |
-| **Embeddings** (`bge-small-en-v1.5`, `bge-m3`) | **Yes**, easily | what an honest answer to [#130](https://github.com/nekloyh/get-hired/issues/130) would need if the "wire it" half is chosen |
-| **Vietnamese STT** ([#87](https://github.com/nekloyh/get-hired/issues/87) voice spike) | **Yes** | `whisper-large-v3-turbo` quantized is ~1.6 GB; PhoWhisper is the VN-specific option. The cheapest spike in the backlog — no API spend at all |
-| **Postgres/Supabase** ([#84](https://github.com/nekloyh/get-hired/issues/84)) | **Yes** | the images are already on this machine |
+| **Simulated candidate** (replay bench) | **Yes** | a 7–8B at Q4 is ~4.5 GB (#146). Not a lever for `coach bench`, which generates no answers (§2) |
+| **Embeddings** (`bge-small-en-v1.5`, `bge-m3`) | **Yes**, easily | the concept store's optional Chroma path (`--extra rag`) |
+| **Vietnamese STT** ([#87](https://github.com/nekloyh/get-hired/issues/87) voice spike) | **Yes** | `whisper-large-v3-turbo` quantized is ~1.6 GB; PhoWhisper is the VN-specific option. No API spend at all |
+| **SQLite / Postgres** ([#143](https://github.com/nekloyh/get-hired/issues/143), [#84](https://github.com/nekloyh/get-hired/issues/84)) | **Yes** | SQLite is the stdlib; the Postgres images are already on this machine |
 
-A second machine or a bigger GPU buys nothing that is currently blocking, because the thing that is
-blocking is an API-priced measurement, not local compute.
-
----
-
-## 3. Order of work
-
-| # | Work | Why here |
-|---|---|---|
-| 1 | ~~**[#113](https://github.com/nekloyh/get-hired/issues/113)** — replay artifacts carry pack provenance~~ **DONE, `v0.2.0`** | unblocked §1: an artifact now says which pack it was recorded against, so the replay bench can be trusted as the cheap tier. `model`/`prompt` provenance is still absent — see the prompt-hash row in §4 |
-| 2 | **Local candidate behind the replay bench** | turns the expensive half of every judge experiment into local compute |
-| 3 | **[#96](https://github.com/nekloyh/get-hired/issues/96)** (then [#103](https://github.com/nekloyh/get-hired/issues/103)) — anchor `depth` and `system_thinking` at 3 | the last red line on the milestone. A missing middle BARS anchor is a measured language-fairness bug, not a style question (ADR 0009 addendum d) |
-| 4 | **Q1 — session/turn/role attribution on the trace** (continues [#81](https://github.com/nekloyh/get-hired/issues/81)) | every per-call `llm-call` line exists but carries no Session, turn or role. Without that a trajectory cannot be reconstructed — and reconstructing trajectories is learning goal #1 |
-| 5 | **[#127](https://github.com/nekloyh/get-hired/issues/127) → [#83](https://github.com/nekloyh/get-hired/issues/83)** — Skill history, then the progress dashboard | closes the loop the tool exists for: practise → see it move → practise again. The ledger keeps **one snapshot per Candidate** today, so there is literally nothing to chart. #127 before #83, not beside it |
-| 6 | **[#87](https://github.com/nekloyh/get-hired/issues/87)** — VN voice spike, go/no-go | runs entirely on this GPU. A spike with a stop point, per M5a |
-
-Not next, deliberately: **[#84](https://github.com/nekloyh/get-hired/issues/84) (accounts/Postgres)**
-is a public-launch gate, not a pilot dependency, and building it early means maintaining auth through
-every schema change that #127 and #83 are about to make.
+A second machine or a bigger GPU would not speed up anything on the critical path. What limits it is
+API-priced measurement, and #145 is the lever for that.
 
 ---
 
-## 4. Build-with-AI practice — where this project already is, and what is missing
+## 4. Build-with-AI practice — where each one lives
 
-Assessed against practice as of this writing; re-check the tooling names before adopting one.
+The state of each practice is the state of the issue named here. This table does not record it.
 
-| Practice | State here | Work |
+| Practice | Where it lives in this repo | Gap tracked by |
 |---|---|---|
-| **Model changes gate on an eval** | **done and unusually strict** — ADR 0009, median-of-k, "never widen a band to go green" | keep |
-| **Cost accounting per call** | **done** — usage ledger, daily caps, `ACCOUNTING:` fails loud and blocks metered work | [#125](https://github.com/nekloyh/get-hired/issues/125)/[#126](https://github.com/nekloyh/get-hired/issues/126) are polish |
-| **Structured output** | **done** — per-model `json_schema` capability | — |
-| **Per-role model routing** | **done** — ADR 0010, judge pinned in code | this is where a local model slots in (§2) |
-| **Two-tier evals** | **unblocked, not built** — one tier, expensive, run by hand; #113's blocker is gone | cheap tier (replay/golden, zero API calls) on every PR; expensive tier only on judge/prompt changes. Nothing is waiting on another fix now |
-| **Prompt versioning** | **missing** — prompts are inline, and a bench artifact does not record which prompt produced it | stamp a prompt hash into the bench artifact. Without it "which prompt was that 35/35 on?" is unanswerable |
-| **Trace attribution** | **partial** — every call logs `llm-call provider= model= ms= …`; none of it carries Session/turn/role | Q1 above. OpenTelemetry GenAI semantic conventions plus a self-hosted viewer (Langfuse/Phoenix) both run comfortably on this box |
-| **Trajectory eval** | **done for the pack axis** — the replay bench exists and its artifacts are no longer pack-blind (`v0.2.0`) | next axis is provenance: stamp the judge model and a prompt hash into the artifact |
-| **Human-in-the-loop labelling** | **decided, deliberately one-way** — the Question Forge writes a review queue a human reads; no code reads it back, and [#129](https://github.com/nekloyh/get-hired/issues/129) resolved that as intended, not broken | the rejected weak answers are bench-label material (ADR 0009 addendum b); each file's header says so |
-| **Refactor safety net** | **done** — `tests/test_serde_golden.py` is a byte-identity harness | use it, not `coach bench`, to prove a refactor changed nothing |
+| **Model changes gate on an eval** | ADR 0009: median-of-k, never widen a band to go green | #141 makes it mechanical |
+| **Cost accounting per call** | the usage ledger; `ACCOUNTING:` fails loud and blocks metered work | #143 (storage), #125, #126 |
+| **Structured output** | a per-model `json_schema` capability | — |
+| **Per-role model routing** | ADR 0010; the judge role is pinned in code | — |
+| **Two-tier evals** | **release tier**: `scripts/gate.sh` + browser specs + image build on every PR, no API spend. **Quality tier**: `coach bench`, only when the judge changes | #141, #145 |
+| **Prompt versioning** | the judge fingerprint: a hash of the exact requests the judge receives | #141 |
+| **Trace attribution** | the per-call `llm-call` line | #144 adds Session/turn/role |
+| **Trajectory eval** | the replay bench (slice 0029), pack-aware since #113 | #146 (local candidate) |
+| **Human-in-the-loop labelling** | the Question Forge review queue, one-way by design (#129) | — |
+| **Refactor safety net** | `tests/test_serde_golden.py`, a byte-identity harness. Use it, not `coach bench`, to prove a refactor changed nothing | — |
 
 ---
 
 ## 5. Not doing, and why
 
-- **Score-averaging multi-judge consensus** — measured worthless on this judge: the verdict moved
-  0.00 across 10 forced escalations. Cheap multi-vote as an *uncertainty* signal is ADR 0011, still
+- **Score-averaging multi-judge consensus**: measured worthless on this judge. The verdict moved 0.00
+  across 10 forced escalations. Cheap multi-vote as an *uncertainty* signal is ADR 0011, which is
   Proposed and experiment-gated.
-- **Modern RAG (HyDE / hybrid / rerank)** — the toy store scores 47/50 against embedders' 46–47/50 at
-  the current shelf size. The Skill filter is doing the work. Triggers to revisit are in #68.
-- **Transcript RAG for judging** — ADR 0006. Scoring memory stays decayed Beta priors.
-- **A visual redesign as a release prerequisite** — [PR #50](https://github.com/nekloyh/get-hired/pull/50)
-  stays open until feedback comprehension and repeat practice are done.
-- **An operations dashboard** — `docker compose logs` and `coach usage` are the interface.
+- **Modern RAG (HyDE / hybrid / rerank)**: the toy store scores 47/50 against the embedders'
+  46–47/50 at the current shelf size, because the Skill filter is doing the work. The triggers to
+  revisit are in #68.
+- **Transcript RAG for judging**: ADR 0006. Scoring memory stays decayed Beta priors.
+- **A visual redesign as a release prerequisite**: the redesign (#60) waits until feedback
+  comprehension and repeat practice are done. Its code is kept at tag `archive/pr-50-frontend-redesign`.
+- **An operations dashboard**: `docker compose logs` and `coach usage` are the interface.

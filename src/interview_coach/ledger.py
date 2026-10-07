@@ -23,7 +23,7 @@ import logging
 import math
 import re
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -66,10 +66,11 @@ def is_safe_candidate_id(candidate_id: str) -> bool:
 # cold start — honest epistemics without a hard cliff.
 LEDGER_HALF_LIFE_DAYS = 30.0
 
-# Serialises the whole load-modify-save in `save_posteriors`. The web API runs every Session on its
-# own thread and saves posteriors when it completes, so two Candidates finishing together race the
-# same file: without this, the later writer merges into a stale read and silently drops the earlier
-# Candidate's record — infrastructure noise corrupting Skill evidence, which ADR 0005 forbids.
+# Serialises the whole load-modify-save in `save_posteriors` and `update_posteriors`. The web API
+# runs every Session on its own thread and saves posteriors when it completes, so two Candidates
+# finishing together race the same file: without this, the later writer merges into a stale read
+# and silently drops the earlier Candidate's record — infrastructure noise corrupting Skill
+# evidence, which ADR 0005 forbids.
 # A process-local Lock is not enough on its own, and the old "the server is documented
 # single-process" argument (docs/deploy.md §6) never covered the case that breaks it: `coach session`
 # and `coach postmortem` write this same file from a SECOND OS process. So the merge also takes an
@@ -78,8 +79,9 @@ LEDGER_HALF_LIFE_DAYS = 30.0
 # lock-order inversion that deadlocks them against each other. Readers deliberately take neither:
 # publication is an atomic
 # rename, so a reader sees the whole old file or the whole new one, and holding it on the hot
-# start-of-Session path would only add contention plus a deadlock surface (`postmortem` already
-# chains load_states → save_posteriors around it).
+# start-of-Session path would only add contention plus a deadlock surface. A WRITER that has to read
+# first (merge carried Skills, fuse a post-mortem) must do the read inside the section too: that is
+# `update_posteriors`, and #122 is what happened while the read sat outside it.
 _SAVE_LOCK = threading.Lock()
 
 
@@ -219,6 +221,46 @@ def load_states(path: str | Path, candidate_id: str, *, now: float) -> dict[str,
     return states
 
 
+def _writable_key(candidate_id: str) -> bool:
+    if not candidate_id:
+        return False
+    if not is_safe_candidate_id(candidate_id):
+        logger.warning("%r is not a valid Skill ledger key; Session memory not persisted.", candidate_id)
+        return False
+    return True
+
+
+def _save_locked(target: Path, candidate_id: str, skill_states: Mapping[str, SkillState], *, now: float) -> None:
+    """Merge one Candidate's record into the ledger. The caller holds ``_SAVE_LOCK`` and the flock."""
+    data: dict[str, object] = {}
+    try:
+        if target.exists():
+            loaded = json.loads(target.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as err:
+        # UnicodeDecodeError is a ValueError, not an OSError, so it used to walk out of a
+        # function whose docstring promises it never raises. NOTE this inherits the existing
+        # "unreadable -> overwrite" policy: one corrupt byte discards every other Candidate's
+        # record. That is the pre-existing policy for malformed JSON and is deliberately not
+        # changed here; quarantine-instead-of-overwrite deserves its own finding.
+        logger.warning("Skill ledger at %s unreadable before save (%s); overwriting.", target, err)
+    if not _ledger_version_is_supported(data, target):
+        return  # never downgrade a ledger a newer build wrote
+    data["_meta"] = {"schema_version": LEDGER_SCHEMA_VERSION}
+    data[candidate_id] = {
+        "completed_at": now,
+        "skills": {skill: {"alpha": state.alpha, "beta": state.beta} for skill, state in skill_states.items()},
+    }
+    try:
+        # Shared with the Markdown export (NEW-04): both live on the same /state volume and both
+        # must survive a disk that fills mid-write. This function is contractually forbidden to
+        # raise, so the OSError stops here.
+        atomic_write_text(target, json.dumps(data, indent=2, sort_keys=True))
+    except OSError as err:
+        logger.warning("Could not write Skill ledger at %s (%s); Session memory not persisted.", target, err)
+
+
 def save_posteriors(
     path: str | Path,
     candidate_id: str,
@@ -233,43 +275,49 @@ def save_posteriors(
     postmortem`` — cannot lose each other's records, and a save that dies mid-flight leaves the
     previous ledger intact rather than a truncated file that cold-starts every Candidate in it.
 
+    This REPLACES the Candidate's record with ``skill_states``. A caller whose new record is built
+    from the old one must use :func:`update_posteriors` instead, or it builds from a read another
+    writer may already have replaced (#122).
+
     Never raises on a write problem: failing to record memory must not fail an otherwise-complete
     Session — it logs a warning and moves on.
     """
-    if not candidate_id:
-        return
-    if not is_safe_candidate_id(candidate_id):
-        logger.warning("%r is not a valid Skill ledger key; Session memory not persisted.", candidate_id)
+    if not _writable_key(candidate_id):
         return
     target = Path(path)
     with _SAVE_LOCK, locked(target):
-        data: dict[str, object] = {}
-        try:
-            if target.exists():
-                loaded = json.loads(target.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    data = loaded
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as err:
-            # UnicodeDecodeError is a ValueError, not an OSError, so it used to walk out of a
-            # function whose docstring promises it never raises. NOTE this inherits the existing
-            # "unreadable -> overwrite" policy: one corrupt byte discards every other Candidate's
-            # record. That is the pre-existing policy for malformed JSON and is deliberately not
-            # changed here; quarantine-instead-of-overwrite deserves its own finding.
-            logger.warning("Skill ledger at %s unreadable before save (%s); overwriting.", path, err)
-        if not _ledger_version_is_supported(data, target):
-            return  # never downgrade a ledger a newer build wrote
-        data["_meta"] = {"schema_version": LEDGER_SCHEMA_VERSION}
-        data[candidate_id] = {
-            "completed_at": now,
-            "skills": {skill: {"alpha": state.alpha, "beta": state.beta} for skill, state in skill_states.items()},
-        }
-        try:
-            # Shared with the Markdown export (NEW-04): both live on the same /state volume and both
-            # must survive a disk that fills mid-write. This function is contractually forbidden to
-            # raise, so the OSError stops here.
-            atomic_write_text(target, json.dumps(data, indent=2, sort_keys=True))
-        except OSError as err:
-            logger.warning("Could not write Skill ledger at %s (%s); Session memory not persisted.", path, err)
+        _save_locked(target, candidate_id, skill_states, now=now)
+
+
+def update_posteriors(
+    path: str | Path,
+    candidate_id: str,
+    update: Callable[[dict[str, SkillState]], Mapping[str, SkillState]],
+    *,
+    now: float,
+) -> dict[str, SkillState] | None:
+    """Load a Candidate's decayed states, apply ``update``, save the result: ONE critical section.
+
+    #122: ``load_states`` → merge or fuse → ``save_posteriors`` used to be three calls with no lock
+    held across them. Two writers for the same Candidate both read the same record, and the second
+    save replaced the whole record with its own copy, dropping the first writer's evidence with no
+    exception and no log line. The read now happens under the same ``_SAVE_LOCK`` + flock the save
+    takes, so the second writer reads what the first one wrote.
+
+    ``update`` receives the carried states, already decayed to ``now`` (decay-before-observe, ADR
+    0006), and returns the full new record. It runs while the ledger is locked against every other
+    writer, in this process and others, so it must be pure arithmetic: no I/O, no LLM call. Returns
+    what was saved, or ``None`` for an empty or unsafe id, which is never written. Like
+    ``save_posteriors`` it never raises on a write problem; an exception from ``update`` itself
+    propagates and nothing is written.
+    """
+    if not _writable_key(candidate_id):
+        return None
+    target = Path(path)
+    with _SAVE_LOCK, locked(target):
+        updated = dict(update(load_states(target, candidate_id, now=now) or {}))
+        _save_locked(target, candidate_id, updated, now=now)
+    return updated
 
 
 def save_measured_posteriors(
@@ -283,9 +331,8 @@ def save_measured_posteriors(
 
     ``save_posteriors`` replaces a Candidate's whole record, so handing it only this Session's probed
     Skills would drop every Skill measured in an earlier one — trading a fake-evidence bug for a
-    lost-evidence bug. Carrying ``load_states`` forward first is the same decay-before-observe
-    composition the post-mortem already uses: the carried params are decayed to ``now`` BEFORE the
-    save restamps the record's decay clock, so nothing is silently un-decayed.
+    lost-evidence bug. Carrying the decayed states forward first is the same decay-before-observe
+    composition the post-mortem uses, done inside one critical section (#122) so that a concurrent
+    writer's Skills are carried too.
     """
-    carried = load_states(path, candidate_id, now=now) or {}
-    save_posteriors(path, candidate_id, {**carried, **measured}, now=now)
+    update_posteriors(path, candidate_id, lambda carried: {**carried, **measured}, now=now)

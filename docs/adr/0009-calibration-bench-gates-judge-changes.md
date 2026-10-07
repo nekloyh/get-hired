@@ -177,3 +177,106 @@ k=3 evidence rather than riding along with the run that discovered it.
 *Source: GH #92 resolution, 2026-07-27 — per-dimension EN/VN diagnosis, judge-guide re-anchor, and
 admission of the six 2026-07-11 pending cases. Evidence:
 `docs/audits/calibration-bench-2026-07-27.md`.*
+
+## Addendum (2026-07-27b, landed 2026-10-06): a scale fix must name the boundary it decides — GH #96
+
+These two rules were recorded on 2026-07-27 with the first attempt at #96. That attempt lived on a
+draft branch that never merged (PR #104, closed 2026-10-06, code at tag
+`archive/pr-104-anchor-depth-system-thinking`). **The anchor change itself is not on `main`**:
+`depth` and `system_thinking` still lack their middle band, and #96 still owns that. The rules are what the
+attempt taught, they hold for every judge change, and the project already treated them as binding, so
+they land here on their own. Evidence: `docs/audits/calibration-bench-2026-07-27-anchor96.md`, a
+record of that unmerged attempt.
+
+Both findings generalise beyond that case, and both cost a red gate to learn.
+
+### (e) An unscoped anchor is a bar change, not a scale fix
+
+The first working wording added the middle band *and* an operational test for it ("a mechanism says
+HOW the technique produces the effect, not merely what it does"). The test was correct, but the
+judge applied it **everywhere**, not only at the 2/3 boundary it was written for: `depth` bias went
++0.03 → −0.11 and strong answers that had been stable at 4.00/4.00/4.00 began drawing 3.5–3.7, until
+one fell below its 3.8 floor.
+
+Rule: **every anchor clause states which boundary it decides and that it does not raise the bar
+above it.** A clause phrased as a general principle will be applied as one. This is the mirror image
+of the missing-anchor bug: a hole lets the judge invent a threshold, and an unscoped rule moves every
+threshold. Both surface as band-edge instability rather than as an obviously wrong score.
+
+### (f) One green invocation is not a measurement, and the gate must be re-run per wording
+
+The unscoped wording returned **35/35, 35/35, 34/35**. Had the first invocation been taken as the
+gate, a change that reds one run in three would have merged with a green artifact attached to it.
+Addendum (d), the 2026-07-27 median-of-k addendum above, made the *gate* median-of-k; this one makes
+the *evidence* multi-invocation. A judge change merges when repeated invocations agree, and each new
+wording restarts that count: a green run of wording A says nothing about wording B. Where the daily
+token budget cannot cover the repeats, the change waits. It does not merge on the runs that were
+affordable.
+
+*Source: GH #96, 2026-07-27: three measured wordings, a per-dimension EN/VN diagnosis on both
+regressed pairs, and the strong-case regression that a single-invocation reading would have missed.
+Landed on `main` 2026-10-06 (GH #141) when the branch that carried it was archived.*
+
+## Addendum (2026-10-06): "is this a judge change?" is now a test — GH #141
+
+### (g) Every judge change moves a hash that the suite pins
+
+Until this addendum, the gate held only if a reviewer recognised a change as a judge change, and one
+slipped through. #129 deleted `SelfCritiqueTrace` in `v0.2.0`, and the three Panel prompts, which
+embed the first-pass JSON, lost their `"self_critique":null` key. By this ADR's first sentence that
+is a prompt change. Nothing noticed it.
+
+`interview_coach.judge_lock` computes a **judge fingerprint**: the sha256 of the exact requests the
+judge would send for three canonical answers. A request means `model`, `temperature`, `messages` and
+`response_format`, built by the production client's own `request_kwargs`. The three answers between
+them walk every request path `evaluate` has: the first pass, the evidence and weak-delivery repairs,
+and the Panel's skeptic, advocate and verdict. Scripted replies stand in for the provider.
+`judge.lock` pins the fingerprint, and `tests/test_judge_lock.py` fails when the code's fingerprint
+differs. A refactor that sends the same bytes passes. A change to a prompt, an anchor, the schema,
+the escalation policy, the model, the temperature or the endpoint fails, and the failure message
+names the procedure.
+
+1. **A red `test_judge_lock` is this ADR's gate, not a test to update.** The lock moves only together
+   with a confirm-bench artifact (k=3, repeated per (f)) that carries the new fingerprint. `coach
+   bench` prints the fingerprint, says whether it matches the lock, and stamps it into the report.
+2. **The lock pins what the code builds**: the bench-validated triple at the default temperature. An env
+   override (`ROLE_JUDGE_TEMPERATURE`, `LLM_TEMPERATURE`) gives a different fingerprint in the bench
+   report, and that is how a run on a non-default configuration shows it cannot be the lock's artifact.
+3. **A measured baseline is not a green one.** The lock's first baseline is the 2026-09-15 artifact, RED
+   at 34/35, and #96 owns the red case. Fixing that case is a judge change like any other.
+4. **The fingerprint covers requests, not replies.** Provider-side drift inside a pinned model id is
+   invisible to it. The 2026-09-15 red case moved with no code change (see that artifact's commit,
+   `df45374`). Only re-running the bench sees that kind of drift.
+
+*Source: GH #141, 2026-10-06. Recomputed at `df45374`, the code the 2026-09-15 bench ran, the
+fingerprint differs from `main`'s only by the `self_critique` key above. That run never escalated
+(105 calls = 35 cases × 3 sweeps), so every request it sent is byte-identical to what `main` sends.*
+
+## Addendum (2026-10-06b): screen a wording, confirm the survivor — GH #145
+
+### (h) Two speeds, and only one of them is a gate
+
+A full confirm run costs ~181–207k tokens per k=3 invocation, and (f) requires several invocations
+per wording. All of that is **judge** spend: `coach bench` scores fixed, hand-labelled answers and
+generates nothing. A cheaper candidate cannot make it cheaper. Filtering by dimension does not help
+either, because every case weights `depth` and `system_thinking`.
+
+What does help is spending the full price only on a wording that has already survived a cheap look:
+
+- **Screen**: `coach bench --only <case_id|paired_id> ...` runs a chosen subset (~10 cases) and asks
+  the budget rail for that share only. Pick the **target pairs** (the red case, the pair the wording
+  is meant to fix) plus **edge sentinels**: cases whose runs straddle a band edge (the `⚠` rows) and
+  strong cases that drifted under an earlier unscoped clause (see (e)). A screen answers two
+  questions: did the fix work, and did it leak? The report is marked `**SCREEN**` and is written to
+  the gitignored `logs/`.
+- **Confirm**: the full set, median-of-k=3, repeated per (f). Only a confirm run counts as gate
+  evidence.
+
+Rule: **a screen is never gate evidence.** It does not count toward (f)'s repeated invocations, and
+`judge.lock` may not point at one, which `tests/test_judge_lock.py` enforces. A wording that fails its
+screen never reaches the confirm stage. Three wordings screened with one confirmed cost about 0.8M
+tokens; confirming all three costs about 1.8M.
+
+*Source: GH #145, 2026-10-06. The earlier plan to cut this cost with a local simulated candidate
+assumed the bench generates answers; it does not (`bench._evaluate_case` → `evaluate`). That lever
+belongs to the replay bench (#146).*

@@ -14,11 +14,12 @@ JSON tool-plan fallback exists only for non-native test/dummy clients.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, cast
 
 from pydantic import BaseModel, Field, field_validator
 
+from . import telemetry
 from .concepts import ConceptLookup, ConceptStore, lookup_concept, seed_concept_store
 from .evaluator import Evaluation
 from .language import answer_is_english
@@ -152,6 +153,17 @@ def _format_assessment(evaluation: Evaluation) -> str:
     return "\n".join(lines)
 
 
+def _asked_block(asked: Sequence[str]) -> str:
+    """Follow-ups already asked in this exchange (#132), so the next one is not a repeat of them.
+
+    Empty for the first follow-up, so that prompt is byte-identical to what it was before the guard.
+    """
+    if not asked:
+        return ""
+    listed = "\n".join(f"- {question}" for question in asked)
+    return f"FOLLOW-UPS ALREADY ASKED IN THIS EXCHANGE (do not repeat any of them):\n{listed}\n\n"
+
+
 def _build_tool_messages(
     original_question: str,
     answer: str,
@@ -178,9 +190,11 @@ def _build_follow_up_messages(
     evaluation: Evaluation,
     lookup: ConceptLookup,
     language_mode: str = "en",
+    asked: Sequence[str] = (),
 ) -> list[Message]:
     user = (
         f"ORIGINAL QUESTION:\n{original_question}\n\n"
+        f"{_asked_block(asked)}"
         f"CANDIDATE'S LATEST ANSWER:\n{answer}\n\n"
         f"EVALUATOR'S ASSESSMENT (weakest dimensions first):\n{_format_assessment(evaluation)}\n\n"
         f"RETRIEVED CONCEPT NOTE FROM lookup_concept:\n{lookup.render()}\n\n"
@@ -208,6 +222,7 @@ def _make_validators(
     original_question: str,
     get_lookup: Callable[[], ConceptLookup | None],
     language_mode: str = "en",
+    asked: Sequence[str] = (),
 ) -> list[Validator]:
     """Quality gates a generated Follow-up must clear (the chat_json retry self-corrects on failure).
 
@@ -219,14 +234,21 @@ def _make_validators(
     touching the micro-loop's control flow — the loop only ever calls :func:`generate_follow_up`.
     """
     target = _normalize(original_question)
+    earlier = {_normalize(question) for question in asked}
 
     def reject_reask(fu: FollowUp) -> None:
         # A Follow-up that just restates the question is answerable by repeating the original answer,
         # which the acceptance criterion forbids.
-        if _normalize(fu.question) == target:
+        question = _normalize(fu.question)
+        if question == target:
             raise ValueError(
                 "the follow-up just re-asks the original question — it must probe the specific gap "
                 "and must not be answerable by repeating the original answer"
+            )
+        # #132: comparing against the seed alone let turn 3 or 4 repeat turn 2 word for word.
+        if question in earlier:
+            raise ValueError(
+                "the follow-up repeats one already asked in this exchange — probe a gap those questions did not cover"
             )
 
     def require_grounding(fu: FollowUp) -> None:
@@ -315,9 +337,11 @@ def _build_native_user(
     evaluation: Evaluation,
     skill: str | None,
     language_mode: str = "en",
+    asked: Sequence[str] = (),
 ) -> str:
     return (
         f"ORIGINAL QUESTION:\n{original_question}\n\n"
+        f"{_asked_block(asked)}"
         f"TARGET SKILL:\n{skill or 'unknown'}\n\n"
         f"CANDIDATE'S LATEST ANSWER:\n{answer}\n\n"
         f"EVALUATOR'S ASSESSMENT (weakest dimensions first):\n{_format_assessment(evaluation)}\n\n"
@@ -376,6 +400,7 @@ def _native_follow_up_attempt(
     skill: str | None,
     store: ConceptStore,
     language_mode: str = "en",
+    asked: Sequence[str] = (),
 ) -> FollowUp:
     """One lookup_concept tool round-trip.
 
@@ -415,15 +440,17 @@ def _native_follow_up_attempt(
         response_model=FollowUp,
         final_instruction=_NATIVE_FINAL_INSTRUCTION,
         validators=_make_validators(
-            original_question, lambda: cast("ConceptLookup | None", captured.get("lookup")), language_mode
+            original_question, lambda: cast("ConceptLookup | None", captured.get("lookup")), language_mode, asked
         ),
         tool_choice={"type": "function", "function": {"name": "lookup_concept"}},
         max_retries=1,
     )
     concept_miss = captured.get("concept_miss")
-    if concept_miss is not None:
+    if concept_miss is not None and not isinstance(captured.get("lookup"), ConceptLookup):
         # The tool ran but no note matched; degrade (after the round-trip, so the router never saw an
         # exception) to resolving the question without a follow-up rather than crashing the Session.
+        # Only when NO lookup succeeded (#132): one turn may call the tool more than once, and a hit
+        # that came after a miss used to be thrown away because the miss was never cleared.
         raise FollowUpUnavailable(
             f"no concept note matched lookup_concept for skill={skill!r}; resolving the question "
             f"without a follow-up. Last error: {concept_miss}"
@@ -462,6 +489,7 @@ def _generate_follow_up_native(
     skill: str | None,
     store: ConceptStore,
     language_mode: str = "en",
+    asked: Sequence[str] = (),
 ) -> FollowUp:
     """Generate a Follow-up via a real provider-level tool call (one lookup_concept round-trip).
 
@@ -478,7 +506,7 @@ def _generate_follow_up_native(
         {"role": "system", "content": NATIVE_TOOL_SYSTEM_PROMPT},
         {
             "role": "user",
-            "content": _build_native_user(original_question, answer, evaluation, skill, language_mode),
+            "content": _build_native_user(original_question, answer, evaluation, skill, language_mode, asked),
         },
     ]
     last_error: UnknownToolCall | None = None
@@ -491,6 +519,7 @@ def _generate_follow_up_native(
                 skill=skill,
                 store=store,
                 language_mode=language_mode,
+                asked=asked,
             )
         except UnknownToolCall as err:
             last_error = err
@@ -516,6 +545,7 @@ def _generate_follow_up_json(
     skill: str | None,
     store: ConceptStore,
     language_mode: str = "en",
+    asked: Sequence[str] = (),
 ) -> FollowUp:
     """Generate a Follow-up by emulating the tool call as two JSON turns (no native function-calling).
 
@@ -544,9 +574,9 @@ def _generate_follow_up_json(
             f"question without a follow-up. Last error: {err}"
         ) from err
     follow_up = client.chat_json(
-        _build_follow_up_messages(original_question, answer, evaluation, lookup, language_mode),
+        _build_follow_up_messages(original_question, answer, evaluation, lookup, language_mode, asked),
         FollowUp,
-        validators=_make_validators(original_question, lambda: lookup, language_mode),
+        validators=_make_validators(original_question, lambda: lookup, language_mode, asked),
         max_retries=1,
     )
     follow_up = follow_up.model_copy(
@@ -568,6 +598,7 @@ def _generate_follow_up_json(
     return follow_up
 
 
+@telemetry.traced_role("interviewer")
 def generate_follow_up(
     client: LLMClient,
     *,
@@ -577,8 +608,12 @@ def generate_follow_up(
     skill: str | None = None,
     concept_store: ConceptStore | None = None,
     language_mode: str = "en",
+    asked: Sequence[str] = (),
 ) -> FollowUp:
     """Generate one grounded Follow-up using the Interviewer's lookup_concept tool.
+
+    ``asked`` holds the follow-ups already asked in this exchange (#132). The prompt lists them and
+    the re-ask validator rejects a repeat of any of them, as it always did for the seed question.
 
     Uses a real provider-level tool call when the client supports it. Clients with no native tool
     interface can still use the JSON tool-plan path for offline fakes, but a native-tool provider
@@ -598,6 +633,7 @@ def generate_follow_up(
                 skill=skill,
                 store=store,
                 language_mode=language_mode,
+                asked=asked,
             )
         return _generate_follow_up_json(
             client,
@@ -607,6 +643,7 @@ def generate_follow_up(
             skill=skill,
             store=store,
             language_mode=language_mode,
+            asked=asked,
         )
     except StructuredOutputError as err:
         # A follow-up that persistently fails its quality validators (re-ask, grounding, or the
@@ -637,6 +674,7 @@ SEED_RENDER_SYSTEM_PROMPT = (
 _SEED_RENDER_SCHEMA_HINT = '{"question": "<the question in the session language>"}'
 
 
+@telemetry.traced_role("interviewer")
 def render_seed_question(client: LLMClient, question: str, language_mode: str = "en") -> str:
     """Re-voice a bank question for a vn/mixed Session; ``en`` passes through with no LLM call.
 

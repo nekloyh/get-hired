@@ -31,6 +31,7 @@ from .usage import (
     AccountingUnavailable,
     ProviderQuotaExhausted,
     accounting_gate,
+    current_session_id,
     record_quota_exhausted,
     record_unmeasured_call,
     record_usage,
@@ -444,15 +445,20 @@ class _OpenAICompatibleClient(LLMClient):
             )
         return self._client
 
-    def _create(
+    def request_kwargs(
         self,
         messages: Sequence[Message],
         *,
         response_format: ResponseFormat | None = None,
         tools: Sequence[ToolSpec] | None = None,
         tool_choice: Any = None,
-    ) -> Any:
-        """Issue one completion and return the raw assistant message (content and/or tool_calls)."""
+    ) -> dict[str, Any]:
+        """The exact keyword arguments one ``chat.completions.create`` call receives.
+
+        Split out of :meth:`_create` so that the judge fingerprint (``judge_lock``, #141) hashes the
+        request this client would really send, without sending it. Whatever is added here reaches
+        both the wire and the fingerprint.
+        """
         kwargs: dict[str, Any] = {
             "model": self._settings.model,
             "messages": list(messages),
@@ -464,6 +470,18 @@ class _OpenAICompatibleClient(LLMClient):
             kwargs["tools"] = list(tools)
             if tool_choice is not None:
                 kwargs["tool_choice"] = tool_choice
+        return kwargs
+
+    def _create(
+        self,
+        messages: Sequence[Message],
+        *,
+        response_format: ResponseFormat | None = None,
+        tools: Sequence[ToolSpec] | None = None,
+        tool_choice: Any = None,
+    ) -> Any:
+        """Issue one completion and return the raw assistant message (content and/or tool_calls)."""
+        kwargs = self.request_kwargs(messages, response_format=response_format, tools=tools, tool_choice=tool_choice)
         # The last point at which this call can still be NOT made (M0a / F1). Every client here is a
         # metered one by construction — demo mode is a different class and never reaches this — so
         # "accounting is broken" and "make a paid call anyway" must not both be true. Checked per
@@ -523,8 +541,10 @@ class _OpenAICompatibleClient(LLMClient):
         used = getattr(completion, "usage", None)
         telemetry.incr(LLM_CALL_KEY)
         telemetry.incr(f"{LLM_CALL_PROVIDER_PREFIX}{self.provider_name}")
+        # #144: who made the call. Appended after `outcome=` so every existing grep still matches.
+        who = telemetry.trace_fields()
         logger.info(
-            "%s provider=%s model=%s ms=%.0f prompt=%d completion=%d outcome=%s",
+            "%s provider=%s model=%s ms=%.0f prompt=%d completion=%d outcome=%s session=%s question=%s turn=%s role=%s",
             CALL_LOG_PREFIX,
             self.provider_name,
             self._settings.model,
@@ -532,6 +552,10 @@ class _OpenAICompatibleClient(LLMClient):
             getattr(used, "prompt_tokens", 0) or 0,
             getattr(used, "completion_tokens", 0) or 0,
             outcome,
+            current_session_id() or "-",
+            who.get("question", "-"),
+            who.get("turn", "-"),
+            who.get("role", "-"),
         )
 
     def _is_billed(self) -> bool:

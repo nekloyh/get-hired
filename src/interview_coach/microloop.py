@@ -231,10 +231,12 @@ def run_micro_loop(
     interviewer = interviewer_client if interviewer_client is not None else client
 
     turns: list[Turn] = []
-    question = render_seed_question(interviewer, seed.question, language_mode)
+    with telemetry.trace_scope(turn=1):
+        question = render_seed_question(interviewer, seed.question, language_mode)
     is_follow_up = False
     grounding_concept_id: str | None = None
     grounding_concept_title: str | None = None
+    asked: list[str] = []  # follow-ups already put to the Candidate in this exchange (#132)
     # One committee per question, not per turn: every turn of a collapsing exchange re-triggering
     # the panel would pay 3 extra calls each time — the budget is the free-tier cost rail.
     panel_budget = PanelBudget.per_question()
@@ -243,7 +245,10 @@ def run_micro_loop(
         calls_before = telemetry.snapshot()
         answer = candidate.answer(question)
         rubric = rubric_with_delivery(seed.rubric, language_mode, answer)
-        evaluation = evaluate(client, question, answer, rubric, language_mode=language_mode, panel_budget=panel_budget)
+        with telemetry.trace_scope(turn=len(turns) + 1):  # #144: the turn this judgment scores
+            evaluation = evaluate(
+                client, question, answer, rubric, language_mode=language_mode, panel_budget=panel_budget
+            )
         llm_calls, llm_calls_by_provider = call_counts(calls_before, telemetry.snapshot())
         turn = Turn(
             question=question,
@@ -282,15 +287,17 @@ def run_micro_loop(
             break
 
         try:
-            follow_up = generate_follow_up(
-                interviewer,
-                original_question=seed.question,
-                answer=answer,
-                evaluation=evaluation,
-                skill=seed.skill,
-                concept_store=concept_store,
-                language_mode=language_mode,
-            )
+            with telemetry.trace_scope(turn=len(turns) + 1):  # the follow-up to this turn's answer
+                follow_up = generate_follow_up(
+                    interviewer,
+                    original_question=seed.question,
+                    answer=answer,
+                    evaluation=evaluation,
+                    skill=seed.skill,
+                    concept_store=concept_store,
+                    language_mode=language_mode,
+                    asked=tuple(asked),
+                )
         except FollowUpUnavailable as err:
             # The Evaluator wanted a follow-up but the Interviewer could not produce one (a persistent
             # malformed tool call survived its retry). Resolve with the last score rather than letting
@@ -320,6 +327,7 @@ def run_micro_loop(
             )
         )
         question = follow_up.question
+        asked.append(question)
         is_follow_up = True
         grounding_concept_id = follow_up.concept_id
         grounding_concept_title = follow_up.concept_title

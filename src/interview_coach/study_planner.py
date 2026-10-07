@@ -14,6 +14,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from . import telemetry
 from .language import DEFAULT_LANGUAGE_MODE
 from .llm import LLMClient, Message, Validator
 from .resources import (
@@ -166,6 +167,7 @@ _STUDY_PLAN_SCHEMA_HINT = (
 )
 
 
+@telemetry.traced_role("planner")
 def plan_study(
     client: LLMClient,
     session_state: Mapping[str, Any],

@@ -253,7 +253,23 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     bench_parser.add_argument(
-        "--out", default="", help="Report output path (default: docs/audits/calibration-bench-<date>.md)."
+        "--out",
+        default="",
+        help=(
+            "Report output path (default: docs/audits/calibration-bench-<date>.md, or "
+            "logs/bench-screen-<date>.md for a --only screen)."
+        ),
+    )
+    bench_parser.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="CASE_OR_PAIR",
+        help=(
+            "SCREEN a judge wording on these case_ids or paired_ids only (repeatable). The report is "
+            "marked SCREEN and is never gate evidence (ADR 0009 addendum h): confirm the wording that "
+            "survives on all cases."
+        ),
     )
     bench_parser.add_argument(
         "--ignore-budget",
