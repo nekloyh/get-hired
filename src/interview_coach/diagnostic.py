@@ -14,6 +14,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
+from . import telemetry
 from .llm import LLMClient, Message, Validator
 from .skill import SkillState
 from .usage import AccountingUnavailable, ProviderQuotaExhausted
@@ -179,6 +180,7 @@ _DIAGNOSTIC_SCHEMA_HINT = (
 )
 
 
+@telemetry.traced_role("diagnostic")
 def diagnose(
     profile: CandidateProfile,
     client: LLMClient | None = None,

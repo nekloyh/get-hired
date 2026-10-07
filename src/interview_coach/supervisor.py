@@ -20,6 +20,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 
+from . import telemetry
 from .concepts import ConceptStore
 from .diagnostic import SKILLS, DiagnosticResult
 from .language import DEFAULT_LANGUAGE_MODE, validate_language_mode
@@ -283,16 +284,18 @@ def build_session_graph(
                 if max_turns_per_question is not None
                 else (DEFAULT_MAX_TURNS if candidate_factory is not None else len(seed.answers))
             )
-            result = run_micro_loop(
-                roles.judge,
-                seed,
-                candidate,
-                before,
-                max_turns=max_turns,
-                concept_store=concept_store,
-                language_mode=state.get("language_mode", DEFAULT_LANGUAGE_MODE),
-                interviewer_client=roles.interviewer,
-            )
+            # #144: every call this question makes is traced as question N (1-based).
+            with telemetry.trace_scope(question=state.get("question_count", 0) + 1):
+                result = run_micro_loop(
+                    roles.judge,
+                    seed,
+                    candidate,
+                    before,
+                    max_turns=max_turns,
+                    concept_store=concept_store,
+                    language_mode=state.get("language_mode", DEFAULT_LANGUAGE_MODE),
+                    interviewer_client=roles.interviewer,
+                )
         except CandidateIntent:
             # ADR 0005 / issue 0018: the Candidate asked to stop (EOF/Ctrl-D, a web cancel/disconnect,
             # or a scripted Candidate with nothing left to say). Intent is not an infrastructure
@@ -398,6 +401,7 @@ def build_session_graph(
     return graph.compile(checkpointer=checkpointer)
 
 
+@telemetry.traced_role("supervisor")
 def decide_next_move(
     client: LLMClient,
     state: SessionState,

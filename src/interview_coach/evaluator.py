@@ -860,6 +860,7 @@ def _finalize(
     )
 
 
+@telemetry.traced_role("judge")
 def evaluate(
     client: LLMClient,
     question: str,

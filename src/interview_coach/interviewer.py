@@ -19,6 +19,7 @@ from typing import Any, cast
 
 from pydantic import BaseModel, Field, field_validator
 
+from . import telemetry
 from .concepts import ConceptLookup, ConceptStore, lookup_concept, seed_concept_store
 from .evaluator import Evaluation
 from .language import answer_is_english
@@ -597,6 +598,7 @@ def _generate_follow_up_json(
     return follow_up
 
 
+@telemetry.traced_role("interviewer")
 def generate_follow_up(
     client: LLMClient,
     *,
@@ -672,6 +674,7 @@ SEED_RENDER_SYSTEM_PROMPT = (
 _SEED_RENDER_SCHEMA_HINT = '{"question": "<the question in the session language>"}'
 
 
+@telemetry.traced_role("interviewer")
 def render_seed_question(client: LLMClient, question: str, language_mode: str = "en") -> str:
     """Re-voice a bank question for a vn/mixed Session; ``en`` passes through with no LLM call.
 
