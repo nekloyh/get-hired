@@ -18,6 +18,7 @@ from interview_coach.bench import (
     repeatability_rows,
     repeatability_warnings,
     run_bench,
+    select_cases,
     weak_strong_separation,
 )
 from interview_coach.evaluator import JUDGE_MAX_RETRIES, DimensionScore, Evaluation
@@ -703,3 +704,73 @@ def test_ignore_budget_cannot_override_a_broken_ledger(tmp_path, monkeypatch, ma
     monkeypatch.setattr(cli, "run_bench", lambda *a, **kw: pytest.fail("must not spend"))
 
     assert cli.main(["bench", "--k", "1", "--ignore-budget", "--out", str(tmp_path / "r.md")]) == 2
+
+
+# --- #145: screen a wording cheaply, confirm on the full set ---------------------------------------
+
+
+def test_select_cases_takes_case_ids_and_whole_pairs():
+    cases = (_case("a_en", paired_id="a"), _case("a_vi", paired_id="a", language="vi"), _case("b_en", paired_id="b"))
+    assert [c.case_id for c in select_cases(cases, [])] == ["a_en", "a_vi", "b_en"]
+    assert [c.case_id for c in select_cases(cases, ["a"])] == ["a_en", "a_vi"]
+    assert [c.case_id for c in select_cases(cases, ["b_en", "a_vi"])] == ["a_vi", "b_en"]
+
+
+def test_select_cases_refuses_a_name_that_matches_nothing():
+    # A typo must not silently screen fewer cases: "the fix leaked nowhere" would be read off a screen
+    # that never ran its target pair.
+    with pytest.raises(ValueError, match="no bench case_id or paired_id: \\['a_ne'\\]"):
+        select_cases((_case("a_en", paired_id="a"),), ["a_ne"])
+
+
+def test_a_screen_report_says_it_is_not_gate_evidence():
+    report = render_bench_report([], screen=["vnlp_segmentation_weak", "panel_sd_retry_storm"])
+    assert "- Mode: **SCREEN**, `--only vnlp_segmentation_weak panel_sd_retry_storm`." in report
+    assert "SCREEN" not in render_bench_report([])
+
+
+def _screen_cli(monkeypatch, make_client):
+    client, _ = make_client([])
+    monkeypatch.setattr(cli, "load_settings", _cli_settings)
+    monkeypatch.setattr(cli, "build_client", lambda settings: client)
+    ran: list[list[str]] = []
+    monkeypatch.setattr(cli, "run_bench", lambda judge, cases, *, k=1: ran.append([c.case_id for c in cases]) or [])
+    return ran
+
+
+def test_coach_bench_only_runs_the_screen_and_files_it_outside_docs_audits(monkeypatch, make_client, tmp_path, capsys):
+    ran = _screen_cli(monkeypatch, make_client)
+    monkeypatch.chdir(tmp_path)  # the default path is relative; keep the test out of the real logs/
+
+    cli.main(["bench", "--k", "1", "--ignore-budget", "--only", "vnlp_segmentation_weak"])
+
+    assert ran == [["vnlp_segmentation_weak_en", "vnlp_segmentation_weak_vi"]]
+    assert "SCREEN: 2 of 35 cases" in capsys.readouterr().out
+    reports = list((tmp_path / "logs").glob("bench-screen-*.md"))
+    assert len(reports) == 1 and "**SCREEN**" in reports[0].read_text(encoding="utf-8")
+    assert not (tmp_path / "docs").exists()
+
+
+def test_coach_bench_refuses_an_unknown_screen_name_before_spending(monkeypatch, make_client, tmp_path, capsys):
+    ran = _screen_cli(monkeypatch, make_client)
+    out = tmp_path / "r.md"
+
+    rc = cli.main(["bench", "--k", "1", "--ignore-budget", "--only", "vnlp_segmentaton_weak", "--out", str(out)])
+
+    assert rc == 2 and ran == [] and not out.exists()
+    assert "vnlp_segmentaton_weak" in capsys.readouterr().err
+
+
+def test_a_screen_asks_the_budget_rail_for_its_share_not_a_full_pass(monkeypatch, make_client, tmp_path):
+    _screen_cli(monkeypatch, make_client)
+    monkeypatch.chdir(tmp_path)  # both runs write a report to a relative default path
+    asked: list[int] = []
+    monkeypatch.setattr(
+        cli, "_refuse_metered_start", lambda judge, *, work, needed, allow_overspend, hint: asked.append(needed)
+    )
+
+    cli.main(["bench", "--k", "3", "--only", "vnlp_segmentation_weak"])
+    cli.main(["bench", "--k", "3"])
+
+    full = cli.BENCH_MIN_BUDGET_TOKENS_PER_PASS * 3
+    assert asked == [-(-full * 2 // 35), full]

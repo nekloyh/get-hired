@@ -28,6 +28,7 @@ from .bench import (
     render_bench_report,
     repeatability_warnings,
     run_bench,
+    select_cases,
 )
 from .cli_parser import build_parser
 from .cli_session import _print_study_plan
@@ -336,10 +337,18 @@ def _cmd_bench(client: ClientArg, args: argparse.Namespace) -> int:
     judge = roles.judge
     provider = provider_label(judge)
     k = max(1, int(args.k))
+    data = load_bench_data(args.cases or None)
+    only = list(getattr(args, "only", None) or [])
+    try:
+        cases = select_cases(data.cases, only)
+    except ValueError as err:
+        print(f"Refusing to run `coach bench`: {err}", file=sys.stderr)
+        return 2
     budget = daily_token_budget()
     usage_before = usage_for_day()
     left = max(0, budget - usage_before.get(provider, {}).get("total", 0))
-    needed = BENCH_MIN_BUDGET_TOKENS_PER_PASS * k
+    # A screen spends in proportion to the cases it runs (#145); the full set needs the full pass.
+    needed = -(-BENCH_MIN_BUDGET_TOKENS_PER_PASS * k * len(cases) // max(1, len(data.cases)))
     print(f"Daily budget check ({provider}): ~{left:,} of {budget:,} tokens left by our count.")
     if refusal := _refuse_metered_start(
         judge,
@@ -371,10 +380,11 @@ def _cmd_bench(client: ClientArg, args: argparse.Namespace) -> int:
             verdict = "DIFFERS from judge.lock: this run measures a judge change"
         print(f"Judge fingerprint {fingerprint} ({verdict}).")
     telemetry_before = telemetry.snapshot()
-    data = load_bench_data(args.cases or None)
+    if only:
+        print(f"SCREEN: {len(cases)} of {len(data.cases)} cases. Not gate evidence (ADR 0009 addendum h).")
     if k > 1:
-        print(f"Running {k} sweeps of {len(data.cases)} cases (gate = median-of-k, ADR 0009d)...")
-    results = run_bench(judge, data.cases, k=k)
+        print(f"Running {k} sweeps of {len(cases)} cases (gate = median-of-k, ADR 0009d)...")
+    results = run_bench(judge, cases, k=k)
     telemetry_after = telemetry.snapshot()
     usage_after = usage_for_day()
     run_usage = _usage_delta(usage_before, usage_after)
@@ -387,8 +397,15 @@ def _cmd_bench(client: ClientArg, args: argparse.Namespace) -> int:
         telemetry_delta=telemetry.delta(telemetry_before, telemetry_after),
         token_usage=run_usage,
         judge_fingerprint=fingerprint,
+        screen=only,
     )
-    out = Path(args.out) if args.out else Path("docs/audits") / f"calibration-bench-{utc_date()}.md"
+    # A screen is iteration, not a record: by default it lands in the gitignored logs/, not docs/audits/.
+    default_out = (
+        Path("logs") / f"bench-screen-{utc_date()}.md"
+        if only
+        else Path("docs/audits") / f"calibration-bench-{utc_date()}.md"
+    )
+    out = Path(args.out) if args.out else default_out
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(report, encoding="utf-8")
     within = sum(1 for r in results if r.within_band)

@@ -184,6 +184,22 @@ def load_bench_data(path: str | Path | None = None) -> BenchData:
     return BenchData(cases=cases, anchors=anchors)
 
 
+def select_cases(cases: Sequence[BenchCase], only: Sequence[str]) -> tuple[BenchCase, ...]:
+    """The screen subset (#145): every case whose ``case_id`` or ``paired_id`` is named in ``only``.
+
+    Empty ``only`` means the full set. A name that matches nothing raises: a typo would otherwise
+    screen fewer cases than the operator believes, and a screen that silently skipped its target
+    pair would read as "the fix leaked nowhere".
+    """
+    if not only:
+        return tuple(cases)
+    wanted = set(only)
+    known = {case.case_id for case in cases} | {case.paired_id for case in cases}
+    if unknown := sorted(wanted - known):
+        raise ValueError(f"--only names no bench case_id or paired_id: {unknown}")
+    return tuple(case for case in cases if case.case_id in wanted or case.paired_id in wanted)
+
+
 def _evaluate_case(client: LLMClient, case: BenchCase) -> tuple[Evaluation | None, str | None]:
     """One judgment attempt: the evaluation, or the provider/schema failure that replaced it."""
     try:
@@ -480,11 +496,13 @@ def render_bench_report(
     telemetry_delta: Mapping[str, int] | None = None,
     token_usage: Mapping[str, Mapping[str, int]] | None = None,
     judge_fingerprint: str | None = None,
+    screen: Sequence[str] = (),
 ) -> str:
     """Render the full Markdown calibration report written into docs/audits/.
 
     ``judge_fingerprint`` (#141) names the exact judge configuration measured. ``judge.lock`` may point
-    only at a report whose stamp matches the code it locks.
+    only at a report whose stamp matches the code it locks. ``screen`` (#145) is the ``--only`` filter
+    of a SCREEN run, which the header says can never be gate evidence.
     """
     total = len(results)
     passed = sum(1 for r in results if r.within_band)
@@ -495,6 +513,14 @@ def render_bench_report(
         f"- Date: `{date}`",
         f"- Provider / model: `{provider}` / `{model}`",
         *([f"- Judge fingerprint: `{judge_fingerprint}` (#141)"] if judge_fingerprint else []),
+        *(
+            [
+                f"- Mode: **SCREEN**, `--only {' '.join(screen)}`. Never gate evidence (ADR 0009 addendum h): "
+                "confirm the surviving wording on every case before it can merge."
+            ]
+            if screen
+            else []
+        ),
         f"- Gate: **median-of-k, k={k}** (ADR 0009 addendum d)" if k > 1 else "- Gate: single run (k=1)",
         f"- Cases within band: **{passed}/{total}**",
         "",

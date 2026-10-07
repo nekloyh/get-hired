@@ -46,6 +46,10 @@ Every PR that changes behaviour, a command or a document's location adds a line 
   prints the fingerprint, says whether it matches the lock, and stamps it into the report. It found
   one judge change that had shipped unbenched: #129 removed `"self_critique":null` from the three
   Panel prompts in 0.2.0. The 2026-09-15 bench never escalated, so its measurement still holds.
+- **`coach bench --only <case_id|paired_id>`** screens a judge wording on a subset ([#145]). The
+  budget rail asks for that share only; the report is marked **SCREEN**, goes to the gitignored
+  `logs/`, and can never be the artifact `judge.lock` points at (ADR 0009 addendum h). An unknown
+  name refuses (exit 2) instead of silently screening less.
 - **ADR 0009 addenda (e) and (f) are on `main`** ([#141]). They were cited as binding but existed only
   on the unmerged #96 branch. Addendum (g) records the lock.
 - **`scripts/release.sh`**: `prepare <ver>` edits only version fields (`pyproject.toml`, `uv.lock`,
