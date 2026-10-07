@@ -479,8 +479,13 @@ def render_bench_report(
     date: str = "unknown",
     telemetry_delta: Mapping[str, int] | None = None,
     token_usage: Mapping[str, Mapping[str, int]] | None = None,
+    judge_fingerprint: str | None = None,
 ) -> str:
-    """Render the full Markdown calibration report written into docs/audits/."""
+    """Render the full Markdown calibration report written into docs/audits/.
+
+    ``judge_fingerprint`` (#141) names the exact judge configuration measured. ``judge.lock`` may point
+    only at a report whose stamp matches the code it locks.
+    """
     total = len(results)
     passed = sum(1 for r in results if r.within_band)
     k = max((len(r.scores) + r.errored_runs for r in results), default=1)
@@ -489,6 +494,7 @@ def render_bench_report(
         "",
         f"- Date: `{date}`",
         f"- Provider / model: `{provider}` / `{model}`",
+        *([f"- Judge fingerprint: `{judge_fingerprint}` (#141)"] if judge_fingerprint else []),
         f"- Gate: **median-of-k, k={k}** (ADR 0009 addendum d)" if k > 1 else "- Gate: single run (k=1)",
         f"- Cases within band: **{passed}/{total}**",
         "",

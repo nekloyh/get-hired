@@ -40,11 +40,20 @@ Every PR that changes behaviour, a command or a document's location adds a line 
 - **CI runs every Monday** and on demand (`workflow_dispatch`), so a pause cannot hide a calendar,
   toolchain or dependency break ([#138]). GitHub disables a public repo's schedule after 60 days with no
   activity. Dependabot alerts and security fixes are on; version-update PRs are not.
+- **A judge fingerprint and `judge.lock`** ([#141]): a sha256 of the exact requests the judge would send
+  for three canonical answers covering every `evaluate` request path. `tests/test_judge_lock.py` fails on
+  any prompt, anchor, schema, escalation-policy, model, temperature or endpoint change. `coach bench`
+  prints the fingerprint, says whether it matches the lock, and stamps it into the report. It found
+  one judge change that had shipped unbenched: #129 removed `"self_critique":null` from the three
+  Panel prompts in 0.2.0. The 2026-09-15 bench never escalated, so its measurement still holds.
+- **ADR 0009 addenda (e) and (f) are on `main`** ([#141]). They were cited as binding but existed only
+  on the unmerged #96 branch. Addendum (g) records the lock.
 - **`scripts/release.sh`**: `prepare <ver>` edits only `pyproject.toml`, `uv.lock` and this file;
   `tag <ver>` gates, tags and pushes the tag in the same step ([#140]).
 
 [#138]: https://github.com/nekloyh/get-hired/issues/138
 [#140]: https://github.com/nekloyh/get-hired/issues/140
+[#141]: https://github.com/nekloyh/get-hired/issues/141
 [#145]: https://github.com/nekloyh/get-hired/issues/145
 
 ---

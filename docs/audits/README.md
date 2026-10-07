@@ -13,12 +13,14 @@ nothing here is status. Work and its state live in the
 ## Judge calibration bench (ADR 0009)
 
 The gate is **median-of-k, k=3, at production temperature** (ADR 0009 addendum b/d). One run is not
-a measurement, and a band is never widened to turn a red green. The newest dated artifact is the
-current reading.
+a measurement, and a band is never widened to turn a red green. The baseline for the judge the code builds
+is whichever artifact [`judge.lock`](../../judge.lock) names (ADR 0009 addendum g). Every report from
+#141 on carries a `Judge fingerprint` line, which is how it is tied to the exact judge it measured.
 
 | Audit | Result | What it measured |
 |---|---|---|
 | [`calibration-bench-2026-09-15.md`](calibration-bench-2026-09-15.md) | **RED, 34/35** | the gate at `v0.1.0-pilot`. The red case is `vnlp_segmentation_weak_vi`, 2.70 against a 2.6 ceiling; its EN twin scores 2.20. That is the EN/VN split which the missing middle anchors in `depth` / `system_thinking` allow. Owned by [#96](https://github.com/nekloyh/get-hired/issues/96) |
+| [`calibration-bench-2026-07-27-anchor96.md`](calibration-bench-2026-07-27-anchor96.md) | GREEN once, never confirmed | the **unmerged** first attempt at #96 (PR #104, archived). One green invocation of its final wording; an earlier wording went 35/35, 35/35, 34/35. The evidence behind ADR 0009 addenda (e) and (f) |
 | [`calibration-bench-2026-07-27.md`](calibration-bench-2026-07-27.md) | GREEN, 35/35 | closed the 2026-07-19 AMBER gate (#92). Read it for the k=3 method |
 | [`calibration-bench-2026-07-19.md`](calibration-bench-2026-07-19.md) | AMBER | the flake that produced #92 |
 | [`calibration-bench-2026-07-11-*.md`](.) (11 files) | one per change | one for every change that touched the judge: gpt-5.4-mini cutover, re-anchor, json_schema, Panel Verdict, trust guards, bilingual mode, evidence-degrade, VN consistency (and its Groq cross-check), Panel baseline |

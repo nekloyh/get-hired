@@ -444,15 +444,20 @@ class _OpenAICompatibleClient(LLMClient):
             )
         return self._client
 
-    def _create(
+    def request_kwargs(
         self,
         messages: Sequence[Message],
         *,
         response_format: ResponseFormat | None = None,
         tools: Sequence[ToolSpec] | None = None,
         tool_choice: Any = None,
-    ) -> Any:
-        """Issue one completion and return the raw assistant message (content and/or tool_calls)."""
+    ) -> dict[str, Any]:
+        """The exact keyword arguments one ``chat.completions.create`` call receives.
+
+        Split out of :meth:`_create` so that the judge fingerprint (``judge_lock``, #141) hashes the
+        request this client would really send, without sending it. Whatever is added here reaches
+        both the wire and the fingerprint.
+        """
         kwargs: dict[str, Any] = {
             "model": self._settings.model,
             "messages": list(messages),
@@ -464,6 +469,18 @@ class _OpenAICompatibleClient(LLMClient):
             kwargs["tools"] = list(tools)
             if tool_choice is not None:
                 kwargs["tool_choice"] = tool_choice
+        return kwargs
+
+    def _create(
+        self,
+        messages: Sequence[Message],
+        *,
+        response_format: ResponseFormat | None = None,
+        tools: Sequence[ToolSpec] | None = None,
+        tool_choice: Any = None,
+    ) -> Any:
+        """Issue one completion and return the raw assistant message (content and/or tool_calls)."""
+        kwargs = self.request_kwargs(messages, response_format=response_format, tools=tools, tool_choice=tool_choice)
         # The last point at which this call can still be NOT made (M0a / F1). Every client here is a
         # metered one by construction — demo mode is a different class and never reaches this — so
         # "accounting is broken" and "make a paid call anyway" must not both be true. Checked per
