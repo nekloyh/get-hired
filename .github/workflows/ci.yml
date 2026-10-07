@@ -4,6 +4,14 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly against `main`, so a pause cannot hide rot (#138). A date-dependent test (#123's
+  # regression test) went red four days after it merged. It was found only because an unrelated
+  # merge happened to run CI (run 35494799189). GitHub DISABLES a public repo's schedule after 60
+  # days with no repository activity, so this covers short pauses only. After a long one, run it by
+  # hand: Actions → CI → Run workflow (that is what `workflow_dispatch` is for).
+  schedule:
+    - cron: "17 2 * * 1"  # Mondays 02:17 UTC = 09:17 Vietnam; off the hour, when Actions queues least
+  workflow_dispatch:
 
 jobs:
   python:
