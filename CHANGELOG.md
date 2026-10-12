@@ -19,6 +19,10 @@ Every PR that changes behaviour, a command or a document's location adds a line 
 
 ## [Unreleased]
 
+---
+
+## [0.3.0] — 2026-10-12
+
 The stable base further work starts from, and the rollback point before anything changes the
 ledgers' on-disk format ([#143]). Every check CI runs passed on a fresh clone of the code this release
 ships, and one live Session ran end-to-end on the compose stack on that same code
@@ -232,6 +236,7 @@ The first tag a trusted pilot could run against: M0a, M0b and M1 complete. Full 
 - **Full-stack nginx/TLS dry-run**, which found two defects and fixed both: WebSocket frames were
   unbounded by nginx, and nginx reported no health of its own.
 
-[Unreleased]: https://github.com/nekloyh/get-hired/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/nekloyh/get-hired/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/nekloyh/get-hired/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/nekloyh/get-hired/compare/v0.1.0-pilot...v0.2.0
 [0.1.0-pilot]: https://github.com/nekloyh/get-hired/releases/tag/v0.1.0-pilot
