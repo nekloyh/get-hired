@@ -39,6 +39,7 @@ is whichever artifact [`judge.lock`](../../judge.lock) names (ADR 0009 addendum 
 
 | Record | What it is |
 |---|---|
+| [`live-smoke-2026-10-12.md`](live-smoke-2026-10-12.md) | one live Session end-to-end on the compose stack at `830ddcf`: 26,478 tokens, 15 calls, accounting and trace attribution exact; run on dev keys, so #139 stays open |
 | [`forensic-audit-2026-09-14.md`](forensic-audit-2026-09-14.md) | the forensic audit at `2dac711` plus the uncommitted M0a work; the input the QA report checked |
 | [`qa-report-2026-09-15.md`](qa-report-2026-09-15.md) | QA of the stabilize branch: 47 findings, the M-0/M-1/M-2 task lists (`QA-NN`, `M0-NN`, `M1-NN`, `M2-N`) |
 | [`milestone-v0.1.0-pilot-2026-09-15.md`](milestone-v0.1.0-pilot-2026-09-15.md) | what `v0.1.0-pilot` shipped, the first full-stack nginx/TLS dry-run, and what that run found |
