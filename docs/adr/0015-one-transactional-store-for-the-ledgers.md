@@ -70,16 +70,28 @@ of a port of four file formats.
 
 Accept when both of these are measured and recorded under `docs/audits/`:
 
-1. **Spike: usage ledger only, behind the existing functions.** `tests/test_usage.py` passes
-   **unmodified**, including the #123 and #122-style concurrency tests. The rail read cost is
-   measured at the real 1.5k rows and at a synthetic 50k rows, against #125's extrapolation of
-   65–72 ms per scan for the JSONL.
-2. **Migration dry-run on copies of the real ledgers.** `coach usage` prints the same totals before
-   and after. Every Candidate's `load_priors` returns the same means. The legacy files survive,
-   renamed. A restore from the `.backup` file serves the same export md5 (the runbook §4 drill).
+1. **Rail cost.** Measure the rails' read cost and the per-row write cost, JSONL against an indexed
+   SQLite table, at the real 1.5k rows and at a synthetic 50k rows.
+2. **Migration dry-run on copies of the real ledgers.** Every aggregate the rails and `coach usage`
+   read must match, Python against SQL. Every Candidate's `load_priors` must be identical. The
+   inputs must be untouched. A restore through SQLite's backup API must reproduce every number.
 
 If (1) shows the indexed read is not materially cheaper, or (2) cannot reproduce today's numbers
 exactly, this stays Proposed and the files stay.
+
+*Amended 2026-10-12, before any measurement was taken.* The first version also required
+`tests/test_usage.py` to pass **unmodified** on the new backend. That cannot happen: 34 of its 82
+tests exercise the JSONL format itself (torn lines, the sidecar, mode bits), and those failure modes
+do not exist under SQLite. The requirement moves to the implementation's definition of done (#143).
+The 48 behaviour tests pass unmodified. Each format test is replaced 1:1 by a test for its SQLite
+counterpart (locked or busy database, corrupt file, full disk mid-transaction), or retired with a
+reason, and the mapping is listed in the PR. The #122/#123 race tests are ported, not dropped.
+
+**Measured 2026-10-12** ([`../audits/adr-0015-gate-2026-10-12.md`](../audits/adr-0015-gate-2026-10-12.md)):
+(1) at 50k rows one node boundary costs 276 ms with JSONL and 0.73 ms with SQLite, and writes are
+equal (≈0.01 ms per row). (2) The import passes with 0 mismatches on both real ledgers, on all 3
+Candidates' priors, on a 5,956-row edge-case ledger and on the restored backup, and the inputs are
+untouched. Both gate conditions hold. Acceptance is the maintainer's call.
 
 ## Considered Options
 
