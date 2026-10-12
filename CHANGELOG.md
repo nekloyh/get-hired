@@ -19,6 +19,16 @@ Every PR that changes behaviour, a command or a document's location adds a line 
 
 ## [Unreleased]
 
+The stable base further work starts from, and the rollback point before anything changes the
+ledgers' on-disk format ([#143]). Every check CI runs passed on a fresh clone of the code this release
+ships, and one live Session ran end-to-end on the compose stack on that same code
+([record](docs/audits/live-smoke-2026-10-12.md), [#142]).
+
+**No on-disk format changed**, so a state volume moves between 0.2.0 and 0.3.0 in either direction.
+The Skill ledger is still schema 1, usage-ledger rows are unchanged, the six serde goldens are
+byte-identical to 0.2.0's, and the checkpointer code is identical: langgraph-checkpoint-sqlite
+3.1.0 → 3.1.1 changed only its key-value Store, which this project does not use.
+
 ### Changed
 
 - **Status lives in three places only**: GitHub milestones (work), this file (what shipped) and ADR
@@ -86,14 +96,39 @@ Every PR that changes behaviour, a command or a document's location adds a line 
   *committee review skipped*, so a suppressed escalation no longer reads as a confident pass. The
   turn trace is typed (`TraceRecord`) instead of `Record<string, unknown>`.
 
+### Security
+
+- **47 Dependabot alerts are patched** ([#156]), among them anyio (critical) and starlette (high:
+  FastAPI's HTTP and WebSocket layer), plus urllib3, langsmith, langgraph-checkpoint-sqlite and
+  pydantic-settings in the image. The 15 npm alerts were all in dev tooling. **langgraph 1.2.2 →
+  1.2.13** with langgraph-sdk 0.4.4 closes one more ([#162]); it is a patch bump, not a framework move.
+- **Four chromadb alerts are dismissed, not fixed.** No patched chromadb exists, and only the optional
+  `rag` extra installs it; the image does not. Re-open them if the image ever gains `--extra rag`.
+
+### Known red
+
+- **Judge calibration bench: 34/35** ([#96]), unchanged since 0.2.0 and now pinned: `judge.lock`
+  names the bench artifact that measured the judge this release builds. The remaining EN/VN split is
+  `panel_sd_retry_storm` (|Δ| = 2.00); #96 and [#103] are the anchor fixes.
+- **The reference deployment's provider keys are dev keys** ([#139]). They were exposed before the
+  live smoke ran, so they fail pilot pre-flight line 1: rotate them before anyone else uses that
+  deployment. Keys live only in the gitignored `.env`; no key appears anywhere in this repository's
+  history.
+
+[#103]: https://github.com/nekloyh/get-hired/issues/103
 [#121]: https://github.com/nekloyh/get-hired/issues/121
 [#122]: https://github.com/nekloyh/get-hired/issues/122
 [#132]: https://github.com/nekloyh/get-hired/issues/132
 [#138]: https://github.com/nekloyh/get-hired/issues/138
+[#139]: https://github.com/nekloyh/get-hired/issues/139
 [#140]: https://github.com/nekloyh/get-hired/issues/140
 [#141]: https://github.com/nekloyh/get-hired/issues/141
+[#142]: https://github.com/nekloyh/get-hired/issues/142
+[#143]: https://github.com/nekloyh/get-hired/issues/143
 [#144]: https://github.com/nekloyh/get-hired/issues/144
 [#145]: https://github.com/nekloyh/get-hired/issues/145
+[#156]: https://github.com/nekloyh/get-hired/pull/156
+[#162]: https://github.com/nekloyh/get-hired/pull/162
 
 ---
 
