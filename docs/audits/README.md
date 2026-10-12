@@ -39,6 +39,7 @@ is whichever artifact [`judge.lock`](../../judge.lock) names (ADR 0009 addendum 
 
 | Record | What it is |
 |---|---|
+| [`adr-0015-gate-2026-10-12.md`](adr-0015-gate-2026-10-12.md) | ADR 0015's gate: rail cost JSONL vs SQLite (276 ms vs 0.73 ms per boundary at 50k rows), and a lossless migration dry-run on the real ledgers; why the "tests pass unmodified" condition was amended |
 | [`forensic-audit-2026-09-14.md`](forensic-audit-2026-09-14.md) | the forensic audit at `2dac711` plus the uncommitted M0a work; the input the QA report checked |
 | [`qa-report-2026-09-15.md`](qa-report-2026-09-15.md) | QA of the stabilize branch: 47 findings, the M-0/M-1/M-2 task lists (`QA-NN`, `M0-NN`, `M1-NN`, `M2-N`) |
 | [`milestone-v0.1.0-pilot-2026-09-15.md`](milestone-v0.1.0-pilot-2026-09-15.md) | what `v0.1.0-pilot` shipped, the first full-stack nginx/TLS dry-run, and what that run found |
