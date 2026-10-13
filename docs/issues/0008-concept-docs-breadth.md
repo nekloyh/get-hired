@@ -8,7 +8,7 @@ Grow the `concepts` collection from the seed set into real coverage across the S
 
 ## Acceptance criteria
 
-- [x] Concept coverage exists for each Skill in the taxonomy (≥2 notes per Skill; enforced by the loader)
+- [x] Concept coverage exists for each Skill in the taxonomy (≥2 notes per Skill; the loader, `bank._load_concepts`, rejects only a Skill with no note, so the depth bar is enforced by `tests/test_bank.py::test_concept_notes_cover_each_skill_in_depth`)
 - [x] Notes are short and self-contained (no chunk-splitting artifacts)
 - [x] A light set of Vietnamese-specific concept notes is included (word-seg, PhoBERT, VnCoreNLP, diacritics)
 - [x] Retrieval for a sampled set of follow-up needs returns relevant, accurate notes — review pass

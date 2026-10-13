@@ -25,6 +25,13 @@ prints a compact recap instead of replaying history.
 
 - [x] Resuming a Session after a long gap does not force-complete on the time rail; the chosen
       clock semantics are documented
+
+  > **Partial at v0.3.0:** this holds for `coach session --resume` only: `cli_session._cmd_session`
+  > resets `SessionState.started_at` on resume. The web resume path,
+  > `web_session_driver._run_session_thread(resume=True)`, streams the checkpoint without touching
+  > `started_at`, so there `max_elapsed_seconds` still measures wall-clock since Session creation and
+  > a web Session resumed after a long gap ends on the time rail.
+
 - [x] `max_elapsed_seconds` finally has a test (currently none)
 - [x] `--resume` with an unknown id exits with a clear one-line error that tells the user how to
       find valid session ids

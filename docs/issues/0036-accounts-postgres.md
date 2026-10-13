@@ -9,7 +9,7 @@
 The shared bearer token (R-07/#62) is a trusted-installation boundary, not per-Candidate identity
 or a measured capacity limit. Accounts and server-enforced ownership are mandatory before public
 launch or private histories between Candidates. They do not block personal/trusted-pilot progress
-work. See the canonical [M4 branch](README.md#m4--public-launch-branch-identity-and-operations).
+work. See M4 in the [2026-09-13 plan record](../audits/implementation-plan-2026-09-13.md#m4--public-launch-branch-identity-and-operations).
 
 The existing B2 Supabase/Postgres implementation proposal is retained below for evaluation.
 **Identity is required; this database migration is conditional.** Before implementation, record
@@ -42,8 +42,11 @@ restore evidence. SQLite itself is not the reason account authorization is missi
 
 ## Blocked by
 
-- M2 before implementation; public launch requires M3 and M4 PASS on the final routes/data model.
-- Reuse the existing R-07/#62 auth seam and R-11/#66 deployment; they are already present locally.
+- #143 (one transactional store; `docs/roadmap.md` section 1): built first, a Postgres port moves
+  one schema instead of several hand-rolled file formats. Public launch also needs the M3 and M4
+  gates of the [2026-09-13 plan record](../audits/implementation-plan-2026-09-13.md) to pass on the
+  final routes/data model.
+- Reuse the existing R-07/#62 auth seam and R-11/#66 deployment.
 - Postgres alone does not replace process-local runtime coordination. Keep the worker guard
   unless M6 independently proves cross-process ownership, routing and durability.
 

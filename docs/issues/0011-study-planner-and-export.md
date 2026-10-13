@@ -6,17 +6,25 @@
 
 The end-of-session output. When the Supervisor ends the **Session**, a Study Planner agent reads the final Skill states, retrieves matching learning materials from a Chroma `resources` collection, and produces a `StudyPlan` (prioritized topics, mapped resources, a 2-week schedule, milestones, a readiness estimate). Also add a session exporter that writes the whole run — transcript, evaluations, and the plan — to Markdown as a portfolio artifact. Resource matching is genuine semantic retrieval (a fuzzy gap → relevant materials); the planner must map to real catalog entries, not invent URLs.
 
+> **Superseded:** #130 deleted the Chroma `resources` collection (fc5b272, PR #136). Resources come from the catalog `resources.SEED_RESOURCES` through `resources.InMemoryResourceStore`, the only store `resources.build_resource_store` builds: a hard Skill filter, then ASCII-token Jaccard ranking, not semantic retrieval. The `resources` module docstring records why, and the shelf-size condition for bringing a semantic store back. The no-invented-URL guarantee is unchanged (`study_planner._validate_resource_ids`, `study_planner._materialize_study_plan`).
+
 ## Acceptance criteria
 
 - [x] At session end a schema-valid StudyPlan is produced from the final Skill states
 - [x] Prioritized topics reflect the weakest, most role-critical Skills
 - [x] Resources come from the `resources` collection (no invented URLs)
+
+  > **Superseded:** there is no `resources` collection since #130 (fc5b272, PR #136); resources come from the catalog `resources.SEED_RESOURCES`, and `study_planner._validate_resource_ids` still rejects any ID outside the retrieved catalog.
+
 - [x] The full session exports to a readable Markdown file
 
 ## Done
 
 - Added `interview_coach.resources` with seed learning materials, an in-memory test store, and a
   Chroma-backed `resources` collection using the same BGE small embedding path as concepts.
+
+  > **Superseded:** #130 deleted the Chroma half (fc5b272, PR #136); `resources.InMemoryResourceStore` is the only store.
+
 - Added `interview_coach.study_planner`: a single-shot Study Planner that ranks final Skill states
   by weakness + Role criticality, retrieves resource candidates in Python, and asks the LLM for a
   schema-valid two-week plan using only retrieved catalog IDs.
@@ -26,6 +34,8 @@ The end-of-session output. When the Supervisor ends the **Session**, a Study Pla
   artifact containing transcript, evaluations, Supervisor decisions, and the Study Plan.
 - Added `coach ingest-resources` and `coach session --resource-store chroma` support for persistent
   resource retrieval.
+
+  > **Superseded:** #130 deleted both with the Chroma store (fc5b272, PR #136), along with `--resource-store` / `--resource-persist-dir` on `coach postmortem`; `--no-seed-resources` remains on `coach session` and `coach postmortem`.
 
 ## Verified
 

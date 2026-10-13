@@ -39,10 +39,13 @@ enforce the boundary are part of this slice's DoD.
 
 ## Blocked by
 
-- [Implementation plan M2](README.md#m2--explain-and-measure-the-judge-and-the-loop): durable
-  turn/effect identity, quality and trace gates before the M3 product milestone.
-- Existing random Session IDs, shared-token/Origin checks and disk exports are implemented in
-  this checkout; preserve them and verify their integration rather than treating them as missing.
+- #127 (Skill history: one snapshot per completed Session; `docs/roadmap.md` section 1). The
+  per-Skill timeline reads it. The gates this bullet first named (durable turn/effect identity,
+  quality and trace gates before the M3 product milestone) are in
+  [M2 of the 2026-09-13 plan record](../audits/implementation-plan-2026-09-13.md#m2--explain-and-measure-the-judge-and-the-loop).
+- Random Session IDs (R-06/#61), shared-token/Origin checks (R-07/#62) and disk exports
+  (R-08/#63) exist in the code this builds on; preserve them and verify their integration rather
+  than rebuilding them.
 - **Personal/trusted pilot:** accounts/Postgres are not prerequisites. Shared-token users share
   a trust boundary; Candidate IDs are not authorization and the dashboard must not imply privacy.
 - **Public launch or private histories between Candidates:** M4 ownership authorization must
@@ -51,6 +54,6 @@ enforce the boundary are part of this slice's DoD.
 ## Status
 
 **Open in the local plan; remote status not refreshed.** Reordered 2026-09-13 from Later/Wave 3
-into [M3](README.md#m3--finish-the-repeat-practice-loop-personaltrusted-pilot). #83 remains the
+into [M3](../audits/implementation-plan-2026-09-13.md#m3--finish-the-repeat-practice-loop-personaltrusted-pilot). #83 remains the
 tracker. The M3 quality gate includes the retry entry point, two-Session flow, truthful progress,
 retention/restore, and a small usefulness review; broad reskin is not a prerequisite.

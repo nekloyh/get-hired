@@ -4,29 +4,32 @@ A multi-agent system that runs an adaptive mock technical interview. Built prima
 agentic patterns** — see `CLAUDE.md` for the authoritative design and `CONTEXT.md` for the domain
 glossary.
 
-Development sequencing and acceptance gates live in **[the implementation plan](docs/issues/README.md)**.
-It links the existing slices and separates personal/trusted-pilot milestones from public-launch requirements.
-**[The roadmap](docs/roadmap.md)** says what to do next and why in that order.
+Work and its order live in the **[GitHub milestones](https://github.com/nekloyh/get-hired/milestones)**.
+[`docs/issues/README.md`](docs/issues/README.md) holds the tracking rules, the ID aliases, the slice
+specs and the gates every milestone keeps. **[The roadmap](docs/roadmap.md)** says what unblocks what,
+and so why the milestones come in that order.
 
 ## Quickstart (live) — clone to a real interview
 
-You need [uv](https://docs.astral.sh/uv/), Node 18+, and **one OpenAI API key**. Nothing else: no
-Chroma, no second provider, no Docker.
+You need [uv](https://docs.astral.sh/uv/), Node 20.19+ or 22.12+ (Vite's `engines` range; CI and the
+image use 22), and **one OpenAI API key**. Nothing else: no Chroma, no second provider, no Docker.
 
 **How long this takes**, measured on a clean clone on 2026-09-15 (R-04 / #59). Two numbers, because
 only one of them is ours to control:
 
 | | wall time | what it covers |
 |---|---:|---|
-| **Repo-controlled** — toolchain caches already warm | **8 s** | clone → `uv sync` → `npm install` → backend answering → a completed interview |
-| **Cold total** — nothing cached, everything downloaded | **38 s** | the above plus ~275 MB: a managed Python (103 MB, 4 s), the Python wheels (171 MB, 24 s) and `node_modules` (41 MB, 5 s) |
+| **Repo-controlled** — toolchain caches already warm | **8 s** | clone → `uv sync` → `npm install` → backend answering → a completed `demo` interview |
+| **Cold total** — nothing cached, everything downloaded | **38 s** | the above plus ~315 MB: a managed Python (103 MB, 4 s), the Python wheels (171 MB, 24 s) and `node_modules` (41 MB, 5 s) |
 
 Add however long it takes you to paste an API key. The cold number is **network-bound**, so it is
 the one that moves: it was measured on fast broadband, and on a slow link the three downloads
 dominate everything else the project does. The repo-controlled 8 s is what changes when this
-repository changes, and is the number to watch in review.
+repository changes, and is the number to watch in review. Both rows ran the interview in `demo`
+mode, so neither includes provider latency; a live Session adds it (one dated record:
+[`docs/audits/live-smoke-2026-10-12.md`](docs/audits/live-smoke-2026-10-12.md)).
 
-**1. Clone and install** (~30 s cold, ~3 s warm)
+**1. Clone and install** (~35 s cold, ~6 s warm)
 
 ```bash
 git clone https://github.com/nekloyh/get-hired.git && cd get-hired
@@ -40,16 +43,20 @@ cd web && npm install && cd ..
 cp .env.example .env
 ```
 
-Edit `.env` and set just these two lines — everything else can stay commented out:
+Edit `.env` and fill in the key. The template already sets the other two lines that matter; leave
+them, and the rest of the file, as they are:
 
 ```dotenv
 PRIMARY_PROVIDER=openai
 OPENAI_API_KEY=sk-...your key...
+OPENAI_MODEL=gpt-5.4-mini
 ```
 
-`OPENAI_MODEL` already defaults to `gpt-5.4-mini`, the judge this project validates against
-(see [Judge calibration gate](#judge-calibration-gate-issue-0022--adr-0009)). MiMo is retired and
-Groq does **not** pass the judge bench — leave both commented out.
+Keep `OPENAI_MODEL`: `config.Settings.openai_model` has no default, and a provider without a model
+counts as unconfigured. `gpt-5.4-mini` is the one judge the code seats by default
+(`config.BENCH_VALIDATED_JUDGES`; see [Judge calibration gate](#judge-calibration-gate-issue-0022--adr-0009)).
+MiMo is retired and has no setting. Groq is not a bench-validated judge and this walkthrough needs no
+second provider, so leave `GROQ_API_KEY` empty ([Setup](#setup) says what a second provider is for).
 
 **3. Start the backend**
 
@@ -72,8 +79,8 @@ Open `http://127.0.0.1:5173`, set **Mode** to `live` and **Max questions** to `1
 
 Expect a **follow-up**: "max questions" caps interview *questions*, not turns, so a single question
 can probe further before it resolves — that is the micro-loop doing its job, not a stuck UI. Answer
-the follow-up too. You then land on a Final Report with a readiness estimate, per-skill bars, and a
-Markdown export button.
+the follow-up too. You then land on a Final Report with a readiness estimate, the priority Skills
+with their mastery, a two-week study schedule, and a Markdown export button.
 
 > Prefer the terminal? `uv run coach session --max-questions 1` does the same thing without the UI.
 > No API key at all? Set **Mode** to `demo` — the whole flow runs on a deterministic fake model.
@@ -82,17 +89,19 @@ Markdown export button.
 
 | Symptom | Cause |
 | --- | --- |
-| `"primary_configured": false` | `.env` is missing `OPENAI_API_KEY`, or `PRIMARY_PROVIDER` is not `openai`. |
+| `"primary_configured": false` | `.env` is missing `OPENAI_API_KEY` or `OPENAI_MODEL`, or `PRIMARY_PROVIDER` is not `openai` (`config.ProviderSettings.configured` needs a key, a base URL and a model). |
+| `live` errors with ``ValueError: ... no green `coach bench` artifact`` | The judge would run on a model the bench never validated: `OPENAI_MODEL` or a `ROLE_JUDGE_*` line names another model, or `PRIMARY_PROVIDER` is not `openai`. See [Setup](#setup). |
 | UI loads but `live` mode errors instantly | The backend cannot reach the provider — check the `coach api` terminal for the `llm-call ... outcome=error:` line, which names the real failure. |
-| `insufficient_quota` | The day's OpenAI allowance is spent. `uv run coach usage` shows what this repo has recorded today. |
+| `insufficient_quota` | OpenAI refused the call on billing grounds: no credit left, or a spend, usage or daily limit on the key's account or project. Retrying cannot help (`llm._quota_exhausted` treats it as terminal); check the account's billing and limits. `uv run coach usage` shows what this repo has recorded today. |
 | Browser cannot reach the API | The UI expects `http://127.0.0.1:8000`; override with `VITE_API_URL` if you moved it. |
 
 ### Exposing it beyond localhost
 
 For an actual deployment — Docker image, compose stack with TLS and `wss://`, and the single-VPS
-runbook — see **[`docs/deploy.md`](docs/deploy.md)**. `docker compose up -d --build` is the whole
-thing once `.env` is filled in. The rest of this section is the configuration that matters wherever
-you run it.
+runbook — see **[`docs/deploy.md`](docs/deploy.md)**. `docker compose up -d --build` brings it up once
+`.env` is filled in and `deploy/nginx/certs/` holds a certificate pair; nginx refuses to start without
+one, so do [its §3](docs/deploy.md#3-certificates) first. The rest of this section is the
+configuration that matters wherever you run it.
 
 The API ships **open** — no auth — because that is the right default for `localhost`, and the wrong
 one anywhere else (`coach api` warns about this on startup). Before putting it on a network:
@@ -137,9 +146,10 @@ Interviewer asks → Candidate answers → Evaluator scores and flags a Follow-u
 one at the gap using the `lookup_concept` tool → repeat until the Evaluator stops or the cap trips.
 The Evaluator is the only component that judges (ADR 0001). When its own deterministic triggers say a
 score is shaky, the judgment escalates to a Skeptic/Advocate **Panel** and the Evaluator re-decides
-having read both; committee disagreement, not judge confidence, becomes the evidence weight. Skill
-state is a decayed Beta posterior per Skill (ADR 0002, ADR 0006), never a running average. A Session
-ends with a two-week Study Plan and a Markdown export of the whole thing.
+having read both; committee disagreement then sets the evidence weight, never above what the
+deterministic confidence guards allow (`skill.evidence_weight_for`). Skill state is a decayed Beta
+posterior per Skill (ADR 0002, ADR 0006), never a running average. A Session ends with a two-week
+Study Plan and a Markdown export of the whole thing.
 
 EN/VN/mixed is first-class (ADR 0007): the mode is Session state, a deterministic detector — never
 the judge — decides when English delivery is scored, and that dimension stays out of `weighted_score`
@@ -150,15 +160,16 @@ Docker image with an nginx/TLS compose stack.
 
 ### Known limits
 
-Each row links the issue that owns it. Whether that issue is still open is the status.
+Each row links the issue that owns it; a row without a link is a design limit no issue owns. Whether
+a linked issue is still open is the status.
 
 | | |
 |---|---|
-| The judge calibration gate is **not green** | an EN/VN split on dimensions with a gap in their 1–5 scale ([#96](https://github.com/nekloyh/get-hired/issues/96)); the newest `docs/audits/calibration-bench-*.md` has the numbers. Scores are for practice, not for comparing people |
-| One shared token, no accounts | anyone with it can read or overwrite anyone's Skill history by typing their Candidate id ([#84](https://github.com/nekloyh/get-hired/issues/84)) |
+| EN and VN answers of the same quality can score differently | a rubric dimension with a gap in its 1–5 scale lets the judge resolve the gap on style (ADR 0009 addendum d; [#96](https://github.com/nekloyh/get-hired/issues/96), [#103](https://github.com/nekloyh/get-hired/issues/103)). [`judge.lock`](judge.lock) names the bench record that measured the judge the code builds. Scores are for practice, not for comparing people |
+| One shared token, no accounts | anyone with it can read or overwrite anyone's Skill ledger record by typing their Candidate id ([#84](https://github.com/nekloyh/get-hired/issues/84)) |
 | Resume is per **question**, not per turn | a crash costs the question in flight, not the interview |
-| The Skill ledger keeps one snapshot per Candidate | there is no history to chart yet ([#127](https://github.com/nekloyh/get-hired/issues/127)) |
-| Self-critique is dormant | its low-confidence trigger never fires on the current judge; the Panel above is what replaced it. The replacement signal is ADR 0011, Proposed and experiment-gated ([#71](https://github.com/nekloyh/get-hired/issues/71)) |
+| The Skill ledger keeps one snapshot per Candidate | there is no history to chart ([#127](https://github.com/nekloyh/get-hired/issues/127)) |
+| Self-critique rarely runs | the Panel above runs only when `evaluator._self_critique_triggers` fires, and its low-confidence trigger reads the judge's self-reported `confidence`, which is saturated on this judge (Derived confidence in [`CONTEXT.md`](CONTEXT.md)). The replacement signal is [ADR 0011](docs/adr/0011-derived-confidence-and-escalation.md) ([#71](https://github.com/nekloyh/get-hired/issues/71)) |
 
 ## Setup
 
@@ -167,15 +178,26 @@ Requires [uv](https://docs.astral.sh/uv/).
 ```bash
 uv sync                 # create the venv + install deps (downloads Python 3.12 if needed)
 uv sync --extra rag     # optional: install Chroma + sentence-transformers for persistent RAG
-cp .env.example .env    # then set PRIMARY_PROVIDER=openai and OPENAI_API_KEY (see Quickstart)
+cp .env.example .env    # then fill in OPENAI_API_KEY (see Quickstart)
 cd web && npm install   # install the React UI toolchain
 ```
 
-`.env` keys: set `PRIMARY_PROVIDER` to `openai`, `groq`, or `zenmux`, then fill that provider's
-`*_API_KEY` and `*_MODEL` (plus `*_BASE_URL` for zenmux). Any other configured provider is used as
-fallback. **The validated judge is `openai` / `gpt-5.4-mini`** — the configuration that passes
-`coach bench` 20/20 (issue 0031) and runs inside OpenAI's free daily tier; `gpt-4o-mini` and Groq
-`llama-3.3-70b` each leave one borderline Vietnamese case out of band (a small-model capability limit).
+`.env` keys: `PRIMARY_PROVIDER` (`openai`, `groq` or `zenmux`) picks the provider every role calls
+unless a `ROLE_*` override moves it; fill that provider's `*_API_KEY` and `*_MODEL` (each `*_BASE_URL`
+has a default). The roles with no override, the judge excepted, share one router: when the primary
+fails, it fails over to one other provider if that one is configured — `config.Settings.fallback_provider`,
+the first of `groq`, `openai`, `zenmux` that is not the primary.
+
+The judge is pinned (ADR 0009 addendum a). It never fails over (`llm.build_role_clients`), and
+`config.Settings.role_config` refuses to seat it on any (provider, model, base URL) outside
+`config.BENCH_VALIDATED_JUDGES`, which holds **`openai` / `gpt-5.4-mini`**. The judge inherits
+`PRIMARY_PROVIDER` unless `ROLE_JUDGE_PROVIDER` is set, so with `groq` or `zenmux` as primary also
+set `ROLE_JUDGE_PROVIDER=openai`, `OPENAI_API_KEY` and `OPENAI_MODEL`, or live Sessions and LLM
+commands refuse to start. `COACH_ALLOW_UNVALIDATED_JUDGE=1` lifts the refusal; it logs a warning and
+stamps every export and turn trace as unvalidated. [`judge.lock`](judge.lock) names the bench record
+that measured the judge the code builds. On the
+[2026-07-11 comparison](docs/audits/calibration-bench-2026-07-11-gpt-5.4-mini.md), `gpt-4o-mini`
+(19/20) and Groq `llama-3.3-70b` (18/20) each left a Vietnamese case out of band.
 
 ## Run
 
@@ -184,12 +206,11 @@ uv run python -m interview_coach                          # prints the subcomman
 uv run python -m interview_coach diagnose --target-role "machine learning engineer" --claim mlops=4             # LLM agent when configured, else deterministic
 uv run python -m interview_coach diagnose --offline --target-role "machine learning engineer" --claim mlops=4   # force the deterministic offline path
 uv run python -m interview_coach session --max-questions 3 --export-markdown exports/session.md                 # interactive Candidate answers
-uv run python -m interview_coach session --scripted --max-questions 3                                           # deterministic demo Candidate
+uv run python -m interview_coach session --scripted --max-questions 3                                           # scripted Candidate answers; still calls the configured provider
 uv run python -m interview_coach session --candidate alice --max-questions 3                                    # 0023: remember a returning Candidate across Sessions
 uv run python -m interview_coach pack lint data/packs/fpt                                                       # 0025: validate a content pack (fail-loud)
 uv run python -m interview_coach session --pack data/packs/fpt --scripted --max-questions 3                     # 0025: run a Session from a pack
 uv run python -m interview_coach eval-harness        # issue 0012: golden-answer Evaluator harness
-uv run python -m interview_coach ingest-concepts --persist-dir .chroma
 uv run python scripts/smoke_issue_0009.py   # live: validate the Diagnostic agent against the real provider
 ```
 
@@ -201,8 +222,9 @@ cd web && npm run dev
 ```
 
 Then open `http://127.0.0.1:5173`. Choose `demo` mode to run without credentials; choose `live` once
-`.env` has the selected provider configured. See [Quickstart](#quickstart-live--clone-to-a-real-interview)
-for the first-run walkthrough and for the auth settings needed before exposing this beyond localhost.
+`.env` seats the judge on a bench-validated model (see [Setup](#setup); the Quickstart's `.env` does).
+See [Quickstart](#quickstart-live--clone-to-a-real-interview) for the first-run walkthrough and for
+the auth settings needed before exposing this beyond localhost.
 
 ## Content packs (issue 0025 / ADR 0008)
 
@@ -239,15 +261,19 @@ uv run coach bench --out docs/audits/bench-x.md     # choose the report path
 `coach bench` runs the hand-labelled EN/VN paired golden set (`data/bench/cases.yaml`) against the
 configured provider and writes a Markdown report to `docs/audits/`: per-dimension bias vs the human
 labels, weak/strong separation, EN-vs-VN paired deltas, and a confidence-calibration table ("when it
-says 0.9, is it right ~90% of the time?"). It exits non-zero on any range regression, so it gates a
-judge change the same way a failing test would. Reports are versioned in `docs/audits/` so judge
-quality has a history, not a vibe.
+says 0.9, is it right ~90% of the time?"). It exits non-zero on any range regression, so a red run
+blocks a judge change. A green run is necessary, not sufficient: the bench is a stochastic
+measurement, so the default `--k 3` gates on the median of three runs per case (ADR 0009 addendum d),
+a judge change merges only when repeated full-set invocations agree, and each new wording restarts
+that count (addendum f). Neither `--k 1` nor an `--only` screen, which writes to `logs/`, is gate
+evidence (addendum h). Reports are versioned in `docs/audits/` so judge quality has a history, not a
+vibe.
 
-Current status: the bench is **green (29/29)** after the gpt-5.4-mini re-anchor — latest report
-`docs/audits/calibration-bench-2026-07-11-reanchor.md`. All six dimensions now carry scored guide
-bands; residual biases are small (communication −0.10, depth −0.31). Known model behavior:
-confidence is saturated (~0.95 uniform), so panel escalation never fires naturally — a deliberate,
-documented non-change (the forced-escalation experiment showed the verdict never moves).
+[`judge.lock`](judge.lock) names the bench record that measured the judge the code builds, and
+`tests/test_judge_lock.py` fails on any change to what the judge is sent; a red there is the gate, not
+a test to update (ADR 0009 addendum g).
+[`docs/audits/README.md`](docs/audits/README.md#judge-calibration-bench-adr-0009) indexes every bench
+record and what it measured.
 
 The bench's companion is the **Simulated Candidate + Supervisor replay bench** (issue 0029,
 `interview_coach.replay`): where `coach bench` calibrates the *judge*, the replay bench calibrates the
@@ -261,16 +287,16 @@ decision-level regression testing. Together they are the two halves of the eval 
 ## Test
 
 ```bash
-./scripts/gate.sh         # everything CI runs, one verdict per line, one GATE: OK at the end
-./scripts/gate.sh --all   # ...plus the image build, compose validation and the browser specs
+./scripts/gate.sh         # CI's python + web jobs, one verdict per line, one GATE: OK at the end
+./scripts/gate.sh --all   # ...plus CI's docker + e2e jobs: image build, compose validation, browser specs (needs `coach api` on :8000)
 ```
 
 Or one at a time:
 
 ```bash
 uv run pytest             # offline/unit tests only (no credentials needed)
-uv run pytest -m live     # explicitly hit the real provider (needs .env configured)
-uv sync --extra rag && uv run pytest -m rag  # optional Chroma/BGE integration
+uv run pytest -m live --timeout=0  # explicitly hit the real provider (needs .env configured; spends tokens)
+uv sync --extra rag && uv run pytest -m rag --timeout=0  # optional Chroma/BGE integration
 cd web && npm run lint
 cd web && npm run test
 cd web && npm run build
@@ -287,8 +313,10 @@ cd web && npm run test:e2e  # optional: requires the backend API running and Pla
   Panel. The Evaluator is the *only* component that judges (ADR 0001).
 - `src/interview_coach/interviewer.py` — the Interviewer: `generate_follow_up()` aims one Follow-up at
   the gap the Evaluator flagged using the `lookup_concept` tool. It never scores.
-- `src/interview_coach/concepts.py` — seed concept notes, the `lookup_concept` tool interface,
-  deterministic in-memory retrieval for tests, and the Chroma/BGE persistent store.
+- `src/interview_coach/concepts.py` — seed concept notes, the `lookup_concept` tool interface, the
+  deterministic in-memory keyword store (the runtime fallback, with a DEGRADED warning, when the
+  `rag` extra is absent), and the Chroma persistent store (BGE for `en`, multilingual-e5 for
+  `vn`/`mixed`).
 - `src/interview_coach/resources.py` — the seed learning-resource catalog and the deterministic
   in-memory retrieval the Study Planner uses. One store by design (#130): the catalog is two entries
   per Skill behind a hard `skill=` filter, which no embedder can rank better.
@@ -308,12 +336,16 @@ cd web && npm run test:e2e  # optional: requires the backend API running and Pla
 - `src/interview_coach/microloop.py` — `run_micro_loop()`: the within-question loop, the `Candidate`
   protocol, `InteractiveCandidate`, `ScriptedCandidate`, and the `RESOLVED`/`SAFETY_CAP` stop
   reasons. Plain Python.
-- `src/interview_coach/seeds.py` — the seed questions and their scripted candidate transcripts.
-- `src/interview_coach/rubric.py` — the fixed 5-dimension rubric; a weight of 0 disables a dimension.
+- `src/interview_coach/seeds.py` — the `SeedQuestion` shape and question selection; the bank itself
+  is `src/interview_coach/data/questions.yaml`, loaded and validated by `bank.load_questions`.
+- `src/interview_coach/rubric.py` — the fixed rubric: five technical dimensions
+  (`rubric.TECHNICAL_DIMENSIONS`) plus `english_delivery`, which never enters `weighted_score`; a
+  weight of 0 disables a dimension.
 - `src/interview_coach/fixtures.py` — the slice-0001 hard-coded question + strong/weak fixture answers.
 - `src/interview_coach/skill.py` — the Beta-distributed `SkillState` (`mastery`/`confidence` from
   α/β) and its pure-Python updater `apply_evaluation()`. No LLM by design (ADR 0002).
-- `src/interview_coach/cli.py` — `session` is the live terminal UI; `api` runs the web backend;
-  `eval-harness` runs the Evaluator regression checks.
+- `src/interview_coach/cli.py` — `main`, dispatch and every subcommand handler except `session`;
+  `cli_parser.py` holds the argparse table and `cli_session.py` the `session` driver (the live
+  terminal UI).
 - `web/` — Vite React + TypeScript local UI with typed WebSocket events, setup controls, interview
   workspace, live Skill/Topic Plan sidebars, final report, unit tests, and a Playwright demo-flow spec.

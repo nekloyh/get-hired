@@ -4,7 +4,7 @@
 
 ## What to build
 
-The planner-executor entry point. A **Diagnostic** agent reads the Candidate profile (claimed skills, self-assessment, target role/companies) and produces a **Topic Plan** — an ordered list of (Skill, target difficulty, rationale). It also seeds the Beta **Skill** priors per `ADR 0002`: priors are *weak* by default (a self-claim sets only the starting question difficulty, never our confidence), cross-skill correlations apply *only to the initial prior*, and **Role criticality** (from a hand-built `target_role` + `target_companies` table) flexes prior strength and the early-termination evidence bar — never the prior mean.
+The planner-executor entry point. A **Diagnostic** agent reads the Candidate profile (claimed skills, self-assessment, target role/companies) and produces a **Topic Plan** — an ordered list of (Skill, target difficulty, rationale). It also seeds the Beta **Skill** priors per `ADR 0002`: priors are *weak* by default (a self-claim sets only the weak prior mean, `diagnostic._self_assessment_to_mean`, which informs the starting question difficulty — never our confidence: `diagnostic._seed_prior` takes the prior's target variance from Role criticality alone, `tests/test_diagnostic.py::test_self_assessment_moves_mean_not_prior_confidence`), cross-skill correlations apply *only to the initial prior*, and **Role criticality** (from a hand-built `target_role` + `target_companies` table) flexes prior strength and the early-termination evidence bar — never the prior mean.
 
 ## Acceptance criteria
 

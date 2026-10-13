@@ -17,10 +17,22 @@ distinctly (a transport degrade is not a schema fallback) and take the determini
 plan-following decision. Per ADR 0005 this is squarely an infrastructure failure — degrade, never
 abort.
 
+> **Superseded:** two failures are no longer degraded here. `supervisor.decide_next_move` re-raises
+> `usage.ProviderQuotaExhausted` (the provider's terminal `insufficient_quota`, ADR 0005's third
+> category: budget exhaustion) and `usage.AccountingUnavailable` (a metered call refused by broken
+> usage accounting) ahead of its `except Exception` backstop. The drivers (`cli_session._cmd_session`,
+> `web_session_driver._run_session_thread`) suspend the Session on the first and stop it on the
+> second, with the checkpoint left resumable (4f8cdf3 for #119, 62154f2 for M0a / F1, both via PR #133).
+
 ## Acceptance criteria
 
 - [x] A provider/transport exception in the Supervisor's LLM call degrades to the deterministic
       plan-following decision instead of crashing the Session
+
+  > **Superseded:** except `usage.ProviderQuotaExhausted` and `usage.AccountingUnavailable`, which
+  > `supervisor.decide_next_move` re-raises so the driver suspends (dead quota) or stops (accounting
+  > fault) the Session; see the note under What to build.
+
 - [x] The degrade is recorded/logged distinctly from the existing schema-fallback path, and the
       export reflects it honestly (consistent with the degraded-stop labeling convention)
 - [x] Test: a fake client raising a transport error at the decision node; the Session still

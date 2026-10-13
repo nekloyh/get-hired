@@ -14,6 +14,12 @@ either language. Grow `eval-harness` into a calibration bench:
   answer variants**, labeled on the 5-dimension rubric by a human.
 - **BARS-style per-band anchors** for at least two dimensions: concrete exemplars of what a 2
   vs a 4 on `system_thinking` sounds like, so labels (and future labelers) stay consistent.
+
+  > **Superseded:** a 2-and-4 pair is not enough. ADR 0009 addendum d makes a missing middle anchor
+  > a language-fairness bug (the judge resolves the gap on style), so an anchored dimension needs a
+  > 2, a 3 and a 4. At v0.3.0 `data/bench/cases.yaml` anchors `correctness` and `communication` at
+  > 2/3/4 (9638283, #92 via PR #97); `system_thinking`, `depth` and `english_delivery` have only 2 and 4.
+
 - **`coach bench`**: runs the set live against the configured provider and writes a Markdown
   calibration report into `docs/audits/` — per-dimension bias vs hand labels, weak/strong
   separation, EN-vs-VN deltas on paired answers, and a confidence-calibration table (when the
@@ -28,6 +34,13 @@ or provider.
 
 - [x] ≥20 golden cases with EN + VN paired answers, human labels on the 5-dim rubric, and
       per-band anchors for ≥2 dimensions
+
+  > **Partial at v0.3.0:** the cases, pairs and anchors exist; the "human" provenance of the labels is
+  > not recorded. `data/bench/cases.yaml` calls its labels human in one comment and, in its HITL note,
+  > says the answers, labels, bands and anchors are an AI-authored draft that needs human review
+  > before the bench gates judge changes. No commit or `docs/audits/` record documents that review
+  > for these 20 cases.
+
 - [x] `coach bench` runs live, writes the calibration report to `docs/audits/`, and exits
       non-zero on regression vs recorded ranges
 - [x] Report covers per-dimension bias, weak/strong separation, EN/VN paired deltas, and
@@ -42,9 +55,10 @@ or provider.
 
 ## Done
 
-- `data/bench/cases.yaml`: 20 hand-labelled cases (10 EN/VN pairs) across five Skills, each with
-  per-dimension human labels and a weighted-score band, plus BARS per-band anchors for two dimensions
-  (`system_thinking`, `correctness`). The prompt-injection case is retained with a VN twin.
+- `data/bench/cases.yaml`: 20 cases (10 EN/VN pairs) across five Skills, each with per-dimension
+  labels and a weighted-score band, plus BARS per-band anchors for two dimensions
+  (`system_thinking`, `correctness`). Labels, bands and anchors were AI-drafted for human review (the
+  HITL note in the file). The prompt-injection case is retained with a VN twin.
 - `bench.py`: `load_bench_data`, `run_bench`, and pure metric functions — `dimension_bias`,
   `weak_strong_separation`, `language_deltas`, `confidence_calibration` — plus `render_bench_report`
   (full Markdown) and `bench_passed` (the regression gate).
@@ -84,6 +98,6 @@ or provider.
   is reported as a tripwire. The 2026-07-11 pending cases were admitted in the same PR (35 cases;
   mlops_awareness reaches n=8). Evidence: docs/audits/calibration-bench-2026-07-27.md.
 - Label freeze + live-query replay: R-15 (GH #70). Backup-judge program: R-17 (GH #72).
-- Still open after #92: `english_delivery` sits at n=5, below `BIAS_MIN_SAMPLES=8`, so its bias
-  estimate keeps the ⚠ unstable flag. Closing it needs 2–3 more EN-dominant delivery cases
-  (broken / mid / strong) — the next forge target.
+- After #92 (2026-07-27, 35 cases): `english_delivery` had n=5 labels, below
+  `bench.BIAS_MIN_SAMPLES` (8), so its bias estimate carried the ⚠ unstable flag. Closing that gap
+  needs 2–3 more EN-dominant delivery cases (broken / mid / strong).

@@ -40,8 +40,8 @@ COACH_ALLOWED_ORIGINS=https://coach.example.com
 | --- | --- |
 | `COACH_AUTH_TOKEN` | **Unset means open.** Every endpoint, to anything that can reach the port. Must be ASCII — HTTP header values are latin-1 on the wire, so a non-ASCII passphrase cannot round-trip through `Authorization: Bearer`, and the server refuses to start rather than lock you out of your own deployment with unexplained 500s. |
 | `COACH_ALLOWED_ORIGINS` | Comma-separated browser origins allowed to open a Session socket, checked **before** the WebSocket is accepted. `CORSMiddleware` cannot do this — it never sees a WebSocket handshake. Leave it empty and the socket falls back to the Vite dev origins, i.e. it will reject your own UI (the server warns about this at startup). |
-| `OPENAI_MODEL` | Defaults to `gpt-5.4-mini`, the judge this project is calibrated against. Changing it is a **judge change** and is gated by `coach bench` (ADR 0009) — do not "upgrade" it on a whim in production. |
-| `LLM_DAILY_TOKEN_BUDGET` | The provider does not expose a daily allowance, so spend is counted client-side. Worth setting before strangers can start interviews on your key. |
+| `OPENAI_MODEL` | `.env.example` sets `gpt-5.4-mini`, the judge in `config.BENCH_VALIDATED_JUDGES`; keep the line. There is no code default (`config.Settings.openai_model` is empty), and an empty model leaves OpenAI unconfigured (`config.ProviderSettings.configured`), so `auto` Sessions fall back to demo mode and `live` ones are refused. Changing it is a **judge change** and is gated by `coach bench` (ADR 0009): a value outside `config.BENCH_VALIDATED_JUDGES` refuses every live Session — do not "upgrade" it on a whim in production. |
+| `LLM_DAILY_TOKEN_BUDGET` | The provider does not expose a daily allowance, so spend is counted client-side. Worth setting before strangers can start interviews on your key. Read from the process environment, not by `config.Settings`: compose's `env_file` delivers it, but under `uv run` a value set only in `.env` is ignored (the same holds for `LLM_SESSION_TOKEN_BUDGET`, `COACH_DAILY_QUESTION_CAP`, `COACH_USAGE_LEDGER`, `COACH_LOG_FILE` and `WEB_CONCURRENCY`). |
 
 The UI asks for `COACH_AUTH_TOKEN` at runtime and keeps it in `sessionStorage`. There is deliberately
 **no build-time token**: Vite inlines `VITE_*` constants into the emitted JavaScript, so a token
@@ -81,10 +81,13 @@ with `https://`, because the UI's WebSocket inherits the page scheme.
 
 The hook is what makes renewal actually land: nginx serves *copies* under `deploy/nginx/certs/`, so
 a renewal that only rewrites `/etc/letsencrypt/live/…` and restarts nginx re-serves the expired
-copy. Certbot saves `--deploy-hook` into `/etc/letsencrypt/renewal/coach.example.com.conf`, so the
-packaged `certbot.timer` needs no further configuration. Two details are load-bearing: the hook runs
-with no useful cwd, so every path in it is absolute; and both `.pem` files are named, because
-certbot runs hooks through `/bin/sh`, which does not expand `{a,b}`.
+copy. Certbot saves `--deploy-hook` into `/etc/letsencrypt/renewal/coach.example.com.conf`, so
+whatever runs `certbot renew` on a schedule needs no further configuration. Confirm one exists, e.g.
+`systemctl list-timers | grep -i certbot` (the Debian/Ubuntu package installs `certbot.timer`, the
+snap `snap.certbot.renew.timer`; a pip install ships none). Two details are load-bearing: the hook
+runs with no useful cwd, so every path in it is absolute; and both `.pem` files are named, because
+certbot runs hooks through `/bin/sh`, which on Debian and Ubuntu is dash and does not expand
+`{a,b}`; naming both files works under any `/bin/sh`.
 
 Verify before you depend on it: `sudo certbot renew --dry-run` with the stack **up**. It exercises
 the webroot for real; it does *not* run deploy hooks, so also confirm the ACME location is
@@ -123,9 +126,16 @@ Back it up **outside the checkout**:
 
 ```bash
 sudo install -d -m 700 /var/backups/coach
+docker compose stop app
 docker compose run --rm --no-deps --user root -v /var/backups/coach:/backup app \
   tar czf "/backup/coach-state-$(date +%F).tgz" -C /app/state .
+docker compose start app
 ```
+
+Stop `app` around the `tar`: `session-checkpoints.sqlite` is WAL-mode SQLite
+(`langgraph.checkpoint.sqlite.SqliteSaver.setup`), and a `tar` of a live one copies the database
+and its `-wal` sidecar at different moments. Like a restart, the stop costs at most the question in
+flight.
 
 `docker compose run` is what makes this correct: Compose names the volume `<project>_coach-state`,
 so a hand-written `docker run` that mounts `coach-state` by its bare key mounts a *different*
@@ -141,7 +151,7 @@ host to make it a backup.
 **Do not add workers.** `runtimes` and `completed_sessions` are per-process dicts and the checkpoint
 store is SQLite, so a second worker gets a resume request for a Session it has never heard of, and
 two processes write the same SQLite file. `WEB_CONCURRENCY` and `--workers` are not supported; the
-image's `CMD` runs one worker on purpose. **The server now refuses to start** on `WEB_CONCURRENCY>1`
+image's `CMD` runs one worker on purpose. **The server refuses to start** on `WEB_CONCURRENCY>1`
 or `--workers >1` (R-12) — the check runs when `interview_coach.web_api` is imported, so under
 `coach api` and `uvicorn …:app` it fires before a port is bound: uvicorn's `config.load_app()` runs
 ahead of `bind_socket()` and `Multiprocess(...)`. It resolves a repeated `--workers` the way uvicorn
@@ -152,7 +162,11 @@ something else in too many other commands to claim on sight.
 Scope: **gunicorn is not covered.** It is not a dependency and not in the image, and its default
 `preload_app=False` binds the port and logs `Listening at:` *before* forking and importing the app —
 so the guard would fire in the children, after the port was already bound. Run this app under
-uvicorn.
+uvicorn. `UVICORN_WORKERS` is not covered either: uvicorn's CLI reads it through click's
+`auto_envvar_prefix="UVICORN"`, while `web_ops._requested_workers` reads only `--workers` and
+`WEB_CONCURRENCY`, so `UVICORN_WORKERS=4 uvicorn interview_coach.web_api:app` forks four workers.
+It has no effect under `coach api` (the image's `CMD`), which calls `uvicorn.run` and never parses
+uvicorn's command line.
 `WEB_CONCURRENCY` is the one that bites without being typed: `docker-compose.yml` passes `.env`
 through wholesale and uvicorn reads the variable itself. One worker handles this workload comfortably
 — a Session spends nearly all of its wall time waiting on the model, and each one runs on its own
@@ -170,39 +184,51 @@ docker compose up -d --build        # redeploy; the state volume is untouched
 ```
 
 `coach usage` leads with an **ACCOUNTING:** line whenever the token ledger cannot be written or is
-holding rows a failed write could not land. Take it seriously: every number that command prints —
-and every budget rail in the app — is arithmetic over `/app/state/usage-ledger.jsonl`, so a ledger
-nobody can write reads as a *full* budget rather than an unknown one. That is not theoretical: until
-M0a the image left `COACH_USAGE_LEDGER` at its repo-anchored default, which resolves to
-`/app/logs/usage-ledger.jsonl` inside the container, and `/app` is `root:root` 755 while the process
-is uid 10001 — so every append failed, every token row was dropped with a warning, and the
-deployment reported a pristine 2,500,000-token allowance for as long as it ran.
+holding rows a failed write could not land. Take it seriously: every spend and remaining-budget
+number that command prints — and every budget rail in the app — is arithmetic over
+`/app/state/usage-ledger.jsonl`, so a ledger nobody can write reads as a *full* budget rather than
+an unknown one. That is not theoretical: until M0a the image left `COACH_USAGE_LEDGER` at its
+repo-anchored default, which resolves to `/app/logs/usage-ledger.jsonl` inside the container, and
+`/app` is `root:root` 755 while the process is uid 10001 — so every append failed, every token row
+was dropped with a warning, and the deployment reported a pristine 2,500,000-token allowance for as
+long as it ran.
 
-Two conditions, with different remedies, and the message says which:
+Three wordings, and the message names the remedy:
 
-- **unavailable** — the path cannot be written. Nothing is unaccounted for, because metered calls
-  are refused while it holds; point `COACH_USAGE_LEDGER` at the state volume and it clears itself.
-- **UNRECONCILED** — a provider call was billed and its usage row would not write. The day's spend
-  is now *undetermined*, which is not zero. The unwritten rows are parked in
-  `/app/state/usage-ledger.jsonl.unreconciled`; fix the path, then
-  `docker compose exec app coach usage --reconcile` replays them into the ledger and clears it.
+- **unavailable** (`usage.check_ledger_writable`) — the path cannot be written. Nothing is
+  unaccounted for, because metered calls are refused while it holds; point `COACH_USAGE_LEDGER` at
+  the state volume and it clears itself.
+- **UNRECONCILED** (`usage.accounting_fault`) — a provider call was billed and its usage row would
+  not write, or the parked rows cannot be read. The day's spend is now *undetermined*, which is not
+  zero. The unwritten rows are parked in `/app/state/usage-ledger.jsonl.unreconciled`; fix the
+  path, then `docker compose exec app coach usage --reconcile` replays them into the ledger and
+  clears it.
+- **degraded** (`usage.accounting_fault`) — only unbilled bookkeeping rows are parked. No provider
+  call is unaccounted for, but the rails read an incomplete ledger until the same `--reconcile`
+  replays them.
 
-Either way metered work stops and demo mode keeps working, so a misconfigured deployment is
+Each of them stops metered work, and demo mode keeps working, so a misconfigured deployment is
 demonstrable rather than dead. Suspended Sessions keep their resolved questions in the checkpoint
 and record nothing as `failed` (ADR 0005).
 
-The `llm-call provider=… model=… ms=… outcome=… session=… question=… turn=… role=…` line (R-26,
-attributed by #144) is the one that makes a silent judge failover visible after the fact. If you
-ever see `role=judge` on a provider it is not pinned to, that is a bug worth reporting: ADR 0009
-says the judge never fails over onto another model. To follow one Session, run
-`docker compose logs app | grep 'session=<id>'`.
+The `llm-call provider=… model=… ms=… prompt=… completion=… outcome=… session=… question=… turn=…
+role=…` line (`llm._OpenAICompatibleClient._trace_call`; R-26, attributed by #144) is the one that
+makes a silent judge failover visible after the fact. If you ever see `role=judge` on a provider it
+is not pinned to, that is a bug worth reporting: ADR 0009 says the judge never fails over onto
+another model. To follow one Session, run
+`docker compose logs app | grep -e 'session=<id>' -e "Session '<id>'"`: the `llm-call` lines carry
+`session=<id>`, and the lifecycle records carry `Session '<id>'`.
 
-Server logs are INFO by default and go to stderr, which `docker compose logs` shows but a container
-restart discards. To keep them, `docker-compose.yml` sets `COACH_LOG_FILE=/app/state/logs/coach-api.log`
-in its `environment:` block — it rotates at 10 MB and keeps 5 files. The path **must** be on the
-state volume: `/app` is `root:root` 755 and the container runs as uid 10001 `coach`, so anything
-else fails `mkdir` and degrades to stderr-only. That is why the value is set there rather than left
-to `.env`, whose copy of the key is a host path for a local checkout (`coach api --log-file …`).
+Server logs are INFO by default and go to stderr, which `docker compose logs` keeps for the life of
+the container: a restart keeps them, but anything that recreates the container — a redeploy that
+changes the image or the config, `docker compose down`, `docker rm` — discards them. To keep them,
+`docker-compose.yml` sets `COACH_LOG_FILE=/app/state/logs/coach-api.log` in its `environment:`
+block — it rotates at 10 MB and keeps 5 rotated files besides the live one
+(`web_ops.configure_session_logging`). The path **must** be on the state volume: `/app` is
+`root:root` 755 and the container runs as uid 10001 `coach`, so any other path under `/app` fails
+`mkdir` and degrades to stderr-only, and a writable path off the volume such as `/tmp` is lost with
+the container. That is why the value is set there rather than left to `.env`, whose copy of the key
+is a host path for a local checkout (`coach api --log-file …`).
 An unwritable path degrades to stderr with a warning rather than refusing to start; losing the log
 is not worth losing the deployment — but it does mean a wrong path is quiet, so check for
 `is not writable` in the first lines of `docker compose logs app`.
@@ -211,7 +237,7 @@ and `Session '…' cancelled by Candidate intent`.
 
 ## 8. Verified, not asserted
 
-Every claim above was executed against real containers on 2026-07-27:
+The checks below were executed against real containers on 2026-07-27:
 
 - `docker build` → image builds; `docker compose up -d` → `app` healthy, `nginx` up.
 - `http://` → **301** to `https://`; `https://` → UI (HTTP 200) and `/api/health` on one origin.
@@ -222,20 +248,28 @@ Every claim above was executed against real containers on 2026-07-27:
 - The Playwright reconnect spec passed pointed at the container:
   `npm run test:e2e:container` (stops and starts the container instead of a local process).
 
+§3's ACME webroot (a token served through nginx) and §5's backup and restore were executed on
+2026-09-15, §5 of
+[`docs/audits/milestone-v0.1.0-pilot-2026-09-15.md`](audits/milestone-v0.1.0-pilot-2026-09-15.md).
+Neither run covers certbot issuance, renewal or the `--deploy-hook`.
+
 §6 and §7 were re-executed on 2026-08-01, against real uvicorn 0.48.0 and the real image
 (source bind-mounted over `/app/src`, which the image installs editable):
 
 - `uvicorn --workers 1 --workers 4 …:app` → refused, **zero** `Started server process` lines. The
   mirror `--workers 4 --workers 1` → starts, one process: the guard follows uvicorn's own
-  last-one-wins resolution rather than a guess. (`uvicorn.main.main.make_context(...)`
-  `.params["workers"]` returns 4 and 1 respectively; `main.run()` calls `config.load_app()` before
-  `config.bind_socket()`, which is what makes "before the port" true.)
+  last-one-wins resolution rather than a guess. (`from uvicorn.main import main;
+  main.make_context("uvicorn", [...]).params["workers"]` returns 4 and 1 respectively; the dotted
+  path `uvicorn.main.main` reaches the click Command's `.main` method instead, because
+  `uvicorn/__init__.py` re-exports `main`. `uvicorn.run()`, which the CLI ends in, calls
+  `config.load_app()` before `config.bind_socket()`, which is what makes "before the port" true.)
 - `docker run -e WEB_CONCURRENCY=4 <image>` (the image's own `CMD`) → **exit 2**, the guard's
   message, no traceback, no port bound.
-- `docker run -e COACH_LOG_FILE=logs/coach-api.log <image>` — the value `.env.example` used to
-  suggest — → `PermissionError: [Errno 13] Permission denied: 'logs'`, degraded to stderr-only.
-  `/app` is `root:root` 755 and the process is uid 10001. With `/app/state/logs/coach-api.log` on
-  the volume the directory is created and the `llm-call` line is in the file.
+- `docker run -e COACH_LOG_FILE=logs/coach-api.log <image>` — the relative value `.env.example`
+  gives for a local checkout — → `PermissionError: [Errno 13] Permission denied: 'logs'`, degraded
+  to stderr-only. `/app` is `root:root` 755 and the process is uid 10001. With
+  `/app/state/logs/coach-api.log` on the volume the directory is created and the `llm-call` line is
+  in the file.
 - `docker compose config` with that same `COACH_LOG_FILE=logs/coach-api.log` in `.env` →
   `COACH_LOG_FILE: /app/state/logs/coach-api.log`: the `environment:` block overrides `env_file`.
 - gunicorn is **not** verified and not covered — see §6.

@@ -13,9 +13,9 @@ Priority is unchanged: **(1) learn agentic systems, (2) a usable prep tool, (3) 
 
 | Milestone | Why it comes here |
 |---|---|
-| `v0.3.0 Stable` | The code was green; the system around it was not. Status copied into many documents drifted: `CLAUDE.md` called the judge green for two months after its gate went red. Two draft PRs aged 71 and 87 days, nothing ran against `main` during a pause, and one data-loss race (#122) is open. Nothing built on top of that can be trusted. |
-| `v0.4.0 Foundation` | The next features touch the same two weak layers. **State:** every product step (#127 → #83, then #84) changes the usage and Skill ledgers, where the race and scaling defects cluster. One transactional store (#143) fixes four open issues by construction. **Measurement:** a judge change is affordable only if a wording can be screened cheaply (#145). A live problem is debuggable only if every call names its Session, turn and role (#144). The anchor fixes #96 and #103 come after both. |
-| `Later` | Frozen until both close: features (#83–#88), the redesign (#60), and eval work gated on ADR sections that are still Proposed (#71, #72, #79). |
+| `v0.3.0 Stable` | The code was green; the system around it was not. Status copied into many documents drifted: `CLAUDE.md` kept calling the judge green at 35/35 for three weeks after a bench run (`calibration-bench-2026-09-15.md`) measured it red. Two draft PRs had aged 71 and 87 days, nothing had run against `main` during a pause, and a data-loss race (#122) sat in the Skill ledger. Nothing built on top of that could be trusted. |
+| `v0.4.0 Foundation` | The next features touch the same two weak layers. **State:** every product step (#127 → #83, then #84) builds on the Skill ledger, which with the usage ledger is where the race and scaling defects cluster. One transactional store (#143) fixes #125, #126 and #127 by construction, and replaces the lock choreography that #122 and #123 needed. **Measurement:** a judge change is affordable only if a wording can be screened cheaply (#145). A live problem is debuggable only if every call names its Session, turn and role (#144). The anchor work (#96, #103) comes after both. |
+| `Later` | Frozen until both close: features (#83–#88), the redesign (#60), eval work gated on the experiments an ADR `Status:` line names (#71: ADR 0011; #79: ADR 0002's evidence-semantics addendum), and the backup-judge program (#72), whose pick can replace the pinned judge only through `coach bench`, never as a judge-role fallback (ADR 0009 addendum a). |
 
 Not next, deliberately: **#84 (accounts/Postgres)** is a public-launch gate, not a pilot dependency.
 Building it before #143 means porting several hand-rolled file formats instead of one schema, then maintaining auth
@@ -26,7 +26,7 @@ through every schema change #127 and #83 make.
 ## 2. A judge change costs judge tokens
 
 A judge change (#96, #103) must pass `coach bench --k 3`, and pass it more than once (ADR 0009
-addenda d–f). On all 35 cases one invocation costs ~181–207k tokens. One wording needs several
+addenda d–f). On all 35 cases one invocation costs ~181–212k tokens. One wording needs several
 invocations, so it costs ~600k.
 
 **All of it is judge spend.** The bench scores fixed, hand-labelled answers from
@@ -43,8 +43,8 @@ The lever is two speeds (#145):
 Screening three wordings and confirming the one that survives then costs ~0.8M tokens. Running all three on the full set three times each costs ~1.8M. A judge fingerprint (#141) ties
 every confirm run to the exact judge configuration it measured.
 
-The judge must stay on an API. ADR 0009 pins it, and no model that fits in 6 GB of VRAM passes the
-bench. A local candidate is useful where candidates *are* generated, in the replay bench (slice 0029,
+The judge must stay on an API. ADR 0009 pins it to a model with a green bench artifact, and no model that
+fits in 6 GB of VRAM has one. A local candidate is useful where candidates *are* generated, in the replay bench (slice 0029,
 #146).
 
 ---
@@ -56,7 +56,7 @@ bench. A local candidate is useful where candidates *are* generated, in the repl
 | CPU | i7-12700H, 20 threads |
 | RAM | 31 GB |
 | GPU | **RTX 3060 Laptop, 6 GB VRAM** |
-| Disk | 334 GB free |
+| Disk | 476 GB NVMe |
 
 The 6 GB of VRAM is the only real constraint, and nothing on the critical path needs more.
 
@@ -64,9 +64,9 @@ The 6 GB of VRAM is the only real constraint, and nothing on the critical path n
 |---|---|---|
 | **Judge** (`gpt-5.4-mini`) | **No** | pinned by ADR 0009 and its addendum a; the judge role never fails over, let alone to a local model. Any swap is a bench-gated change |
 | **Simulated candidate** (replay bench) | **Yes** | a 7–8B at Q4 is ~4.5 GB (#146). Not a lever for `coach bench`, which generates no answers (§2) |
-| **Embeddings** (`bge-small-en-v1.5`, `bge-m3`) | **Yes**, easily | the concept store's optional Chroma path (`--extra rag`) |
-| **Vietnamese STT** ([#87](https://github.com/nekloyh/get-hired/issues/87) voice spike) | **Yes** | `whisper-large-v3-turbo` quantized is ~1.6 GB; PhoWhisper is the VN-specific option. No API spend at all |
-| **SQLite / Postgres** ([#143](https://github.com/nekloyh/get-hired/issues/143), [#84](https://github.com/nekloyh/get-hired/issues/84)) | **Yes** | SQLite is the stdlib; the Postgres images are already on this machine |
+| **Embeddings** (`bge-small-en-v1.5` for en, `multilingual-e5-small` for vn/mixed: `concepts.embedder_for_language`) | **Yes**, easily | the concept store's optional Chroma path (`--extra rag`) |
+| **Vietnamese STT** ([#87](https://github.com/nekloyh/get-hired/issues/87) voice spike) | **Yes** | `whisper-large-v3-turbo` (809M parameters) is ~1.6 GB at fp16, half that at int8; PhoWhisper is the VN-specific option. No API spend at all |
+| **SQLite / Postgres** ([#143](https://github.com/nekloyh/get-hired/issues/143), [#84](https://github.com/nekloyh/get-hired/issues/84)) | **Yes** | SQLite is the stdlib (`sqlite3`); Postgres runs from its official container image |
 
 A second machine or a bigger GPU would not speed up anything on the critical path. What limits it is
 API-priced measurement, and #145 is the lever for that.
@@ -94,12 +94,13 @@ The state of each practice is the state of the issue named here. This table does
 
 ## 5. Not doing, and why
 
-- **Score-averaging multi-judge consensus**: measured worthless on this judge. The verdict moved 0.00
-  across 10 forced escalations. Cheap multi-vote as an *uncertainty* signal is ADR 0011, which is
-  Proposed and experiment-gated.
-- **Modern RAG (HyDE / hybrid / rerank)**: the toy store scores 47/50 against the embedders'
-  46–47/50 at the current shelf size, because the Skill filter is doing the work. The triggers to
-  revisit are in #68.
+- **Score-averaging multi-judge consensus**: its nearest measured relative, debate as a score
+  corrector (the Panel Verdict), moved the verdict 0.00 across 10 forced escalations. Cheap
+  multi-vote as an *uncertainty* signal is the subject of ADR 0011; its `Status:` line says whether
+  it binds.
+- **Modern RAG (HyDE / hybrid / rerank)**: the toy store scored 47/50 against the embedders'
+  46–47/50 on the 2026-07-11 shelf (40 notes, at most 9 per Skill), because the Skill filter is
+  doing the work. The triggers to revisit are in #68.
 - **Transcript RAG for judging**: ADR 0006. Scoring memory stays decayed Beta priors.
 - **A visual redesign as a release prerequisite**: the redesign (#60) waits until feedback
   comprehension and repeat practice are done. Its code is kept at tag `archive/pr-50-frontend-redesign`.

@@ -26,6 +26,8 @@ Implemented in `src/interview_coach/evaluator.py` as the deterministic `linear_w
 when it diverges from the mechanical weighted mean, which now deterministically triggers the slice
 0006 Self-critique path. Covered by `tests/test_evaluator.py`.
 
+> **Superseded:** a divergent judgment still deterministically raises the `weighted_score_divergence` and `low_confidence` triggers in `evaluator._self_critique_triggers` (the guard's `evaluator.DIVERGENCE_CONFIDENCE_CEILING` sits below `evaluator.SELF_CRITIQUE_CONFIDENCE_THRESHOLD`), but a triggered judgment now escalates to the Panel Verdict, not slice 0006's re-read (issue 0027, PR #47). The escalation is skipped, and `evaluator.TrustTrace.panel_suppressed` set, when the question's `evaluator.PanelBudget` is spent or a panel voice fails.
+
 ## Status
 
 **Closed.** Acceptance criteria are implemented and covered.

@@ -33,6 +33,14 @@ the degrade distinctly (mirroring issue 0020's `reason_prefix` convention).
       Session proceeds normally from there
 - [x] Test: a fake client raising a transport error at the Diagnostic call site — the Session still
       starts and completes
+
+  > **Partial at v0.3.0:** the test is unit-level.
+  > `tests/test_diagnostic.py::test_diagnose_or_degrade_degrades_to_deterministic_on_provider_error`
+  > shows a transport error in `diagnostic.diagnose_or_degrade` yields the deterministic Topic Plan;
+  > no Session runs in it. No test runs a Session to completion after a degraded Diagnostic, in
+  > `cli_session._cmd_session` or in `web_session_driver._run_session_thread`. The `spy_diagnose`
+  > wiring tests stub the backstop and cover `coach diagnose` only.
+
 - [x] Consider whether the same gap exists in `web_api.py`'s equivalent Diagnostic call (the
       websocket `start_session` path) and fix it there too if so
 
@@ -49,6 +57,14 @@ None — can start immediately.
   and tests that want the raw error keep calling it directly (see
   `test_diagnose_propagates_llm_failure_without_deterministic_fallback`). A genuine bug in the pure
   prep helpers still surfaces: it re-raises on the deterministic retry, which is not caught.
+
+  > **Superseded:** not on *any* provider failure. `diagnostic.diagnose_or_degrade` re-raises
+  > `usage.AccountingUnavailable` (3ea1275, M0a) and `usage.ProviderQuotaExhausted` (4f8cdf3, #119)
+  > before its `except Exception`, so a broken usage ledger or a terminal `insufficient_quota` stops
+  > or suspends the Session instead of starting it on a deterministic Topic Plan. Only an error
+  > carrying `insufficient_quota` becomes `ProviderQuotaExhausted` (`llm._quota_exhausted`); any other
+  > 429, such as a Groq daily-token-limit error without that string, still degrades.
+
 - Wired all three runtime entry points through the backstop: the two CLI commands (`_cmd_session`,
   `_cmd_diagnose`) and the web `_run_session_thread` (`web_api.py`). The web path already had an
   outer `except Exception` that converted failures to a `session_error` event, so it never crashed

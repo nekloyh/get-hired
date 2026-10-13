@@ -12,6 +12,13 @@ instead of only consuming hand-authored YAML. `coach forge --skill X --n 5`:
 2. Drafts pass through **ordered gates, cheap → expensive**:
    - **Gate 1 — contract:** pack-lint schema + cross-referential validation (issue 0025's lint).
    - **Gate 2 — novelty:** embedding-duplicate detection against the existing bank/packs.
+
+     > **Superseded:** gate 2 shipped as token-set Jaccard (`forge.jaccard_similarity`, threshold
+     > `forge.NOVELTY_SIMILARITY_THRESHOLD` = 0.6), not embeddings. `forge.novelty_gate` keeps a
+     > `similarity_fn` seam for an embedding ranker, which would need its own threshold; `coach forge`
+     > (`cli._cmd_forge`) passes none, and the optional BGE ranker
+     > (`forge.build_embedding_similarity`) was deleted in 4f8cdf3.
+
    - **Gate 3 — admission test:** generate a strong and a weak answer for the draft and require
      the live Evaluator to *separate* them into the right bands — reusing the golden-answer
      machinery. A question the judge can't discriminate on is a bad question.
@@ -43,8 +50,10 @@ the Status narrative; the mismatch was doc drift found by the panel review.)
 **Closed (2026-07-11).** Implemented on the worktree-agent branch (commit 4da117b), integrated
 after 0026/0027. `forge.py` runs Writer drafts through three gates — contract (validators reused
 from `bank.validate_question`), novelty (Jaccard 0.6 vs bank + optional pack; embedding similarity
-pluggable), admission (the live Evaluator must score the golden strong answer >= 4 and the weak
-one <= 3) — and writes a human review queue, never merging into the bank itself. Live gate-3
+pluggable), admission (the live Evaluator must score the generated strong answer inside
+`forge.STRONG_BAND`, 3.5–5.0, and the weak one inside `forge.WEAK_BAND`, 1.0–3.0, the thresholds
+`bench.BenchCase` derives `is_strong`/`is_weak` from) — and writes a human review queue, never
+merging into the bank itself. Live gate-3
 smoke on gpt-5.4-mini: 2/2 mlops drafts admitted (nearest-neighbor sim 0.17–0.20; strong 5.00 /
 weak 3.00). 344 offline tests green.
 

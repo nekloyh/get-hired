@@ -19,10 +19,15 @@ record the result as an audit. Decide the fate of the legacy `LLM_*` alias path 
 loader — either document it in `.env.example`/README or remove it; today it exists only in code
 and silently steered the live path onto a dead provider.
 
+> **Superseded:** `config.Settings.primary_provider` defaults to `openai`, and since PR #105 `PRIMARY_PROVIDER=groq` on its own fails when the judge client is built (`llm.build_role_clients`): `config.Settings._require_bench_validated_judge` will not seat the judge on Groq, which has no entry in `config.BENCH_VALIDATED_JUDGES` (ADR 0009 addendum a). Groq can still serve the other roles if `ROLE_JUDGE_PROVIDER` / `ROLE_JUDGE_MODEL` name a validated triple.
+
 ## Acceptance criteria
 
 - [x] `.env` matches the documented scheme; a live `coach session --scripted --max-questions 1`
       completes on Groq end-to-end (micro-loop, follow-up tool call, Study Plan, export)
+
+  > **Superseded:** this ran on 2026-07-06 (`docs/audits/0015-groq-cutover-live-validation.md`), before the judge was pinned. The same configuration has been refused since PR #105; see the note under What to build.
+
 - [x] `uv run pytest -m live` passes against Groq with the tests actually *executing* — a run
       where they all skip on missing credentials counts as failure for this criterion
 - [x] A `docs/audits/` entry records the first Groq validation: date, model, which tests ran,

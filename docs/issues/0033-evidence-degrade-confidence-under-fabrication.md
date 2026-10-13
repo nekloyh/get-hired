@@ -43,6 +43,14 @@ is not penalised. A *partial* blank keeps today's behavior (score + confidence i
 unverifiable trail is treated as the hallucination signal. The exporter surfaces a "scored, but
 citations unverifiable" warning so the audit gap is visible downstream.
 
+> **Superseded:** the haircut is graded. A *partial* blank keeps the score and leaves
+> `evidence_degraded` unset, but `evaluator.apply_evidence_degrade_haircut` caps confidence at
+> `1 − (1 − EVIDENCE_DEGRADE_CONFIDENCE_CEILING) × evaluator.unverifiable_fraction`, sliding from 1.0
+> (clean trail) to 0.4 (every citation blanked); `evaluator._finalize` applies it to every kept
+> judgment. One citation blanked out of two caps confidence at 0.7
+> (`tests/test_evaluator.py::test_partial_citation_blanking_takes_a_graded_haircut`). Only a wholly
+> unverifiable trail sets `evidence_degraded` (e6179f7, PR #89).
+
 Verified against `coach bench` (ADR 0009) on `openai`/`gpt-4o-mini`:
 `docs/audits/calibration-bench-2026-07-11-evidence-degrade.md` — **18/20 within band**, unchanged from
 the 2026-07-07 baseline, per-dimension bias identical, and the haircut never fired on a calibrated

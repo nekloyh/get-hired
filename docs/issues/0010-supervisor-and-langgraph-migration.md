@@ -39,6 +39,8 @@ The **Macro-loop** and the move to LangGraph (see `ADR 0001` and `ADR 0004`). Bu
 - **`coach session` concept flags:** `--concept-store` / `--concept-persist-dir` / `--no-seed-concepts`
   (parity with `coach interview`), threaded into the graph's Micro-loop.
 
+  > **Superseded:** `coach interview` was deleted in 4f8cdf3 (PR #133); `coach session` keeps all three flags (`cli_parser.build_parser`).
+
 ## Verified
 
 - `uv run pytest` -> 93 passed, 6 deselected.
@@ -48,6 +50,8 @@ The **Macro-loop** and the move to LangGraph (see `ADR 0001` and `ADR 0004`). Bu
   -> live MiMo Session completed through LangGraph across four **distinct** Skills
   (`ml_fundamentals` → `mlops` → `deep_learning` → `system_design`), no verbatim repeats, Follow-ups
   grounded in concept notes, Supervisor reasoning citing seed availability; `max_questions` ended it.
+
+  > **Superseded:** at 52ebe48 `coach session` always used scripted answers. Since e1d9f8e (PR #15) it prompts the Candidate on stdin (`microloop.InteractiveCandidate`) unless `--scripted` is passed, so this command no longer reproduces the run above; and MiMo is no longer a provider (`config.ProviderName`, 3f19c99, PR #133).
 - `uv run coach session --diagram ...` -> exported a PNG architecture diagram.
 
 ## Status

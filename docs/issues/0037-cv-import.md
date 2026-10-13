@@ -6,9 +6,10 @@
 
 ## What to build
 
-This slice is split under the [implementation plan M3](README.md#m3--finish-the-repeat-practice-loop-personaltrusted-pilot).
-Keep #86 as the tracker: a bounded text input adapter first, document upload only after evidence
-of demand. The existing Diagnostic already consumes claims + `target_role` + `target_companies`.
+This slice is split under [M3 of the 2026-09-13 plan record](../audits/implementation-plan-2026-09-13.md#m3--finish-the-repeat-practice-loop-personaltrusted-pilot).
+#86 is the tracker; this spec's JD-first scope replaces the CV-upload AC and DoD in #86's body: a
+bounded text input adapter first, document upload only after evidence of demand. The existing
+Diagnostic already consumes claims + `target_role` + `target_companies`.
 
 ### First increment: JD text
 
@@ -48,8 +49,11 @@ limits, sensitive-data retention and applicable ownership tests before accepting
 
 ## Blocked by
 
-- M2 quality/trace gates and M0 input/budget limits; no accounts/Postgres prerequisite for a
-  personal/trusted-pilot JD text form under the documented shared trust boundary.
+- The quality/trace gates M2 of the [2026-09-13 plan record](../audits/implementation-plan-2026-09-13.md)
+  defines, and the M0 input/budget rails this reuses (the answer bound
+  `web_protocol.MAX_ANSWER_CHARS`, `usage.daily_token_budget`); the order is the GitHub milestone #86
+  sits in. No accounts/Postgres prerequisite for a personal/trusted-pilot JD text form under the
+  documented shared trust boundary.
 - M4 ownership and data controls before public exposure. CV upload requires its own later gate.
 
 ## Status

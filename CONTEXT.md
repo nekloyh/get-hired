@@ -13,7 +13,7 @@ One end-to-end interview run for a Candidate, persisted and resumable.
 _Avoid_: conversation, chat
 
 **Interviewer**:
-The agent that drives the conversation within a single question — asks the question, and when a **Follow-up** is called for, reasons (with RAG tools) to generate a good one. It does **not** judge or score answers. Owns **depth** mechanically (it runs the micro-loop), but not the judgment that drives it.
+The agent that drives the conversation within a single question — asks the question, and when a **Follow-up** is called for, reasons (with its RAG tool, `interviewer.LOOKUP_CONCEPT_TOOL`) to generate a good one. It does **not** judge or score answers. Owns **depth** mechanically (it runs the micro-loop), but not the judgment that drives it.
 _Avoid_: bot, assistant
 
 **Evaluator**:
@@ -25,7 +25,7 @@ A plan-executor with an LLM-judged override. By default it walks the **Topic Pla
 _Avoid_: orchestrator, router (those name the mechanism, not the role)
 
 **Self-critique**:
-A re-evaluation the **Evaluator** triggers on itself when its own score has low confidence — part of producing a trustworthy score for the *current* question. Lives inside the micro-loop, not the Supervisor.
+A re-evaluation the **Evaluator** triggers on itself when its own score has low confidence, a `weighted_score` cross-check divergence included (`evaluator._self_critique_triggers`) — part of producing a trustworthy score for the *current* question. It runs as the Panel Verdict (issue 0027): a Skeptic and an Advocate argue the exchange, then the Evaluator re-judges having read both, and that verdict is kept. Lives inside the micro-loop, not the Supervisor.
 _Avoid_: reflection (too broad), supervisor review
 
 **Topic Plan**:
@@ -47,15 +47,15 @@ The within-a-question cycle: Interviewer asks → Candidate answers → Evaluato
 The between-questions cycle owned by the **Supervisor**: decide the next move once a question is fully resolved.
 
 **Skill**:
-A canonical competency the system assesses (e.g. ml_fundamentals, mlops, system_design, vietnamese_nlp). The taxonomy is fixed today; making it pack data is ADR 0014 (Proposed).
+A canonical competency the system assesses (e.g. ml_fundamentals, mlops, system_design, vietnamese_nlp). The taxonomy is the code constant `diagnostic.SKILLS`, and a pack may use no other Skill; making it pack data is ADR 0014 (check its `Status:` line).
 _Avoid_: topic, area, dimension (a Skill is not a rubric dimension)
 
 **Derived confidence**:
-Uncertainty computed from *measured* signals — spread between independent judge votes, committee disagreement — rather than the judge's self-reported `confidence` field (which is saturated on the current judge and carries no discriminating signal). Proposed control signal for Self-critique/Panel escalation and evidence weighting; ADR 0011, experiment-gated, not yet in code.
+Uncertainty computed from *measured* signals — spread between independent judge votes, committee disagreement — rather than the judge's self-reported `confidence` field (which sat between 0.89 and 0.99 on all 35 cases of `docs/audits/calibration-bench-2026-09-15.md`). Committee disagreement caps the evidence weight of a Panel-escalated judgment (`skill.evidence_weight_for` → `skill.panel_agreement_weight`, issue 0027). ADR 0011 proposes independent votes and derived confidence as the control signal for Self-critique/Panel escalation and evidence weighting; it is experiment-gated, so check its `Status:` line.
 _Avoid_: self-reported confidence (the signal it replaces), certainty, trust score
 
 **Budget exhaustion**:
-The daily token budget running out mid-Session — *anticipated scarcity*. Neither Candidate intent nor an infrastructure surprise (ADR 0005 addendum): the Session suspends cleanly with a visible reason and resumes when the budget resets. Never recorded as `failed` questions, never a silent stall.
+The daily token budget running out mid-Session — *anticipated scarcity*. Neither Candidate intent nor an infrastructure surprise (ADR 0005 addendum): the Session suspends cleanly with a visible reason and offers resume; a resume before the daily reset (`usage.daily_reset_hint`) suspends again at the same point. The provider's `insufficient_quota` latch and the per-run token ceiling stop a Session through the same suspend (`usage.budget_stop_reason`). Never recorded as `failed` questions, never a silent stall.
 _Avoid_: quota error (that names the provider symptom, not the category), timeout
 
 **Coaching memory**:
@@ -63,11 +63,11 @@ Session history shown to the Candidate on presentation & planning surfaces — t
 _Avoid_: transcript RAG (the rejected mechanism), long-term memory (too broad — conflates the two sides of the boundary)
 
 **Skill ledger**:
-The per-Candidate JSON file of final Beta posteriors (`{candidate_id: {completed_at, skills: {skill: {alpha, beta}}}}`) that seeds a returning Candidate's decayed priors — `ledger.py`, `.skill-ledger.json`, `COACH_LEDGER_DB` / `--ledger-db`. It is scoring memory (ADR 0006), a latest snapshot per Candidate, not a history and not a record of spend.
+The per-Candidate JSON file of final Beta posteriors (`{_meta: {schema_version}, candidate_id: {completed_at, skills: {skill: {alpha, beta}}}}`) that seeds a returning Candidate's decayed priors — `ledger.py`, `.skill-ledger.json`; the web server takes its path from `COACH_LEDGER_DB` (`config.Settings.ledger_db`), `coach session` and `coach postmortem` from `--ledger-db`, which does not read `COACH_LEDGER_DB`. It is scoring memory (ADR 0006), a latest snapshot per Candidate, not a history and not a record of spend.
 _Avoid_: ledger (unqualified — ambiguous with the usage ledger), priors file, memory DB
 
 **Usage ledger**:
-The append-only JSONL file of provider token spend and budget rows (token rows, `session_run`, `questions`, `quota_exhausted`/`quota_retry`) that every budget rail counts — `usage.py`, `logs/usage-ledger.jsonl`, `COACH_USAGE_LEDGER`, plus its `.unreconciled` sidecar. It records spend and the quota latch only; it holds no Skill evidence and no Session state.
+The append-only JSONL file of provider token spend and budget rows (token rows, `session_run`, `questions`/`questions_released`, `quota_exhausted`/`quota_retry`) that every budget rail counts — `usage.py`, `logs/usage-ledger.jsonl`, `COACH_USAGE_LEDGER`, plus its `.unreconciled` sidecar. It records spend, question reservations, per-run baselines and the quota latch only; it holds no Skill evidence and no Session state.
 _Avoid_: ledger (unqualified), token log, cost log, `COACH_LEDGER_DB` (that is the Skill ledger)
 
 ## Relationships
@@ -87,5 +87,5 @@ _Avoid_: ledger (unqualified), token log, cost log, `COACH_LEDGER_DB` (that is t
 
 ## Flagged ambiguities
 
-- "deep-dive" appeared in the V2 plan as a *Supervisor* action — resolved: digging into one question is a **Follow-up** owned by the **Interviewer**, not a Supervisor move. Supervisor breadth ≠ Interviewer depth.
+- "deep-dive" appeared in the V2 plan (`docs/reference/MVP_v2.md`, deleted by #129; `git log --diff-filter=D -- docs/reference` finds it) as a *Supervisor* action — resolved: digging into one question is a **Follow-up** owned by the **Interviewer**, not a Supervisor move. Supervisor breadth ≠ Interviewer depth.
 - "self_critique" appeared in the V2 plan as a *Supervisor* action — resolved: re-checking a low-confidence score is part of finishing the current question's judgment, so it's **Self-critique** inside the **Evaluator**'s micro-loop. Same principle as deep-dive: the Supervisor only owns between-question moves.

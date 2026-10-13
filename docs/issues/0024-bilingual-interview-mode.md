@@ -28,6 +28,14 @@ calibration bench measures, which is why this sequences after 0022.
       language/mix → Evaluator instructed per mode → export records the mode
 - [x] `english_delivery` is scored only on English answers; technical dimensions proven
       language-independent on the bench's EN/VN paired cases (deltas within a stated tolerance)
+
+  > **Partial at v0.3.0:** no EN/VN delta tolerance was ever stated or gated. `bench.language_deltas`
+  > only reports the paired deltas; `bench.bench_passed` gates on each case's band and on
+  > `english_delivery` (`bench.BenchResult.DELIVERY_TOLERANCE`) alone. This slice's own run had mean
+  > |Δ| 0.00, but every gate run re-measures parity and later runs differ: on 2026-09-15
+  > (`docs/audits/calibration-bench-2026-09-15.md`) mean |Δ| was 0.23, max 1.00, with VN scored
+  > higher on `panel_ml_eval_on_train`, `panel_sd_retry_storm` and `vnlp_segmentation_weak`.
+
 - [x] Weak-delivery feedback includes ≥3 concrete phrase fixes
 - [x] Bench (0022) extended with mixed-mode cases; the regression gate stays green
 - [x] A pure-VN Session simply never activates `english_delivery` — no phantom scores
@@ -67,7 +75,8 @@ calibration bench measures, which is why this sequences after 0022.
   content in broken English), an `english_delivery` anchor, and a mixed-mode report section.
 - Live gate (ADR 0009): `docs/audits/calibration-bench-2026-07-11-bilingual-mode.md` — all four
   mixed cases in band; the broken-English case scored technical 4.00 with english_delivery 2/2
-  (judge matches the human label) and 3 phrase fixes; EN/VN paired deltas mean |Δ| 0.22.
+  (judge matches the human label) and 3 phrase fixes; EN/VN paired deltas mean |Δ| 0.00 (previous
+  best 0.22–0.30).
 
 ## Continued by (2026-07-19 remediation)
 
