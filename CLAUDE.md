@@ -6,7 +6,7 @@ This file tells any agent or contributor where the authoritative design lives, s
 
 1. **`/CONTEXT.md`** — domain glossary. Use these exact terms (Candidate, Session, Interviewer, Evaluator, Supervisor, Micro-loop, Macro-loop, Skill, Topic Plan, Role criticality, Follow-up, Self-critique, Derived confidence, Budget exhaustion, Coaching memory, Skill ledger, Usage ledger).
 2. **`/docs/adr/`** — the binding architectural decisions. Twelve files, numbered 0001–0011 and 0014; **there is no 0012 or 0013** and never was, so a missing number is not a missing document. **These win over everything else.** Sections and files marked `Status: Proposed` are experiment-gated hypotheses — do NOT implement from them until their status is Accepted; everything else (including addenda dated 2026-07-19) is binding now.
-3. **[GitHub milestones](https://github.com/nekloyh/get-hired/milestones)**: the only place work, its order and its status live. `v0.3.0 Stable`, then `v0.4.0 Foundation`; `Later` is frozen until both close. **[`/docs/issues/README.md`](docs/issues/README.md)** holds the tracking rules and the alias table (`R-NN = #(55+NN)`, work IDs `F1`/`Q1`/…, `M0a`–`M6`). **`/docs/issues/00NN-*.md`** are slice specs: design and acceptance criteria. Their `## Status` sections are historical.
+3. **[GitHub milestones](https://github.com/nekloyh/get-hired/milestones)**: the only place work, its order and its status live. `v0.4.0 Pilot-ready`, then `v0.5.0 Pilot round 2`; `Later` is frozen until both close. **[`/docs/issues/README.md`](docs/issues/README.md)** holds the tracking rules and the alias table (`R-NN = #(55+NN)`, work IDs `F1`/`Q1`/…, `M0a`–`M6`). **`/docs/issues/00NN-*.md`** are slice specs: design and acceptance criteria. Their `## Status` sections are historical.
 4. **[`/docs/roadmap.md`](docs/roadmap.md)**: direction. It says what unblocks what and what the hardware can host. Subordinate to the ADRs and the milestones; it answers *why in this order*, not *what is in each milestone*.
 
 ## Three rules for anything you write here
@@ -19,7 +19,7 @@ This file tells any agent or contributor where the authoritative design lives, s
 
 `/docs/reference/MVP_v1_2day.md` and `MVP_v2.md` (1,261 lines) were removed — every agent was told to load them and then told not to implement from them, which is the worst of both. They are in git history if you need them; `git log --diff-filter=D -- docs/reference` finds the commit.
 
-They were optimized for shipping fast / recruiter signal. That is **not** this project's priority order, which is: **(1) learn agentic systems, (2) a usable prep tool, (3) recruiter signal.** Everything they said that still holds is in an ADR, and where they conflicted with one, the ADR won.
+They were optimized for shipping fast / recruiter signal. That is **not** this project's priority order. The maintainer re-ordered it on 2026-10-13 ([`docs/audits/pilot-plan-2026-10-13.md`](docs/audits/pilot-plan-2026-10-13.md) §0): **(1) a complete, usable prep tool, piloted with a trusted group before anything is widened or made public, (2) the best architecture and stack to finish it, with learning agentic systems as the by-product rather than the goal, (3) recruiter signal.** Everything the MVP docs said that still holds is in an ADR, and where they conflicted with one, the ADR won.
 
 ## For Implementers
 

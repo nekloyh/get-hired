@@ -5,20 +5,25 @@ hold what each milestone contains and whether it is done.** This file does not r
 ADR wins over both. It answers two questions a milestone list cannot: why this order, and what the
 hardware can and cannot host.
 
-Priority is unchanged: **(1) learn agentic systems, (2) a usable prep tool, (3) recruiter signal.**
+Priority, as the maintainer re-ordered it on 2026-10-13
+([`audits/pilot-plan-2026-10-13.md`](audits/pilot-plan-2026-10-13.md) §0): **(1) a complete, usable prep
+tool, piloted with a trusted group before anything is widened or made public, (2) the best architecture
+and stack to finish it, with learning agentic systems as the by-product, (3) recruiter signal.**
 
 ---
 
-## 1. Order: stable, then foundation, then features
+## 1. Order: pilot-ready, then pilot round 2, then features
 
 | Milestone | Why it comes here |
 |---|---|
-| `v0.3.0 Stable` | The code was green; the system around it was not. Status copied into many documents drifted: `CLAUDE.md` kept calling the judge green at 35/35 for three weeks after a bench run (`calibration-bench-2026-09-15.md`) measured it red. Two draft PRs had aged 71 and 87 days, nothing had run against `main` during a pause, and a data-loss race (#122) sat in the Skill ledger. Nothing built on top of that could be trusted. |
-| `v0.4.0 Foundation` | The next features touch the same two weak layers. **State:** every product step (#127 → #83, then #84) builds on the Skill ledger, which with the usage ledger is where the race and scaling defects cluster. One transactional store (#143) fixes #125, #126 and #127 by construction, and replaces the lock choreography that #122 and #123 needed. **Measurement:** a judge change is affordable only if a wording can be screened cheaply (#145). A live problem is debuggable only if every call names its Session, turn and role (#144). The anchor work (#96, #103) comes after both. |
-| `Later` | Frozen until both close: features (#83–#88), the redesign (#60), eval work gated on the experiments an ADR `Status:` line names (#71: ADR 0011; #79: ADR 0002's evidence-semantics addendum), and the backup-judge program (#72), whose pick can replace the pinned judge only through `coach bench`, never as a judge-role fallback (ADR 0009 addendum a). |
+| `v0.3.0 Stable` (closed) | The code was green; the system around it was not. Status copied into many documents drifted: `CLAUDE.md` kept calling the judge green at 35/35 for three weeks after a bench run (`calibration-bench-2026-09-15.md`) measured it red. Two draft PRs had aged 71 and 87 days, nothing had run against `main` during a pause, and a data-loss race (#122) sat in the Skill ledger. Nothing built on top of that could be trusted. The tag is the anchor every later measurement names. |
+| `v0.4.0 Pilot-ready` | The user journey at the anchor does not survive a second day: a web resume keeps the old Session clock, a demo Session writes real Skill evidence, a second Session in the same browser fails, an unknown role silently gets no critical Skills, and the report never says why a score is what it is ([`audits/pilot-plan-2026-10-13.md`](audits/pilot-plan-2026-10-13.md) §1). Every one of those is small and costs no judge tokens, and none of them is a store or a judge change. Real feedback from a trusted group is worth more than another month of foundation, so it comes first. The one judge spend in this milestone is a live `vn` and `mixed` smoke, because those modes have never run end to end. |
+| `v0.5.0 Pilot round 2` | What round 1 cannot fix cheaply. **Scoring:** the EN/VN split comes from missing middle BARS anchors (ADR 0009 addendum d); each re-anchor (#96, #103, `mlops_awareness`) is a bench-gated judge change, screened first (#145) and confirmed at k=3, so it waits for a day with the token allowance to spare. **State:** repeat practice (no repeated questions, a Session history, #83 reduced) needs Skill history (#127), and #127 needs the store decision (ADR 0015, #143), which the maintainer paused for review on 2026-10-13. Round-1 feedback decides the rest of the list. |
+| `Later` | Frozen until both close: the remaining elevate-track features (#84, #86, #87), eval work gated on the experiments an ADR `Status:` line names (#71: ADR 0011; #79: ADR 0002's evidence-semantics addendum), the backup-judge program (#72), whose pick can replace the pinned judge only through `coach bench`, never as a judge-role fallback (ADR 0009 addendum a), and low-severity debt (#128, #146). |
 
 Not next, deliberately: **#84 (accounts/Postgres)** is a public-launch gate, not a pilot dependency.
-Building it before #143 means porting several hand-rolled file formats instead of one schema, then maintaining auth
+The trusted group shares one token; a per-person token is the cheap bridge. Building accounts before
+#143 means porting several hand-rolled file formats instead of one schema, then maintaining auth
 through every schema change #127 and #83 make.
 
 ---
@@ -102,6 +107,7 @@ The state of each practice is the state of the issue named here. This table does
   46–47/50 on the 2026-07-11 shelf (40 notes, at most 9 per Skill), because the Skill filter is
   doing the work. The triggers to revisit are in #68.
 - **Transcript RAG for judging**: ADR 0006. Scoring memory stays decayed Beta priors.
-- **A visual redesign as a release prerequisite**: the redesign (#60) waits until feedback
-  comprehension and repeat practice are done. Its code is kept at tag `archive/pr-50-frontend-redesign`.
+- **A visual redesign as a release prerequisite**: #60 was closed as not planned on 2026-10-13. The
+  UX the pilot needs, report comprehension and user-language copy, is done on the current UI; the
+  redesign's code is kept at tag `archive/pr-50-frontend-redesign` if round-1 feedback asks for it.
 - **An operations dashboard**: `docker compose logs` and `coach usage` are the interface.

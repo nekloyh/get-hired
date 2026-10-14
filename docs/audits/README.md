@@ -42,7 +42,8 @@ is whichever artifact [`judge.lock`](../../judge.lock) names (ADR 0009 addendum 
 
 | Record | What it is |
 |---|---|
-| [`pilot-plan-2026-10-13.md`](pilot-plan-2026-10-13.md) | a proposal, written after the maintainer re-ordered the priorities on 2026-10-13: what a trusted pilot meets at `2ceaf81`, three directions with costs, and the milestones, issues and tracker changes the chosen one needs; it binds only once the milestones exist on GitHub |
+| [`maintainer-review-plan-2026-10-13.md`](maintainer-review-plan-2026-10-13.md) | the reading order and the decision list (`D-*`) for the maintainer's own review of the product direction, the milestones and issues, every ADR with its experiment costs, and the evergreen docs; the tracker changes made on 2026-10-13 are in its §0 and §8 |
+| [`pilot-plan-2026-10-13.md`](pilot-plan-2026-10-13.md) | a proposal, written after the maintainer re-ordered the priorities on 2026-10-13: what a trusted pilot meets at `2ceaf81`, three directions with costs, and the milestones, issues and tracker changes the chosen one needs. The maintainer accepted it on 2026-10-13; the review plan below records what was filed |
 | [`docs-review-2026-10-12.md`](docs-review-2026-10-12.md) | the docs and ADR review at `2ceaf81`: 2,772 claims checked, 664 verified findings (46 high), in [`docs-review-2026-10-12.findings.jsonl`](docs-review-2026-10-12.findings.jsonl); its ADR recommendations are review input only, since ADR decisions were paused on 2026-10-13 |
 | [`live-smoke-2026-10-12.md`](live-smoke-2026-10-12.md) | one live Session end-to-end on the compose stack at `830ddcf`: 26,478 tokens, 15 calls, accounting and trace attribution exact; run on dev keys, which fail pilot pre-flight line 1 (#139) |
 | [`forensic-audit-2026-09-14.md`](forensic-audit-2026-09-14.md) | the forensic audit at `2dac711` plus the uncommitted M0a work; the input the QA report checked |
