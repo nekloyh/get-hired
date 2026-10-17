@@ -44,6 +44,8 @@ guardrail whose trip is a distinct `StopReason.SAFETY_CAP` logged at WARNING, se
 questions in `seeds.py`. `coach interview` runs it; covered by `tests/test_microloop.py` +
 `tests/test_interviewer.py` (offline, with live sanity checks marked `live`).
 
+> **Superseded:** the `coach interview` demo was deleted in 4f8cdf3 (PR #133). `microloop.run_micro_loop` now runs inside every Session, in the question node of `supervisor.build_session_graph`; `coach session --scripted` drives it with `microloop.ScriptedCandidate` over each bank question's scripted `seeds.SeedQuestion.answers`. The questions no longer live in `seeds.py`: `bank.load_questions` loads them from YAML into `seeds.QUESTION_BANK` (issue 0013), and `seeds.SEED_QUESTIONS` is its `ml_fundamentals` shelf. Since slice 0007, `interviewer.generate_follow_up` is not a single `chat_json` call: it grounds the Follow-up in a `lookup_concept` call, natively through `client.chat_with_tools` (`interviewer._generate_follow_up_native`) when the client supports tool calls, otherwise as two `chat_json` turns (`interviewer._generate_follow_up_json`) for offline fakes.
+
 Traceability is now part of the loop output: `Turn.trace` records Evaluator self-critique triggers,
 the Interviewer's `lookup_concept` query/filter/hit when that turn generated a Follow-up, and the
 turn that actually stopped the loop (`resolved` or `safety_cap`). This makes a bad Session transcript

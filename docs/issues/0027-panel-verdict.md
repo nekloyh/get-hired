@@ -17,6 +17,11 @@ committee split on moves the Beta less. Append a **committee packet** to the Mar
 each voice's one-paragraph scorecard and the disagreement — the artifact a real hiring-committee
 debrief produces.
 
+> **Superseded:** the agreement weight caps the 0021 confidence weight instead of replacing it.
+> `skill.evidence_weight_for` takes the `min()` of `skill.panel_agreement_weight` and
+> `skill.confidence_weight` on an escalated question, so committee agreement can lower the weight
+> but never raise it above what the deterministic guards allow (129e4e3, QA-07, via PR #133).
+
 Strictly cost-gated: with one free-tier provider, the panel runs *only* in the ambiguous band the
 existing triggers already define — never on confident scores.
 
@@ -28,6 +33,14 @@ existing triggers already define — never on confident scores.
       advisory and visible in the export's committee packet
 - [x] Agreement → evidence-weight mapping is tested: disagreement produces a strictly smaller
       posterior shift than consensus at the same score
+
+  > **Partial at v0.3.0:** because `skill.evidence_weight_for` takes the `min()` of the agreement
+  > and confidence weights, a split moves the posterior strictly less only when it pushes
+  > `skill.panel_agreement_weight` below `skill.confidence_weight`. At confidence 0.4 (weight 1.1),
+  > disagreement 0, 1 and 2 all weigh 1.1; at confidence 0 every disagreement weighs 0.5. The test
+  > `tests/test_skill.py::test_contested_verdict_moves_posterior_less_than_consensus_at_identical_score`
+  > compares disagreement 0 with 3 at confidence 0.9, where the property does hold.
+
 - [x] 2–3 bench cases (0022) measure whether the panel improves accuracy on borderline goldens;
       the result is recorded in `docs/audits/` either way
 

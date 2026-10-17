@@ -39,6 +39,13 @@ within an answer or two, and Role criticality still never moves the prior mean.
   `save_posteriors` persists final posteriors on completion; `load_priors` returns a returning
   Candidate's carried priors (raw last-Session means for display + `decay_beta`-decayed means for the
   prior seam) or `None` for a first-ever/absent/corrupt ledger.
+
+  > **Superseded:** both Session drivers (`cli_session._cmd_session`,
+  > `web_session_driver._run_session_thread`) now persist through `ledger.save_measured_posteriors`:
+  > only the Skills the Session measured (`session_serde.measured_skill_states`), merged into the
+  > Candidate's carried, decayed record inside one locked section (`ledger.update_posteriors`).
+  > `ledger.save_posteriors` replaces a whole record (5950aea, NEW-17, via PR #133).
+
 - `decay_beta` decays Beta pseudo-counts toward the neutral prior by `0.5 ** (days / half_life)`
   (`LEDGER_HALF_LIFE_DAYS = 30`), so older evidence is pulled toward mean 0.5 and counts strictly less
   — warmer than a stranger, still probed. Pure arithmetic, no LLM (ADR 0006).
@@ -47,6 +54,12 @@ within an answer or two, and Role criticality still never moves the prior mean.
 - `coach session --candidate <id> [--ledger-db path]` loads/persists; `candidate_id` rides in
   `SessionState` so a resumed Session also persists. Web `start_session` accepts `candidate_id` and the
   React setup panel exposes a "Candidate id" field.
+
+  > **Partial at v0.3.0:** the web driver persists a resumed Session under the checkpoint's
+  > `candidate_id` (`web_session_driver._run_session_thread`). `coach session --resume` does not read
+  > it: `cli_session._cmd_session` persists only when `--candidate` is passed again, under that
+  > flag's id.
+
 - Export gets a "Since Previous Session" before → after table and the terminal summary a "SINCE LAST
   SESSION" block, both only for a returning Candidate; cold start renders nothing.
 - Missing/corrupt/malformed ledgers degrade to cold start with a logged warning; write failures never

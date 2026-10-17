@@ -35,6 +35,16 @@ backstop, not a hot path. To make that backstop safe, `question_node` now perfor
 *inside* its slice-0014 failure-isolation net, so an over-subscribed plan is recorded as a visible
 `FAILED` question and the Session advances — never a re-served duplicate, never a crash.
 
+> **Partial at v0.3.0:** the exhaustion signal and the isolation net hold; the unreachability
+> argument does not, and never did. It covers the Topic Plan (`diagnostic._make_plan_validators`
+> lists each Skill once) and the deviation gates (`supervisor._make_supervisor_validators` checks
+> `supervisor._has_unused_seed` for `extra_question`, `switch_skill` and `skip_ahead`), but not
+> `advance_plan`. `switch_skill` moves `current_plan_index` back to the target Skill's plan entry
+> (`supervisor._apply_supervisor_decision`, `supervisor._plan_index_for_skill`, both older than this
+> fix), so later `advance_plan` steps re-enter entries already asked, with no seed check. A Skill with
+> few seeds (easy to hit with a small pack) can then reach `seeds.SeedQuestionsExhausted` in a
+> well-formed run, which the net records as a `FAILED` question.
+
 Covered by `tests/test_seeds.py` (attempts ≥ `seed_count` raise for every Skill; attempts `0..n-1`
 stay distinct; difficulty ordering and rotation preserved) and
 `tests/test_supervisor.py::test_seed_exhaustion_is_isolated_as_a_failed_question_not_a_duplicate`.

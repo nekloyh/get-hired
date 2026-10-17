@@ -36,6 +36,15 @@ as issue 0013, whose breadth tail effectively becomes pack authoring under this 
       different questions chosen
 - [x] A returning Candidate does not get the identical question sequence (rotation aware of
       session history; integrates with the ledger id when 0023 lands, but must not require it)
+
+  > **Partial at v0.3.0:** `seeds.rotation_offset` hashes the Session id; it reads no Session history
+  > and no Candidate id, although 0023 landed. `seeds.select_seed_question` ranks by distance to
+  > `target_difficulty` first, and `question_node` (in `supervisor.build_session_graph`) always passes
+  > the Topic Plan's target, so rotation only reorders equally distant questions. Where one question
+  > sits closest to the target, every Session gets the same first prompt for that Skill: over 50
+  > Session ids the built-in bank yields one distinct first question for every Skill at target 1, and
+  > for `vietnamese_nlp` at targets 1, 2, 4 and 5.
+
 - [x] The FPT-style pack ships with ≥20 lint-clean questions including the EN self-intro item
 
 ## Blocked by
@@ -58,6 +67,10 @@ as issue 0013, whose breadth tail effectively becomes pack authoring under this 
   bank was tagged with a 2/3/4 spread per Skill.
 - `rotation_offset(session_id, span)` (stable SHA-256 hash) rotates the bank per Session so a returning
   Candidate does not get the identical sequence — no ledger required.
+
+  > **Partial at v0.3.0:** rotation only breaks difficulty ties; see the note under the rotation
+  > criterion above.
+
 - Ships `data/packs/fpt/` — an FPT-style pack: 20 lint-clean questions across the five canonical
   Skills (flavoured after public FPT interview reports) including an English self-introduction item,
   plus 10 concept notes. (Taxonomy note: FPT's OOP/SQL emphasis is mapped onto the canonical Skills;

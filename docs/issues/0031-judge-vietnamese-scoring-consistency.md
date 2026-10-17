@@ -68,15 +68,26 @@ Vietnamese input**, not a provider quirk and not a mislabelled band. Groq is als
 (harsher judge; a different near-miss on `dl_overfitting_strong_en` = 3.70), so a *same-tier* provider
 swap is not a win. Prompt tuning and relabeling were both ruled out.
 
-**Resolved by a stronger judge model — `gpt-5.4-mini`.**
+**Resolved on 2026-07-11 by a stronger judge model — `gpt-5.4-mini`.**
 `docs/audits/calibration-bench-2026-07-11-gpt-5.4-mini.md`. Upgrading the judge from `gpt-4o-mini` to
 `gpt-5.4-mini` (still on the language-invariance prompt) takes the bench to **20/20, exit 0 (green)**:
-`vnlp_segmentation_weak_vi` now scores **2.00, in band**, matching its English twin (Δ = 0.00), and
-weak/strong separation improves to 2.83. This confirms the residual was a **small-model capability
-limit**, exactly the resolution this issue pointed to. `gpt-5.4-mini` sits in OpenAI's free
-2.5M-tokens/day tier, so the upgrade is $0 at dev volume. Follow-up (not blocking): the bench bands
-were labelled against `gpt-4o-mini`, and `gpt-5.4-mini` shows a `communication` bias of +0.65 and
-scores strong answers high — worth a future anchor re-review for the new judge.
+on that run `vnlp_segmentation_weak_vi` scored **2.00, in band**, matching its English twin
+(Δ = 0.00), and weak/strong separation improves to 2.83. This confirms the residual was a
+**small-model capability limit**, exactly the resolution this issue pointed to. On 2026-07-11 this
+account's OpenAI data-sharing allowance covered `gpt-5.4-mini` at 2.5M tokens/day for data-shared
+traffic (the record's `## Cost` section), so the upgrade cost nothing at dev volume; the public
+price list states no free tier for it (`docs/research/2026-09-02-stack-references.md`). Follow-up
+(not blocking): the bench bands were labelled against `gpt-4o-mini`, and `gpt-5.4-mini` shows a
+`communication` bias of +0.65 and scores strong answers high — worth a future anchor re-review for
+the new judge.
+
+> **Superseded:** the stronger judge did not settle it. On 2026-09-15, on `gpt-5.4-mini` at k=3,
+> `vnlp_segmentation_weak_vi` scored 2.70/2.70/2.70 against its 1.0–2.6 band, the bench's one red case
+> (EN twin 2.20, |Δ| 0.50; `docs/audits/calibration-bench-2026-09-15.md`, the baseline `judge.lock`
+> names). Earlier `gpt-5.4-mini` runs gave 2.00 (2026-07-19) and 2.10 from 2.10/2.60/2.00
+> (2026-07-27). ADR 0009 addendum d (2026-07-27) traces EN/VN splits of this kind to missing middle
+> BARS anchors rather than to model size, and `rubric.DIMENSION_GUIDE` has no 3 anchor for `depth`
+> or `system_thinking`.
 
 ## Blocked by
 

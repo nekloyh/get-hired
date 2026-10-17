@@ -11,7 +11,7 @@ is not a disclaimer; it is the deployment's actual security model.
 
 ---
 
-## 1. Pre-flight — every line is one command with a binary answer
+## 1. Pre-flight — every line has a binary answer
 
 Run these **on the deploy host**, against the real hostname, after `docker compose up -d`. Do not
 skip a line because it "was fine last time": three of these are one-character mistakes that leave
@@ -19,7 +19,7 @@ the deployment looking healthy.
 
 | # | Check | Command | Pass |
 |---|---|---|---|
-| 1 | **Groq key rotated** | — (provider dashboard) | the key in `.env` is one that has never been in a git checkout, a chat log, or an audit transcript |
+| 1 | **Every provider key rotated** | `grep -E '^[A-Z]+_API_KEY=.' .env \| cut -d= -f1` names them; each provider's dashboard answers | every key it names (`OPENAI_API_KEY` always — the judge runs on it; `GROQ_API_KEY` / `ZENMUX_API_KEY` if set) has never been in a git checkout, a chat log, or an audit transcript, and the key it replaced is revoked (#139) |
 | 2 | Production origin, not localhost | `grep '^COACH_ALLOWED_ORIGINS=' .env` | `https://<your real host>` — **not** `http://localhost:5173`, not `*` (refused at startup), not `http://` |
 | 3 | Production token, freshly generated | `grep -c '^COACH_AUTH_TOKEN=.\{32,\}' .env` | `1`, and its value was generated **for this host** — not reused from a dev `.env` |
 | 4 | No dead MiMo keys | `grep -c '^MIMO_' .env` | `0` |
@@ -29,14 +29,14 @@ the deployment looking healthy.
 | 8 | The gate is actually closed | `curl -s -o /dev/null -w '%{http_code}' https://<host>/api/sessions/x/export.md` | `401` |
 | 9 | The gate opens for the right token | `curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" https://<host>/api/sessions/x/export.md` | `404` — not `401` (a `401` here means the token you handed out is not the token the server loaded) |
 | 10 | The socket refuses a foreign origin | see §1.1 | handshake `HTTP 403` |
-| 11 | Cert renewal can work in 90 days | `echo tok > deploy/certbot-webroot/.well-known/acme-challenge/t && curl -s http://<host>/.well-known/acme-challenge/t` | prints `tok` — **not** a 301. If this redirects, http-01 renewal will fail silently three months from now |
+| 11 | Cert renewal can work in 90 days | `d=deploy/certbot-webroot/.well-known/acme-challenge; mkdir -p $d && echo tok > $d/t && curl -s http://<host>/.well-known/acme-challenge/t; rm -f $d/t` (from the checkout root; git ships only `deploy/certbot-webroot/`) | prints `tok` — **not** a 301. If this redirects, http-01 renewal will fail silently three months from now |
 | 12 | The first backup exists and restores | §4 | an archive outside the checkout, **and** a test restore that serves the same export md5 |
 
 **Caveat on line 5.** `nginx healthy` proves nginx is listening and `coach.conf` loaded. It does
-**not** prove TLS serves or that the upstream is up — the image has neither `curl` nor `openssl`, and
-busybox `wget` follows the 301 into TLS and fails certificate verification, so a `:443` probe would
-report unhealthy throughout the self-signed bootstrap that `deploy.md` §3 requires. Measured: with
-`app` stopped, `nginx` still reads healthy while `https://…/api/health` returns **502**. Lines 6–9
+**not** prove TLS serves or that the upstream is up — the healthcheck (`docker-compose.yml`, service
+`nginx`) probes only `:80` for the 301, never `:443` or `app`, so that it stays green through the
+self-signed bootstrap that `deploy.md` §3 requires. Measured: with `app` stopped, `nginx` still
+reads healthy while `https://…/api/health` returns **502**. Lines 6–9
 are what cover that gap, which is why they are run against the real hostname and not `127.0.0.1`.
 
 ### 1.1 The origin check
@@ -78,8 +78,8 @@ worked around.
 Everyone shares one password to the whole installation. There is no per-person account. Concretely:
 
 - **Anyone who has the link and the token can read and overwrite anyone else's saved skill
-  history**, just by typing that person's Candidate id. The id is not a secret and is not checked
-  against who you are.
+  estimates** (their Skill ledger entry), just by typing that person's Candidate id. The id is not
+  a secret and is not checked against who you are.
 - **Anyone can open, resume, cancel, or download any interview report** whose Session id they can
   guess or are shown.
 
@@ -102,11 +102,13 @@ the same question is re-issued → the post-restart answer lands in the report.)
 
 ### The scores are for practice, not for judging anyone
 
-The grader is an LLM whose calibration is **known to have drifted**, and its calibration gate is
-**not green** (GH #96 owns it; the newest `docs/audits/calibration-bench-*.md` has the numbers). One known effect:
-Vietnamese answers can score higher than the identical English answer, because two rubric dimensions
-have a gap in their scale. Use the feedback to practise. **Do not use these scores to compare
-people, and do not put them in front of a recruiter as a measurement.**
+The Evaluator — the LLM that scores answers — has a calibration gate (ADR 0009), and its result is
+the bench artifact [`judge.lock`](../judge.lock) names: read that result before the pilot and tell
+users what it says. One known effect: Vietnamese answers can score higher than the identical English
+answer wherever a rubric dimension has no anchor at some point of its 1–5 scale
+(`rubric.DIMENSION_GUIDE`), because the judge fills the gap on phrasing (GH #96 is the anchor work).
+Use the feedback to practise. **Do not use these scores to compare people, and do not put them in
+front of a recruiter as a measurement.**
 
 ---
 
@@ -130,10 +132,10 @@ Symptoms and what they mean:
 
 | What they report | What to check | What to do |
 |---|---|---|
-| "It says the previous run is still finishing" | `docker compose logs app \| grep 'still finishing'` clustered on one Session id | a provider stall holds the runtime up to ~4 min. Tell them to wait, not to retry-storm |
-| "It just stopped" right after typing fast | `grep 'Answer refused'` | answers are bound to the question they were typed for; the refusal is the guard working. Reload and re-answer |
+| "It says the previous run is still finishing" | the refusal (`web_runtime._STILL_FINISHING`) goes to the browser only, never to the log. Ask for their Session id, then `docker compose logs app \| grep 'session=<id>'` (its `llm-call` lines): a stall shows as `outcome=retry:…` / `outcome=error:…` with a large `ms=` | a provider stall holds the runtime up to ~4 min. Tell them to wait, not to retry-storm |
+| "Answer refused" right after typing fast | nothing server-side: the refusal is a socket frame (`web_protocol._frame_refused`), never logged. The browser shows `Answer refused: it does not answer the pending question.` | answers are bound to the question they were typed for; the refusal is the guard working. The answer goes back into the box: send it again, or reload and re-answer |
 | The browser never connects at all | `docker compose logs nginx`, then pre-flight line 10 | almost always `COACH_ALLOWED_ORIGINS` not matching the origin the browser actually sends |
-| A session cannot start, cap message | `docker compose exec app coach usage` | the shared 480/day is spent. It resets on the UTC day |
+| A session cannot start, cap message | `docker compose logs app \| grep 'refused to start Session'` (the cap's line reads `Daily question cap reached: <n> of <cap> …`; `coach usage` prints only the cap's size) | the shared 480/day is spent. It resets on the UTC day |
 | `coach usage` leads with `ACCOUNTING:` | `deploy.md` §7 | **unavailable** → fix the path. **UNRECONCILED** → fix the path, then `coach usage --reconcile` |
 
 ### Restarting
@@ -147,38 +149,46 @@ question open reconnects and is re-asked that question; completed questions are 
 ## 4. Backup and restore — both halves, verified
 
 The state volume is the interviews. Losing it loses every in-flight session, every report not yet
-downloaded, and everyone's cross-session skill history.
+downloaded, and everyone's Skill ledger entry (the skill estimates a returning Candidate starts from).
 
 **Back up** (from the checkout, as `deploy.md` §5 specifies — `docker compose run` is load-bearing,
 because a hand-written `docker run` mounting `coach-state` by its bare key silently creates a
-*different*, empty volume and tars nothing):
+*different*, empty volume and tars nothing). Stop `app` around it: `session-checkpoints.sqlite` is
+WAL-mode SQLite (`langgraph.checkpoint.sqlite.SqliteSaver.setup`), and a `tar` of a live one copies
+the database and its `-wal` sidecar at different moments. Like a restart (§3), the stop costs at
+most the question in flight:
 
 ```bash
 sudo install -d -m 700 /var/backups/coach
+docker compose stop app
 docker compose run --rm --no-deps --user root -v /var/backups/coach:/backup app \
   tar czf "/backup/coach-state-$(date +%F).tgz" -C /app/state .
+docker compose start app
 ```
 
 **Restore, and prove it restored** — a backup you have never restored is a hope, not a backup:
 
 ```bash
+curl -s -H "Authorization: Bearer $TOKEN" https://<host>/api/sessions/<known-id>/export.md | md5sum  # the md5 to reproduce
 docker volume create coach-restore-test
 docker run --rm --user root -v coach-restore-test:/app/state -v /var/backups/coach:/backup:ro \
   <image> sh -c 'tar xzf /backup/coach-state-<DATE>.tgz -C /app/state && chown -R 10001:10001 /app/state'
-docker run -d --name coach-restored -p 18110:8000 --env-file .env -v coach-restore-test:/app/state <image>
+docker run -d --name coach-restored -p 127.0.0.1:18110:8000 --env-file .env -v coach-restore-test:/app/state <image>
+curl -sf --retry 30 --retry-delay 1 --retry-connrefused localhost:18110/api/health >/dev/null  # wait for startup
 curl -s -H "Authorization: Bearer $TOKEN" localhost:18110/api/sessions/<known-id>/export.md | md5sum
 docker rm -f coach-restored && docker volume rm coach-restore-test
 ```
 
-The `chown -R 10001:10001` is required: `tar` restores the archive's ownership, the container runs as
-uid 10001, and without it the app cannot write the volume it just restored.
+The `chown -R 10001:10001` makes the restored files belong to the container's uid 10001, whatever
+ownership the archive carries; without write access the app cannot use the volume it just restored.
 
 Executed on 2026-09-15 against the real image: archive → empty volume → new container → both known
 exports served **HTTP 200 with byte-identical md5s** (`e848a3c8…`, `f0cb41f4…`).
 
-**Note** `usage-ledger.jsonl` will not be in the archive until the deployment has made its first
-metered call — demo-mode traffic creates no rows. Once live, it is in the archive and it matters:
-that file **is** the budget balance, so restoring without it resets the day's spend to zero.
+**Note** `usage-ledger.jsonl` has no rows until the deployment's first metered Session or call —
+demo-mode traffic writes none — and before that it may be absent or empty (`coach usage` creates it
+empty). Once live, it matters: that file **is** the budget balance, so restoring without it resets
+the day's spend to zero.
 
 ---
 
@@ -187,9 +197,9 @@ that file **is** the budget balance, so restoring without it resets the day's sp
 | Not covered | Why it is acceptable for a pilot | What it would take |
 |---|---|---|
 | Per-user auth / per-record ownership | five trusted people | GH #84 (R-29) |
-| Per-turn resume | a crash costs one question, not the interview | M1/F4 |
+| Per-turn resume | a crash costs one question, not the interview | durable turn IDs/ACKs — work ID F4's scope in `docs/audits/implementation-plan-2026-09-13.md` |
 | Skill history over time | one snapshot per Candidate | GH #127, then #83 |
-| A green judge gate | scores are framed as practice (§2) | GH #96 |
-| Load, latency or cost SLO | one shared 480/day cap is the only rail | — |
-| Browser E2E in CI | the WebSocket path is covered by the dry-run above | — |
-| Operations dashboard | `docker compose logs` + `coach usage` | deferred |
+| Judge calibration as a measurement | scores are framed as practice (§2); the gate's result is the artifact `judge.lock` names | GH #96 (anchors), then a median-of-k bench run (ADR 0009) |
+| Load, latency or cost SLO | three spend rails, no SLO: the shared daily question cap (`usage.question_cap_reason`), the daily token budget (`usage.start_refusal_reason`, `LLM_DAILY_TOKEN_BUDGET`) and the per-run ceiling (`usage.session_budget_guard`) | — |
+| Browser E2E against a live provider | CI's `e2e` job (`.github/workflows/ci.yml`) runs both Playwright specs in demo mode; a whole Session over `wss://` through nginx ran in the dated dry-run (`docs/audits/milestone-v0.1.0-pilot-2026-09-15.md` §5) | a `COACH_E2E_MODE=live` run of `web/e2e/reconnect-flow.spec.ts` (spends provider tokens) |
+| Operations dashboard | `docker compose logs` + `coach usage` | — (`docs/roadmap.md` §5) |
